@@ -1,0 +1,6 @@
+[Dianne&Marcus]
+Tight ampersand, no spaces at all
+[Dianne   &   Marcus]
+Loose ampersand, spaces everywhere
+[  Dianne & Marcus  ]
+Padded brackets around the whole tag

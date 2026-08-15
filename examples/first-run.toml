@@ -1,0 +1,212 @@
+# Example run config, tuned for the FIRST real end-to-end render on doris.
+#
+# Copy this next to your assets and edit the paths. Relative paths resolve
+# against THIS FILE's directory, not the process working directory.
+#
+# ORDER MATTERS. Every top-level setting must appear ABOVE the first table
+# header ([cast.*], [hardware]). TOML assigns a bare key to whichever table
+# precedes it, so a `render_width` written below `[hardware]` silently becomes
+# `hardware.render_width` -- an unknown key the loader ignores -- and the run
+# quietly uses the default instead. An earlier version of this very file made
+# that mistake with SIX settings, including the 864x480 that is its whole
+# point, so every copy of it rendered at 1344x768 and took 3x as long as
+# advertised. Keep the tables at the bottom.
+
+# --------------------------------------------------------------------------- #
+# Inputs
+# --------------------------------------------------------------------------- #
+
+master_audio          = "audio/master.wav"
+lyrics_file           = "lyrics.txt"
+global_style          = "Refestramus progressive rock music video, 35mm film"
+narrative_concept     = "Wandering through a surgery, kicking a life support plug out, surgeons scrambling"
+default_lead_vocalist = "Dianne"
+
+# WHERE AND WHEN the whole video happens. Composed into every prompt, so the
+# geography cannot drift between shots.
+#
+# Leave this out and each shot's location is whatever its own description
+# implies: the first full render put a British terraced street, wheelie bins
+# and sash windows in some shots and a Central-Park-ish snowy park with US
+# emergency vehicles in others. Individually plausible, incoherent in sequence.
+# The loader warns when this is missing.
+setting = "London, UK -- contemporary, overcast winter"
+
+# Whole-video film look -- stock, lens, depth of field, lighting philosophy.
+# Separate from global_style (band/genre/tone) and from a shot plan entry's
+# own `camera` field (this SHOT's framing/movement -- see shot_plan.toml).
+# Optional; omitting it is what every config before issue #53 already does.
+# cinematography = "35mm film, shallow depth of field, warm natural light"
+
+# How the CAST should be presented -- lighting, styling, grading. Separate from
+# global_style (which is about the film) and from a cast member's `role` (which
+# is about who they are in the story). Per-member direction goes in
+# [cast.<Name>].appearance below.
+#
+# STATE AN ENDPOINT, NEVER A DISPLACEMENT (issue #46). "Slimmer" names no
+# endpoint, so it can always go further; "slim" names one, and applying it to
+# something already slim changes nothing. This is not a style preference: on
+# the chained render path the shot is seeded from the previous shot's own last
+# frame, so every relative directive is re-applied to its own output, once per
+# chunk. The code no longer restates appearance on that path, which stops it
+# compounding -- but a displacement is still the wrong shape of instruction,
+# and the base path re-reads it against the photo every time.
+global_appearance = "everyone slim, trim and healthy looking"
+
+# This is the default (issue #50), so it can be omitted entirely -- it
+# assumes the orchestrator runs on the same host as ComfyUI. Pointing it at a
+# remote host instead is a supported override (e.g. a Tailscale hostname --
+# never a raw LAN IP -- if ComfyUI runs on a separate GPU box on the tailnet).
+comfyui_url = "http://127.0.0.1:8188"
+
+workflow_template = "workflow_api.json"
+
+chunks_dir      = "output/chunks"
+final_video_dir = "output/final"
+
+# Optional per-chunk narrative direction. Without it every chunk is prompted
+# with the same `narrative_concept`, which gives a video with no progression --
+# and if that string names several settings, H3 cuts between all of them inside
+# every chunk and most of the lip-sync is lost. See the README's "Shot plan".
+#
+# Generate a skeleton (chunk_id/start/lyric filled in, shot left blank) rather
+# than transcribing a render log by hand:
+#     music-video-maker --config run.toml --prepare
+# shot_plan = "shot_plan.toml"
+
+# --------------------------------------------------------------------------- #
+# Render resolution. THE biggest lever on how long a run takes, because cost
+# scales with the latent volume, not with the frame count alone. Measured on
+# the doris 4090 at 141 frames:
+#
+#     864 x 480   ->  ~3.5 min/chunk   (~2.3 h for a 4:22 song)
+#    1152 x 640   ->  ~6.6 min/chunk   (~4.8 h)
+#    1344 x 768   ->  ~9.25 min/chunk  (~6.8 h)   <- the template's own default
+#
+# Omit both to use whatever the template was authored with. Both must be set
+# together, and both must be multiples of 32 (H3's declared dimension grid).
+#
+# Render small while you are still iterating on the shot plan; raise it once
+# the video is right. 864x480 is what was used for hands-on testing.
+# --------------------------------------------------------------------------- #
+
+render_width  = 864
+render_height = 480
+
+# --------------------------------------------------------------------------- #
+# Coverage
+# --------------------------------------------------------------------------- #
+
+# Render the unvoiced spans -- intro, outro, and every instrumental break --
+# as b-roll chunks, so the chunk timeline covers the whole track contiguously.
+#
+# Leave this ON. With it off, only voiced spans are rendered, and Stage 5's
+# concat squeezes every skipped instrumental out of the video while the muxed
+# master audio keeps it: the video finishes short and every chunk after the
+# first break plays against the wrong moment of the song. A typical track is
+# well under half vocals -- "The Lucky Ones" is 135s of singing across 250s,
+# so gap-skipping loses nearly half the song and desyncs everything after 0:16.
+#
+# Cost is GPU time: it roughly doubles the chunk count (22 -> 39 on that track).
+instrumental_coverage = true
+
+# I2V continuity needs a SECOND authored template. Leave this off for a first
+# run -- it is a separate graph, and one unknown at a time is easier to debug.
+i2v_continuity = false
+
+# --------------------------------------------------------------------------- #
+# Resilience + custody. All optional; defaults shown where useful.
+# --------------------------------------------------------------------------- #
+
+# doris runs high-90s %% full; the pre-flight refuses a run rather than hitting
+# ENOSPC dozens of chunks in.
+min_free_disk_gb = 20.0
+
+# Absolute free-VRAM floor, checked ONCE before the run starts.
+#
+# 16.0 is the lowest free-VRAM figure at which a render has ever demonstrably
+# succeeded on doris. That is the rule: set the floor at the worst
+# configuration observed to WORK -- never below it because less might do,
+# never above it because more ought to be needed.
+#
+# For scale, ComfyUI reports H3 staging 19995 MB for the diffusion model, plus
+# a 14956 MB text encoder and ~5.5 GB of VAEs. Renders still succeed at 16 GB
+# free because ComfyUI offloads between stages, so do NOT read 19995 MB as the
+# floor -- a floor of 20 would refuse configurations that demonstrably work.
+#
+# This number has been wrong in both directions: 90% of nominal VRAM (too
+# strict), then 12.0 -- below anything ever demonstrated -- which on
+# 2026-08-07 green-lit a run onto a contended card that went SILENT rather
+# than raising CUDA OOM and wedged the host past SIGKILL.
+#
+# The check is POINT-IN-TIME. It cannot see another process claiming the card
+# mid-run, which is how that incident actually started. Confirm the card is
+# clear yourself before a long run -- stopping the one tenant you know about
+# is not the same as freeing the card:
+#
+#     nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+min_free_vram_gb = 16.0
+
+# --------------------------------------------------------------------------- #
+# TABLES LAST. Nothing below this line may be a top-level setting.
+# --------------------------------------------------------------------------- #
+
+# Cast. A member need never be the active vocalist -- background members are
+# simply entries that are never `default_lead_vocalist` and never tagged in the
+# lyrics. Every character tagged in the lyrics file MUST appear here.
+
+# A role describes who the character IS -- appearance, wardrobe, demeanour.
+# It must NOT say what they are doing vocally. The role is injected into every
+# chunk, so "singing to camera" in a role contradicts the pipeline's own
+# instrumental clause on every unvoiced chunk, and the character-attached
+# instruction wins: the performer sings straight through the instrumental
+# breaks. Whether someone is singing is per-chunk state that prompting.py
+# already handles.
+#
+# `appearance` is optional and is how this member should be PRESENTED --
+# lighting, styling, a flattering look. It applies to every chunk they are in,
+# exactly like `role` does, which is precisely why it is a separate key: mixing
+# kinds of statement into one string is what made the performer sing through
+# every instrumental. Note the weaker lever, too -- H3 follows the reference
+# photo far more closely than any adjective here, so a lightly retouched
+# `image` will do more than this string will.
+#
+# Same rule as global_appearance: state an ENDPOINT, not a displacement. This
+# example used to read "looking a few years younger", and on the v7 render the
+# lead visibly became a different, younger woman over each chained run of shots
+# -- each shot applying "a few years younger" to a frame that was already a few
+# years younger (issue #46). "In her late forties" is the same intent with a
+# floor under it.
+[cast.Dianne]
+role       = "Lead Vocalist, smiling constantly, oblivious"
+image      = "cast/dianne_ref_01.jpg"
+appearance = "in her late forties, softly lit, flattering"
+
+[cast.Rex]
+role  = "Drummer, background, never sings"
+image = "cast/rex_ref.jpg"
+
+[hardware]
+name    = "RTX 4090 24GB (doris)"
+vram_gb = 24.0
+
+# H3's trained range is 124-362 frames (5.167s - 15.083s), and that is what the
+# profiles default to. This caps FIRST runs well inside it, on purpose.
+#
+# What is proven on this card: 124-141 frame clips at good quality. Nothing
+# longer has been rendered at any resolution. Temporal VAE decode memory scales
+# NON-LINEARLY with frame count, so 362 frames is roughly 3x the frame count
+# anyone has tested and is the most likely thing to fail on a first run.
+#
+# For TIMING, see render_width/render_height above -- a chunk's cost is set by
+# resolution far more than by frame count.
+#
+# 8.0s is a deliberate choice, not a round number: it is exactly 192 frames
+# (5 + 17*11), landing precisely on H3's `length` grid. The window this opens
+# is 124 / 141 / 158 / 175 / 192 frames -- five valid chunk lengths, none of
+# them far outside proven territory.
+#
+# Raise this once you have measured a longer chunk (issue #21). If a run
+# dead-letters chunks with CUDA OOM, lower it before reaching for anything
+# else: fewer frames per chunk needs no code change.
+max_chunk_seconds = 8.0

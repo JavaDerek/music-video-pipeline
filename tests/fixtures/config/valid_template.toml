@@ -1,0 +1,24 @@
+master_audio = "{base}/audio/master.wav"
+lyrics_file = "{base}/lyrics.txt"
+global_style = "Refestramus progressive rock music video, 35mm film"
+narrative_concept = "Wandering through a surgery, kicking a life support plug out, surgeons scrambling"
+default_lead_vocalist = "Dianne"
+comfyui_url = "http://127.0.0.1:8188"
+workflow_template = "{base}/workflow_api.json"
+chunks_dir = "{base}/output/chunks"
+final_video_dir = "{base}/output/final"
+
+[cast.Dianne]
+role = "Lead Vocalist, smiling constantly, oblivious"
+image = "{base}/cast/dianne_ref_01.jpg"
+
+[cast.Rex]
+role = "Drummer, background, never sings"
+image = "{base}/cast/rex_ref.jpg"
+
+[hardware]
+name = "RTX 4090"
+vram_gb = 24.0
+min_chunk_seconds = 4.0
+max_chunk_seconds = 15.0
+recommended_nodes = ["SageAttention"]

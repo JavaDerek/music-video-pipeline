@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the declared floor (pyproject.toml); 3.13 exercises the
+        # audioop-lts conditional dependency PEP 594 made necessary.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Deliberately the core install plus [dev] only -- no [align] or
+      # [faces]. The suite must pass this way: Stage 1 mocks the stable-ts
+      # model entirely and the seed-frame face-gate tests skip themselves via
+      # pytest.importorskip("cv2") when OpenCV is absent. If a future test
+      # silently needs one of those extras, this is what catches it -- see the
+      # note on issue #51 §6 about the two tests that only looked
+      # environmental.
+      - run: pip install -e ".[dev]"
+
+      - run: ruff check .
+
+      # Integration tests need a real ffmpeg/claude binary and are deselected
+      # here, not skipped silently -- see the `integration` marker registered
+      # in pyproject.toml. Both self-skip if run directly without their
+      # binary present, but deselecting keeps the CI run's intent explicit.
+      - run: pytest -m "not integration"

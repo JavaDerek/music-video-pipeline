@@ -1,0 +1,100 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "music-video-maker"
+version = "0.1.0"
+description = "Turn a master audio track, lyrics, and cast photos into a lip-synced music video via a local ComfyUI running MiniMax H3."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Derek Ferguson" }]
+
+# Core runtime deps. Deliberately excludes the heavy ML stack -- see the
+# [project.optional-dependencies] "align" extra below.
+dependencies = [
+    "pydub>=0.25.1",
+    "requests>=2.31",
+    "websocket-client>=1.7",
+    "ffmpeg-python>=0.2.0",
+    "tomli>=2.0; python_version < '3.11'",
+    # PEP 594 removed stdlib `audioop` in 3.13; pydub imports it unconditionally.
+    "audioop-lts>=0.2; python_version >= '3.13'",
+]
+
+[project.optional-dependencies]
+# Forced alignment pulls torch (~2 GB). Stage 1 unit tests mock the stable-ts
+# model entirely (issue #3), so CI and every other stage stay light. Install
+# this extra only on the machine that actually runs alignment.
+# Issue #47: the seed-frame face gate. Kept an extra rather than a hard
+# dependency because the whole test suite exercises the *decision* through an
+# injected predicate and never needs OpenCV -- only a machine that actually
+# chains renders does. Set i2v_require_seed_face = false to run without it.
+faces = [
+    "opencv-python-headless>=4.9",
+]
+align = [
+    "stable-ts>=2.17",
+    "torch>=2.1",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+music-video-maker = "music_video_maker.cli:main"
+# Issue #54: a SEPARATE binary, not a flag on music-video-maker -- the whole
+# point is that "does the render binary ever call a model?" stays answerable
+# by reading this table. Needs zero new pip dependencies in phase 1 (stdlib
+# subprocess + json only); it does need the `claude` CLI itself on PATH.
+mvm-author = "music_video_maker.authoring.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["music_video_maker*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # bugbear
+    "UP",  # pyupgrade
+    "SIM", # flake8-simplify
+    "LOG", # flake8-logging
+    "G",   # flake8-logging-format
+    "T20", # flake8-print -- no print() in production paths (global standard)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests and the mock harness may print freely.
+"tests/**" = ["T20"]
+# mvm-author's `status`/`concept --dry-run` output IS the product a human
+# reads in a terminal (like `git status`), not diagnostic noise -- routing
+# it through logger.info() would prefix every line with a timestamp and
+# mangle the table/prompt dump. Diagnostics in this file still go through
+# `logger`; only the two direct user-facing prints are exempted here.
+"music_video_maker/authoring/cli.py" = ["T20"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "--strict-markers",
+    "--cov=music_video_maker",
+    "--cov-report=term-missing",
+    "--cov-fail-under=80",
+]
+markers = [
+    "integration: requires real ffmpeg/ComfyUI/GPU -- deselected in CI (-m 'not integration')",
+]
+
+[tool.coverage.run]
+branch = true
+omit = ["music_video_maker/contracts.py"]
