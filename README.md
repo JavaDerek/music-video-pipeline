@@ -28,6 +28,15 @@ edits, no cuts added afterward — of **"Storms"**, track 1 on
 [*Morri's Rock Boutique*](https://refestramus.com/music/morris-rock-boutique/)
 (Melodic Revolution Records, 2026). "Storms" © 2026 Refestramus.
 
+Much of what this README asserts about lip-sync, alignment models and shot
+framing was measured on a second track from the same album — **"Deathless
+(incl. Above Volokov's Mill, Goodbye America! and He Always Will)"**, track 6,
+8:32, © 2026 Refestramus. It earns its place in the docs by being *hard*: two
+singers trading verses, a third of the runtime instrumental, and long enough
+that a whole class of alignment failure only shows up past the five-minute
+mark. Where a rule below cites a number, "Deathless" is usually where the
+number came from.
+
 ## Why this isn't a button
 
 MiniMax H3 is a genuinely remarkable model. Hand it a photo, a line of text and
@@ -949,9 +958,53 @@ for what that showed it still cannot do.*
 **separate binary** that does, on purpose: it reads a song's real structure
 (the same Stage 1-2 alignment/slicing `--prepare` runs) and proposes a
 narrative concept, then a beat sheet, then the shot lines themselves —
-through the Claude CLI, never a metered API. Its job ends at a
+through the Claude CLI rather than an HTTP API of its own. Its job ends at a
 `shot_plan.toml` on disk that a human reads, edits and commits; nothing it
 produces is ever fed back into a render automatically.
+
+### What runs where, and what it actually costs you
+
+This project has **two separate compute paths**, and they bill completely
+differently. Worth being clear about before your first run, because the two
+binaries look alike and are not.
+
+| | `music-video-maker` (the render) | `mvm-author` (the authoring layer) |
+|---|---|---|
+| What it runs on | **your GPU**, via a ComfyUI you host | **the `claude` CLI**, on your machine |
+| Needs an API key? | **No.** Never talks to any model service | Only if that's how your `claude` CLI is signed in |
+| What a run costs | GPU time and electricity | depends entirely on the row above |
+| Typical scale | hours per song | seconds to minutes, a handful of calls per song |
+
+The render path contains **no model calls at all** — that is the
+[no-LLM-in-the-render-path invariant](#non-negotiable-invariants), and it is
+enforced by [`tests/test_authoring_boundary.py`](tests/test_authoring_boundary.py),
+not just asserted here. If you have an API key sitting in your environment, the
+render will not use it. If you don't have one, the render does not care.
+
+`mvm-author` is the one place a model is called, and it does so by shelling out
+to the `claude` CLI — so **whatever that CLI is authenticated with is what
+pays**. If you're signed in with a Claude subscription, a song's authoring is
+covered by it and there is no per-run charge. If your CLI is configured against
+an API key, those same calls are billed per token like any other API usage.
+This project neither knows nor chooses which; it runs the binary on your PATH.
+
+**About the `cost_usd` numbers.** `mvm-author` records a figure per stage in
+`.authoring/session.json`, and prints one when a stage finishes:
+
+```
+Concept written to .authoring/concept.json (model=claude-fable-5, cost=$0.3055)
+```
+
+That number is read straight out of the CLI's own JSON envelope
+([`driver.py`](music_video_maker/authoring/driver.py) — it is `None` rather
+than a guess when the CLI reports nothing). It is a **token-usage valuation at
+API list prices**, not necessarily a charge: on a subscription nothing is
+billed per run and the figure is a measure of how much work a stage did. It is
+genuinely useful that way — it tells you a beats pass costs roughly twice a
+concept pass, and that a revision round is not free — so it is worth reading as
+*relative effort* rather than as an invoice. Do not add these up and call it
+what a video cost; on most setups the real cost of a song is the hours of GPU
+time, which this table's first column is about.
 
 ```bash
 mvm-author --config run.toml concept --dry-run   # print the exact prompt, call nothing
@@ -1094,12 +1147,28 @@ docstring for the full design.
   other people in it, somebody else's face passes while the lead has her back
   turned. See
   [#49](https://github.com/JavaDerek/music-video-pipeline/issues/49).
-- **A generated plan is a draft, not an approval, and it has never been
-  rendered.** `mvm-author`
-  ([#54](https://github.com/JavaDerek/music-video-pipeline/issues/54)) has been
-  validated by re-authoring "The Lucky Ones" from scratch and comparing
-  against the hand-written 36-entry plan, but no generated plan has been
-  through a GPU. Everything below is measured on the *text*, not on frames.
+- **A generated plan is a draft, not an approval — and what a GPU says about
+  one is not what the text says.** `mvm-author`
+  ([#54](https://github.com/JavaDerek/music-video-pipeline/issues/54)) was
+  first validated by re-authoring "The Lucky Ones" and comparing against the
+  hand-written 36-entry plan — on the *text*. A generated plan has since been
+  rendered end to end, and the gap between those two kinds of validation is
+  the thing to know about: the plan passed every lint, read well, and its
+  first frames showed the wrong person singing.
+
+  Three defects were invisible on the page and obvious in one frame. A beat
+  sheet that assigned sung chunks to whichever character the story wanted
+  there, because the chunk table it reads never said who was audible — 25 of
+  41 sung chunks framed on somebody not singing. An object staged correctly
+  "near" but at the performer's boots, so the frame held no face. A shot line
+  settling the singer's gaze on the far valley, which no camera direction
+  could pull back. Each was fixed at the stage that caused it, and each is now
+  a rule with the measurement attached — but none was findable without
+  rendering.
+
+  So: read the plan, then render two or three chunks and *look at them*
+  before committing hours. `--only-chunks` exists for this. Text review
+  catches structure; only frames catch what a model will actually do with it.
 - **The lints cannot catch flat writing.** They catch structural defects.
   The first real run produced prose that passed every check and read as a
   template — "in the foreground" in 24 of 36 shots where the human used it in

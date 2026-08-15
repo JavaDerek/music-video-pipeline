@@ -9,6 +9,8 @@ installed in this environment on purpose -- this file (and
 from __future__ import annotations
 
 import logging
+import subprocess
+import sys
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
@@ -231,7 +233,28 @@ def test_align_zero_segments_from_model_falls_back_to_probed_duration(tmp_path):
     assert result.track_duration == 12.0
 
 
-def test_align_without_injected_model_raises_clear_error_when_stable_ts_missing(tmp_path):
+# Both tests below used to assert the *absence* of the [align] extra --
+# `"stable_whisper" not in sys.modules`, and align() raising because the
+# import fails. CI installs `.[dev]` only, so they were green there forever
+# while failing on every machine that can actually run Stage 1. Worse, the
+# first one did not merely fail with the extra installed: align() fell
+# through to _load_model() and ran a REAL whisper alignment inside a unit
+# test, downloading ~145 MB of weights on a machine with a cold cache --
+# against CONTRIBUTING.md's "no network" rule.
+#
+# The property each one is really about does not depend on the environment,
+# so neither test does now.
+
+
+def test_align_without_injected_model_raises_clear_error_when_stable_ts_missing(
+    tmp_path, monkeypatch
+):
+    """Simulated absence, not observed absence. A None in sys.modules makes
+    `import stable_whisper` raise ImportError on demand, so this exercises the
+    missing-extra path identically whether or not stable-ts is installed --
+    and never loads a model."""
+    monkeypatch.setitem(sys.modules, "stable_whisper", None)
+
     audio = write_silent_wav(tmp_path / "master.wav", seconds=10.0)
     lines = [LyricLine(index=0, text="hello there", characters=("Dianne",))]
 
@@ -239,13 +262,22 @@ def test_align_without_injected_model_raises_clear_error_when_stable_ts_missing(
         align(audio, lines)
 
 
-def test_module_imports_without_stable_whisper_installed():
-    # If this file collected and ran at all, music_video_maker.alignment
-    # already imported cleanly without stable-ts/torch -- assert explicitly.
-    import sys
-
-    assert "stable_whisper" not in sys.modules
-    assert "torch" not in sys.modules
+def test_module_import_does_not_pull_in_stable_whisper_or_torch():
+    """The real property is that alignment.py's stable-ts import is LAZY, so
+    every other stage stays light. Asserting `not in sys.modules` in-process
+    only tested that nothing else had imported it yet. A fresh interpreter
+    tests the import itself, and gives the same answer either way."""
+    probe = (
+        "import sys; import music_video_maker.alignment as a; "
+        "print('stable_whisper' in sys.modules, 'torch' in sys.modules)"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert out.stdout.strip() == "False False", out.stdout
 
 
 def test_probe_duration_degrades_gracefully_for_missing_file(caplog):

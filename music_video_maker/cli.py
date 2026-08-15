@@ -78,6 +78,7 @@ from music_video_maker.shot_plan import (
     ShotPlanError,
     lint_camera_face_away_on_voiced_chunks,
     lint_shots_against_lyrics,
+    lint_voiced_framing,
     load_shot_plan,
     resolve_camera,
     resolve_present,
@@ -428,6 +429,10 @@ def run_pipeline(
             config.master_audio,
             lines,
             model=align_model,
+            # Ignored when `model` is injected (the test rigs), and the only
+            # thing that decides the timeline when it is not. Unpassed until
+            # now, which pinned every run to "base" however the config read.
+            model_size=config.alignment_model_size,
             strict_alignment=config.strict_alignment,
             # Issue #42: authored corrections for provably mis-placed
             # segments; applied inside align(), before quality evaluation.
@@ -480,6 +485,9 @@ def run_pipeline(
             # Issue #58: a camera direction that turns her away from the
             # lens on a voiced chunk costs that chunk's lip-sync.
             lint_camera_face_away_on_voiced_chunks(plan, chunks)
+            # A sung chunk framed wide (or not framed at all) has no face big
+            # enough to read a mouth -- the one thing the whole pipeline is for.
+            lint_voiced_framing(plan, chunks)
 
         prompts = {
             chunk.chunk_id: expand_prompt(
@@ -732,6 +740,9 @@ def prepare_shot_plan(
         config.master_audio,
         lines,
         model=align_model,
+        # --prepare must align exactly as the render will, or the skeleton
+        # describes chunks the render never emits (issue #52's whole point).
+        model_size=config.alignment_model_size,
         strict_alignment=config.strict_alignment,
         overrides=config.alignment_overrides,
     )

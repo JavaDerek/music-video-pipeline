@@ -147,6 +147,44 @@ min_free_disk_gb = 20.0
 #     nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
 min_free_vram_gb = 16.0
 
+# The floor above is checked ONCE, before the run starts. This one is
+# re-checked before EVERY chunk, and it is the only thing that catches a new
+# tenant landing on the card mid-render -- the failure this project has spent
+# more words on than any other (issues #23, #24), because H3 staging onto a
+# contended card can go silent instead of raising CUDA OOM and wedge the host.
+#
+# It is deliberately LOW. Mid-render, 1.5-5 GB free is healthy: H3 is resident
+# and using the rest. This is not a restatement of the cold floor above, which
+# would abort every run the moment it started working; it is a tripwire for
+# something ELSE arriving. On this project's host the largest other consumer
+# loads ~15 GB on demand, so it fires long before the card is exhausted.
+#
+# Omitted from this file until 2026-08-15, and absent from every doc, so it
+# was unreachable for anyone who had not read config.py -- found while
+# rebuilding this config from the docs alone as a clean-room check.
+between_chunk_min_free_vram_gb = 1.0
+
+# Which whisper model Stage 1 aligns with. Defaults to "base", which is what
+# every config written before this key existed used.
+#
+# Worth measuring per song rather than leaving alone. On an 8:32 progressive
+# rock track, "base" found 77.2s of vocal and believed the singing stopped at
+# 3:11 -- which renders most of the video as "performs silently" over a master
+# that has her audibly singing, with no error raised anywhere. "small" found
+# 187.2s and ran to the end of the track.
+#
+# Bigger is NOT automatically better: on that same song "medium" placed a
+# lyric 17s before any vocal energy exists and dropped closing-refrain
+# segments into the trailing silence. Read the alignment quality report
+# (issue #35, logged at INFO on every run) and pick on the evidence.
+# alignment_model_size = "small"
+
+# Editorial length for instrumental chunks only, separate from
+# max_chunk_seconds below (issue #27): fewer, longer takes through a solo or
+# an intro, while sung chunks keep the tighter bound. Costs no extra wall
+# clock -- the same total frames in fewer chunks.
+# instrumental_shot_seconds = 10.0
+
 # --------------------------------------------------------------------------- #
 # TABLES LAST. Nothing below this line may be a top-level setting.
 # --------------------------------------------------------------------------- #

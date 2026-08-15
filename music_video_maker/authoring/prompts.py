@@ -113,7 +113,30 @@ voiced consequence chunk (issue #58), no rewrite of the camera direction or \
 the shot line kept the performer facing the lens past roughly the shot's \
 midpoint -- wording could not fix it, only not spending a LYRIC chunk on it \
 in the first place.
-5. `length_seconds` is OPTIONAL and editorial: set it only where a shot \
+5. A BEAT ON A CHUNK TAGGED LYRIC IS ABOUT THE PERSON SINGING IT. The \
+skeleton below has a `singer` column: on a LYRIC chunk it names who is \
+audible, and that character is the one the beat happens to. Do not spend a \
+sung chunk on what the OTHER character is doing -- their beats belong on the \
+INSTRUMENTAL chunks, and in a two-hander there are usually plenty. This is \
+the same trade as rule 4 and it costs nothing dramatically: a story that cuts \
+between two people has to put one of them somewhere, and the chunks with no \
+voice on them are free.
+
+Why it matters more than it looks: whatever a beat is about, the later stages \
+faithfully build on. Prose makes it the sentence's subject, photography frames \
+it close, and `present` supplies that character's reference photograph -- so a \
+beat about the wrong person produces a technically excellent shot of somebody \
+who is not singing, over a vocal. Measured on the first machine-authored plan \
+to reach a GPU: 25 of 41 sung chunks were framed on whoever was not singing \
+them, and no fix downstream recovered it -- the shot line was rewritten, the \
+camera was pointed at the singer, the other character was bound and unbound, \
+and one chunk was re-rendered four separate ways still losing the face. The \
+only thing that works is not giving the sung chunk away in the first place.
+
+The other character may still be ON SCREEN in a sung chunk -- standing in the \
+frame, reacting, present -- and often should be. What they must not be is \
+what the beat is ABOUT.
+6. `length_seconds` is OPTIONAL and editorial: set it only where a shot \
 genuinely wants to be longer or shorter than the timeline gave it (a long \
 unbroken take across a solo, say). It re-cuts the timeline, so asking for \
 many of them in a row will leave parts of the song with no beat and come \
@@ -172,10 +195,34 @@ Reply with a single JSON object, no other text:
 field, lighting philosophy, grade. One string, no per-shot content. If you \
 are told the look is already fixed, return an empty string for it.
 
-`camera` is per-shot framing and movement, and it is OPTIONAL PER SHOT. Give \
-one only where the shot genuinely wants it. An absent direction composes \
-nothing, which is the right answer for most shots; a direction on every chunk \
-is filler, and every one of them still lands in a real prompt.
+`camera` is per-shot framing and movement, and it is OPTIONAL PER SHOT -- \
+with one exception, below. Give one only where the shot genuinely wants it. \
+An absent direction composes nothing, which is the right answer for most \
+shots; a direction on every chunk is filler, and every one of them still \
+lands in a real prompt.
+
+THE EXCEPTION, AND IT IS NOT OPTIONAL: every chunk tagged LYRIC below gets a \
+`camera` value, and that value must frame the person singing it CLOSE OR \
+MEDIUM -- near enough that a mouth can be read. This video exists to be \
+lip-synced; a singer who is small in frame has no lip-sync, however good the \
+picture is. Measured on the first machine-authored plan to reach a GPU: of \
+its 41 sung chunks, 29 carried no `camera` at all and only 11 were close or \
+medium, and across the rendered chunks a face was detectable in 0-33% of \
+sampled frames. One of those chunks was re-rendered four separate ways -- the \
+second character bound and unbound, the shot line rewritten to make the \
+singer its subject, the camera pointed explicitly at her -- and every variant \
+still lost the face, because the shots around it were landscape. No wording \
+elsewhere recovers a frame the photography gave away.
+
+"Close or medium" means close enough to READ A MOUTH, so it has to include \
+the head: a framing anchored on boots, feet or the ground satisfies \
+"close" and still has no face in it. If a sung chunk's object sits at \
+foot level, frame the singer and let the object fall partly out of frame.
+
+Wide is very often the better image, and on this song the wide valleys were \
+the better image. Spend them on the INSTRUMENTAL chunks, which is where a \
+music video earns its scale and where no mouth has to match anything. On a \
+sung chunk, go close.
 
 THE ONE RULE THAT IS CHECKED MECHANICALLY: the renderer composes your value \
 as ", camera <your value>" -- it supplies the word "camera" itself. So write \
@@ -290,7 +337,34 @@ printer from before", no "the aforementioned desk". Such a reference points at \
 nothing and the clause built on it has no anchor. Measured: a line reading "the \
 sill of that same empty frame" rendered no printer at all, while the shots \
 either side of it rendered theirs. Re-describe the thing in full every time, as \
-if this were the first shot of the film.\
+if this were the first shot of the film.
+11. ON A CHUNK THAT CARRIES A LYRIC, THE SINGER PERFORMS THE SENTENCE'S \
+ACTION. Whatever the sentence describes somebody doing is done by whoever H3 \
+puts on screen, so handing a second cast member an active verb -- stands, \
+watches, turns, grips, prays, keeps his gaze -- in a sung shot costs you the \
+singer's face. Measured on one chunk, both ways: with the other character \
+bound by `present` he rendered correctly and held the first 101 of 175 frames, \
+leaving the singer 41% of a chunk she sings throughout; with `present` removed \
+the singer inherited his watching, turned her back to camera, and 0 of 35 \
+sampled frames contained a detectable face at all. `present` is not the lever \
+here -- it decides WHO a pronoun is, never WHOSE shot this is. If the other \
+character must be in frame at all on a sung chunk, he is scenery and must read \
+as motionless: "a still figure on the crest above her", never "he watches from \
+the crest". And if an OBJECT has to be staged on a sung chunk, put it at hand \
+or head height -- in frame with the face. Near is not the same as in frame \
+with the face: a line reading "pushing up between his boots" rendered legs, \
+boots and perfect mushrooms over his own vocal, with no head anywhere; a \
+needle in a raised fist kept the face for 80% of its frames. Below the chin, \
+move the beat to an instrumental chunk instead. And do not settle her GAZE on \
+something in the scene on a sung chunk -- "as she looks back down at them", \
+"her gaze fixed on the valley" -- because a gaze that settles turns the head \
+away from the lens, and the camera field cannot pull it back: one chunk asked \
+for "her face centre" and rendered her back-to-camera for its whole duration. \
+A glance is fine, because a glance returns. If she has to look at something, \
+put the something near her. Better still, make the \
+beat about her action. This does not soften \
+rule 2: an OBJECT may still be the grammatical subject of a consequence, and \
+usually should be.\
 """
 
 

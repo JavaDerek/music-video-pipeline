@@ -680,3 +680,35 @@ def test_the_preamble_tells_the_model_about_present_and_anaphora():
 
     assert "present" in PROSE_PREAMBLE.lower()
     assert "that same window" in PROSE_PREAMBLE
+
+
+# --------------------------------------------------------------------------- #
+# A sung chunk's action belongs to the singer.
+#
+# `present` (above) binds a pronoun so H3 stops inventing a stranger -- and it
+# works. What it does not do is decide WHOSE shot it is. Measured on
+# "Deathless" chunk 7, a chunk Dianne sings whose line gave the action to the
+# other character ("...as he stands high above it on the mountain's edge,
+# watching"):
+#
+#   present = ["Jan"]  -> Jan renders correctly, holds frames 0-101 of 175,
+#                         and the singer gets the last 41% of the chunk
+#   no present         -> the singer INHERITS the watching, turns away, and
+#                         0 of 35 sampled frames contain a detectable face
+#
+# So both settings lose the lip-sync and the field is not the lever: whatever
+# action the sentence describes is performed by whoever is on screen. The
+# lever is the sentence, which is #60's lesson one level up.
+# --------------------------------------------------------------------------- #
+
+
+def test_the_preamble_says_a_sung_shot_belongs_to_the_singer():
+    """A rule the validator cannot enforce -- "is this verb the singer's?" is
+    not decidable from the text -- so the preamble is the only place it can
+    live."""
+    from music_video_maker.authoring.prompts import PROSE_PREAMBLE
+
+    lowered = PROSE_PREAMBLE.lower()
+    assert "carries a lyric" in lowered or "sung shot" in lowered
+    # The measured numbers, so a future editor cannot mistake it for taste.
+    assert "0 of 35" in PROSE_PREAMBLE

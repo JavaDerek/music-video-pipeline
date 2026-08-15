@@ -922,6 +922,170 @@ park while chunk 11's shot -- the immediately preceding one -- establishes the
 park it is standing in."""
 
 
+_WIDE_FRAMING_KEYWORDS: frozenset[str] = frozenset({
+    # Chosen by reading the 79 camera values a real generated plan produced,
+    # not by imagination. Every one of these appeared there; each describes a
+    # frame in which a person is small.
+    "wide", "extreme wide", "very wide", "aerial", "locked off", "high above",
+    "high and wide", "from a distance", "establishing",
+})
+
+_FOOT_LEVEL_KEYWORDS: frozenset[str] = frozenset({
+    # Body parts and surfaces below the chin. Each one anchors a frame that
+    # cannot also hold a face. "hands" is deliberately NOT here: hands come up
+    # to the face, and a close shot of hands often keeps the head in frame --
+    # measured, a chunk framed on a needle in a raised fist kept the face for
+    # 80% of its frames.
+    "boots", "boot", "feet", "ankles", "underfoot", "knees", "hem",
+    "at his feet", "at her feet", "soil", "the ground", "the floor",
+})
+
+_GAZE_AWAY_KEYWORDS: frozenset[str] = frozenset({
+    # A gaze that SETTLES on something in the scene turns the head away from
+    # the lens, and the sentence beats the camera field every time: one chunk
+    # asked for "medium close, her face centre" and read "as she looks back
+    # down at them", and she was back-to-camera throughout.
+    #
+    # Scored against the 41 sung lines of a real generated plan before
+    # shipping, the way issue #60 requires. These matched the 8 lines that
+    # send the gaze away and none of the lines that rendered well.
+    "looks out", "looks back", "looks down", "looks up at", "looks over",
+    "looking back", "looking down", "looking out",
+    "staring down", "staring out", "staring up", "stares down", "stares out",
+    "gaze drops", "gaze lifts", "gaze fixed", "gaze drifts",
+    "lifts her gaze", "lifts his gaze", "keeps her gaze", "keeps his gaze",
+    "turns back", "turns away",
+    # DELIBERATELY EXCLUDED, with reasons:
+    #   "glancing" -- the highest-scoring chunk of the whole run (80-89% face
+    #     presence) reads "glancing up at a motionless figure". A glance
+    #     returns to camera; a gaze settles. Including it would have flagged
+    #     the best line in the plan.
+    #   "watches"/"watching" -- appears in lines that rendered fine and in
+    #     lines that did not, so it does not discriminate. A word that fires
+    #     on both is noise, and noise is what makes a lint block get skipped.
+})
+
+_BEHIND_CAMERA_KEYWORDS: frozenset[str] = frozenset({
+    # Where the lens is relative to the FACE, which is not the same as the
+    # direction of travel. Measured on one run: "travelling with her" up a
+    # climb gave 0% face presence, while "ahead of her" on the same run gave
+    # 89% -- so a moving camera is fine and a following one is not.
+    #
+    # "in profile" is NOT here, deliberately: it measured 8%, 0% and 45% on
+    # three sung chunks, which is a real risk but not a reliable one, and a
+    # profile close-up is a legitimate shot. Recorded in the run findings
+    # instead of shipped as a keyword that fires on a defensible choice.
+    "travelling with", "tracking behind", "from behind", "following her",
+    "following him", "behind her shoulder", "over her shoulder from behind",
+})
+
+_CLOSE_FRAMING_KEYWORDS: frozenset[str] = frozenset({
+    # If any of these is present the framing is close enough to read a mouth,
+    # even when a width word also appears ("medium wide on her face").
+    "close", "tight", "macro", "medium", "three-quarter", "over the shoulder",
+    "portrait", "head and shoulders",
+})
+
+
+def lint_voiced_framing(
+    plan: Mapping[int, ShotPlanEntry],
+    chunks: Sequence[AudioChunk],
+) -> None:
+    """Warn (never raise) when a chunk that carries a lyric is not framed
+    close enough to read a mouth.
+
+    Lip-sync is the whole reason this pipeline exists, and it needs a face
+    big enough in frame to see. Nothing else in the authoring layer knows
+    that: the photography stage optimises for the image, and for most of a
+    song the better image genuinely is the wide one.
+
+    Measured on the first machine-authored plan to reach a GPU. Of its 41
+    voiced chunks, **11** had a close or medium framing; 1 was explicitly
+    wide and 29 carried no ``camera`` value at all. Across the chunks
+    rendered from it a face was detectable (YuNet, the #47 detector) in
+    0-33% of sampled frames. One chunk was re-rendered four ways -- the
+    second character bound with ``present`` and not, the shot line rewritten
+    to make the singer the subject, the camera pointed at her -- and every
+    variant lost the face, because the plan around it was landscape.
+
+    Absent is warned about as loudly as wide, deliberately: ``camera`` is
+    optional per shot, and an omitted framing on a sung chunk is not a
+    neutral default. It hands the decision to H3, which measured wide.
+
+    Warning only, like every lint here: a wide shot over a sung line is a
+    real editorial choice (a held establishing shot under the first line of a
+    verse), and a false positive must never be able to block a run.
+    """
+    voiced = {c.chunk_id for c in chunks if not c.is_instrumental and (c.text or "").strip()}
+    for chunk_id in sorted(plan):
+        if chunk_id not in voiced:
+            continue
+        camera = (plan[chunk_id].camera or "").strip().lower()
+        if not camera:
+            logger.warning(
+                "Shot plan: chunk_id=%d carries a lyric but sets no `camera`, so nothing "
+                "asks for the singer to be close enough to read a mouth -- the framing is "
+                "left to H3, which measured wide. Lip-sync needs a face in frame; give a "
+                "sung chunk a close or medium framing on whoever is singing it.",
+                chunk_id,
+            )
+            continue
+        # Near is not the same as in frame with the face. #58's rule -- stage
+        # the object near, not far -- is right and says nothing about height,
+        # so a sung chunk can satisfy it with an object at the performer's
+        # feet and lose the head out of the top of frame. Measured: a line
+        # reading "pushing up between his boots" rendered legs, boots and
+        # perfect mushrooms, over his own vocal, with no face anywhere.
+        shot_lower = plan[chunk_id].shot.lower()
+        gaze = next((k for k in sorted(_GAZE_AWAY_KEYWORDS) if k in shot_lower), None)
+        if gaze:
+            logger.warning(
+                "Shot plan: chunk_id=%d carries a lyric but its shot line says %r, which "
+                "settles the singer's gaze on something in the scene and turns the head "
+                "away from the lens -- the sentence outranks the camera field, so no "
+                "framing recovers it. Put what she is looking at near her, or move the "
+                "looking to an instrumental chunk.",
+                chunk_id,
+                gaze,
+            )
+            continue
+        behind = next((k for k in sorted(_BEHIND_CAMERA_KEYWORDS) if k in camera), None)
+        if behind:
+            logger.warning(
+                "Shot plan: chunk_id=%d carries a lyric but the camera is %r -- a "
+                "following shot is the back of a head. A moving camera is fine: the "
+                "same run measured 89%% face presence on \"ahead of her\" and 0%% on "
+                "\"travelling with her\". Put the lens in front of the singer.",
+                chunk_id,
+                behind,
+            )
+            continue
+        blob = f"{camera} {shot_lower}"
+        low = next((k for k in sorted(_FOOT_LEVEL_KEYWORDS) if re.search(rf"\b{k}\b", blob)), None)
+        if low:
+            logger.warning(
+                "Shot plan: chunk_id=%d carries a lyric but stages %r, which pulls the "
+                "frame down off the singer's head -- near is not the same as in frame "
+                "with the face. Put the object at hand or head height on a sung chunk, "
+                "or move the beat to an instrumental one.",
+                chunk_id,
+                low,
+            )
+            continue
+        if any(k in camera for k in _CLOSE_FRAMING_KEYWORDS):
+            continue
+        hit = next((k for k in sorted(_WIDE_FRAMING_KEYWORDS) if k in camera), None)
+        if hit:
+            logger.warning(
+                "Shot plan: chunk_id=%d carries a lyric but is framed %r, which puts the "
+                "singer too small to read a mouth. Wide shots are what a music video is "
+                "for -- spend them on the instrumental chunks, where no mouth has to "
+                "match anything.",
+                chunk_id,
+                hit,
+            )
+
+
 def lint_shots_against_lyrics(
     plan: Mapping[int, ShotPlanEntry],
     chunks: Sequence[AudioChunk],

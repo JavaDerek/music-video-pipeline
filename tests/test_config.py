@@ -15,6 +15,8 @@ import pytest
 
 from music_video_maker import config as config_module
 from music_video_maker.config import (
+    ALIGNMENT_MODEL_SIZES,
+    DEFAULT_ALIGNMENT_MODEL_SIZE,
     REALISM_LORA,
     REALISM_LORA_STRENGTH,
     REALISM_LORA_TRIGGER,
@@ -1261,3 +1263,41 @@ def test_realistic_with_no_appearance_direction_is_quiet(tmp_path, caplog):
     with caplog.at_level(logging.WARNING):
         _load_with(tmp_path, face_treatment='"realistic"')
     assert "pull in opposite directions" not in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# Alignment model size. Stage 1's whisper model was hardcoded to "base": the
+# parameter existed on align() but nothing ever passed it, so a run could not
+# change it without editing the package. On "Deathless" (8:32) base placed
+# 77.2s of vocal against small's 187.2s and believed the singing stopped at
+# 3:11 of an 8:32 track -- 56 of 71 chunks would have rendered as "performs
+# silently" while the master audio has her singing, with no error raised.
+# --------------------------------------------------------------------------- #
+
+
+def test_alignment_model_size_defaults_to_base(tmp_path):
+    """Every config written before this key existed must align exactly as it
+    always did -- the default is the old hardcoded value, not the better one."""
+    config = _load_with(tmp_path)
+    assert config.alignment_model_size == "base"
+
+
+def test_alignment_model_size_can_be_set(tmp_path):
+    config = _load_with(tmp_path, alignment_model_size='"small"')
+    assert config.alignment_model_size == "small"
+
+
+def test_an_unknown_alignment_model_size_is_refused(tmp_path):
+    """A typo here costs the whole of Stage 1 and is only visible as a stack
+    trace from inside stable-ts, after the model download."""
+    with pytest.raises(ConfigError, match="alignment_model_size"):
+        _load_with(tmp_path, alignment_model_size='"smal"')
+
+
+def test_config_and_alignment_agree_on_the_default_model():
+    """config mirrors the constant rather than importing the alignment module
+    (the MAX_NOISE_SEED rule). Mirrors drift; this is what stops it."""
+    from music_video_maker.alignment import DEFAULT_MODEL_SIZE
+
+    assert DEFAULT_ALIGNMENT_MODEL_SIZE == DEFAULT_MODEL_SIZE
+    assert DEFAULT_ALIGNMENT_MODEL_SIZE in ALIGNMENT_MODEL_SIZES

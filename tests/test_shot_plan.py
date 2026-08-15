@@ -33,6 +33,7 @@ from music_video_maker.shot_plan import (
     ShotPlanError,
     lint_camera_face_away_on_voiced_chunks,
     lint_shots_against_lyrics,
+    lint_voiced_framing,
     load_shot_plan,
     render_shot_plan_skeleton,
     resolve_camera,
@@ -1391,3 +1392,193 @@ def test_the_warning_stops_once_present_binds_somebody(tmp_path: Path, caplog):
     with caplog.at_level(logging.WARNING):
         load_shot_plan(plan)
     assert "second person on screen" not in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# A sung chunk needs the singer close enough to read a mouth.
+#
+# The first machine-authored plan to reach a GPU put 41 voiced chunks on
+# screen with a close or medium framing on **11** of them: 1 explicitly wide
+# and 29 with no `camera` value at all. Across the chunks rendered from it,
+# a face was detectable in 0-33% of sampled frames, voiced or not, because
+# the plan is composed of landscape shots -- mills, valleys, massed armies --
+# and the singer is small inside them. No amount of `present` or shot-line
+# rewording fixed it; four separate variants of one chunk were rendered and
+# every one lost the face.
+#
+# The generator has no reason to know this: it optimises the image, and a
+# wide valley IS the better image. So the constraint has to be stated.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_voiced_chunk_with_no_camera_direction_warns(caplog):
+    plan = _plan_from({3: "She stands on the ridge as the valley burns below"})
+    chunks = [_chunk_stub(3, "Walking the empty road tonight")]
+
+    with caplog.at_level(logging.WARNING):
+        lint_voiced_framing(plan, chunks)
+
+    assert "chunk_id=3" in caplog.text
+    assert "camera" in caplog.text.lower()
+
+
+def test_a_voiced_chunk_framed_wide_warns(caplog):
+    plan = {
+        3: ShotPlanEntry(
+            chunk_id=3,
+            start=3.0,
+            shot="She stands on the ridge as the valley burns below",
+            camera="extreme wide, static, her figure small on the bare hill",
+        )
+    }
+    chunks = [_chunk_stub(3, "Walking the empty road tonight")]
+
+    with caplog.at_level(logging.WARNING):
+        lint_voiced_framing(plan, chunks)
+
+    assert "chunk_id=3" in caplog.text
+
+
+def test_a_voiced_chunk_framed_close_is_quiet(caplog):
+    plan = {
+        3: ShotPlanEntry(
+            chunk_id=3,
+            start=3.0,
+            shot="She stands on the ridge as the valley burns below",
+            camera="close on her face, the valley soft behind her",
+        )
+    }
+    chunks = [_chunk_stub(3, "Walking the empty road tonight")]
+
+    with caplog.at_level(logging.WARNING):
+        lint_voiced_framing(plan, chunks)
+
+    assert caplog.text == ""
+
+
+def test_an_instrumental_chunk_may_be_as_wide_as_it_likes(caplog):
+    """The whole point of the rule is that it applies to sung chunks only --
+    an instrumental has no mouth to match, and the wide landscape shots are
+    where a music video earns its scale."""
+    plan = {
+        3: ShotPlanEntry(
+            chunk_id=3,
+            start=3.0,
+            shot="The valley lies churned into craters under a low sky",
+            camera="extreme wide, static, the ridge small against the horizon",
+        )
+    }
+    chunks = [_chunk_stub(3, "", instrumental=True)]
+
+    with caplog.at_level(logging.WARNING):
+        lint_voiced_framing(plan, chunks)
+
+    assert caplog.text == ""
+
+
+def test_a_voiced_chunk_framed_at_foot_level_warns(caplog):
+    """Near is not the same as in-frame-with-the-face. #58 says stage the
+    object near, not far, and that is right -- but on a sung chunk an object
+    staged at the feet pulls the frame down off the head. Measured: a chunk
+    whose line read "pushing up between his boots" rendered his legs and
+    boots, mushrooms perfectly, and no face anywhere, over his own vocal."""
+    plan = {
+        3: ShotPlanEntry(
+            chunk_id=3,
+            start=3.0,
+            shot="Pale mushroom caps push up between his boots where he stands",
+            camera="medium close on Jan, the mushrooms at his boots just inside the lower frame",
+        )
+    }
+    chunks = [_chunk_stub(3, "Nobody was counting then")]
+
+    with caplog.at_level(logging.WARNING):
+        lint_voiced_framing(plan, chunks)
+
+    assert "chunk_id=3" in caplog.text
+    assert "boots" in caplog.text
+
+
+def test_an_instrumental_chunk_may_be_framed_at_foot_level(caplog):
+    plan = {
+        3: ShotPlanEntry(
+            chunk_id=3, start=3.0,
+            shot="Mushrooms push up through the churned soil",
+            camera="macro on the soil, caps breaking the crust",
+        )
+    }
+    chunks = [_chunk_stub(3, "", instrumental=True)]
+
+    with caplog.at_level(logging.WARNING):
+        lint_voiced_framing(plan, chunks)
+
+    assert caplog.text == ""
+
+
+def test_a_voiced_chunk_sending_the_singer_gaze_away_warns(caplog):
+    """The camera can ask for her face and lose it anyway: the sentence
+    outranks the field. Measured -- chunk 9's camera read "medium close,
+    slightly above her, her face centre" and its shot line read "as she looks
+    back down at them"; she rendered back-to-camera for the whole chunk."""
+    plan = {
+        3: ShotPlanEntry(
+            chunk_id=3, start=3.0,
+            shot="Armies mass across the valley below, as she looks back down at them",
+            camera="medium close, her face centre with the valley out of focus",
+        )
+    }
+    chunks = [_chunk_stub(3, "Walking the empty road tonight")]
+
+    with caplog.at_level(logging.WARNING):
+        lint_voiced_framing(plan, chunks)
+
+    assert "chunk_id=3" in caplog.text
+    assert "looks back" in caplog.text
+
+
+def test_a_voiced_chunk_glancing_at_something_is_quiet(caplog):
+    """`glancing` is deliberately NOT a keyword. The chunk that scored highest
+    all run -- 80-89% face presence -- reads "glancing up at a motionless
+    figure". A glance returns; a gaze settles."""
+    plan = {
+        3: ShotPlanEntry(
+            chunk_id=3, start=3.0,
+            shot="She climbs the trail, glancing up at a motionless figure on the ridge",
+            camera="medium close on her face as she climbs",
+        )
+    }
+    chunks = [_chunk_stub(3, "Walking the empty road tonight")]
+
+    with caplog.at_level(logging.WARNING):
+        lint_voiced_framing(plan, chunks)
+
+    assert caplog.text == ""
+
+
+def test_a_voiced_chunk_shot_from_behind_warns(caplog):
+    """"Travelling with her" up a climb is a following shot: the back of a
+    head. Measured 0% face presence. Distinct from "ahead of her", which
+    faces her and measured 89% on the same run -- the direction of travel is
+    not the point, where the lens is relative to the face is."""
+    plan = {
+        3: ShotPlanEntry(
+            chunk_id=3, start=3.0, shot="The mill turns slower overhead as she climbs on",
+            camera="medium close, travelling with her, the sails passing behind",
+        )
+    }
+    with caplog.at_level(logging.WARNING):
+        lint_voiced_framing(plan, [_chunk_stub(3, "Walking the empty road tonight")])
+    assert "chunk_id=3" in caplog.text
+
+
+def test_a_voiced_chunk_shot_from_ahead_is_quiet(caplog):
+    """The control that stops this becoming a lint against movement."""
+    plan = {
+        3: ShotPlanEntry(
+            chunk_id=3, start=3.0, shot="She climbs the switchback with the needle in her fist",
+            camera="medium close, tracking backwards ahead of her, her face held",
+        )
+    }
+    with caplog.at_level(logging.WARNING):
+        lint_voiced_framing(plan, [_chunk_stub(3, "Walking the empty road tonight")])
+    assert caplog.text == ""

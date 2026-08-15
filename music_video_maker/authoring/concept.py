@@ -145,7 +145,7 @@ def build_concept_prompt(
             f"{stats['instrumental_seconds']:.1f}s instrumental, "
             f"{stats['chunk_count']} chunks)"
         ),
-        "chunk_id\tstart\tend\tframes\ttag\tlyric",
+        "chunk_id\tstart\tend\tframes\ttag\tsinger\tlyric",
         skeleton_table_text(chunks),
         "## Cast",
         cast_lines,

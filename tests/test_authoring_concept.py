@@ -267,3 +267,37 @@ def test_generate_concept_propagates_a_driver_error_without_extra_retries(tmp_pa
         generate_concept(config, chunks, driver)
 
     assert len(driver.calls) == 1
+
+
+# --------------------------------------------------------------------------- #
+# The authoring layer is a THIRD align() call site. Its own docstring says it
+# is "the same one source of truth run_pipeline and prepare_shot_plan already
+# share" -- which was true of the audio, the lyrics and the overrides, and not
+# of the model size. A plan authored against `base` describes a timeline the
+# render (on `small`) never emits: 71 chunks vs 80, 15 voiced vs 41.
+# --------------------------------------------------------------------------- #
+
+
+def test_skeleton_uses_the_configured_alignment_model(tmp_path, monkeypatch):
+    """Adding a config value means finding every consumer of it. `grep -rn
+    'align('` is that check; a docstring claiming shared truth is not."""
+    from dataclasses import replace
+
+    from music_video_maker.authoring import chunks as chunks_mod
+
+    config = replace(
+        _config(tmp_path, lyrics_text="Walking through the empty halls tonight\n"),
+        alignment_model_size="small",
+    )
+
+    seen: dict = {}
+    real_align = chunks_mod.align
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return real_align(*args, **kwargs)
+
+    monkeypatch.setattr(chunks_mod, "align", spy)
+    load_chunk_skeleton(config, align_model=_FakeAlignModel())
+
+    assert seen["model_size"] == "small"

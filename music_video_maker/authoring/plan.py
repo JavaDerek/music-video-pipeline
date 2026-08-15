@@ -53,6 +53,7 @@ from music_video_maker.shot_plan import (
     ShotPlanError,
     lint_camera_face_away_on_voiced_chunks,
     lint_shots_against_lyrics,
+    lint_voiced_framing,
     load_shot_plan,
     resolve_camera,
     resolve_shot,
@@ -318,6 +319,7 @@ def check_plan(
                 resolve_camera(plan, chunk)
             lint_shots_against_lyrics(plan, chunks)
             lint_camera_face_away_on_voiced_chunks(plan, chunks)
+            lint_voiced_framing(plan, chunks)
         except ShotPlanError as exc:
             # Drift, a duplicate chunk_id, a malformed entry: by construction
             # none of these can come from the model -- anchors are copied from

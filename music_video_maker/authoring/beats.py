@@ -393,7 +393,7 @@ def build_beats_prompt(
             f"{len(chunks)} chunk(s), {voiced + instrumental:.1f}s total "
             f"({voiced:.1f}s voiced, {instrumental:.1f}s instrumental)"
         ),
-        "chunk_id\tstart\tend\tframes\ttag\tlyric",
+        "chunk_id\tstart\tend\tframes\ttag\tsinger\tlyric",
         skeleton_table_text(chunks),
         "## Cast",
         cast_lines,

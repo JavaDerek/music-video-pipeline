@@ -95,6 +95,28 @@ DEFAULT_COMFYUI_URL = "http://127.0.0.1:8188"
 host, no network hop required. A remote ComfyUI host -- e.g. reached over
 Tailscale, never a raw LAN IP -- is a config override, not the assumption."""
 
+ALIGNMENT_MODEL_SIZES = frozenset(
+    {
+        "tiny", "tiny.en",
+        "base", "base.en",
+        "small", "small.en",
+        "medium", "medium.en",
+        "large", "large-v1", "large-v2", "large-v3", "large-v3-turbo", "turbo",
+    }
+)
+"""Whisper model names stable-ts will load. Validated at config load time
+because the alternative is a stack trace from inside stable-ts *after* the
+weights download, which on a first run is several minutes in."""
+
+DEFAULT_ALIGNMENT_MODEL_SIZE = "base"
+"""Mirrors :data:`music_video_maker.alignment.DEFAULT_MODEL_SIZE` (a test
+asserts the two stay equal) -- config must not import the alignment module
+just for a constant, the same rule :data:`MAX_NOISE_SEED` follows.
+
+"base" and not the better-measured "small" on purpose: this key exists so a
+run can *choose*, and changing the default would silently re-cut the timeline
+of every config already committed."""
+
 _PATH_FIELDS = ("master_audio", "lyrics_file", "workflow_template", "chunks_dir", "final_video_dir")
 _SCALAR_FIELDS = ("global_style", "narrative_concept", "default_lead_vocalist")
 
@@ -343,6 +365,41 @@ class RunConfig:
     mid-render. Even then it is a blunt instrument: our own workload swings
     several GB between sampling and VAE decode, so a threshold tight enough to
     catch a 2 GB intruder will fire on us instead."""
+
+    alignment_model_size: str = DEFAULT_ALIGNMENT_MODEL_SIZE
+    """Which whisper model Stage 1's forced alignment loads.
+
+    ``align()`` always took a ``model_size``, but nothing ever passed it, so
+    every run was pinned to ``"base"`` and the only remedy for a bad alignment
+    was hand-authored ``[[alignment_override]]`` tables (issue #42) -- one per
+    segment, which stops scaling the moment more than a handful are wrong.
+
+    Measured on "Deathless" (8:32, heavily instrumented), same audio and
+    lyrics, only this value differing:
+
+    ==========  ========  ==============  =================
+    model       segments  voiced total    last vocal placed
+    ==========  ========  ==============  =================
+    ``base``    49        77.2s (15.1%)   3:11
+    ``small``   57        187.2s (36.6%)  8:21
+    ``medium``  --        see below       --
+    ==========  ========  ==============  =================
+
+    ``base`` believed the singing stopped at 3:11 of an 8:32 track, which would
+    have rendered 56 of 71 chunks as "performs silently, no lyric to sing"
+    against a master that has her audibly singing -- a video-destroying result
+    that raises no error and is only visible after hours of GPU time.
+
+    Bigger is **not** automatically better, which is why this is a per-run
+    value and not a new default. On "The Lucky Ones" both ``small`` and
+    ``medium`` hallucinated the vocoded tail lines into the dead outro where
+    ``base`` was correct (issue #42); on "Deathless" ``medium`` placed a lyric
+    17s before any vocal energy exists and dumped two closing-refrain segments
+    into the trailing silence. Measure per song; the alignment quality report
+    (issue #35) is what to measure with.
+
+    Defaults to ``"base"`` so every config written before this key existed
+    aligns exactly as it always did."""
 
     strict_alignment: bool = False
     """Issue #35: fail the run when the alignment-quality check finds problems
@@ -902,6 +959,15 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
     values["i2v_continuity"] = _flag(merged, "i2v_continuity", False)
     values["resume_ignore_prompt_changes"] = _flag(merged, "resume_ignore_prompt_changes", False)
     values["strict_alignment"] = _flag(merged, "strict_alignment", False)
+
+    model_size = merged.get("alignment_model_size", DEFAULT_ALIGNMENT_MODEL_SIZE)
+    if model_size not in ALIGNMENT_MODEL_SIZES:
+        raise ConfigError(
+            f"alignment_model_size must be one of {sorted(ALIGNMENT_MODEL_SIZES)}; got "
+            f"{model_size!r}. Caught here because the alternative is a failure from "
+            "inside stable-ts after the weights download, minutes into Stage 1"
+        )
+    values["alignment_model_size"] = model_size
     between_chunk_floor = merged.get("between_chunk_min_free_vram_gb")
     values["between_chunk_min_free_vram_gb"] = (
         _positive_number(merged, "between_chunk_min_free_vram_gb", 0.0)

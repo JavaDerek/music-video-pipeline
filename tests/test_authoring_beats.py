@@ -69,6 +69,21 @@ def _config(tmp_path: Path, *, lyrics_text: str = "") -> RunConfig:
     )
 
 
+
+def _chunk(chunk_id, text, *, instrumental=False, characters=()):
+    """One chunk, with the singer attached -- the field the skeleton table
+    now has to surface."""
+    return contracts.AudioChunk(
+        chunk_id=chunk_id,
+        audio_file=Path(f"chunk_{chunk_id:04d}.wav"),
+        start=float(chunk_id) * 6.0,
+        end=float(chunk_id) * 6.0 + 6.0,
+        text=text,
+        is_instrumental=instrumental,
+        characters=characters,
+    )
+
+
 def _chunks(n: int = 3, width: float = 6.0):
     return tuple(
         contracts.AudioChunk(
@@ -410,3 +425,45 @@ def test_a_beat_is_serialisable_and_round_trips():
     beats = validate_beats(_three_beat_gag(), _chunks())
 
     assert tuple(Beat.from_dict(b.to_dict()) for b in beats) == beats
+
+
+# --------------------------------------------------------------------------- #
+# A sung chunk's beat belongs to the person singing it.
+#
+# The alignment already knows who sings each chunk -- the render uses
+# `chunk.characters` to pick which cast photo conditions the shot. The
+# authoring layer never showed it to the model, so the beat sheet assigned
+# the OTHER character to chunks the singer carries, and every downstream
+# stage then did its job correctly on a wrong premise: prose wrote him into
+# the sentence, photography framed him close, `present` supplied his
+# photograph. Measured on the first machine-authored plan to reach a GPU:
+# 25 of 41 sung chunks ended up framed on whoever was not singing them.
+# --------------------------------------------------------------------------- #
+
+
+def test_the_skeleton_table_names_who_sings_each_chunk():
+    """Unenforceable otherwise: the model cannot honour a rule about the
+    singer if the skeleton never says who that is."""
+    from music_video_maker.authoring.chunks import skeleton_table_text
+
+    chunks = [
+        _chunk(1, "Walking the empty road tonight", characters=("Dianne",)),
+        _chunk(2, "", instrumental=True),
+        _chunk(3, "Nobody was counting then", characters=("Jan",)),
+    ]
+
+    table = skeleton_table_text(chunks)
+    rows = [r.split("\t") for r in table.strip().split("\n")]
+
+    assert "Dianne" in rows[0]
+    assert "Jan" in rows[2]
+    # An instrumental has nobody singing it, and must not claim otherwise.
+    assert "Dianne" not in rows[1] and "Jan" not in rows[1]
+
+
+def test_the_beats_preamble_puts_a_sung_beat_on_its_own_singer():
+    from music_video_maker.authoring.prompts import BEATS_PREAMBLE
+
+    lowered = BEATS_PREAMBLE.lower()
+    assert "singer" in lowered
+    assert "25 of 41" in BEATS_PREAMBLE

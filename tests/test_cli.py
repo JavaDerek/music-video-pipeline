@@ -1755,3 +1755,49 @@ def test_main_prepare_returns_error_code_when_it_raises(tmp_path: Path, monkeypa
 
     assert exit_code == cli.EXIT_ERROR
     assert any("Failed to prepare shot plan" in r.message for r in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
+# The alignment model reaches Stage 1. `align()` has always taken a
+# `model_size`, but nothing passed it, so every run was pinned to "base" no
+# matter what the config said. The gap was invisible because align() has a
+# working default -- the run succeeds, it just aligns with the wrong model.
+# --------------------------------------------------------------------------- #
+
+
+def test_configured_alignment_model_size_reaches_align(tmp_path, monkeypatch):
+    """A config key nothing reads is worse than no key: it reports a choice
+    the run did not make. On "Deathless" this was the difference between 77.2s
+    and 187.2s of detected vocal."""
+    rig = Rig(tmp_path)
+    rig.config = replace(rig.config, alignment_model_size="small")
+
+    seen: dict[str, Any] = {}
+    real_align = cli.align
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return real_align(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "align", spy)
+    rig.run([rig.seed_success(1, 0), rig.seed_success(2, 1), rig.seed_success(3, 2)])
+
+    assert seen["model_size"] == "small"
+
+
+def test_alignment_model_size_default_is_passed_not_assumed(tmp_path, monkeypatch):
+    """The default must travel the same path as an override, so the plumbing
+    is exercised by every run rather than only by configs that set the key."""
+    rig = Rig(tmp_path)
+
+    seen: dict[str, Any] = {}
+    real_align = cli.align
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return real_align(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "align", spy)
+    rig.run([rig.seed_success(1, 0), rig.seed_success(2, 1), rig.seed_success(3, 2)])
+
+    assert seen["model_size"] == "base"

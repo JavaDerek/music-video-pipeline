@@ -398,3 +398,30 @@ def test_the_global_style_reaches_the_prompt(tmp_path):
 
     assert config.global_style in prompt
     assert "must not contradict it" in prompt
+
+
+# --------------------------------------------------------------------------- #
+# A sung chunk's framing is not optional, and it has to be close enough to
+# read a mouth.
+#
+# The preamble already asks the model to keep her face available to the lens.
+# That is about DIRECTION (don't crane away); it says nothing about SCALE, and
+# it sits next to "camera is OPTIONAL PER SHOT ... an absent direction is the
+# right answer for most shots". On the first machine-authored plan to reach a
+# GPU that combination produced 41 voiced chunks of which 29 had no `camera`
+# at all and only 11 were close or medium -- and a face was detectable in
+# 0-33% of sampled frames. Wide is the better image and the model has every
+# reason to choose it; the exception for sung chunks has to be explicit.
+# --------------------------------------------------------------------------- #
+
+
+def test_the_preamble_requires_a_close_framing_on_sung_chunks():
+    from music_video_maker.authoring.prompts import PHOTOGRAPHY_PREAMBLE
+
+    lowered = PHOTOGRAPHY_PREAMBLE.lower()
+    assert "close or medium" in lowered
+    # The scale rule must not be phrased as optional the way the general
+    # camera guidance is.
+    assert "not optional" in lowered
+    # Measured, so it reads as evidence rather than taste.
+    assert "0-33%" in PHOTOGRAPHY_PREAMBLE

@@ -55,6 +55,11 @@ def load_chunk_skeleton(
         config.master_audio,
         lines,
         model=align_model,
+        # The third call site, and the one easiest to miss: a plan authored
+        # against a different alignment than the render uses describes chunks
+        # the render never emits. On "Deathless" that was 71 chunks (15 voiced)
+        # against 80 (41 voiced) -- every anchor in the plan wrong.
+        model_size=config.alignment_model_size,
         strict_alignment=config.strict_alignment,
         overrides=config.alignment_overrides,
     )
@@ -94,6 +99,17 @@ def skeleton_table_text(chunks: Sequence[AudioChunk]) -> str:
                 f"{chunk.end:.3f}",
                 str(chunk.frame_count),
                 "INSTRUMENTAL" if chunk.is_instrumental else "LYRIC",
+                # Who is singing this chunk. The alignment has always known
+                # (the render reads it to pick which cast photo conditions
+                # the shot) and the authoring layer never showed it to the
+                # model, so a beat sheet could hand a sung chunk to the
+                # character who is not singing it -- and every downstream
+                # stage then did its job correctly on a wrong premise. On the
+                # first machine-authored plan to reach a GPU, 25 of 41 sung
+                # chunks ended up framed on whoever was not singing them.
+                # Empty on an instrumental: nobody is singing it, and saying
+                # otherwise would invite a beat about a voice that is silent.
+                "/".join(chunk.characters) if not chunk.is_instrumental else "",
                 chunk.text.strip() if chunk.text else "",
             )
         )

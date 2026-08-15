@@ -108,6 +108,15 @@ LINES = {
     3: "Rain crosses the whole length of the pavement, gutters filling",
 }
 
+# A sung chunk needs a framing close enough to read a mouth, or
+# `lint_voiced_framing` rightly objects -- these fixtures stand in for a
+# *clean* plan, so they have to satisfy the rule like a real one would.
+CAMERAS = {
+    1: "medium on her as the shutters come down behind her",
+    2: "close on the swinging receiver, her face held behind it",
+    3: "medium on her, rain crossing the frame",
+}
+
 
 class _Reviser:
     """Stands in for ``prose.revise_prose``: records what it was asked to fix
@@ -134,7 +143,7 @@ def test_a_generated_plan_round_trips_through_the_real_loaders(tmp_path):
     chunks = _chunks(["a first line", "", "a third line"])
     beats = (_beat(1), _beat(2), _beat(3))
 
-    text = render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE)
+    text = render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, camera=CAMERAS)
     path = tmp_path / "shot_plan.toml"
     path.write_text(text)
 
@@ -151,7 +160,7 @@ def test_anchors_come_from_the_chunks_not_from_the_beats(tmp_path):
     chunks = _chunks(["a line"])
     stale = (Beat(chunk_id=1, start=999.0, end=1005.0, beat="b", beat_role="plant", beat_group=1),)
 
-    text = render_plan_toml(chunks, stale, {1: LINES[1]}, provenance=PROVENANCE)
+    text = render_plan_toml(chunks, stale, {1: LINES[1]}, provenance=PROVENANCE, camera=CAMERAS)
     path = tmp_path / "shot_plan.toml"
     path.write_text(text)
 
@@ -173,7 +182,7 @@ def test_focus_and_length_come_from_the_beat(tmp_path):
     beats = (_beat(1, role="consequence", focus="action"), _beat(2, length=9.0))
 
     path = tmp_path / "shot_plan.toml"
-    path.write_text(render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE))
+    path.write_text(render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, camera=CAMERAS))
     plan = load_shot_plan(path)
 
     assert plan[1].subject_is_focus is False
@@ -248,7 +257,10 @@ def test_lint_comments_land_above_their_entry(tmp_path):
 
 def test_a_clean_plan_checks_clean(tmp_path):
     chunks = _chunks(["a first line", "", "a third line"])
-    text = render_plan_toml(chunks, (_beat(1), _beat(2), _beat(3)), LINES, provenance=PROVENANCE)
+    text = render_plan_toml(
+        chunks, (_beat(1), _beat(2), _beat(3)), LINES,
+        provenance=PROVENANCE, camera=CAMERAS,
+    )
 
     check = check_plan(text, _config(tmp_path), chunks)
 
@@ -321,6 +333,7 @@ def test_an_error_is_revised_and_the_fixed_plan_is_returned(tmp_path):
         {1: LINES[1]},  # chunk 2 blank -> an error
         provenance=PROVENANCE,
         reviser=reviser,
+        camera=CAMERAS,
     )
 
     assert [sorted(call) for call in reviser.calls] == [[2]]
@@ -340,6 +353,7 @@ def test_an_unfixable_error_aborts_after_the_bound_and_writes_nothing(tmp_path):
             {1: LINES[1]},
             provenance=PROVENANCE,
             reviser=reviser,
+            camera=CAMERAS,
         )
 
     assert len(reviser.calls) == MAX_ERROR_ROUNDS
@@ -357,6 +371,7 @@ def test_a_warning_gets_exactly_one_revision_round_then_is_annotated(tmp_path):
     built = build_plan(
         _config(tmp_path), chunks, (_beat(1), _beat(2)), shots, provenance=PROVENANCE,
         reviser=reviser,
+        camera=CAMERAS,
     )
 
     assert len(reviser.calls) == 1  # exactly one, never a second
@@ -375,6 +390,7 @@ def test_a_revision_that_breaks_the_plan_is_discarded(tmp_path):
     built = build_plan(
         _config(tmp_path), chunks, (_beat(1), _beat(2)), shots, provenance=PROVENANCE,
         reviser=reviser,
+        camera=CAMERAS,
     )
 
     # The prose is rolled back too, not just the verdict: keeping the new line
@@ -395,6 +411,7 @@ def test_a_clean_plan_calls_the_reviser_not_at_all(tmp_path):
         LINES,
         provenance=PROVENANCE,
         reviser=reviser,
+        camera=CAMERAS,
     )
 
     assert reviser.calls == []
@@ -415,6 +432,7 @@ def test_a_revision_leaves_every_out_of_scope_line_byte_identical(tmp_path):
         shots,
         provenance=PROVENANCE,
         reviser=reviser,
+        camera=CAMERAS,
     )
 
     assert built.shots[1] == LINES[1]
@@ -501,6 +519,7 @@ def test_extra_checks_reach_the_written_file_as_lint_comments(tmp_path):
         LINES,
         provenance=PROVENANCE,
         reviser=reviser,
+        camera=CAMERAS,
         extra_checks=lambda shots: [
             Issue(chunk_id=2, severity="warning", message="carries its own camera direction")
         ],
@@ -533,6 +552,7 @@ def test_extra_checks_are_re_run_on_the_revised_text_not_the_original(tmp_path):
         LINES,
         provenance=PROVENANCE,
         reviser=reviser,
+        camera=CAMERAS,
         extra_checks=extra_checks,
     )
 
