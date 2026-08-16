@@ -53,6 +53,37 @@ durations), the total runtime, the cast (names and roles), and any \
 setting/style already fixed by the run's config. You may also be given \
 freeform hints from the person running this -- follow them.
 
+FILL `reading` FIRST, AND DERIVE EVERYTHING ELSE FROM IT. This is the whole \
+point of this stage running in two parts, one call: read the song before you \
+pitch a video for it. Nobody upstream of you has ever asked what these words \
+mean, who is speaking, to whom, what happens, or when and where it is set --  \
+skip straight to inventing a concept and you invent a video for a song you \
+were never asked to read. `logline`/`setting`/`tone`/`motifs`/`avoid`/ \
+`locations`/`acts` must be consistent with what `reading` says, not a \
+separate, freestanding pitch.
+
+`reading` is a comprehension step, not an invention step:
+- `subject` -- what the song is about, in one line.
+- `speaker` / `addressee` -- who is singing, and to whom. This pipeline has \
+a hard-won separation between who is AUDIBLE and who is ON SCREEN; the \
+lyrics usually imply both.
+- `situation` / `change` -- the situation the song opens on, and what \
+changes across it, stated as the song's OWN movement -- never an invented \
+one. This is the raw material `acts` below is built from.
+- `register` / `period` / `place` -- implied by the words themselves. A \
+lyric naming "American sanctions" is contemporary; a render that stayed \
+medieval against that lyric is a real mistake this field exists to catch.
+- `nouns` -- concrete, renderable objects the lyrics themselves name, \
+before you invent anything of your own.
+- `references` -- cultural, historical, mythological, religious or \
+political references the lyrics actually make, each with the concrete \
+imagery it carries (`{"reference": ..., "what_it_is": ..., "imagery": \
+[...]}`). Most songs make none, and an EMPTY LIST IS THE CORRECT ANSWER for \
+those -- a song about a breakup has no folklore in it. Do NOT invent a \
+reference to fill this field: a wrong or fabricated reference gets staged \
+downstream as if it were real, and that is worse than leaving it empty. \
+Only name what the words themselves point to.
+
 If the config already fixes a `setting`, propose a concept that lives \
 inside it, never one that contradicts it. If it does not, your own \
 `setting` field is a real proposal for that config value, not a shot \
@@ -60,12 +91,27 @@ description.
 
 Reply with a single JSON object, no other text, matching exactly:
 {
+  "reading": {
+    "subject": "one line: what this song is about",
+    "speaker": "who is singing",
+    "addressee": "who they are singing to",
+    "situation": "the situation the song opens on",
+    "change": "what changes across the song, in the song's own terms",
+    "register": "formal, colloquial, contemporary, archaic, etc.",
+    "period": "when this is set, as the words imply it",
+    "place": "where this is set, as the words imply it",
+    "nouns": ["concrete objects the lyrics themselves name -- may be EMPTY"],
+    "references": [{"reference": "name", "what_it_is": "what it is",
+                     "imagery": ["concrete images it carries"]}]
+  },
   "logline": "one or two sentences: what happens, who it happens to",
   "setting": "where and when this takes place",
   "tone": "the emotional register -- comic, elegiac, tense, etc.",
   "motifs": ["a short list of recurring visual ideas the shot plan can plant and pay off"],
   "avoid": ["things this concept deliberately does NOT want on screen"],
-  "locations": ["a small closed list of DISTINCT places within `setting` the story actually visits"]
+  "locations": ["a small closed list of DISTINCT places within `setting` the story visits"],
+  "acts": [{"name": "situation", "function": "what this act establishes"},
+           {"name": "resolution", "function": "what this act pays off, planted earlier"}]
 }
 
 `locations` matters more than its size suggests. `setting` fixes the whole \
@@ -78,6 +124,18 @@ gradient like "closer to the summit" or a duplicate of another entry under a \
 different name. Every chunk's `location` in the next stage is assigned from \
 exactly this list, and a place that is not on it cannot be used -- so name \
 everywhere the story actually goes, and nothing it does not.
+
+`acts` is the video's dramatic shape -- a small, ORDERED, closed list, each \
+entry a name and what that act is FOR. Nothing prescribes the set: a ballad \
+and a protest song do not have the same shape, so choose whatever act \
+structure actually fits THIS song's `reading.situation` and `reading.change` \
+-- "situation / complication / turn / resolution" is one example, not a \
+mandate. Every beat in the next stage is assigned to exactly one of these \
+acts, in this order, and the LAST act must eventually pay off something an \
+EARLIER act planted -- that is the one thing that turns a sequence of shots \
+into a story with a shape, and it is checked mechanically, not just asked \
+for nicely. Ground `acts` in `reading.change`: an act structure that ignores \
+what you already said changes across the song is decoration, not a shape.
 
 This is the tightest review point in the whole pipeline -- a human reads \
 this paragraph in seconds and decides whether to proceed. Write something \
@@ -93,14 +151,14 @@ prose that will describe them. A later stage writes the shot lines; if you \
 write finished prose here it will be thrown away.
 
 You will be given the approved concept (including its closed `locations` \
-list), the song's chunk skeleton, the cast, and possibly notes from the \
-person reviewing this.
+list and its ORDERED `acts` structure), the song's chunk skeleton, the cast, \
+and possibly notes from the person reviewing this.
 
 Reply with a single JSON object, no other text:
 {"beats": [
   {"chunk_id": 12, "beat": "the printer erupts", "beat_role": "consequence",
    "beat_group": 3, "focus": "action", "location": "the office aisle",
-   "length_seconds": 9.0}
+   "act": "resolution", "length_seconds": 9.0}
 ]}
 
 Rules your reply is CHECKED against -- a violation is sent straight back to \
@@ -131,6 +189,18 @@ actually moves the character somewhere else. If a `location` you need is not \
 on the approved list, say so in your reply instead of inventing one -- the \
 concept can be revised, the render cannot silently absorb an unapproved \
 place.
+3b. `act` MUST be exactly one of the concept's ordered `acts` -- copy the \
+name verbatim. This is the video's dramatic shape (issue #84): every chunk \
+belongs to exactly one act, the acts run in the concept's own stated order \
+with each act's chunks forming ONE UNBROKEN RUN (an act may not start, stop \
+for a later act, then start again), and the FINAL act must contain at least \
+one `consequence` beat whose `beat_group` also contains a `plant` from an \
+EARLIER act -- an arc has to pay off something it planted, not just narrate \
+events in sequence. All of this is checked mechanically and reported back to \
+you if it fails; it is not a request to sound story-shaped, it is a \
+structural property of the beat sheet you write. Use the concept's own \
+`reading.change` to decide where the turn actually falls -- the acts exist \
+to carry that movement, not to be evenly-sized decoration.
 4. Every `consequence` sets `focus` to "action". Everything else uses \
 "subject". This is not stylistic -- "action" is what stops the composed \
 "X is the focus of this shot" clause from competing with the state change. \
@@ -171,6 +241,23 @@ unbroken take across a solo, say). It re-cuts the timeline, so asking for \
 many of them in a row will leave parts of the song with no beat and come \
 back to you. H3's trained range is about 5.2s to 15.1s; anything outside it \
 is clamped.
+7. `subject` is OPTIONAL and says WHOSE SHOT an INSTRUMENTAL beat is (issue \
+#82). On a chunk tagged INSTRUMENTAL below, the render composes the "Default \
+lead vocalist" named in the Cast section above as the focus of that shot by \
+default -- a config fallback, not a statement about this beat. If an \
+instrumental beat is actually about a DIFFERENT cast member, set `subject` \
+to that member's name so the render composes THEM as the focus instead. \
+Leave `subject` out entirely otherwise, which is most beats: a chunk about \
+the default lead vocalist, or about nobody in particular, needs no `subject` \
+at all. NEVER set `subject` on a chunk tagged LYRIC -- the singer already \
+owns the frame there (rules 4 and 5 above, and issues #58, #59, #60), and a \
+`subject` on a voiced chunk is rejected outright, not silently honoured. A \
+real render put an instrumental beat's shot line entirely about one cast \
+member while the render composed a different one as the focus, and H3 \
+morphed one into the other mid-shot; `subject` is the missing statement that \
+prevents that, and this stage is where it belongs because you already know \
+whose beat this is -- nothing downstream should have to guess it back from \
+pronouns.
 
 `beat` itself is one short clause -- what happens, not how it is shot. No \
 camera direction (a later stage owns that), no restating who the character \

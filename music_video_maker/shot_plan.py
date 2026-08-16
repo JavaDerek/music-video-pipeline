@@ -372,6 +372,39 @@ class ShotPlanEntry:
     shot line is free text that nothing resolves against the cast, so it
     would stage no photo, and it would fight rule 2 of the prose preamble."""
 
+    subject: str | None = None
+    """Whose shot this is (issue #82) -- a single cast name, or ``None``.
+
+    Not :attr:`present`: that field answers "is this cast member visibly on
+    screen" (and, via #72's referent lint, "does a pronoun bind to them"),
+    but it never changes who the render composes as *"is the focus of this
+    shot"* -- that stays whichever member is singing, or
+    ``config.default_lead_vocalist`` on an instrumental chunk, regardless of
+    what ``present`` says. On "Deathless" chunk 29 (instrumental, shot line
+    entirely about Jan) ``present = ["Jan"]`` staged his name, role,
+    appearance and photo -- and the prompt still said Dianne was the focus.
+    H3 morphed one into the other at 3:11. ``subject`` is the field that
+    actually reassigns focus.
+
+    Not :attr:`subject_is_focus` either, though the names are easy to
+    confuse: ``subject_is_focus`` (issue #26) is a boolean asking whether the
+    active member is what the sentence is *about* (vs. a consequence they
+    have walked away from, e.g. a burning printer) -- it never says *who*
+    the active member is. ``subject`` says who the focus member IS. The two
+    compose independently: which member is the focus, and whether that
+    member is the sentence's subject, are different questions.
+
+    Legal only on an **instrumental** chunk. A voiced chunk's singer owns the
+    frame -- three separate measured findings (#58, #59, #60) say the
+    sentence outranks any field that argues otherwise -- so `subject` there
+    is refused by :func:`lint_subject_on_voiced_chunk`, never silently
+    honoured: a field that could override the singer would be a new way to
+    reintroduce the very desync it exists to prevent.
+
+    ``None`` (the default) is "not authored", and composes exactly like the
+    pre-#82 prompt: the instrumental fallback to ``default_lead_vocalist``
+    is unchanged when nobody has said otherwise."""
+
     length_seconds: float | None = None
     """How long this shot should run, in seconds (issue #27).
 
@@ -468,7 +501,7 @@ def load_shot_plan(
 
     plan: dict[int, ShotPlanEntry] = {}
     for index, raw in enumerate(raw_entries):
-        entry = _parse_entry(raw, index, path)
+        entry = _parse_entry(raw, index, path, cast_names)
         if entry.chunk_id in plan:
             logger.error(
                 "Shot plan %s defines chunk_id=%d more than once", path, entry.chunk_id
@@ -1960,8 +1993,199 @@ def lint_present_location_mismatch(
             )
 
 
+# --------------------------------------------------------------------------- #
+# `subject`: whose shot this is (issue #82)
+# --------------------------------------------------------------------------- #
+
+
+def lint_subject_on_voiced_chunk(
+    plan: Mapping[int, ShotPlanEntry],
+    chunks: Sequence[AudioChunk],
+    path: Path | None = None,
+) -> None:
+    """RAISE (not warn) when an entry sets ``subject`` and its chunk is
+    voiced (issue #82).
+
+    The one lint in this module that raises rather than warns, because
+    ``ShotPlanEntry.subject``'s docstring states the asymmetry: on a voiced
+    chunk the singer owns the frame, and three separate measured findings
+    (#58, #59, #60) say the sentence outranks any field that argues
+    otherwise. Honouring ``subject`` there would make the field a new way to
+    reintroduce the very desync it exists to prevent, so a plan that tries
+    it is refused before any GPU time is spent rather than silently
+    mis-composed. ``expand_prompt`` also refuses this case
+    (:class:`~music_video_maker.prompting.SubjectOnVoicedChunkError`) as
+    defence in depth, but this is the primary gate: it runs at plan-load
+    time, against the real chunk timeline, before Stage 3 ever stages
+    anything.
+
+    Silent whenever ``plan``/``chunks`` is empty, an entry never set
+    ``subject``, or its chunk is instrumental -- the legal case.
+    """
+    if not plan or not chunks:
+        return
+    for chunk in chunks:
+        entry = plan.get(chunk.chunk_id)
+        if entry is None or entry.subject is None or chunk.is_instrumental:
+            continue
+        logger.error(
+            "Shot plan %s: chunk_id=%d sets subject=%r but this chunk is voiced -- the "
+            "singer owns the frame on a voiced chunk (issues #58, #59, #60), and "
+            "honouring `subject` here would reintroduce the desync the field exists to "
+            "avoid. `subject` is legal only on an instrumental chunk.",
+            path,
+            chunk.chunk_id,
+            entry.subject,
+        )
+        raise ShotPlanError(
+            f"shot plan chunk_id={chunk.chunk_id} sets subject={entry.subject!r} but this "
+            "chunk is voiced; `subject` is legal only on an instrumental chunk -- the "
+            "singer owns the frame on a voiced chunk (issues #58, #59, #60)"
+        )
+
+
+def _solo_voiced_pronoun_counts(
+    plan: Mapping[int, ShotPlanEntry], chunks: Sequence[AudioChunk]
+) -> dict[str, dict[str, int]]:
+    """``{cast_name: {pronoun: count}}``, tallied from the shot line of every
+    chunk where ``name`` is this chunk's ONLY singer.
+
+    Not a guess from the name -- issue #72's own docstring already rejects
+    that ("Nothing in this project's cast configuration carries a gender...
+    Rather than guess it from a name (unreliable...)"). This measures
+    instead: on a solo voiced chunk the sentence's subject is already the
+    singer (#58, #59, #60), so whatever third-person pronoun the author
+    reached for while writing that chunk's own shot line IS that singer's
+    own pronoun, self-reference by construction -- evidence from the plan in
+    hand, not an assumption about the name."""
+    counts: dict[str, dict[str, int]] = {}
+    for chunk in chunks:
+        if len(chunk.characters) != 1:
+            continue
+        entry = plan.get(chunk.chunk_id)
+        if entry is None or not entry.shot:
+            continue
+        name = chunk.characters[0]
+        for match in _THIRD_PERSON_PRONOUN_PATTERN.finditer(entry.shot):
+            token = match.group(0).lower()
+            bucket = counts.setdefault(name, {})
+            bucket[token] = bucket.get(token, 0) + 1
+    return counts
+
+
+def _pronoun_ownership(counts: Mapping[str, Mapping[str, int]]) -> dict[str, str]:
+    """``{pronoun: cast_name}`` for every pronoun with an unambiguous
+    majority owner among :func:`_solo_voiced_pronoun_counts`' measurements,
+    omitted when the evidence is too thin to trust.
+
+    Two occurrences is the floor -- a single hit is noise, not a signature,
+    issue #60's own lesson -- and the top name must strictly outrank every
+    other name that also used the pronoun at all. Measured on the real
+    80-chunk "Deathless" plan this cleanly separates "she"/"her" (Dianne: 22
+    and 23 of the singer's own solo occurrences, against 2 and 1 noise) from
+    "he"/"his"/"him" (Jan: 11, 17 and 3, against 2, 0 and 0 noise) with no
+    tie either way."""
+    totals: dict[str, dict[str, int]] = {}
+    for name, pronoun_counts in counts.items():
+        for pronoun, n in pronoun_counts.items():
+            totals.setdefault(pronoun, {})[name] = n
+    ownership: dict[str, str] = {}
+    for pronoun, by_name in totals.items():
+        ranked = sorted(by_name.items(), key=lambda item: -item[1])
+        top_name, top_count = ranked[0]
+        if top_count <= 1:
+            continue
+        if len(ranked) > 1 and ranked[1][1] >= top_count:
+            continue
+        ownership[pronoun] = top_name
+    return ownership
+
+
+def lint_instrumental_focus_mismatch(
+    plan: Mapping[int, ShotPlanEntry],
+    chunks: Sequence[AudioChunk],
+    default_lead_vocalist: str,
+) -> None:
+    """Warn (never raise) when an instrumental chunk's shot line reads as
+    entirely about a ``present`` bystander, with nothing in the plan telling
+    the render that (issue #82) -- the general shape of the chunk 29 bug
+    ``subject`` (above) exists to fix.
+
+    ``chunk.characters`` is empty on an instrumental chunk, so
+    ``prompting._resolve_active_members`` falls back to
+    ``default_lead_vocalist`` and composes THAT person as "the focus of this
+    shot" -- a config default answering a question the shot line already
+    answers differently. ``present`` (issue #59) stages the real subject's
+    name, role, appearance and photo, but does not change who is billed as
+    the focus, and #72's own referent lint stays silent here too: its whole
+    premise is that a pronoun needs a bound name to resolve to, and
+    ``present`` already bound one. Only ``subject`` fixes it; this lint is a
+    way to notice a plan is missing it before a render finds out.
+
+    Fires only when EVERY third-person pronoun this chunk's shot line uses
+    belongs (per :func:`_pronoun_ownership`'s measured evidence) to someone
+    named in ``present``, and NONE belongs to ``default_lead_vocalist`` --
+    i.e. the sentence gives the composed default focus no textual ground to
+    stand on at all. Measured on the real 80-chunk "Deathless" plan: 10 of
+    39 instrumental chunks fire this way, including chunk 29 itself and the
+    other three (1, 4, 34) a manual audit (issue #72) had already found by
+    eye before ``present`` existed to bind them halfway. Seven further
+    chunks that also name a `present` bystander with a pronoun in the line
+    (32, 33, 54, 70, 71, 72, 75) stay silent, correctly: each one also uses
+    at least one pronoun the evidence attributes to the default focus, so
+    those shots really are about the singer with a bystander alongside, not
+    a bystander alone.
+
+    Silent whenever the evidence is too thin to trust: no ``present``, no
+    third-person pronoun in the line, ``subject`` already set (nothing left
+    to notice), a voiced chunk (this lint's whole premise is the
+    instrumental fallback), or fewer than two solo-voiced occurrences of a
+    pronoun anywhere in the plan (see :func:`_pronoun_ownership`). Warning
+    tier, like every lint in this module: a false positive on prose a human
+    wrote deliberately must never be able to block a run.
+    """
+    if not plan or not chunks:
+        return
+    ownership = _pronoun_ownership(_solo_voiced_pronoun_counts(plan, chunks))
+    if not ownership:
+        return
+    for chunk in chunks:
+        if not chunk.is_instrumental:
+            continue
+        entry = plan.get(chunk.chunk_id)
+        if entry is None or entry.subject is not None or not entry.present:
+            continue
+        pronouns = {
+            match.group(0).lower()
+            for match in _THIRD_PERSON_PRONOUN_PATTERN.finditer(entry.shot)
+        }
+        owners = {ownership[p] for p in pronouns if p in ownership}
+        if not owners or default_lead_vocalist in owners:
+            continue
+        subjects = owners & set(entry.present)
+        if not subjects:
+            continue
+        implied = sorted(subjects)[0]
+        logger.warning(
+            "Shot plan chunk_id=%d: this instrumental chunk's shot line reads as "
+            "entirely about %s (present=%s), but nothing tells the render that -- the "
+            "composed focus still falls back to default_lead_vocalist=%r, who has no "
+            "pronoun in this line at all (issue #82). Set subject = %r, or reword so "
+            "the line is genuinely about %r too.",
+            chunk.chunk_id,
+            implied,
+            list(entry.present),
+            default_lead_vocalist,
+            implied,
+            default_lead_vocalist,
+        )
+
+
 ENTRY_KEYS = frozenset(
-    {"chunk_id", "start", "shot", "focus", "length_seconds", "camera", "present", "location"}
+    {
+        "chunk_id", "start", "shot", "focus", "length_seconds", "camera", "present",
+        "location", "subject",
+    }
 )
 """Every key this module actually reads out of a ``[[shot]]`` table."""
 
@@ -2000,7 +2224,9 @@ def _warn_unknown_entry_keys(raw: dict, chunk_id: object, path: Path) -> None:
     )
 
 
-def _parse_entry(raw: object, index: int, path: Path) -> ShotPlanEntry:
+def _parse_entry(
+    raw: object, index: int, path: Path, cast_names: Iterable[str] = ()
+) -> ShotPlanEntry:
     if not isinstance(raw, dict):
         raise ShotPlanError(f"shot plan {path}: [[shot]] #{index} is not a table")
 
@@ -2041,7 +2267,62 @@ def _parse_entry(raw: object, index: int, path: Path) -> ShotPlanEntry:
         camera=_parse_camera(raw, chunk_id, path),
         present=_parse_present(raw, chunk_id, path),
         location=_parse_location(raw, chunk_id, path),
+        subject=_parse_subject(raw, chunk_id, path, cast_names),
     )
+
+
+def _parse_subject(
+    raw: dict, chunk_id: object, path: Path, cast_names: Iterable[str] = ()
+) -> str | None:
+    """Read the optional ``subject`` field: whose shot this is (issue #82).
+
+    Not :func:`_parse_present` -- that reads a *list*; a shot has exactly one
+    subject, so a list here is the wrong shape, not merely a longer one. An
+    error rather than a warning when malformed, the same rule ``present``
+    follows and for the same reason: silently dropping this renders exactly
+    the bug it exists to fix (a config default standing in for a stated
+    focus), with nothing to show for the direction that was written.
+
+    Unlike ``present`` (which defers its cast check to ``prompting``, the
+    module that actually has the cast in scope), an unknown name is checked
+    HERE, because ``load_shot_plan`` already has ``cast_names`` in scope and
+    there is no "may also turn out to be a singer" ambiguity to defer for --
+    a shot has one subject, named once. Skipped when ``cast_names`` is
+    empty, exactly as :func:`_lint_setting_consistency`'s own cast check is:
+    the "cast unknown" call sites (most tests, and any caller that has not
+    wired the cast dict through) must not be forced to supply one just to
+    parse a plan.
+    """
+    subject = raw.get("subject")
+    if subject is None:
+        return None
+    if not isinstance(subject, str) or not subject.strip():
+        logger.error(
+            "Shot plan %s: chunk_id=%s has subject=%r, which must be a single non-blank "
+            "cast name (not a list, unlike present)",
+            path,
+            chunk_id,
+            subject,
+        )
+        raise ShotPlanError(
+            f"shot plan {path}: chunk_id={chunk_id} has subject={subject!r}; it must be a "
+            'single cast name, e.g. subject = "Jan" -- not a list, unlike present'
+        )
+    name = subject.strip()
+    known = {n.strip() for n in cast_names if n and n.strip()}
+    if known and name not in known:
+        logger.error(
+            "Shot plan %s: chunk_id=%s has subject=%r, which is not in the known cast %s",
+            path,
+            chunk_id,
+            name,
+            sorted(known),
+        )
+        raise ShotPlanError(
+            f"shot plan {path}: chunk_id={chunk_id} has subject={name!r}, which is not a "
+            f"known cast member; known cast: {sorted(known)}"
+        )
+    return name
 
 
 def _parse_present(raw: dict, chunk_id: object, path: Path) -> tuple[str, ...]:
@@ -2300,6 +2581,24 @@ def resolve_present(
     return entry.present if entry is not None else ()
 
 
+def resolve_subject(
+    plan: Mapping[int, ShotPlanEntry] | None, chunk: AudioChunk
+) -> str | None:
+    """Whose shot this is (issue #82), or ``None`` when the plan has no
+    entry for it, the entry never set ``subject``, or (via
+    :func:`_resolve_entry`) the plan itself is absent.
+
+    Not :func:`resolve_present`: ``present`` answers who a pronoun in the
+    shot line binds to; this answers who the render composes as the focus of
+    the shot. ``None`` is the honest answer for an unauthored chunk, and
+    composes exactly as every instrumental chunk did before this field
+    existed (the ``default_lead_vocalist`` fallback, unchanged). Shares
+    :func:`_resolve_entry`'s drift check for the same reason
+    :func:`resolve_camera`/:func:`resolve_present` do."""
+    entry = _resolve_entry(plan, chunk)
+    return entry.subject if entry is not None else None
+
+
 def resolve_location(
     plan: Mapping[int, ShotPlanEntry] | None, chunk: AudioChunk
 ) -> str | None:
@@ -2409,9 +2708,11 @@ def write_shot_plan_skeleton(
 
 __all__ = [
     "lint_camera_face_away_on_voiced_chunks",
+    "lint_instrumental_focus_mismatch",
     "lint_present_location_mismatch",
     "lint_role_prohibition_contradiction",
     "lint_shots_against_lyrics",
+    "lint_subject_on_voiced_chunk",
     "lint_unbound_companion_referent",
     "ENTRY_KEYS",
     "LANDMARK_CONTRADICTION_WINDOW_SECONDS",
@@ -2429,6 +2730,7 @@ __all__ = [
     "resolve_camera",
     "resolve_location",
     "resolve_shot",
+    "resolve_subject",
     "shot_length_requests",
     "write_shot_plan_skeleton",
 ]

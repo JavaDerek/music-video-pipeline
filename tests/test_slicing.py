@@ -28,7 +28,14 @@ import pytest
 
 import music_video_maker.slicing as slicing_module
 from music_video_maker import hardware
-from music_video_maker.contracts import AlignmentResult, AudioChunk, HardwareProfile
+from music_video_maker.contracts import (
+    AlignedSegment,
+    AlignmentResult,
+    AudioChunk,
+    HardwareProfile,
+    WordTiming,
+)
+from music_video_maker.shot_plan import ShotLength
 from music_video_maker.slicing import slice_audio
 from tests.harness.factories import (
     make_aligned_segment,
@@ -566,13 +573,19 @@ def test_retiling_residue_landing_inside_a_segment_is_logged(caplog):
     host even one filler chunk (`_plan_frames_run` returns `()` for it), so
     `_cover_instrumentals` absorbs it entirely: the next piece is placed
     immediately after the previous one's end, with no filler at all, rather
-    than at its own true (pre-retiling) start.
+    than at its own true (pre-retiling) start -- 1.0s earlier than passes
+    1-3 placed it.
 
-    Here that shifts the second piece 1.0s earlier than where passes 1-3
-    placed it. Its duration is unchanged, so its end also moves 1.0s
-    earlier -- from 14.167s (which fully covered the segment's true
-    8.5-14.0s span) to 13.167s, which now falls *inside* that span. Pass 2
-    never had a boundary anywhere near this piece (it was never part of a
+    Issue #79's `_prefer_vocal_onset` then recovers 1 grid step (0.708s) of
+    that shift toward the segment's own first word (8.5s), since the
+    preceding piece has room to grow and this piece has a step of headroom
+    above its own floor -- landing the final start at 8.0s, not 7.292s. That
+    refinement is a *compensated* transfer (see its docstring): it moves
+    only this piece's start, never its end, so the piece's end is exactly
+    what plain gap-absorption alone would have produced -- 1.0s earlier than
+    passes 1-3 placed it, at 13.167s, which falls *inside* the segment's
+    true 8.5-14.0s span (14.167s would have fully covered it). Pass 2 never
+    had a boundary anywhere near this piece (it was never part of a
     max-duration split), so only this pass can see the cut.
     """
     seg0 = make_aligned_segment(0, "first line here", 0.0, 7.0, "Dianne")
@@ -600,10 +613,14 @@ def test_retiling_residue_landing_inside_a_segment_is_logged(caplog):
             grid=GRID,
         )
 
-    # The gap was fully absorbed: piece1 starts exactly where piece0 ends,
-    # 1.0s earlier than its true start.
+    # The gap was fully absorbed, then issue #79's refinement recovered one
+    # grid step of it: piece1 starts 1 step after piece0 ends, not exactly
+    # where it ends. Its end is untouched -- the compensated transfer never
+    # moves it -- so it is still 1.0s earlier than piece1's true start.
     retiled_piece1 = covered[1]
-    assert retiled_piece1.start == pytest.approx(piece0_end, abs=1e-6)
+    assert retiled_piece1.start == pytest.approx(
+        piece0_end + GRID.frames_to_seconds(GRID.step_frames), abs=1e-6
+    )
     assert retiled_piece1.end == pytest.approx(piece0_end + 141 / 24, abs=1e-6)
 
     assert "Final chunk boundary" in caplog.text
@@ -1567,3 +1584,430 @@ def test_plain_alignment_results_leave_chunks_unchanged(tmp_path):
     master = write_silent_wav(tmp_path / "master.wav", alignment.track_duration)
     chunks = slice_audio(master, alignment, DEFAULT_HARDWARE, tmp_path / "chunks")
     assert all(c.concurrent_texts == () and c.concurrent_characters == () for c in chunks)
+
+
+# --------------------------------------------------------------------------- #
+# Issue #79: leading vocal offset.
+#
+# H3 starts the mouth at frame 0 of a chunk regardless of where in that chunk
+# the voice actually starts, so a chunk prompted with a lyric that begins
+# seconds into its own span is out of phase for the whole chunk. Two parts:
+#
+# * `_log_leading_vocal_offset` (always on): names every voiced chunk whose
+#   leading offset exceeds `LEADING_VOCAL_OFFSET_WARN_SECONDS`, on the final
+#   post-retiling timeline.
+# * `_prefer_vocal_onset` (always on, no config flag): a local, zero-cascade
+#   boundary refinement that moves what it safely can toward the onset by
+#   transferring whole grid steps between two neighbouring chunks.
+#
+# _MIN79/_MAX79 are 124/192 frames (5.166667s/8.0s) -- the real "Deathless"
+# run's own trained-range window (`eff_min=5.1667s eff_max=8.0s` from the
+# issue). Passed as exact fractions of the grid (`124 / 24`, never a rounded
+# decimal literal like `5.167`) because `_grid_frames_at_or_above` is exact
+# down to the microsecond: a literal a hair above the true trained floor
+# quantizes up a whole grid step (124 -> 141), silently changing every
+# expected number below.
+# --------------------------------------------------------------------------- #
+
+_STEP79 = GRID.step_frames  # 17
+_STEP79_S = GRID.frames_to_seconds(_STEP79)  # ~0.708333s
+_MIN79 = 124
+_MAX79 = 192
+
+
+def _word_seg(index, text, seg_start, seg_end, word_start, word_end, character="Dianne"):
+    """An ``AlignedSegment`` with exactly one word, whose timing can be
+    placed anywhere inside (or straddling outside) the segment's own
+    ``start``/``end``.
+
+    These tests need to separate two things that are usually the same in
+    real data: *where the segment's own span is* (what
+    ``_segment_containing`` checks a candidate boundary against) and *where
+    the attributed word starts* (what ``_first_prompted_word_onset`` reports
+    as the onset). Decoupling them is what lets a single fixture stand in
+    for "the alignment's segment boundary sits a little before its first
+    clean word," which is plausible in real stable-ts output and is exactly
+    the shape issue #79's search-downward refusal needs to exercise.
+    """
+    return AlignedSegment(
+        index=index,
+        text=text,
+        start=seg_start,
+        end=seg_end,
+        words=(WordTiming(word=text, start=word_start, end=word_end),),
+        characters=(character,) if character else (),
+    )
+
+
+# --- _log_leading_vocal_offset: the report --- #
+
+
+def test_leading_vocal_offset_warns_above_threshold(caplog):
+    seg = _word_seg(0, "late", 6.5, 9.5, 6.5, 9.5)
+    piece = slicing_module._Piece(
+        members=(seg,), start=5.0, end=11.0, is_split_continuation=False, frame_count=144
+    )
+    with caplog.at_level(logging.WARNING):
+        slicing_module._log_leading_vocal_offset([piece], (seg,))
+
+    assert "issue #79" in caplog.text
+    assert "Chunk 0 (5.000-11.000s)" in caplog.text
+    assert "starting 1.500s into its own span" in caplog.text
+    assert "first word onset 6.500s" in caplog.text
+    assert "'late'" in caplog.text
+
+
+def test_leading_vocal_offset_silent_below_threshold_but_counted(caplog):
+    """An offset under the threshold gets no per-chunk WARNING, but still
+    counts toward the INFO summary's voiced-chunk total."""
+    seg = _word_seg(0, "soon", 5.3, 9.0, 5.3, 9.0)
+    piece = slicing_module._Piece(
+        members=(seg,), start=5.0, end=11.0, is_split_continuation=False, frame_count=144
+    )
+    with caplog.at_level(logging.INFO):
+        slicing_module._log_leading_vocal_offset([piece], (seg,))
+
+    assert "is prompted to sing starting" not in caplog.text
+    assert "1 voiced chunk(s), 0 over the 1.00s warning threshold" in caplog.text
+
+
+def test_leading_vocal_offset_skips_chunks_with_no_prompted_words(caplog):
+    """An instrumental piece (no ``members``) has nothing to report and must
+    not be counted as a voiced chunk at all."""
+    piece = slicing_module._Piece(
+        members=(), start=0.0, end=5.0, is_split_continuation=False, frame_count=120
+    )
+    with caplog.at_level(logging.INFO):
+        slicing_module._log_leading_vocal_offset([piece], ())
+
+    assert caplog.text == ""
+
+
+def test_leading_vocal_offset_all_at_onset_reports_distinctly(caplog):
+    """When every voiced chunk already starts at its own first word, the
+    summary says so rather than naming a "worst" that doesn't exist."""
+    seg = _word_seg(0, "now", 0.0, 3.0, 0.0, 3.0)
+    piece = slicing_module._Piece(
+        members=(seg,), start=0.0, end=5.0, is_split_continuation=False, frame_count=120
+    )
+    with caplog.at_level(logging.INFO):
+        slicing_module._log_leading_vocal_offset([piece], (seg,))
+
+    assert "all start at their own first prompted word" in caplog.text
+
+
+def test_leading_vocal_offset_summary_names_the_worst_chunk(caplog):
+    seg1 = _word_seg(0, "late", 6.5, 9.5, 6.5, 9.5)
+    piece1 = slicing_module._Piece(
+        members=(seg1,), start=5.0, end=11.0, is_split_continuation=False, frame_count=144
+    )
+    seg2 = _word_seg(1, "later", 12.3, 16.0, 12.3, 16.0)
+    piece2 = slicing_module._Piece(
+        members=(seg2,), start=11.0, end=17.0, is_split_continuation=False, frame_count=144
+    )
+    with caplog.at_level(logging.INFO):
+        slicing_module._log_leading_vocal_offset([piece1, piece2], (seg1, seg2))
+
+    assert "2 voiced chunk(s), 2 over the 1.00s warning threshold" in caplog.text
+    assert "worst is chunk 0 at 1.500s" in caplog.text
+
+
+# --- _prefer_vocal_onset: the boundary refinement --- #
+
+
+def test_prefer_vocal_onset_moves_boundary_toward_the_onset():
+    """Happy path: capacity and offset both allow the full move, and there
+    is nothing in the way -- the boundary lands exactly at the onset."""
+    seg = _word_seg(0, "word", 7.375, 11.0, 7.375, 11.0)
+    boundaries = [(0.0, 141, False), (141 / 24, 158, False)]
+
+    result = slicing_module._prefer_vocal_onset(
+        boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
+    )
+
+    assert result[0] == (pytest.approx(0.0), 175, False)
+    assert result[1][1] == 124
+    assert result[1][0] == pytest.approx(7.291666667, abs=1e-6)
+
+
+def test_prefer_vocal_onset_refuses_when_predecessor_has_no_headroom():
+    """The preceding chunk is already at its own ceiling (192 frames, the
+    8.0s max) -- there are no frames left to give it, so the pair is
+    refused entirely and nothing changes."""
+    seg = _word_seg(0, "word", 9.5, 12.5, 9.5, 12.5)
+    boundaries = [(0.0, 192, False), (8.0, 158, False)]
+
+    result = slicing_module._prefer_vocal_onset(
+        boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
+    )
+
+    assert result == boundaries
+
+
+def test_prefer_vocal_onset_refuses_when_chunk_is_already_at_the_floor():
+    """The chunk with the offset is already at the 124-frame trained floor
+    -- it cannot give up any frames without going below the minimum, so the
+    pair is refused."""
+    seg = _word_seg(0, "word", 7.375, 10.5, 7.375, 10.5)
+    boundaries = [(0.0, 141, False), (141 / 24, 124, False)]
+
+    result = slicing_module._prefer_vocal_onset(
+        boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
+    )
+
+    assert result == boundaries
+
+
+def test_prefer_vocal_onset_refuses_when_either_side_is_pinned():
+    """An honoured ShotLength request's own chunk must never be silently
+    nudged -- pinning either the predecessor's or the chunk's own index
+    refuses the pair."""
+    seg = _word_seg(0, "word", 7.375, 11.0, 7.375, 11.0)
+    boundaries = [(0.0, 141, False), (141 / 24, 158, False)]
+
+    for pinned in (frozenset({0}), frozenset({1})):
+        result = slicing_module._prefer_vocal_onset(
+            boundaries, (seg,), pinned, _MIN79, _MAX79, _MAX79, GRID
+        )
+        assert result == boundaries
+
+
+def test_prefer_vocal_onset_uses_the_filler_ceiling_for_an_instrumental_predecessor():
+    """The predecessor here has no aligned segment overlapping it at all --
+    an instrumental filler chunk -- so its ceiling is `filler_max_frames`
+    (158), not the lyric ceiling `max_frames` (192): only 1 grid step of
+    headroom, not 3."""
+    seg = _word_seg(0, "word", 7.375, 11.0, 7.375, 11.0)
+    boundaries = [(0.0, 141, False), (141 / 24, 158, False)]
+
+    result = slicing_module._prefer_vocal_onset(
+        boundaries, (seg,), frozenset(), _MIN79, _MAX79, 158, GRID
+    )
+
+    assert result[0] == (pytest.approx(0.0), 158, False)
+    assert result[1] == (pytest.approx(141 / 24 + _STEP79_S, abs=1e-6), 141, False)
+
+
+def test_prefer_vocal_onset_refuses_the_largest_k_and_accepts_a_smaller_clean_one():
+    """The segment's own span (7.0-11.0) starts before its attributed word
+    (7.375) -- plausible alignment padding. The largest permitted move (2
+    grid steps, to 7.292s) lands inside that span and is refused; 1 grid
+    step (to 6.583s) lands in the gap before it and is accepted."""
+    seg = _word_seg(0, "word", 7.0, 11.0, 7.375, 11.0)
+    boundaries = [(0.0, 141, False), (141 / 24, 158, False)]
+
+    result = slicing_module._prefer_vocal_onset(
+        boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
+    )
+
+    assert result[0] == (pytest.approx(0.0), 158, False)
+    assert result[1] == (pytest.approx(141 / 24 + _STEP79_S, abs=1e-6), 141, False)
+
+
+def test_prefer_vocal_onset_refuses_entirely_when_every_candidate_lands_inside_a_segment():
+    """Same shape as the search-downward case, but the segment's span (6.0-
+    11.0) is wide enough to cover every candidate boundary the offset and
+    capacity would otherwise permit -- trading the leading-offset defect for
+    a mid-utterance cut is not a preference, so nothing moves."""
+    seg = _word_seg(0, "word", 6.0, 11.0, 7.375, 11.0)
+    boundaries = [(0.0, 141, False), (141 / 24, 158, False)]
+
+    result = slicing_module._prefer_vocal_onset(
+        boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
+    )
+
+    assert result == boundaries
+
+
+def test_prefer_vocal_onset_never_moves_more_than_the_offset_even_with_room_to_spare():
+    """Offset is 1.0s -- more than 1 grid step (0.708s) but less than 2
+    (1.417s) -- while both neighbours have several steps of capacity to
+    spare. The move must stop at 1 step, never overshoot toward capacity."""
+    seg = _word_seg(0, "word", 6.166667, 9.5, 6.166667, 9.5)
+    boundaries = [(0.0, 124, False), (124 / 24, 175, False)]
+
+    result = slicing_module._prefer_vocal_onset(
+        boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
+    )
+
+    assert result[0][1] == 141  # exactly 1 step grown, not 2 or 3
+    assert result[1][1] == 158
+    assert result[1][0] == pytest.approx(124 / 24 + _STEP79_S, abs=1e-6)
+    onset = 6.166667
+    assert result[1][0] <= onset + 1e-6, "must never move past the onset it targets"
+
+
+def test_prefer_vocal_onset_is_local_and_preserves_every_other_boundary():
+    """The compensated-transfer property, checked directly: only the moved
+    boundary's start and the two adjacent frame counts change. Total frame
+    count, every other boundary's start, every other frame count, and every
+    continuation flag are byte-identical."""
+    seg = _word_seg(0, "word", 7.375, 11.0, 7.375, 11.0)
+    b0 = 0.0
+    b1 = 141 / 24
+    b2 = b1 + 158 / 24
+    b3 = b2 + 175 / 24
+    boundaries = [(b0, 141, False), (b1, 158, False), (b2, 175, True), (b3, 124, False)]
+
+    result = slicing_module._prefer_vocal_onset(
+        boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
+    )
+
+    assert sum(f for _, f, _ in result) == sum(f for _, f, _ in boundaries)
+    # Only boundary 1 (the moved one) and the frame counts either side of it
+    # differ; boundaries 0, 2 and 3 -- start, frame count, continuation flag
+    # alike -- are exactly what they were.
+    assert result[0][0] == pytest.approx(boundaries[0][0])
+    assert result[2] == boundaries[2]
+    assert result[3] == boundaries[3]
+    assert result[1][0] != pytest.approx(boundaries[1][0])
+
+
+def test_prefer_vocal_onset_noop_on_zero_offset():
+    """The chunk's first prompted word already starts at its own start --
+    nothing to move toward."""
+    seg = _word_seg(0, "word", 5.0, 8.0, 5.0, 8.0)
+    boundaries = [(0.0, 141, False), (141 / 24, 158, False)]
+
+    result = slicing_module._prefer_vocal_onset(
+        boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
+    )
+
+    assert result == boundaries
+
+
+def test_prefer_vocal_onset_noop_on_a_single_boundary():
+    result = slicing_module._prefer_vocal_onset(
+        [(0.0, 141, False)], (), frozenset(), _MIN79, _MAX79, _MAX79, GRID
+    )
+    assert result == [(0.0, 141, False)]
+
+
+# --- _apply_shot_lengths: pinned-index bookkeeping (issue #79 needs it) --- #
+
+
+def test_apply_shot_lengths_pins_the_honoured_requests_own_index():
+    boundaries = [(0.0, 124, False), (124 / 24, 124, False), (248 / 24, 124, False)]
+    request = ShotLength(start=124 / 24, length_seconds=124 / 24, source_chunk_id=7)
+
+    _, pinned = slicing_module._apply_shot_lengths(boundaries, [request], _MIN79, _MAX79, GRID)
+
+    assert pinned == frozenset({1})
+
+
+def test_apply_shot_lengths_pins_nothing_when_the_request_is_refused():
+    boundaries = [(0.0, 124, False), (124 / 24, 124, False), (248 / 24, 124, False)]
+    request = ShotLength(start=999.0, length_seconds=5.0, source_chunk_id=1)
+
+    _, pinned = slicing_module._apply_shot_lengths(boundaries, [request], _MIN79, _MAX79, GRID)
+
+    assert pinned == frozenset()
+
+
+# --- End-to-end through _cover_instrumentals: wiring, not just the parts --- #
+
+
+def test_cover_instrumentals_reports_the_offset_it_cannot_fix(caplog):
+    """A gap of 3.0s -- below the 5.167s trained floor -- gets fully
+    absorbed by retiling (mirrors ``test_retiling_residue_landing_inside_a_
+    segment_is_logged`` above), pulling the following chunk 3.0s earlier
+    than the vocal it is prompted with. That chunk is already at the 124-
+    frame floor, so `_prefer_vocal_onset` has no frames to give up: the
+    boundary does not move, and the full 3.0s offset is reported."""
+    seg0 = make_aligned_segment(0, "first line here", 0.0, 5.0, "Dianne")
+    seg1 = _word_seg(1, "word", 8.166667, 12.0, 8.166667, 12.0)
+    piece0 = slicing_module._Piece(
+        members=(seg0,), start=0.0, end=124 / 24, is_split_continuation=False, frame_count=124
+    )
+    piece1 = slicing_module._Piece(
+        members=(seg1,),
+        start=8.166667,
+        end=8.166667 + 124 / 24,
+        is_split_continuation=False,
+        frame_count=124,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        covered = slicing_module._cover_instrumentals(
+            [piece0, piece1],
+            (seg0, seg1),
+            track_duration=20.0,
+            eff_min=GRID.frames_to_seconds(_MIN79),
+            eff_max=GRID.frames_to_seconds(_MAX79),
+            grid=GRID,
+        )
+
+    assert covered[1].start == pytest.approx(124 / 24, abs=1e-6)
+    assert covered[1].frame_count == 124
+    assert "Chunk 1 (5.167-10.333s)" in caplog.text
+    assert "starting 3.000s into its own span" in caplog.text
+    assert "issue #79" in caplog.text
+
+
+def test_cover_instrumentals_reduces_a_fixable_offset(caplog):
+    """Same shape as above, but this time the chunk carrying the offset has
+    3 grid steps of headroom above the floor. `_prefer_vocal_onset` uses
+    exactly as much of it as capacity and the offset allow (3 steps, since
+    both cap it there), cutting the offset from 3.0s to 0.875s -- below the
+    warning threshold, so no per-chunk WARNING fires."""
+    seg0 = make_aligned_segment(0, "first line here", 0.0, 5.0, "Dianne")
+    seg1 = _word_seg(1, "word", 8.166667, 12.0, 8.166667, 12.0)
+    piece0 = slicing_module._Piece(
+        members=(seg0,), start=0.0, end=124 / 24, is_split_continuation=False, frame_count=124
+    )
+    piece1 = slicing_module._Piece(
+        members=(seg1,),
+        start=8.166667,
+        end=8.166667 + 175 / 24,
+        is_split_continuation=False,
+        frame_count=175,
+    )
+
+    with caplog.at_level(logging.INFO):
+        covered = slicing_module._cover_instrumentals(
+            [piece0, piece1],
+            (seg0, seg1),
+            track_duration=20.0,
+            eff_min=GRID.frames_to_seconds(_MIN79),
+            eff_max=GRID.frames_to_seconds(_MAX79),
+            grid=GRID,
+        )
+
+    assert covered[0].frame_count == 175
+    assert covered[1].frame_count == 124
+    assert covered[1].start == pytest.approx(7.291666667, abs=1e-6)
+    assert "is prompted to sing starting" not in caplog.text
+    assert "worst is chunk 1 at 0.875s" in caplog.text
+
+
+def test_cover_instrumentals_does_not_move_a_boundary_pinned_by_a_shot_length():
+    """Identical to the fixable case above, but an honoured ShotLength
+    request pins chunk 0's own index -- so `_prefer_vocal_onset` must refuse
+    to touch the boundary between it and chunk 1, even though it otherwise
+    could. An author's explicit length is never silently overridden."""
+    seg0 = make_aligned_segment(0, "first line here", 0.0, 5.0, "Dianne")
+    seg1 = _word_seg(1, "word", 8.166667, 12.0, 8.166667, 12.0)
+    piece0 = slicing_module._Piece(
+        members=(seg0,), start=0.0, end=124 / 24, is_split_continuation=False, frame_count=124
+    )
+    piece1 = slicing_module._Piece(
+        members=(seg1,),
+        start=8.166667,
+        end=8.166667 + 175 / 24,
+        is_split_continuation=False,
+        frame_count=175,
+    )
+    request = ShotLength(start=0.0, length_seconds=124 / 24, source_chunk_id=99)
+
+    covered = slicing_module._cover_instrumentals(
+        [piece0, piece1],
+        (seg0, seg1),
+        track_duration=20.0,
+        eff_min=GRID.frames_to_seconds(_MIN79),
+        eff_max=GRID.frames_to_seconds(_MAX79),
+        grid=GRID,
+        shot_lengths=[request],
+    )
+
+    assert covered[1].start == pytest.approx(124 / 24, abs=1e-6)
+    assert covered[1].frame_count == 175

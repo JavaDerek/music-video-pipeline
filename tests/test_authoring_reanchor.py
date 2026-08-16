@@ -44,6 +44,7 @@ def _chunks(spans: list[tuple[float, float]], *, instrumental_from: int | None =
 def _beat(
     chunk_id, start, end, *,
     role="transition", group=1, focus="subject", length=None, location="the room",
+    act="the story", subject=None,
 ):
     return Beat(
         chunk_id=chunk_id,
@@ -53,8 +54,10 @@ def _beat(
         beat_role=role,
         beat_group=group,
         location=location,
+        act=act,
         focus=focus,
         length_seconds=length,
+        subject=subject,
     )
 
 
@@ -219,6 +222,164 @@ def test_a_merge_with_matching_locations_does_not_warn(caplog):
         reanchor_beats(beats, v1)
 
     assert "location" not in caplog.text.lower()
+
+
+# --------------------------------------------------------------------------- #
+# `act` -- issue #84 -- follows the exact same merge treatment as `location`:
+# first member wins, a mismatch is warned about rather than silently dropped.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_merge_keeps_the_first_members_act():
+    v1 = _chunks([(0.0, 12.0)])
+    beats = (
+        _beat(1, 0.0, 6.0, act="situation"),
+        _beat(2, 6.0, 12.0, act="resolution"),
+    )
+
+    result = reanchor_beats(beats, v1)
+
+    assert result.beats[0].act == "situation"
+
+
+def test_a_merge_warns_when_it_joins_two_different_acts(caplog):
+    v1 = _chunks([(0.0, 12.0)])
+    beats = (
+        _beat(1, 0.0, 6.0, act="situation"),
+        _beat(2, 6.0, 12.0, act="resolution"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        reanchor_beats(beats, v1)
+
+    assert "act" in caplog.text.lower()
+    assert "situation" in caplog.text
+    assert "resolution" in caplog.text
+
+
+def test_a_merge_with_matching_acts_does_not_warn(caplog):
+    v1 = _chunks([(0.0, 12.0)])
+    beats = (
+        _beat(1, 0.0, 6.0, act="situation"),
+        _beat(2, 6.0, 12.0, act="situation"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        reanchor_beats(beats, v1)
+
+    assert "different act" not in caplog.text.lower()
+
+
+def test_a_single_member_chunk_keeps_its_own_act():
+    """The identity path -- `replace()`, not `_merge`'s multi-member branch
+    -- must carry `act` through exactly like every other field."""
+    v0 = _chunks(_uniform(2))
+    beats = (_beat(1, 0.0, 6.0, act="situation"), _beat(2, 6.0, 12.0, act="resolution"))
+
+    result = reanchor_beats(beats, v0)
+
+    assert [b.act for b in result.beats] == ["situation", "resolution"]
+
+
+# --------------------------------------------------------------------------- #
+# `subject` -- issue #82. Rides along like `location`/`act`, BUT a beat
+# re-anchored onto a chunk that is now VOICED must have it dropped, not
+# carried: the field is illegal there (issues #58, #59, #60), and a
+# `length_seconds` re-cut can change which chunks are voiced.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_single_beats_subject_survives_reanchoring_onto_a_still_instrumental_chunk():
+    v0 = _chunks(_uniform(2), instrumental_from=0)
+    beats = (_beat(1, 0.0, 6.0, subject="Jan"), _beat(2, 6.0, 12.0))
+
+    result = reanchor_beats(beats, v0)
+
+    assert result.beats[0].subject == "Jan"
+
+
+def test_a_single_beats_subject_is_dropped_when_its_chunk_is_now_voiced(caplog):
+    """The identity path (one beat, one chunk) must apply the same drop rule
+    as a merge -- a `length_seconds` re-cut is not the only way a beat's
+    target chunk can turn out to be voiced."""
+    v1 = _chunks([(0.0, 6.0)])  # voiced: instrumental_from unset
+    beats = (_beat(1, 0.0, 6.0, subject="Jan"),)
+
+    with caplog.at_level(logging.WARNING):
+        result = reanchor_beats(beats, v1)
+
+    assert result.beats[0].subject is None
+    assert "subject" in caplog.text.lower()
+
+
+def test_a_merge_keeps_the_only_set_subject():
+    v1 = _chunks([(0.0, 12.0)], instrumental_from=0)
+    beats = (
+        _beat(1, 0.0, 6.0, subject=None),
+        _beat(2, 6.0, 12.0, subject="Jan"),
+    )
+
+    result = reanchor_beats(beats, v1)
+
+    assert result.beats[0].subject == "Jan"
+
+
+def test_a_merge_warns_when_it_joins_two_different_subjects(caplog):
+    v1 = _chunks([(0.0, 12.0)], instrumental_from=0)
+    beats = (
+        _beat(1, 0.0, 6.0, subject="Jan"),
+        _beat(2, 6.0, 12.0, subject="Dianne"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = reanchor_beats(beats, v1)
+
+    assert result.beats[0].subject == "Jan"
+    assert "subject" in caplog.text.lower()
+    assert "Jan" in caplog.text
+    assert "Dianne" in caplog.text
+
+
+def test_a_merge_with_matching_subjects_does_not_warn(caplog):
+    v1 = _chunks([(0.0, 12.0)], instrumental_from=0)
+    beats = (
+        _beat(1, 0.0, 6.0, subject="Jan"),
+        _beat(2, 6.0, 12.0, subject="Jan"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        reanchor_beats(beats, v1)
+
+    assert "different subject" not in caplog.text.lower()
+
+
+def test_a_merge_drops_subject_when_the_merged_chunk_is_now_voiced(caplog):
+    """The case the issue exists for: honouring a `length_seconds` re-cut
+    swallowed an instrumental beat's subject into a chunk that is voiced in
+    the retiled timeline."""
+    v1 = _chunks([(0.0, 12.0)])  # voiced: instrumental_from unset
+    beats = (
+        _beat(1, 0.0, 6.0, subject="Jan"),
+        _beat(2, 6.0, 12.0),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        result = reanchor_beats(beats, v1)
+
+    assert result.beats[0].subject is None
+    assert "subject" in caplog.text.lower()
+
+
+def test_a_merge_onto_a_still_instrumental_chunk_keeps_the_subject():
+    v1 = _chunks([(0.0, 12.0)], instrumental_from=0)
+    beats = (
+        _beat(1, 0.0, 6.0, subject="Jan"),
+        _beat(2, 6.0, 12.0),
+    )
+
+    result = reanchor_beats(beats, v1)
+
+    assert result.beats[0].subject == "Jan"
 
 
 # --------------------------------------------------------------------------- #
@@ -417,6 +578,7 @@ def _entry(chunk_id, *, length=None) -> dict:
         "beat_group": 1,
         "focus": "subject",
         "location": "the room",
+        "act": "the story",
     }
     if length is not None:
         entry["length_seconds"] = length

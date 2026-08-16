@@ -77,15 +77,18 @@ from music_video_maker.shot_plan import (
     ShotLength,
     ShotPlanError,
     lint_camera_face_away_on_voiced_chunks,
+    lint_instrumental_focus_mismatch,
     lint_present_location_mismatch,
     lint_role_prohibition_contradiction,
     lint_shots_against_lyrics,
+    lint_subject_on_voiced_chunk,
     lint_unbound_companion_referent,
     lint_voiced_framing,
     load_shot_plan,
     resolve_camera,
     resolve_present,
     resolve_shot,
+    resolve_subject,
     shot_length_requests,
     write_shot_plan_skeleton,
 )
@@ -552,6 +555,11 @@ def run_pipeline(
             ).chunks
 
         if plan is not None:
+            # Issue #82: raises, so it goes first -- no point running
+            # advisory lints on a plan a raising lint will refuse outright.
+            # `subject` is legal only on an instrumental chunk; honouring it
+            # on a voiced one would reintroduce the desync it exists to fix.
+            lint_subject_on_voiced_chunk(plan, chunks)
             # Issue #37: both strings are in hand here -- a lyric naming an
             # object the plan stages only elsewhere is mechanically visible,
             # for free, before any GPU time is spent on it.
@@ -571,6 +579,10 @@ def run_pipeline(
             # Issue #78: `present` staging a companion at a location that
             # contradicts where their own singing chunks place them.
             lint_present_location_mismatch(plan, chunks)
+            # Issue #82: an instrumental chunk whose shot line reads as
+            # entirely about a `present` bystander, with no `subject` set to
+            # tell the render that -- the general shape of the chunk 29 bug.
+            lint_instrumental_focus_mismatch(plan, chunks, config.default_lead_vocalist)
 
         prompts = {
             chunk.chunk_id: expand_prompt(
@@ -593,6 +605,10 @@ def run_pipeline(
                 # appearance or reference photo behind it, and the model
                 # invents a different person every chunk.
                 present=resolve_present(plan, chunk),
+                # Issue #82: whose shot this is, on an instrumental chunk --
+                # replaces the default_lead_vocalist fallback with the
+                # actually-authored focus member.
+                subject=resolve_subject(plan, chunk),
             )
             for chunk in chunks
         }

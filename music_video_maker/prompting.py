@@ -102,6 +102,20 @@ class UnknownCastMemberError(ValueError):
     """
 
 
+class SubjectOnVoicedChunkError(ValueError):
+    """Raised when ``subject`` is passed for a chunk that has a singer
+    (issue #82).
+
+    ``ShotPlanEntry.subject`` is legal only on an instrumental chunk -- the
+    singer owns the frame on a voiced one, per three separate measured
+    findings (#58, #59, #60). ``shot_plan.lint_subject_on_voiced_chunk`` is
+    the primary gate, refusing this at plan-load time before any GPU work;
+    this is defence in depth, because ``expand_prompt`` is a public function
+    in its own right and must not silently mis-compose a voiced chunk just
+    because some other caller skipped the lint.
+    """
+
+
 def expand_prompt(
     config: RunConfig,
     chunk: AudioChunk,
@@ -109,6 +123,7 @@ def expand_prompt(
     subject_is_focus: bool = True,
     camera: str | None = None,
     present: Sequence[str] = (),
+    subject: str | None = None,
 ) -> ExpandedPrompt:
     """Compose the deterministic Stage 2b prompt for one audio chunk.
 
@@ -145,11 +160,27 @@ def expand_prompt(
     ``config.narrative_concept``. See :func:`_apply_camera_clause` for why it
     is appended to that sentence rather than composed as its own.
 
+    ``subject`` (issue #82) is this chunk's authored focus member, from
+    ``ShotPlanEntry.subject`` -- whose shot this IS, as opposed to ``present``
+    (who is merely on screen). ``None`` (the default) composes
+    byte-identically to the pre-#82 prompt: the active member stays whichever
+    ``chunk.characters`` names, or ``config.default_lead_vocalist`` on an
+    empty (instrumental) chunk. When set, that fallback is replaced by
+    ``config.cast[subject]`` everywhere it would otherwise apply -- the focus
+    clause, :attr:`~music_video_maker.contracts.ExpandedPrompt.characters`,
+    ``image_ref`` and ``image_refs`` -- and a name also listed in ``present``
+    is dropped from it (the focus member is not also a silent bystander,
+    same rule a singing name already follows). Raises
+    :class:`SubjectOnVoicedChunkError` if ``chunk.characters`` is non-empty
+    (a voiced chunk's singer owns the frame -- see the shot-plan lint that is
+    the primary gate for this) and :class:`UnknownCastMemberError` if
+    ``subject`` is not in ``config.cast``.
+
     Passing the text in rather than looking it up keeps this module free of
     file I/O and keeps it a pure function of its arguments -- resolution
     (including the drift check) happens once, upstream, in ``cli``.
     """
-    members = _resolve_active_members(config, chunk)
+    members = _resolve_active_members(config, chunk, subject)
     present_members = _resolve_present_members(config, chunk, present, members)
     prompt = _compose_prompt(
         config, members, chunk, shot, subject_is_focus, camera=camera, present=present_members
@@ -192,7 +223,47 @@ def expand_prompt(
     )
 
 
-def _resolve_active_members(config: RunConfig, chunk: AudioChunk) -> tuple[CastMember, ...]:
+def _resolve_active_members(
+    config: RunConfig, chunk: AudioChunk, subject: str | None = None
+) -> tuple[CastMember, ...]:
+    """Resolve the active (focus) cast member(s) for this chunk.
+
+    ``subject`` (issue #82) is checked first and, when given, replaces the
+    entire pre-#82 resolution: it stands in for ``default_lead_vocalist`` on
+    what must be an instrumental chunk (``chunk.characters`` empty), never
+    alongside a singer -- see :class:`SubjectOnVoicedChunkError`. Leaving it
+    ``None`` (the default) runs the original resolution unchanged, which is
+    what keeps every pre-#82 caller byte-identical."""
+    if subject is not None:
+        if chunk.characters:
+            logger.error(
+                "chunk_id=%s sets subject=%r but has singer(s) %s -- the singer owns the "
+                "frame on a voiced chunk (issues #58, #59, #60); `subject` is legal only "
+                "on an instrumental chunk",
+                chunk.chunk_id,
+                subject,
+                chunk.characters,
+            )
+            raise SubjectOnVoicedChunkError(
+                f"chunk {chunk.chunk_id} sets subject={subject!r} but has singer(s) "
+                f"{chunk.characters}; `subject` is legal only on an instrumental chunk -- "
+                "the singer owns the frame on a voiced chunk (issues #58, #59, #60)"
+            )
+        try:
+            return (config.cast[subject],)
+        except KeyError:
+            logger.error(
+                "chunk_id=%s sets subject=%r, which is not in the known cast (known cast: "
+                "%s)",
+                chunk.chunk_id,
+                subject,
+                sorted(config.cast),
+            )
+            raise UnknownCastMemberError(
+                f"chunk {chunk.chunk_id} sets subject={subject!r}, which is not a known "
+                f"cast character; known cast members: {sorted(config.cast)}"
+            ) from None
+
     names = chunk.characters or (config.default_lead_vocalist,)
     members = []
     for name in names:

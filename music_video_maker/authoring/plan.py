@@ -55,6 +55,7 @@ from music_video_maker.shot_plan import (
     lint_present_location_mismatch,
     lint_role_prohibition_contradiction,
     lint_shots_against_lyrics,
+    lint_subject_on_voiced_chunk,
     lint_unbound_companion_referent,
     lint_voiced_framing,
     load_shot_plan,
@@ -206,10 +207,15 @@ def render_plan_toml(
         else:
             block.append(f'# lyric: "{_comment(chunk.text).replace(chr(34), chr(39))}"')
         if beat is not None:
-            block.append(
-                f"# beat: {_comment(beat.beat)}  "
-                f"[{beat.beat_role}, group {beat.beat_group}]"
-            )
+            # Issue #84: the act a human reviewing the plan as text can see
+            # beside the beat's role and group -- the same comment line, not
+            # a separate one, so the arc is visible at a glance rather than
+            # requiring a second scan of the file. Omitted when absent (a
+            # hand-built Beat, or one from a pre-#84 persisted sheet).
+            tags = f"{beat.beat_role}, group {beat.beat_group}"
+            if beat.act:
+                tags += f', act "{beat.act}"'
+            block.append(f"# beat: {_comment(beat.beat)}  [{tags}]")
             if beat.focus == "action":
                 block.append('focus = "action"')
             if beat.length_seconds is not None:
@@ -231,6 +237,13 @@ def render_plan_toml(
         if present.get(chunk.chunk_id):
             names = ", ".join(_toml_string(n) for n in present[chunk.chunk_id])
             block.append(f"present = [{names}]")
+        # Issue #82: re-emitted from the beat, never inferred here -- the
+        # same "anchors are copied from the chunks/beats" rule `location`
+        # follows. Emitted beside `present` because both answer "who is in
+        # this shot", though `subject` answers a different question of it
+        # (who the render composes as the FOCUS, not merely present).
+        if beat is not None and beat.subject:
+            block.append(f"subject = {_toml_string(beat.subject)}")
         block.append(f'generated_by = "{"prose" if shot else "skeleton"}"')
         block.append(f"content_sha256 = {_toml_string(sha256_text(shot))}")
         block.append(f"shot = {_toml_string(shot)}")
@@ -325,6 +338,12 @@ def check_plan(
             plan = load_shot_plan(
                 candidate, setting=config.setting, cast_names=tuple(config.cast)
             )
+            # Issue #82: refused by the render's OWN rule, never a copy of
+            # it -- run first, before any advisory lint, because it raises
+            # and there is no point checking anything else on a plan this
+            # will refuse (the same ordering `cli.py`'s render-side lint
+            # block uses for the render path's own call to this function).
+            lint_subject_on_voiced_chunk(plan, chunks, candidate)
             shot_length_requests(plan)
             for chunk in chunks:
                 resolve_shot(plan, chunk)

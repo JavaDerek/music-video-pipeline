@@ -18,7 +18,11 @@ import pytest
 
 from music_video_maker import contracts
 from music_video_maker.config import RunConfig
-from music_video_maker.prompting import UnknownCastMemberError, expand_prompt
+from music_video_maker.prompting import (
+    SubjectOnVoicedChunkError,
+    UnknownCastMemberError,
+    expand_prompt,
+)
 from tests.harness.factories import make_cast_dict
 
 GLOBAL_STYLE = (
@@ -1310,6 +1314,124 @@ def test_present_cast_member_demeanour_is_composed(config: RunConfig, cast):
     assert (
         "Also in shot, silent: Rex, Drummer, background, never sings, impassive, "
         "watching" in result.prompt
+    )
+
+
+# --------------------------------------------------------------------------- #
+# `subject`: whose shot this is on an instrumental chunk (issue #82)
+#
+# `chunk.characters` is empty on an instrumental chunk, so this module falls
+# back to `config.default_lead_vocalist` and composes THAT person as "the
+# focus of this shot" -- a config default answering a question the shot line
+# may already answer differently. On "Deathless" chunk 29, `present =
+# ["Jan"]` staged his name/role/photo but the composed focus stayed Dianne,
+# and H3 morphed one into the other. `subject` replaces the fallback with the
+# actually-authored focus member; `present` (issue #59) is deliberately not
+# this lever (CLAUDE.md: "`present` decides who a pronoun is, never whose
+# shot this is").
+# --------------------------------------------------------------------------- #
+
+
+def test_subject_none_is_byte_identical_to_the_pre_82_prompt(config: RunConfig, cast):
+    """The established rule in this module: an untouched case stays
+    untouched -- compared against the exact golden prompt a solo singer
+    composed before this field existed."""
+    chunk = _chunk(
+        chunk_id=1,
+        text="walking through the empty halls tonight",
+        character="Dianne",
+        source_segment_indices=(2,),
+    )
+
+    result = expand_prompt(config, chunk, subject=None)
+
+    assert result == contracts.ExpandedPrompt(
+        chunk_id=1,
+        prompt=(
+            "Refestramus progressive rock music video, atmospheric lighting, "
+            "high quality cinematic. Wandering through a surgery, kicking a "
+            "life support plug out. Dianne, Lead Vocalist, smiling constantly, "
+            "oblivious, is the focus of this shot. The character is actively "
+            "singing the lyric: 'walking through the empty halls tonight'."
+        ),
+        image_ref=cast["Dianne"].image,
+        image_refs=(cast["Dianne"].image,),
+        characters=("Dianne",),
+        chained_prompt=(
+            "Refestramus progressive rock music video, atmospheric lighting, "
+            "high quality cinematic. Wandering through a surgery, kicking a "
+            "life support plug out. Dianne, Lead Vocalist, smiling constantly, "
+            "oblivious, is the focus of this shot. The character is actively "
+            "singing the lyric: 'walking through the empty halls tonight'."
+        ),
+    )
+    # And the parameter's default (omitting it entirely) must agree.
+    assert result == expand_prompt(config, chunk)
+
+
+def test_subject_becomes_the_focus_on_an_instrumental_chunk(config: RunConfig, cast):
+    """The chunk 29 fix itself: an instrumental chunk (no singer) whose shot
+    line is about the drummer, not the default lead vocalist."""
+    chunk = _chunk(chunk_id=29, text="")  # empty characters: the instrumental case
+
+    result = expand_prompt(
+        config, chunk, shot="His boot settles into a hollow", subject="Rex"
+    )
+
+    assert (
+        "Rex, Drummer, background, never sings, is the focus of this shot" in result.prompt
+    )
+    assert "Dianne" not in result.prompt
+    assert result.characters == ("Rex",)
+    assert result.image_ref == cast["Rex"].image
+    assert result.image_refs == (cast["Rex"].image,)
+
+
+def test_subject_on_a_chunk_with_a_singer_raises(config: RunConfig):
+    """Defence in depth: the shot-plan lint is the primary gate, but
+    `expand_prompt` is a public function and must not silently do the wrong
+    thing on a voiced chunk -- the singer owns the frame there (#58, #59,
+    #60)."""
+    chunk = _chunk(chunk_id=29, text="a lyric", character="Dianne")
+
+    with pytest.raises(SubjectOnVoicedChunkError, match="29"):
+        expand_prompt(config, chunk, subject="Rex")
+
+
+def test_unknown_subject_raises(config: RunConfig):
+    """Same rule as every other cast-valued field: a typo must fail loudly."""
+    chunk = _chunk(chunk_id=29, text="")
+
+    with pytest.raises(UnknownCastMemberError, match="Nope"):
+        expand_prompt(config, chunk, subject="Nope")
+
+
+def test_subject_is_dropped_from_present_when_also_listed_there(config: RunConfig, cast):
+    """The focus member is not also a silent bystander -- same rule
+    `_resolve_present_members` already applies to a singer named twice."""
+    chunk = _chunk(chunk_id=29, text="")
+
+    result = expand_prompt(config, chunk, subject="Rex", present=("Rex",))
+
+    assert "Also in shot" not in result.prompt
+    assert result.image_refs == (cast["Rex"].image,)
+    assert result.present_cast == ()
+
+
+def test_subject_appearance_is_dropped_on_the_chained_variant(config: RunConfig, cast):
+    """Issue #46 applies to the focus member exactly as it always has --
+    `subject` only changes WHO the focus member is, not that rule."""
+    described = dataclasses.replace(cast["Rex"], appearance="grizzled, weathered")
+    cfg = dataclasses.replace(config, cast={**cast, "Rex": described})
+    chunk = _chunk(chunk_id=29, text="")
+
+    result = expand_prompt(cfg, chunk, subject="Rex")
+
+    assert "grizzled, weathered" in result.prompt
+    assert "grizzled, weathered" not in result.chained_prompt
+    assert (
+        "Rex, Drummer, background, never sings, is the focus of this shot"
+        in result.chained_prompt
     )
 
 

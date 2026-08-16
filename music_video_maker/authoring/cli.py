@@ -312,6 +312,31 @@ def _cmd_concept(args: argparse.Namespace) -> int:
         if result.driver_result.cost_usd is not None
         else "not reported",
     )
+    # Issue #69: the comprehension step, surfaced first -- a confidently
+    # wrong reading is exactly what a human catches in five seconds and no
+    # downstream stage ever can. Printed before the invented pitch below so
+    # the review reads in the order the model was told to write it: reading
+    # first, invention second.
+    reading = result.data.get("reading") or {}
+    print(f"reading.subject: {reading.get('subject', '')}")
+    print(
+        f"reading.speaker -> addressee: {reading.get('speaker', '')} -> "
+        f"{reading.get('addressee', '')}"
+    )
+    print(f"reading.situation: {reading.get('situation', '')}")
+    print(f"reading.change: {reading.get('change', '')}")
+    print(
+        f"reading.register/period/place: {reading.get('register', '')} / "
+        f"{reading.get('period', '')} / {reading.get('place', '')}"
+    )
+    nouns = reading.get("nouns") or []
+    print(f"reading.nouns: {', '.join(map(str, nouns)) if nouns else '(none)'}")
+    references = reading.get("references") or []
+    if references:
+        for ref in references:
+            print(f"reading.reference: {ref.get('reference', '')} ({ref.get('what_it_is', '')})")
+    else:
+        print("reading.references: (none)")
     print(f"logline: {result.data['logline']}")
     print(f"setting: {result.data['setting']}")
     print(f"tone: {result.data['tone']}")
@@ -320,6 +345,11 @@ def _cmd_concept(args: argparse.Namespace) -> int:
     # logline, since a bad or missing entry here is a bad or missing entry
     # for the whole rest of the video.
     print(f"locations: {', '.join(result.data.get('locations', []))}")
+    # Issue #84: the video's dramatic shape, in order -- the human review
+    # point for whether this song's acts actually make sense before any beat
+    # is generated against them.
+    acts = result.data.get("acts") or []
+    print(f"acts: {' -> '.join(a.get('name', '') for a in acts)}")
     return EXIT_SUCCESS
 
 
@@ -425,9 +455,10 @@ def _cmd_beats(args: argparse.Namespace) -> int:
     )
     for beat in plan.beats:
         merged = f"  [merged {list(beat.merged_from)}]" if beat.merged_from else ""
+        act_tag = f"<{beat.act}> " if beat.act else ""
         print(
             f"{beat.chunk_id:>4}  {beat.start:>8.3f}  {beat.beat_role:<13}"
-            f"g{beat.beat_group:<3} [{beat.location}] {beat.beat}{merged}"
+            f"g{beat.beat_group:<3} [{beat.location}] {act_tag}{beat.beat}{merged}"
         )
     return EXIT_SUCCESS
 

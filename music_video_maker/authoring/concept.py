@@ -38,11 +38,86 @@ retry on mechanical failures (non-zero exit, timeout, non-JSON). This stage
 owns the local validator the driver knows nothing about, so this stage owns
 the retry that feeds the validator's own error back into the prompt."""
 
+READING_STRING_FIELDS: tuple[str, ...] = (
+    "subject", "speaker", "addressee", "situation", "change", "register", "period", "place",
+)
+"""Issue #69's comprehension fields, every one a plain non-empty string:
+what the song is about, who is speaking and to whom (this pipeline's own
+hard-won audible/on-screen split), the situation and what changes across the
+song (the raw material #84's arc is built from), and register/period/place
+implied by the words -- the "American sanctions" lyric a viewer noticed
+render as medieval."""
+
+READING_REQUIRED_FIELDS: tuple[str, ...] = (
+    *READING_STRING_FIELDS, "nouns", "references",
+)
+
+REFERENCE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["reference", "what_it_is", "imagery"],
+    "properties": {
+        "reference": {"type": "string", "minLength": 1},
+        "what_it_is": {"type": "string", "minLength": 1},
+        "imagery": {"type": "array", "items": {"type": "string"}},
+    },
+}
+"""One cultural/historical/mythological/religious/political reference the
+lyrics themselves name, with the concrete imagery it carries -- Koschey's
+death nested in a needle, in an egg, in a duck, in a hare, in a chest, under
+an oak on an island. ``imagery`` may be empty; nothing about a reference's
+*existence* requires its imagery to be non-empty, though a model that names
+one without any is not doing this field's job."""
+
+READING_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": list(READING_REQUIRED_FIELDS),
+    "properties": {
+        "subject": {"type": "string", "minLength": 1},
+        "speaker": {"type": "string", "minLength": 1},
+        "addressee": {"type": "string", "minLength": 1},
+        "situation": {"type": "string", "minLength": 1},
+        "change": {"type": "string", "minLength": 1},
+        "register": {"type": "string", "minLength": 1},
+        "period": {"type": "string", "minLength": 1},
+        "place": {"type": "string", "minLength": 1},
+        # Issue #69 requirement 2: empty is a first-class, valid answer for
+        # both of these -- a breakup song has no mythology and naming none is
+        # the CORRECT reply, not an incomplete one. Never minItems here.
+        "nouns": {"type": "array", "items": {"type": "string"}},
+        "references": {"type": "array", "items": REFERENCE_SCHEMA},
+    },
+}
+"""Issue #69: a comprehension step the concept stage answers *before*
+inventing anything, so the concept -- and #84's acts, and everything
+downstream -- descends from what the song actually says rather than a
+generic music-video pitch. Structured and validated like every other stage's
+reply (requirement 1), never prose, so :mod:`.beats` can consume it
+directly."""
+
+ACT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["name", "function"],
+    "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "function": {"type": "string", "minLength": 1},
+    },
+}
+"""One act of issue #84's story structure: a name and what it is FOR
+("resolution" / "where the earlier plant pays off"), never a bare label. The
+issue's own open question -- fixed vocabulary or chosen per song -- is
+answered here as chosen per song: a ballad and a protest song do not have the
+same shape, the same reasoning #67 already gives for a directorial choice
+being config rather than a preamble opinion."""
+
 CONCEPT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["logline", "setting", "tone", "motifs", "avoid", "locations"],
+    "required": ["reading", "logline", "setting", "tone", "motifs", "avoid", "locations", "acts"],
     "properties": {
+        "reading": READING_SCHEMA,
         "logline": {"type": "string", "minLength": 1},
         "setting": {"type": "string", "minLength": 1},
         "tone": {"type": "string", "minLength": 1},
@@ -51,6 +126,11 @@ CONCEPT_SCHEMA: dict[str, Any] = {
         "locations": {
             "type": "array",
             "items": {"type": "string", "minLength": 1},
+            "minItems": 1,
+        },
+        "acts": {
+            "type": "array",
+            "items": ACT_SCHEMA,
             "minItems": 1,
         },
     },
@@ -98,6 +178,118 @@ def validate_concept(data: object) -> None:
             f"the beats stage has no vocabulary to assign `location` from otherwise), got "
             f"{locations!r}"
         )
+
+    problems = _validate_reading(data["reading"]) + _validate_acts(data["acts"])
+    if problems:
+        raise ConceptValidationError(
+            f"concept reply has {len(problems)} problem(s):\n- " + "\n- ".join(problems)
+        )
+
+
+def _validate_reading(reading: object) -> list[str]:
+    """Issue #69's comprehension object. Returns every problem found rather
+    than raising on the first, the same "report everything in one message"
+    convention :mod:`.beats` uses -- a retry round costs a whole model call."""
+    if not isinstance(reading, dict):
+        return [f"concept.reading must be a JSON object, got {type(reading).__name__}"]
+
+    problems: list[str] = []
+    missing = [key for key in READING_REQUIRED_FIELDS if key not in reading]
+    if missing:
+        problems.append(f"concept.reading is missing required field(s): {missing}")
+
+    for key in READING_STRING_FIELDS:
+        if key not in reading:
+            continue
+        value = reading[key]
+        if not isinstance(value, str) or not value.strip():
+            problems.append(f"concept.reading.{key} must be a non-empty string, got {value!r}")
+
+    if "nouns" in reading:
+        nouns = reading["nouns"]
+        # Issue #69 requirement 2: an empty list is the CORRECT answer for a
+        # song with no concrete nouns worth naming -- never required non-empty.
+        if not isinstance(nouns, list) or not all(isinstance(v, str) for v in nouns):
+            problems.append(f"concept.reading.nouns must be a list of strings, got {nouns!r}")
+
+    if "references" in reading:
+        references = reading["references"]
+        if not isinstance(references, list):
+            # Issue #69 requirement 2: empty is fine and expected for most
+            # songs -- only the wrong *type* is a problem, never an empty one.
+            problems.append(f"concept.reading.references must be a list, got {references!r}")
+        else:
+            for index, ref in enumerate(references):
+                problems.extend(_validate_reference(ref, index))
+
+    return problems
+
+
+def _validate_reference(ref: object, index: int) -> list[str]:
+    if not isinstance(ref, dict):
+        return [f"concept.reading.references[{index}] is not an object, got {ref!r}"]
+
+    problems: list[str] = []
+    missing = [key for key in ("reference", "what_it_is", "imagery") if key not in ref]
+    if missing:
+        problems.append(f"concept.reading.references[{index}] is missing field(s): {missing}")
+        return problems
+
+    for key in ("reference", "what_it_is"):
+        value = ref[key]
+        if not isinstance(value, str) or not value.strip():
+            problems.append(
+                f"concept.reading.references[{index}].{key} must be a non-empty string, "
+                f"got {value!r}"
+            )
+
+    imagery = ref["imagery"]
+    if not isinstance(imagery, list) or not all(isinstance(v, str) for v in imagery):
+        problems.append(
+            f"concept.reading.references[{index}].imagery must be a list of strings, "
+            f"got {imagery!r}"
+        )
+    return problems
+
+
+def _validate_acts(acts: object) -> list[str]:
+    """Issue #84's closed, ordered act vocabulary: non-empty, and every
+    name unique (case/whitespace-insensitive, the same canonicalization
+    :mod:`.beats` gives ``locations``). Order itself needs no validation here
+    -- the list order IS the stated order; there is nothing to compare it
+    against yet."""
+    if not isinstance(acts, list) or not acts:
+        return [
+            "concept.acts must be a non-empty list of {'name', 'function'} objects (issue #84: "
+            f"the beats stage has no act structure to assign `act` from otherwise), got {acts!r}"
+        ]
+
+    problems: list[str] = []
+    seen: dict[str, int] = {}
+    for index, entry in enumerate(acts):
+        if not isinstance(entry, dict):
+            problems.append(f"concept.acts[{index}] is not an object, got {entry!r}")
+            continue
+        name = entry.get("name")
+        function = entry.get("function")
+        if not isinstance(name, str) or not name.strip():
+            problems.append(
+                f"concept.acts[{index}].name must be a non-empty string, got {name!r}"
+            )
+        else:
+            key = name.strip().lower()
+            if key in seen:
+                problems.append(
+                    f"concept.acts names must be unique, but {name!r} appears more than once "
+                    f"(acts[{seen[key]}] and acts[{index}])"
+                )
+            else:
+                seen[key] = index
+        if not isinstance(function, str) or not function.strip():
+            problems.append(
+                f"concept.acts[{index}].function must be a non-empty string, got {function!r}"
+            )
+    return problems
 
 
 @dataclass(frozen=True)
@@ -236,9 +428,14 @@ def generate_concept(
 
 
 __all__ = [
+    "ACT_SCHEMA",
     "CONCEPT_REQUIRED_FIELDS",
     "CONCEPT_SCHEMA",
     "MAX_VALIDATION_ATTEMPTS",
+    "READING_REQUIRED_FIELDS",
+    "READING_SCHEMA",
+    "READING_STRING_FIELDS",
+    "REFERENCE_SCHEMA",
     "ConceptResult",
     "ConceptValidationError",
     "build_concept_prompt",

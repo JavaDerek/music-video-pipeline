@@ -824,6 +824,55 @@ not also the singer, nothing bound the pronoun to anybody, and H3 invented a
 different man each time. The companion's face changes seven times over one
 walk.
 
+## Say whose shot it is, in `subject` (issue #82)
+
+`present` binds a pronoun to a face. It does **not** say who the shot is
+about — CLAUDE.md puts it bluntly: *"`present` decides who a pronoun is,
+never whose shot this is."*
+
+On a **voiced** chunk that question is already settled: the singer owns the
+frame, and three separate measured findings (#58, #59, #60) say the sentence
+outranks any field that argues otherwise. So `subject` is refused there —
+setting it is an error, not an override.
+
+On an **instrumental** chunk nobody is singing, so `chunk.characters` is
+empty and the render falls back to `default_lead_vocalist` and bills *that*
+person as "the focus of this shot". When the line is about somebody else,
+the prompt then contradicts itself:
+
+```toml
+# Wrong -- an instrumental chunk whose sentence is entirely about Jan, with
+# nothing telling the render that. The prompt billed Dianne as the focus and
+# Jan as a silent bystander, and H3 resolved it by morphing one into the
+# other at 3:11:
+[[shot]]
+chunk_id = 29
+# INSTRUMENTAL -- no lyric to sing
+present = ["Jan"]
+shot = "His boot settles into a hollow already worn into the watch-post
+        stone, the rock beneath him scarred smooth from years of the same
+        unmoving stance."
+
+# Right -- the same line, with the billing it always implied:
+[[shot]]
+chunk_id = 29
+# INSTRUMENTAL -- no lyric to sing
+subject = "Jan"
+shot = "His boot settles into a hollow already worn into the watch-post
+        stone, the rock beneath him scarred smooth from years of the same
+        unmoving stance."
+```
+
+`subject` replaces the default focus outright: that member's name, role,
+appearance and reference photo become the shot's, and they are no longer
+listed as "also in shot, silent". Name at most one person — a shot has one
+subject.
+
+Measured on the "Deathless" plan the viewer reviewed: 10 of its 39
+instrumental chunks (0, 1, 4, 29, 34, 45, 46, 56, 62, 66) describe only Jan
+and the scenery while Dianne is composed as their focus.
+`lint_instrumental_focus_mismatch` names them; it warns and never blocks.
+
 ## Put each joke where it is legible
 
 A gag needs the room that makes it make sense. An exploding printer in an
@@ -928,6 +977,16 @@ Run down this list before committing a shot plan:
 - [ ] Is a voiced chunk's `camera` framed "in profile"? Measured with no
       counter-example on a real render (issue #76) — prefer facing the lens
       more directly, or move the profile framing to an instrumental chunk.
+- [ ] On an instrumental chunk whose line is about somebody other than the
+      default lead vocalist, is `subject` set to that cast member? `present`
+      does not answer this, and without `subject` the render bills the
+      config's default singer as the focus of a shot they are not in.
+- [ ] Does any **voiced** chunk set `subject`? That is refused, not
+      honoured — the singer owns the frame on a chunk they sing.
+- [ ] Does every act declared by the concept actually happen, in order, in
+      one unbroken run — and does the final act pay off something a
+      previous act planted? A plan can satisfy every other check here and
+      still be a sequence of events rather than a story.
 - [ ] Does the `shot` line avoid restating things the render loop already
       composes — character identity, appearance, the lyric line, whether
       the character is singing?

@@ -32,9 +32,11 @@ from music_video_maker.shot_plan import (
     ShotPlanEntry,
     ShotPlanError,
     lint_camera_face_away_on_voiced_chunks,
+    lint_instrumental_focus_mismatch,
     lint_present_location_mismatch,
     lint_role_prohibition_contradiction,
     lint_shots_against_lyrics,
+    lint_subject_on_voiced_chunk,
     lint_unbound_companion_referent,
     lint_voiced_framing,
     load_shot_plan,
@@ -42,6 +44,7 @@ from music_video_maker.shot_plan import (
     resolve_camera,
     resolve_location,
     resolve_shot,
+    resolve_subject,
     write_shot_plan_skeleton,
 )
 
@@ -1294,6 +1297,158 @@ def test_present_is_a_known_key(tmp_path: Path, caplog):
 
 
 # --------------------------------------------------------------------------- #
+# `subject`: whose shot this is, distinct from `present` (issue #82)
+#
+# `present` (issue #59) answers who a pronoun binds to; it never answered
+# whose shot this IS. On an instrumental chunk `chunk.characters` is empty,
+# so `prompting._resolve_active_members` falls back to
+# `config.default_lead_vocalist` and composes THAT person as "the focus of
+# this shot" -- a config default silently answering a question the shot line
+# already answers differently. `subject` names the actual focus; it is a
+# single name, not a list (a shot has exactly one subject), and it is legal
+# only on an instrumental chunk -- three measured findings (#58, #59, #60)
+# say the singer owns the frame on a voiced one, so `subject` there is an
+# error (see the lint section below), never a silently-honoured override.
+# --------------------------------------------------------------------------- #
+
+
+def test_subject_is_parsed_as_a_single_name(tmp_path: Path):
+    plan = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 4\nstart = 26.3\n'
+        'shot = "His boot settles into a hollow"\nsubject = "Jan"\n',
+    )
+    assert load_shot_plan(plan, cast_names=("Jan", "Dianne"))[4].subject == "Jan"
+
+
+def test_subject_defaults_to_none(tmp_path: Path):
+    plan = _write_plan(tmp_path, '[[shot]]\nchunk_id = 4\nstart = 26.3\nshot = "x"\n')
+    assert load_shot_plan(plan)[4].subject is None
+
+
+def test_subject_wrong_type_is_an_error(tmp_path: Path):
+    """Unlike `present`, this is a single name -- a list is the wrong shape."""
+    plan = _write_plan(
+        tmp_path, '[[shot]]\nchunk_id = 4\nstart = 26.3\nshot = "x"\nsubject = ["Jan"]\n'
+    )
+    with pytest.raises(ShotPlanError, match="subject"):
+        load_shot_plan(plan)
+
+
+def test_subject_non_string_is_an_error(tmp_path: Path):
+    plan = _write_plan(
+        tmp_path, '[[shot]]\nchunk_id = 4\nstart = 26.3\nshot = "x"\nsubject = 3\n'
+    )
+    with pytest.raises(ShotPlanError, match="subject"):
+        load_shot_plan(plan)
+
+
+def test_subject_empty_string_is_an_error(tmp_path: Path):
+    plan = _write_plan(
+        tmp_path, '[[shot]]\nchunk_id = 4\nstart = 26.3\nshot = "x"\nsubject = "   "\n'
+    )
+    with pytest.raises(ShotPlanError, match="subject"):
+        load_shot_plan(plan)
+
+
+def test_subject_unknown_cast_name_is_an_error(tmp_path: Path):
+    plan = _write_plan(
+        tmp_path, '[[shot]]\nchunk_id = 4\nstart = 26.3\nshot = "x"\nsubject = "Nobody"\n'
+    )
+    with pytest.raises(ShotPlanError, match="Nobody"):
+        load_shot_plan(plan, cast_names=("Jan", "Dianne"))
+
+
+def test_subject_skips_the_membership_check_when_cast_names_is_empty(tmp_path: Path):
+    """The "cast unknown" call sites -- most tests, and any caller that has
+    not wired the cast dict through -- must not be forced to supply one just
+    to parse a plan, the same rule every other cast-valued field follows."""
+    plan = _write_plan(
+        tmp_path, '[[shot]]\nchunk_id = 4\nstart = 26.3\nshot = "x"\nsubject = "Whoever"\n'
+    )
+    assert load_shot_plan(plan)[4].subject == "Whoever"
+
+
+def test_subject_is_a_known_key(tmp_path: Path, caplog):
+    """It must not be reported by the unknown-key lint."""
+    plan = _write_plan(
+        tmp_path, '[[shot]]\nchunk_id = 4\nstart = 26.3\nshot = "x"\nsubject = "Jan"\n'
+    )
+    with caplog.at_level(logging.WARNING):
+        load_shot_plan(plan, cast_names=("Jan",))
+    assert "nothing reads" not in caplog.text
+
+
+def test_resolve_subject_returns_none_with_no_plan():
+    chunk = _chunk(4, 26.3, 34.3)
+    assert resolve_subject(None, chunk) is None
+
+
+def test_resolve_subject_returns_the_entry_subject():
+    plan = {4: ShotPlanEntry(chunk_id=4, start=26.3, shot="x", subject="Jan")}
+    chunk = _chunk(4, 26.3, 34.3)
+    assert resolve_subject(plan, chunk) == "Jan"
+
+
+def test_resolve_subject_is_none_when_the_entry_never_set_it():
+    plan = {4: ShotPlanEntry(chunk_id=4, start=26.3, shot="x")}
+    chunk = _chunk(4, 26.3, 34.3)
+    assert resolve_subject(plan, chunk) is None
+
+
+def test_resolve_subject_raises_on_drift_same_as_resolve_shot():
+    """Shares `_resolve_entry`'s drift check -- a stale plan must refuse every
+    field the same way, not just the ones the render loop always consumed."""
+    plan = {4: ShotPlanEntry(chunk_id=4, start=26.3, shot="x", subject="Jan")}
+    chunk = _chunk(4, 26.3 + TOLERANCE_EXCEEDED, 34.3 + TOLERANCE_EXCEEDED)
+    with pytest.raises(ShotPlanDriftError):
+        resolve_subject(plan, chunk)
+
+
+# --------------------------------------------------------------------------- #
+# The `subject`-on-a-voiced-chunk lint: the one lint in this module that
+# RAISES rather than warns (issue #82). The singer owns the frame on a voiced
+# chunk (#58, #59, #60); honouring `subject` there would reintroduce the
+# desync the field exists to avoid, so it is refused before any GPU time is
+# spent rather than silently mis-composed.
+# --------------------------------------------------------------------------- #
+
+
+def test_subject_on_a_voiced_chunk_raises(caplog):
+    plan = {4: ShotPlanEntry(chunk_id=4, start=4.0, shot="x", subject="Jan")}
+    chunks = [_chunk_stub(4, "a lyric", instrumental=False)]
+
+    with caplog.at_level(logging.ERROR), pytest.raises(ShotPlanError, match="Jan"):
+        lint_subject_on_voiced_chunk(plan, chunks)
+    assert "chunk_id=4" in caplog.text
+
+
+def test_subject_on_an_instrumental_chunk_does_not_raise():
+    plan = {4: ShotPlanEntry(chunk_id=4, start=4.0, shot="x", subject="Jan")}
+    chunks = [_chunk_stub(4, "", instrumental=True)]
+
+    lint_subject_on_voiced_chunk(plan, chunks)  # must simply return
+
+
+def test_no_subject_set_never_raises_even_on_a_voiced_chunk():
+    plan = {4: ShotPlanEntry(chunk_id=4, start=4.0, shot="x")}
+    chunks = [_chunk_stub(4, "a lyric", instrumental=False)]
+
+    lint_subject_on_voiced_chunk(plan, chunks)  # must simply return
+
+
+def test_subject_lint_is_silent_with_no_plan_or_no_chunks():
+    lint_subject_on_voiced_chunk({}, [_chunk_stub(4, "a lyric")])
+    lint_subject_on_voiced_chunk(
+        {4: ShotPlanEntry(chunk_id=4, start=4.0, shot="x", subject="Jan")}, []
+    )
+
+
+def test_subject_lint_ignores_a_chunk_missing_from_the_plan():
+    lint_subject_on_voiced_chunk({}, [_chunk_stub(4, "a lyric", instrumental=False)])
+
+
+# --------------------------------------------------------------------------- #
 # Distant staging: the phrasings the first full render actually used (#58)
 # --------------------------------------------------------------------------- #
 
@@ -2499,4 +2654,175 @@ def test_present_location_mismatch_on_the_real_80_chunk_plan_is_silent(caplog):
 def test_present_location_mismatch_ignores_a_chunk_missing_from_the_plan(caplog):
     with caplog.at_level(logging.WARNING):
         lint_present_location_mismatch({}, [_chunk_stub(1, "", characters=("Jan",))])
+    assert caplog.records == []
+
+
+# --------------------------------------------------------------------------- #
+# Instrumental focus mismatch: the general shape of the chunk 29 bug (issue
+# #82). `chunk.characters` is empty on an instrumental chunk, so the render
+# falls back to `default_lead_vocalist` and composes THEM as the focus, even
+# when the shot line is grammatically, entirely about somebody named in
+# `present` instead. `subject` is the fix an author reaches for; this lint
+# notices a plan that needed it and does not have it, before a render finds
+# out.
+#
+# Which name a pronoun "belongs to" is measured from THIS plan's own
+# solo-voiced shot lines, never guessed from the name (issue #72 already
+# rejected that): on a solo voiced chunk the sentence's subject is already
+# the singer (#58, #59, #60), so a solo singer's own third-person pronouns
+# are self-reference by construction.
+# --------------------------------------------------------------------------- #
+
+
+def test_instrumental_focus_mismatch_warns_when_the_line_is_entirely_about_present(caplog):
+    plan = {
+        3: ShotPlanEntry(
+            chunk_id=3, start=3.0,
+            shot="He keeps his own steady watch, his rifle close at hand.",
+        ),
+        29: ShotPlanEntry(
+            chunk_id=29, start=29.0,
+            shot="His boot settles into a hollow already worn into the stone.",
+            present=("Jan",),
+        ),
+    }
+    chunks = [
+        _chunk_stub(3, "a lyric", characters=("Jan",)),
+        _chunk_stub(29, "", instrumental=True),
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        lint_instrumental_focus_mismatch(plan, chunks, "Dianne")
+
+    assert "chunk_id=29" in caplog.text
+    assert "Jan" in caplog.text
+
+
+def test_instrumental_focus_mismatch_is_silent_when_the_line_also_names_the_default(caplog):
+    """Chunk 70 of the real plan: 'She steps up onto the ridge beside him,
+    ...his eyes stay fixed...' -- Jan is present and named by a pronoun, but
+    so is Dianne (the default focus), so the composed focus has real textual
+    ground and nothing is wrong."""
+    plan = {
+        3: ShotPlanEntry(
+            chunk_id=3, start=3.0,
+            shot="He keeps his own steady watch, his rifle close at hand.",
+        ),
+        5: ShotPlanEntry(
+            chunk_id=5, start=5.0, shot="She waits there too, she never leaves.",
+        ),
+        70: ShotPlanEntry(
+            chunk_id=70, start=70.0,
+            shot="She steps up onto the ridge beside him, his eyes stay fixed below.",
+            present=("Jan",),
+        ),
+    }
+    chunks = [
+        _chunk_stub(3, "a lyric", characters=("Jan",)),
+        _chunk_stub(5, "a lyric", characters=("Dianne",)),
+        _chunk_stub(70, "", instrumental=True),
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        lint_instrumental_focus_mismatch(plan, chunks, "Dianne")
+
+    assert caplog.records == []
+
+
+def test_instrumental_focus_mismatch_is_silent_with_no_pronoun_evidence_yet(caplog):
+    """No solo-voiced chunk anywhere in the plan establishes which name owns
+    which pronoun -- silent on absence of evidence, the same discipline every
+    other lint in this module follows, rather than firing on a guess."""
+    plan = {
+        29: ShotPlanEntry(
+            chunk_id=29, start=29.0,
+            shot="His boot settles into a hollow already worn into the stone.",
+            present=("Jan",),
+        ),
+    }
+    chunks = [_chunk_stub(29, "", instrumental=True)]
+
+    with caplog.at_level(logging.WARNING):
+        lint_instrumental_focus_mismatch(plan, chunks, "Dianne")
+
+    assert caplog.records == []
+
+
+def test_instrumental_focus_mismatch_is_silent_when_subject_is_already_set(caplog):
+    plan = {
+        3: ShotPlanEntry(
+            chunk_id=3, start=3.0,
+            shot="He keeps his own steady watch, his rifle close at hand.",
+        ),
+        29: ShotPlanEntry(
+            chunk_id=29, start=29.0,
+            shot="His boot settles into a hollow already worn into the stone.",
+            present=("Jan",), subject="Jan",
+        ),
+    }
+    chunks = [
+        _chunk_stub(3, "a lyric", characters=("Jan",)),
+        _chunk_stub(29, "", instrumental=True),
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        lint_instrumental_focus_mismatch(plan, chunks, "Dianne")
+
+    assert caplog.records == []
+
+
+def test_instrumental_focus_mismatch_is_silent_with_no_present(caplog):
+    plan = {
+        3: ShotPlanEntry(
+            chunk_id=3, start=3.0,
+            shot="He keeps his own steady watch, his rifle close at hand.",
+        ),
+        29: ShotPlanEntry(
+            chunk_id=29, start=29.0,
+            shot="His boot settles into a hollow already worn into the stone.",
+        ),
+    }
+    chunks = [
+        _chunk_stub(3, "a lyric", characters=("Jan",)),
+        _chunk_stub(29, "", instrumental=True),
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        lint_instrumental_focus_mismatch(plan, chunks, "Dianne")
+
+    assert caplog.records == []
+
+
+def test_instrumental_focus_mismatch_is_silent_on_a_voiced_chunk(caplog):
+    """This lint's whole premise is the instrumental fallback -- a voiced
+    chunk's focus is the singer, not a config default, so there is nothing
+    for `subject` to fix there in the first place (that case is
+    `lint_subject_on_voiced_chunk`'s, and it raises, not warns)."""
+    plan = {
+        3: ShotPlanEntry(
+            chunk_id=3, start=3.0,
+            shot="He keeps his own steady watch, his rifle close at hand.",
+        ),
+        29: ShotPlanEntry(
+            chunk_id=29, start=29.0,
+            shot="His boot settles into a hollow already worn into the stone.",
+            present=("Jan",),
+        ),
+    }
+    chunks = [
+        _chunk_stub(3, "a lyric", characters=("Jan",)),
+        _chunk_stub(29, "a lyric", characters=("Dianne",), instrumental=False),
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        lint_instrumental_focus_mismatch(plan, chunks, "Dianne")
+
+    assert caplog.records == []
+
+
+def test_instrumental_focus_mismatch_ignores_a_chunk_missing_from_the_plan(caplog):
+    with caplog.at_level(logging.WARNING):
+        lint_instrumental_focus_mismatch(
+            {}, [_chunk_stub(29, "", instrumental=True)], "Dianne"
+        )
     assert caplog.records == []

@@ -29,7 +29,36 @@ from music_video_maker.authoring.prompts import LYRICS_FORMAT_DOC
 from music_video_maker.config import RunConfig
 from tests.harness.factories import make_cast_dict, make_raw_stablets_result, write_silent_wav
 
+VALID_READING = {
+    # Issue #69: the comprehension step, filled first and derived from
+    # rather than a second freestanding pitch. `nouns`/`references` are
+    # deliberately populated here (a happy-path fixture); the "empty is a
+    # valid answer" behaviour has its own dedicated tests below.
+    "subject": "a drummer waiting out a storm that finally breaks",
+    "speaker": "the drummer",
+    "addressee": "someone who has already left",
+    "situation": "she is alone on the boardwalk as the weather turns",
+    "change": "the storm builds, breaks, and clears, and she is still standing after",
+    "register": "plain, contemporary",
+    "period": "present day",
+    "place": "a coastal town",
+    "nouns": ["a snare drum", "a folding chair", "a length of rope"],
+    "references": [
+        {
+            "reference": "a lighthouse",
+            "what_it_is": "a navigational structure",
+            "imagery": ["a beam sweeping the water", "a white tower against grey sky"],
+        }
+    ],
+}
+
+VALID_ACTS = [
+    {"name": "situation", "function": "she waits alone as the storm gathers"},
+    {"name": "resolution", "function": "the storm clears and what she planted pays off"},
+]
+
 VALID_CONCEPT = {
+    "reading": VALID_READING,
     "logline": "A drummer walks through gathering weather as a storm builds and clears.",
     "setting": "a coastal town, contemporary",
     "tone": "elegiac, quiet",
@@ -40,6 +69,8 @@ VALID_CONCEPT = {
     # actually visits, not a monotonic progress scalar (the issue's own
     # "probably the version to build" framing).
     "locations": ["the boardwalk", "the empty pier", "her front porch"],
+    # Issue #84: the video's dramatic shape, ordered.
+    "acts": VALID_ACTS,
 }
 
 
@@ -137,6 +168,187 @@ def test_locations_must_be_a_non_empty_list_of_strings():
     bad4 = {**VALID_CONCEPT, "locations": ["  "]}
     with pytest.raises(ConceptValidationError, match="locations"):
         validate_concept(bad4)
+
+
+# --------------------------------------------------------------------------- #
+# `reading` -- issue #69's comprehension step. Structured and validated like
+# every other stage's reply so `beats` can consume it directly, and empty
+# `nouns`/`references` are a first-class, VALID answer -- a model forced to
+# invent a reference for a song with none will invent one, and the invention
+# gets staged.
+# --------------------------------------------------------------------------- #
+
+
+def test_reading_is_required():
+    bad = {k: v for k, v in VALID_CONCEPT.items() if k != "reading"}
+    with pytest.raises(ConceptValidationError, match="reading"):
+        validate_concept(bad)
+
+
+def test_reading_must_be_an_object():
+    bad = {**VALID_CONCEPT, "reading": "just read it yourself"}
+    with pytest.raises(ConceptValidationError, match="reading"):
+        validate_concept(bad)
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["subject", "speaker", "addressee", "situation", "change", "register", "period", "place"],
+)
+def test_each_reading_string_field_is_required_and_non_empty(key):
+    missing = {**VALID_CONCEPT, "reading": {k: v for k, v in VALID_READING.items() if k != key}}
+    with pytest.raises(ConceptValidationError, match=key):
+        validate_concept(missing)
+
+    blank = {**VALID_CONCEPT, "reading": {**VALID_READING, key: "   "}}
+    with pytest.raises(ConceptValidationError, match=key):
+        validate_concept(blank)
+
+
+def test_reading_nouns_may_be_an_empty_list():
+    """Issue #69 requirement 2: a song with no concrete nouns worth naming is
+    a real, valid answer -- never something the validator treats as missing
+    or incomplete."""
+    concept = {**VALID_CONCEPT, "reading": {**VALID_READING, "nouns": []}}
+    validate_concept(concept)  # must not raise
+
+
+def test_reading_nouns_must_be_a_list_of_strings():
+    bad = {**VALID_CONCEPT, "reading": {**VALID_READING, "nouns": "a drum, a chair"}}
+    with pytest.raises(ConceptValidationError, match="nouns"):
+        validate_concept(bad)
+
+    bad2 = {**VALID_CONCEPT, "reading": {**VALID_READING, "nouns": [1, 2]}}
+    with pytest.raises(ConceptValidationError, match="nouns"):
+        validate_concept(bad2)
+
+
+def test_reading_references_may_be_an_empty_list():
+    """Issue #69 requirement 2, and the whole reason this issue exists: most
+    songs -- a breakup song, say -- make no cultural/historical/mythological
+    reference at all, and an empty list here is the CORRECT reply, not a
+    gap."""
+    concept = {**VALID_CONCEPT, "reading": {**VALID_READING, "references": []}}
+    validate_concept(concept)  # must not raise
+
+
+def test_reading_references_must_be_a_list():
+    bad = {**VALID_CONCEPT, "reading": {**VALID_READING, "references": "Koschey the Deathless"}}
+    with pytest.raises(ConceptValidationError, match="references"):
+        validate_concept(bad)
+
+
+def test_a_reference_missing_a_field_is_rejected():
+    bad_ref = {"reference": "a lighthouse", "what_it_is": "a structure"}  # no imagery
+    concept = {**VALID_CONCEPT, "reading": {**VALID_READING, "references": [bad_ref]}}
+    with pytest.raises(ConceptValidationError, match="imagery"):
+        validate_concept(concept)
+
+
+def test_a_reference_with_an_empty_name_is_rejected():
+    bad_ref = {"reference": "  ", "what_it_is": "a structure", "imagery": ["a beam of light"]}
+    concept = {**VALID_CONCEPT, "reading": {**VALID_READING, "references": [bad_ref]}}
+    with pytest.raises(ConceptValidationError, match="reference"):
+        validate_concept(concept)
+
+
+def test_a_references_imagery_may_itself_be_empty():
+    """Only `references` and `nouns` are required to accept the empty case --
+    this asserts that a reference's own `imagery` list is allowed to be
+    empty too, since nothing in the issue requires it non-empty."""
+    ref = {"reference": "a lighthouse", "what_it_is": "a structure", "imagery": []}
+    concept = {**VALID_CONCEPT, "reading": {**VALID_READING, "references": [ref]}}
+    validate_concept(concept)  # must not raise
+
+
+def test_a_references_imagery_must_be_a_list_of_strings():
+    bad_ref = {"reference": "a lighthouse", "what_it_is": "a structure", "imagery": "a beam"}
+    concept = {**VALID_CONCEPT, "reading": {**VALID_READING, "references": [bad_ref]}}
+    with pytest.raises(ConceptValidationError, match="imagery"):
+        validate_concept(concept)
+
+
+def test_every_reading_problem_is_reported_at_once():
+    """One retry round costs a whole model call -- three faults in `reading`
+    must come back with three complaints, the same convention `beats` uses."""
+    broken = {
+        **VALID_READING,
+        "subject": "",
+        "nouns": "not a list",
+        "references": [{"reference": "x"}],  # missing what_it_is, imagery
+    }
+    concept = {**VALID_CONCEPT, "reading": broken}
+    with pytest.raises(ConceptValidationError) as excinfo:
+        validate_concept(concept)
+
+    message = str(excinfo.value)
+    assert "subject" in message
+    assert "nouns" in message
+    assert "reading.references[0]" in message
+
+
+# --------------------------------------------------------------------------- #
+# `acts` -- issue #84's closed, ordered story-structure vocabulary. `beats`
+# assigns every chunk's `act` from exactly this list; validated the way
+# `locations` is: non-empty, and here also unique by name.
+# --------------------------------------------------------------------------- #
+
+
+def test_acts_is_required():
+    bad = {k: v for k, v in VALID_CONCEPT.items() if k != "acts"}
+    with pytest.raises(ConceptValidationError, match="acts"):
+        validate_concept(bad)
+
+
+def test_acts_must_be_a_non_empty_list():
+    bad = {**VALID_CONCEPT, "acts": []}
+    with pytest.raises(ConceptValidationError, match="acts"):
+        validate_concept(bad)
+
+    bad2 = {**VALID_CONCEPT, "acts": "situation, resolution"}
+    with pytest.raises(ConceptValidationError, match="acts"):
+        validate_concept(bad2)
+
+
+def test_an_act_needs_a_name_and_a_function():
+    bad = {**VALID_CONCEPT, "acts": [{"name": "situation"}]}  # no function
+    with pytest.raises(ConceptValidationError, match="function"):
+        validate_concept(bad)
+
+    bad2 = {**VALID_CONCEPT, "acts": [{"function": "sets the scene"}]}  # no name
+    with pytest.raises(ConceptValidationError, match="name"):
+        validate_concept(bad2)
+
+
+def test_an_act_with_a_blank_name_is_rejected():
+    bad = {**VALID_CONCEPT, "acts": [{"name": "  ", "function": "sets the scene"}]}
+    with pytest.raises(ConceptValidationError, match="name"):
+        validate_concept(bad)
+
+
+def test_duplicate_act_names_are_rejected():
+    bad = {
+        **VALID_CONCEPT,
+        "acts": [
+            {"name": "Situation", "function": "the opening"},
+            {"name": "situation", "function": "a different one, badly renamed"},
+        ],
+    }
+    with pytest.raises(ConceptValidationError, match="unique"):
+        validate_concept(bad)
+
+
+def test_a_well_formed_multi_act_structure_passes_silently():
+    concept = {
+        **VALID_CONCEPT,
+        "acts": [
+            {"name": "situation", "function": "she waits"},
+            {"name": "complication", "function": "the storm builds"},
+            {"name": "turn", "function": "it breaks"},
+            {"name": "resolution", "function": "it clears, and what she planted pays off"},
+        ],
+    }
+    validate_concept(concept)  # must not raise
 
 
 # --------------------------------------------------------------------------- #
@@ -338,3 +550,33 @@ def test_skeleton_uses_the_configured_alignment_model(tmp_path, monkeypatch):
     load_chunk_skeleton(config, align_model=_FakeAlignModel())
 
     assert seen["model_size"] == "small"
+
+
+# --------------------------------------------------------------------------- #
+# Issue #69: the system prompt has to instruct comprehension BEFORE
+# invention, and say plainly that an empty reference/noun list is correct.
+# --------------------------------------------------------------------------- #
+
+
+def test_the_concept_preamble_asks_for_reading_before_inventing():
+    from music_video_maker.authoring.prompts import CONCEPT_PREAMBLE
+
+    lowered = CONCEPT_PREAMBLE.lower()
+    assert "reading" in lowered
+    assert "fill" in lowered and "first" in lowered
+
+
+def test_the_concept_preamble_says_empty_references_are_correct():
+    from music_video_maker.authoring.prompts import CONCEPT_PREAMBLE
+
+    lowered = CONCEPT_PREAMBLE.lower()
+    assert "empty list is the correct answer" in lowered
+    assert "invent a reference" in lowered
+
+
+def test_the_concept_preamble_explains_the_acts_payoff_requirement():
+    from music_video_maker.authoring.prompts import CONCEPT_PREAMBLE
+
+    lowered = CONCEPT_PREAMBLE.lower()
+    assert "acts" in lowered
+    assert "pay off" in lowered or "payoff" in lowered

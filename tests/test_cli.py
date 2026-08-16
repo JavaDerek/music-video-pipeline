@@ -1320,6 +1320,96 @@ def test_run_pipeline_wires_the_present_location_mismatch_lint(tmp_path: Path, m
 
 
 # --------------------------------------------------------------------------- #
+# `subject`: whose shot this is on an instrumental chunk (issue #82)
+# --------------------------------------------------------------------------- #
+
+
+def test_run_pipeline_wires_the_subject_on_voiced_chunk_lint(tmp_path: Path, monkeypatch):
+    """The raising lint must actually run against the real plan/chunks, not
+    just exist in isolation -- same wiring style as the #78 lint above."""
+    rig = Rig(tmp_path)
+    plan_path = tmp_path / "shot_plan.toml"
+    plan_path.write_text(
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks alone."\n'
+    )
+    rig.config = replace(rig.config, shot_plan=plan_path)
+
+    calls = []
+    real_lint = cli.lint_subject_on_voiced_chunk
+
+    def spy(plan, chunks):
+        calls.append((plan, chunks))
+        return real_lint(plan, chunks)
+
+    monkeypatch.setattr(cli, "lint_subject_on_voiced_chunk", spy)
+    sequences = [build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)]
+
+    rig.run(sequences)
+
+    assert len(calls) == 1
+    plan_arg, chunks_arg = calls[0]
+    assert 0 in plan_arg
+    assert len(chunks_arg) == 3
+
+
+def test_run_pipeline_refuses_when_subject_is_set_on_a_voiced_chunk(tmp_path: Path):
+    """The lint's whole point: this is refused before any GPU time is spent,
+    not silently mis-composed."""
+    from music_video_maker.shot_plan import ShotPlanError
+
+    rig = Rig(tmp_path)  # DEFAULT_SEGMENT_SPECS: every chunk here is voiced.
+    plan_path = tmp_path / "shot_plan.toml"
+    plan_path.write_text(
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks."\nsubject = "Dianne"\n'
+    )
+    rig.config = replace(rig.config, shot_plan=plan_path)
+
+    with pytest.raises(ShotPlanError):
+        rig.run([])
+
+    assert rig.submitted == []
+
+
+def test_run_pipeline_passes_the_resolved_subject_into_expand_prompt(
+    tmp_path: Path, monkeypatch
+):
+    """`resolve_subject(plan, chunk)` must actually reach `expand_prompt`,
+    and only for the chunk the plan authored it against. A single lyric
+    segment in the middle of the track, with `instrumental_coverage` on,
+    tiles a genuine instrumental filler chunk (chunk_id=0, 0.000-10.125s)
+    ahead of it -- the case `subject` exists for."""
+    rig = Rig(
+        tmp_path,
+        segment_specs=[("walking through the empty halls tonight", 10.0, 16.0)],
+        instrumental_coverage=True,
+    )
+    plan_path = tmp_path / "shot_plan.toml"
+    plan_path.write_text(
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\n'
+        'shot = "He stands alone at the cliff edge."\nsubject = "Dianne"\n'
+    )
+    rig.config = replace(rig.config, shot_plan=plan_path)
+
+    calls: dict[int, object] = {}
+    real_expand = cli.expand_prompt
+
+    def spy(config, chunk, **kwargs):
+        calls[chunk.chunk_id] = kwargs.get("subject")
+        return real_expand(config, chunk, **kwargs)
+
+    monkeypatch.setattr(cli, "expand_prompt", spy)
+    sequences = [build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)]
+
+    rig.run(sequences)
+
+    assert calls[0] == "Dianne"
+    # Every other chunk (nothing authored for it) must resolve to None, not
+    # inherit chunk 0's subject.
+    assert all(subject is None for cid, subject in calls.items() if cid != 0)
+    assert len(calls) == 3
+
+
+# --------------------------------------------------------------------------- #
 # Issue #28: chain scope wiring
 # --------------------------------------------------------------------------- #
 

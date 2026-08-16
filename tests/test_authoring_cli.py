@@ -27,6 +27,21 @@ from music_video_maker.authoring.driver import ScriptedDriver
 from tests.harness.factories import write_silent_wav
 
 VALID_CONCEPT = {
+    # Issue #69: the comprehension step, filled first. `nouns`/`references`
+    # are deliberately empty here -- this fixture's song has neither, and an
+    # empty list is the CORRECT reply, not an incomplete one.
+    "reading": {
+        "subject": "a drummer waiting out a storm",
+        "speaker": "the drummer",
+        "addressee": "herself",
+        "situation": "she is alone on the boardwalk as weather gathers",
+        "change": "the storm builds and clears, and she is still standing after",
+        "register": "plain, contemporary",
+        "period": "present day",
+        "place": "a coastal town",
+        "nouns": [],
+        "references": [],
+    },
     "logline": "A drummer walks through gathering weather as a storm builds and clears.",
     "setting": "a coastal town, contemporary",
     "tone": "elegiac, quiet",
@@ -35,6 +50,14 @@ VALID_CONCEPT = {
     # Issue #78: the closed vocabulary the beats stage assigns `location`
     # from.
     "locations": ["the boardwalk", "the empty pier"],
+    # Issue #84: the video's dramatic shape. A single act on purpose -- most
+    # of this file's tests exercise machinery unrelated to #84's arc checks,
+    # and a one-act vocabulary keeps `check_act_structure`'s coverage/order/
+    # contiguity checks trivially satisfied (one act, used everywhere) while
+    # its payoff check is deliberately skipped for exactly this case (see
+    # `check_act_structure`'s own docstring). The arc checks get their own
+    # dedicated coverage in tests/test_authoring_beats.py.
+    "acts": [{"name": "the whole song", "function": "start to finish, one movement"}],
 }
 
 
@@ -199,6 +222,26 @@ def test_concept_prints_a_human_readable_summary(tmp_path, monkeypatch, capsys):
     assert "the empty pier" in out
 
 
+def test_concept_prints_the_reading_and_acts_for_review(tmp_path, monkeypatch, capsys):
+    """Issue #69 requirement 4: the comprehension step has to be surfaced for
+    human review, not just written to disk -- a confidently wrong reading is
+    exactly what a human catches in five seconds and no downstream stage
+    ever can. Issue #84's `acts` gets the same treatment."""
+    config_path = _write_config(tmp_path, lyrics_text="")
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([VALID_CONCEPT]))
+
+    auth_cli.main(["--config", str(config_path), "concept"])
+
+    out = capsys.readouterr().out
+    assert VALID_CONCEPT["reading"]["subject"] in out
+    assert VALID_CONCEPT["reading"]["situation"] in out
+    assert VALID_CONCEPT["reading"]["change"] in out
+    # This fixture's song has neither -- printed explicitly as "(none)"
+    # rather than a blank line a reviewer could mistake for missing output.
+    assert "(none)" in out
+    assert "the whole song" in out  # the one entry in VALID_CONCEPT["acts"]
+
+
 def test_concept_notes_reach_the_prompt(tmp_path, monkeypatch):
     config_path = _write_config(tmp_path, lyrics_text="")
     driver = ScriptedDriver([VALID_CONCEPT])
@@ -262,6 +305,9 @@ def _beat_sheet(config_path: Path, *, lengths: dict[int, float] | None = None) -
                 # own `locations` list when one is supplied (VALID_CONCEPT's
                 # above, throughout this file).
                 "location": "the boardwalk",
+                # Issue #84: required, and validated against VALID_CONCEPT's
+                # own single-entry `acts` list above.
+                "act": "the whole song",
                 **({"length_seconds": lengths[c.chunk_id]} if c.chunk_id in lengths else {}),
             }
             for c in chunks
@@ -336,6 +382,21 @@ def test_beats_prints_each_beats_location(tmp_path, monkeypatch, capsys):
     assert exit_code == auth_cli.EXIT_SUCCESS
     out = capsys.readouterr().out
     assert "the boardwalk" in out
+
+
+def test_beats_prints_each_beats_act(tmp_path, monkeypatch, capsys):
+    """Issue #84: `act` is as much a per-beat review item as `location`
+    already is."""
+    config_path = _write_config(tmp_path, lyrics_text="")
+    _run_concept(config_path, monkeypatch)
+    sheet = _beat_sheet(config_path)
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([sheet]))
+
+    exit_code = auth_cli.main(["--config", str(config_path), "beats"])
+
+    assert exit_code == auth_cli.EXIT_SUCCESS
+    out = capsys.readouterr().out
+    assert "<the whole song>" in out
 
 
 def test_beats_records_the_re_cut_timeline_when_a_length_moves_it(tmp_path, monkeypatch):

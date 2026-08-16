@@ -91,7 +91,7 @@ def _chunks(texts: list[str], width: float = 5.875):
 
 def _beat(
     chunk_id, *, group=1, role="transition", focus="subject", length=None, width=5.875,
-    location="the street",
+    location="the street", act="the story", subject=None,
 ):
     start = (chunk_id - 1) * width
     return Beat(
@@ -102,8 +102,10 @@ def _beat(
         beat_role=role,
         beat_group=group,
         location=location,
+        act=act,
         focus=focus,
         length_seconds=length,
+        subject=subject,
     )
 
 
@@ -225,6 +227,59 @@ def test_location_comes_from_the_beat(tmp_path):
 
     assert plan[1].location == "the mill"
     assert plan[2].location == "the watch-post"
+
+
+def test_act_is_surfaced_in_the_beat_comment_line(tmp_path):
+    """Issue #84: a human reviewing the plan as text has to be able to see
+    the arc, so `act` rides beside `beat_role`/`beat_group` in the same
+    `# beat: ...` comment line rather than a separate one."""
+    chunks = _chunks(["a line", ""])
+    beats = (
+        _beat(1, role="plant", group=1, act="situation"),
+        _beat(2, role="consequence", group=1, focus="action", act="resolution"),
+    )
+
+    text = render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, camera=CAMERAS)
+
+    assert '[plant, group 1, act "situation"]' in text
+    assert '[consequence, group 1, act "resolution"]' in text
+
+
+def test_an_absent_act_is_omitted_from_the_comment_line(tmp_path):
+    """A hand-built `Beat` or a pre-#84 persisted sheet has no `act` at all
+    (``""`` -- the same "not authored" default `location` follows). The
+    comment must not claim an act that was never assigned."""
+    chunks = _chunks(["a line"])
+    beats = (_beat(1, role="plant", group=1, act=""),)
+
+    text = render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, camera=CAMERAS)
+
+    assert "act" not in text.split("# beat:")[1].split("\n")[0]
+
+
+def test_subject_is_emitted_next_to_present(tmp_path):
+    """Issue #82: whose shot this is, re-emitted from the beat -- the same
+    "anchors are copied from the chunks/beats" rule `location`/`act` follow."""
+    chunks = _chunks(["", "a second line"])
+    beats = (_beat(1, subject="Jan"), _beat(2))
+    shots = {1: "An instrumental line about Jan", 2: LINES[2]}
+
+    text = render_plan_toml(
+        chunks, beats, shots, provenance=PROVENANCE, camera=CAMERAS, present={1: ["Jan"]},
+    )
+
+    assert 'subject = "Jan"' in text
+    lines = text.split("[[shot]]")[1].splitlines()
+    present_at = next(i for i, line in enumerate(lines) if line.startswith("present"))
+    subject_at = next(i for i, line in enumerate(lines) if line.startswith("subject"))
+    assert subject_at == present_at + 1
+
+
+def test_a_beat_with_no_subject_emits_no_subject_key(tmp_path):
+    path = tmp_path / "shot_plan.toml"
+    path.write_text(render_plan_toml(_chunks(["x"]), (_beat(1),), LINES, provenance=PROVENANCE))
+
+    assert "subject" not in path.read_text()
 
 
 def test_provenance_records_hashes_never_content(tmp_path):
@@ -787,3 +842,61 @@ def test_no_present_emits_no_key_at_all(tmp_path):
     )
 
     assert "present" not in path.read_text()
+
+
+# --------------------------------------------------------------------------- #
+# `subject` round-trips through the real loader, and `check_plan` refuses a
+# generated plan that sets it on a voiced chunk through the RENDER'S OWN rule
+# (`lint_subject_on_voiced_chunk`), never a copy of it (issue #82).
+# --------------------------------------------------------------------------- #
+
+
+def test_subject_round_trips_through_the_real_loader(tmp_path):
+    chunks = _chunks(["", "a second line"])
+    path = tmp_path / "shot_plan.toml"
+    path.write_text(
+        render_plan_toml(
+            chunks,
+            (_beat(1, subject="Jan"), _beat(2)),
+            {1: "An instrumental line about Jan", 2: LINES[2]},
+            provenance=PROVENANCE,
+            camera=CAMERAS,
+            present={1: ["Jan"]},
+        )
+    )
+    plan = load_shot_plan(path, cast_names=("Dianne", "Jan"))
+
+    assert plan[1].subject == "Jan"
+    assert plan[2].subject is None
+
+
+def test_check_plan_refuses_a_generated_plan_with_a_voiced_chunk_subject(tmp_path):
+    """The whole point of wiring `lint_subject_on_voiced_chunk` into
+    `check_plan`: a plan that sets `subject` on a voiced chunk is refused by
+    the render's own rule (issues #58, #59, #60), not a reimplementation of
+    it -- and if this module ever drifted from the render's rule, this test
+    would still pass on a stale copy while the render refused the same plan.
+    """
+    chunks = _chunks(["a voiced line", ""])
+    beats = (_beat(1, subject="Dianne"), _beat(2))
+    shots = {1: LINES[1], 2: "An instrumental line"}
+    text = render_plan_toml(
+        chunks, beats, shots, provenance=PROVENANCE, camera=CAMERAS,
+    )
+
+    check = check_plan(text, _config(tmp_path), chunks)
+
+    assert not check.ok
+
+
+def test_check_plan_accepts_a_subject_on_an_instrumental_chunk(tmp_path):
+    chunks = _chunks(["", "a second line"])
+    beats = (_beat(1, subject="Marcus"), _beat(2))
+    shots = {1: "An instrumental line about Marcus", 2: LINES[2]}
+    text = render_plan_toml(
+        chunks, beats, shots, provenance=PROVENANCE, camera=CAMERAS, present={1: ["Marcus"]},
+    )
+
+    check = check_plan(text, _config(tmp_path), chunks)
+
+    assert check.ok

@@ -28,6 +28,7 @@ from music_video_maker.authoring.beats import (
     beat_length_requests,
     beats_input_hashes,
     build_beats_prompt,
+    check_act_structure,
     generate_beats,
     validate_beats,
 )
@@ -102,7 +103,8 @@ def _reply(*entries: dict) -> dict:
 
 
 def _entry(
-    chunk_id, *, role="transition", group=1, focus="subject", location="the room", **extra
+    chunk_id, *, role="transition", group=1, focus="subject", location="the room",
+    act="the story", **extra,
 ) -> dict:
     return {
         "chunk_id": chunk_id,
@@ -111,6 +113,7 @@ def _entry(
         "beat_group": group,
         "focus": focus,
         "location": location,
+        "act": act,
         **extra,
     }
 
@@ -196,6 +199,9 @@ def test_a_missing_beats_array_is_rejected():
         {"location": ""},
         {"location": None},
         {"location": 5},
+        {"act": ""},
+        {"act": None},
+        {"act": 5},
     ],
 )
 def test_malformed_fields_are_rejected(bad):
@@ -277,6 +283,252 @@ def test_generate_beats_threads_the_concepts_locations_into_validation(tmp_path)
     assert len(driver.calls) == 2
     assert "approved locations" in driver.calls[1]["prompt"]
     assert len(result.beats) == 3
+
+
+# --------------------------------------------------------------------------- #
+# `act` -- issue #84's closed, ORDERED vocabulary. Membership works exactly
+# like `location` (issue #78); the arc structure itself (order, contiguity,
+# payoff) is `check_act_structure`'s own section below. These membership
+# tests deliberately use a SINGLE-act vocabulary so `check_act_structure`'s
+# coverage/payoff checks (exercised on their own, below) cannot fail a sheet
+# whose whole point is testing membership resolution in isolation.
+# --------------------------------------------------------------------------- #
+
+_APPROVED_ACTS = ("situation", "complication", "resolution")
+_ONE_ACT = ("the whole song",)
+
+
+def test_an_act_outside_the_approved_list_is_rejected():
+    reply = _three_beat_gag()
+    reply["beats"][0]["act"] = "an act nobody declared"
+
+    with pytest.raises(BeatsValidationError, match="approved acts"):
+        validate_beats(reply, _chunks(), (), _APPROVED_ACTS)
+
+
+def test_an_act_on_the_approved_list_is_accepted():
+    reply = _three_beat_gag()
+    for entry in reply["beats"]:
+        entry["act"] = "the whole song"
+
+    beats = validate_beats(reply, _chunks(), (), _ONE_ACT)
+
+    assert [b.act for b in beats] == ["the whole song"] * 3
+
+
+def test_act_matching_is_case_and_whitespace_insensitive_and_canonicalizes():
+    reply = _three_beat_gag()
+    reply["beats"][0]["act"] = "  The Whole Song  "
+    reply["beats"][1]["act"] = "the whole song"
+    reply["beats"][2]["act"] = "THE WHOLE SONG"
+
+    beats = validate_beats(reply, _chunks(), (), _ONE_ACT)
+
+    assert [b.act for b in beats] == ["the whole song"] * 3
+
+
+def test_an_empty_acts_vocabulary_accepts_anything_non_empty():
+    """No vocabulary supplied (a pre-#84 concept, or a caller not using the
+    field) means no closed-set check and no arc-structure check at all --
+    only "is this a non-empty string"."""
+    reply = _three_beat_gag()
+    for entry in reply["beats"]:
+        entry["act"] = "whatever, no vocabulary was given"
+
+    beats = validate_beats(reply, _chunks(), (), ())
+
+    assert [b.act for b in beats] == ["whatever, no vocabulary was given"] * 3
+
+
+def test_generate_beats_threads_the_concepts_acts_into_validation(tmp_path):
+    concept_with_acts = {**CONCEPT, "acts": [{"name": n, "function": "x"} for n in _ONE_ACT]}
+    bad = _three_beat_gag()
+    bad["beats"][0]["act"] = "not on the list"
+    good = _three_beat_gag()
+    for entry in good["beats"]:
+        entry["act"] = "the whole song"
+    driver = ScriptedDriver([bad, good])
+
+    result = generate_beats(_config(tmp_path), _chunks(), concept_with_acts, driver)
+
+    assert len(driver.calls) == 2
+    assert "approved acts" in driver.calls[1]["prompt"]
+    assert len(result.beats) == 3
+
+
+def test_a_concept_with_no_acts_logs_a_warning_but_still_generates(tmp_path, caplog):
+    """Backward compatibility, deliberately chosen: a pre-#84 persisted
+    concept degrades gracefully (no arc to check) rather than hard-failing,
+    the same treatment `locations` already gets -- but it is reported, not
+    silent."""
+    driver = ScriptedDriver([_three_beat_gag()])
+    with caplog.at_level("WARNING"):
+        result = generate_beats(_config(tmp_path), _chunks(), CONCEPT, driver)
+
+    assert len(result.beats) == 3
+    assert "no `acts` structure" in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# check_act_structure -- issue #84's four mechanical arc checks. Each is
+# independently testable and independently failing, and a sheet violating
+# more than one must report all of them in a single message (one retry round
+# costs a whole model call).
+# --------------------------------------------------------------------------- #
+
+
+def _act_beat(chunk_id, act, *, role="transition", group=1, focus="subject", start=None):
+    return Beat(
+        chunk_id=chunk_id,
+        start=start if start is not None else float(chunk_id) * 6.0,
+        end=(start if start is not None else float(chunk_id) * 6.0) + 6.0,
+        beat=f"beat {chunk_id}",
+        beat_role=role,
+        beat_group=group,
+        location="the room",
+        act=act,
+        focus=focus,
+    )
+
+
+_THREE_ACTS = ("situation", "complication", "resolution")
+
+
+def test_an_empty_acts_vocabulary_skips_every_check():
+    beats = (_act_beat(1, "anything"), _act_beat(2, "anything else"))
+    problems: list[str] = []
+
+    check_act_structure(beats, (), problems)
+
+    assert problems == []
+
+
+def test_a_valid_arc_passes_every_check():
+    beats = (
+        _act_beat(1, "situation", role="plant", group=1),
+        _act_beat(2, "complication", role="contact", group=1),
+        _act_beat(3, "resolution", role="consequence", group=1, focus="action"),
+    )
+    problems: list[str] = []
+
+    check_act_structure(beats, _THREE_ACTS, problems)
+
+    assert problems == []
+
+
+def test_an_act_with_no_beat_at_all_is_reported():
+    beats = (
+        _act_beat(1, "situation", role="plant", group=1),
+        _act_beat(2, "resolution", role="consequence", group=1, focus="action"),
+        # "complication" never appears
+    )
+    problems: list[str] = []
+
+    check_act_structure(beats, _THREE_ACTS, problems)
+
+    assert any("complication" in p and "no beat" in p for p in problems)
+
+
+def test_acts_visited_out_of_the_concepts_stated_order_are_reported():
+    """Order can fail even when every act's own beats stay contiguous: here
+    the concept declares situation/complication/resolution, but the beats
+    visit resolution, then situation, then complication -- three clean
+    blocks, wrong sequence."""
+    beats = (
+        _act_beat(1, "resolution", start=0.0),
+        _act_beat(2, "situation", start=6.0),
+        _act_beat(3, "complication", start=12.0),
+    )
+    problems: list[str] = []
+
+    check_act_structure(beats, _THREE_ACTS, problems)
+
+    assert any("does not follow the concept's stated order" in p for p in problems)
+    # Contiguity is NOT violated by this sheet -- each act's beats still form
+    # one unbroken run -- so this must be the only failure of its kind.
+    assert not any("reappear" in p for p in problems)
+
+
+def test_an_act_that_reappears_after_a_later_one_started_is_reported():
+    """Contiguity can fail even when the overall first-appearance order is
+    correct: situation is seen first, complication second (correct order),
+    but situation then comes BACK after complication has already started."""
+    beats = (
+        _act_beat(1, "situation", start=0.0),
+        _act_beat(2, "complication", start=6.0),
+        _act_beat(3, "situation", start=12.0),
+        _act_beat(4, "resolution", start=18.0),
+    )
+    problems: list[str] = []
+
+    check_act_structure(beats, _THREE_ACTS, problems)
+
+    assert any("reappear" in p and "situation" in p for p in problems)
+    # Order of FIRST appearances (situation, complication, resolution) is
+    # still correct, so this must be the only failure of its kind.
+    assert not any("does not follow the concept's stated order" in p for p in problems)
+
+
+def test_a_final_act_with_no_payoff_of_an_earlier_plant_is_reported():
+    """The only real test of an arc, and the issue says so: a sequence of
+    events with no earlier plant paid off at the end is not a story."""
+    beats = (
+        _act_beat(1, "situation", role="transition", start=0.0),
+        _act_beat(2, "complication", role="transition", start=6.0),
+        _act_beat(3, "resolution", role="transition", start=12.0),
+    )
+    problems: list[str] = []
+
+    check_act_structure(beats, _THREE_ACTS, problems)
+
+    assert any("no consequence beat" in p for p in problems)
+
+
+def test_a_final_act_consequence_whose_plant_is_in_the_same_act_does_not_count():
+    """The plant has to be in an EARLIER act -- a plant and its consequence
+    both inside the final act is not an arc, it is one more local gag."""
+    beats = (
+        _act_beat(1, "situation", role="transition", start=0.0),
+        _act_beat(2, "complication", role="transition", start=6.0),
+        _act_beat(3, "resolution", role="plant", group=5, start=12.0),
+        _act_beat(4, "resolution", role="contact", group=5, start=18.0),
+        _act_beat(5, "resolution", role="consequence", group=5, focus="action", start=24.0),
+    )
+    problems: list[str] = []
+
+    check_act_structure(beats, _THREE_ACTS, problems)
+
+    assert any("no consequence beat" in p for p in problems)
+    assert not any("no beat" in p for p in problems)  # every act IS used; isolate the payoff fault
+
+
+def test_a_single_act_skips_the_payoff_check():
+    """With only one act there is no EARLIER act to plant from, so the
+    payoff check would be unsatisfiable by construction -- deliberately
+    skipped rather than an always-failing trap for a legitimately single-act
+    song."""
+    beats = (_act_beat(1, "the whole song", role="transition"),)
+    problems: list[str] = []
+
+    check_act_structure(beats, ("the whole song",), problems)
+
+    assert problems == []
+
+
+def test_every_act_problem_is_reported_at_once():
+    """One retry round costs a whole model call: a sheet with several arc
+    faults must come back with several complaints, not the first one."""
+    beats = (
+        _act_beat(1, "resolution", role="transition", start=0.0),
+        _act_beat(2, "situation", role="transition", start=6.0),
+        # "complication" never appears, order is wrong, and there is no
+        # payoff -- three distinct faults in one small sheet.
+    )
+    problems: list[str] = []
+
+    check_act_structure(beats, _THREE_ACTS, problems)
+
+    assert len(problems) >= 3
 
 
 def test_every_named_beat_role_is_accepted():
@@ -517,6 +769,144 @@ def test_a_beat_is_serialisable_and_round_trips():
     beats = validate_beats(_three_beat_gag(), _chunks())
 
     assert tuple(Beat.from_dict(b.to_dict()) for b in beats) == beats
+
+
+# --------------------------------------------------------------------------- #
+# `subject` -- issue #82: whose shot an INSTRUMENTAL beat is. Emitted here
+# rather than inferred from pronouns later, per the issue's own instruction:
+# "the beats stage already knows whose beat it is". Legal only on a chunk
+# nobody sings; the stage has `chunks` in scope, so that is checkable here.
+# --------------------------------------------------------------------------- #
+
+_CAST_NAMES = ("Dianne", "Jan")
+
+
+def _mixed_chunks():
+    """One instrumental chunk (1) and two voiced chunks (2, 3), all in the
+    same beat_group=1/transition shape so no consequence plumbing is needed
+    to isolate `subject` behaviour."""
+    return (
+        _chunk(1, "", instrumental=True),
+        _chunk(2, "lyric line two", characters=("Dianne",)),
+        _chunk(3, "lyric line three", characters=("Jan",)),
+    )
+
+
+def test_a_subject_on_an_instrumental_chunk_is_accepted():
+    reply = _reply(
+        _entry(1, subject="Jan"),
+        _entry(2),
+        _entry(3),
+    )
+
+    beats = validate_beats(reply, _mixed_chunks(), cast_names=_CAST_NAMES)
+
+    assert next(b for b in beats if b.chunk_id == 1).subject == "Jan"
+    assert next(b for b in beats if b.chunk_id == 2).subject is None
+
+
+def test_subject_is_absent_by_default():
+    beats = validate_beats(_three_beat_gag(), _chunks())
+
+    assert all(b.subject is None for b in beats)
+
+
+@pytest.mark.parametrize("bad", [123, [], {}, True])
+def test_a_non_string_subject_is_rejected(bad):
+    reply = _reply(_entry(1, subject=bad), _entry(2), _entry(3))
+
+    with pytest.raises(BeatsValidationError):
+        validate_beats(reply, _mixed_chunks(), cast_names=_CAST_NAMES)
+
+
+def test_an_empty_string_subject_is_rejected():
+    reply = _reply(_entry(1, subject="   "), _entry(2), _entry(3))
+
+    with pytest.raises(BeatsValidationError):
+        validate_beats(reply, _mixed_chunks(), cast_names=_CAST_NAMES)
+
+
+def test_a_subject_not_in_the_known_cast_is_rejected():
+    reply = _reply(_entry(1, subject="Marcus"), _entry(2), _entry(3))
+
+    with pytest.raises(BeatsValidationError, match="cast"):
+        validate_beats(reply, _mixed_chunks(), cast_names=_CAST_NAMES)
+
+
+def test_an_empty_cast_names_vocabulary_accepts_any_non_empty_subject():
+    """Same "no vocabulary supplied" degradation `locations`/`acts` already
+    get -- a caller that has not wired the cast through must not be blocked
+    from parsing at all."""
+    reply = _reply(_entry(1, subject="Anybody"), _entry(2), _entry(3))
+
+    beats = validate_beats(reply, _mixed_chunks(), cast_names=())
+
+    assert next(b for b in beats if b.chunk_id == 1).subject == "Anybody"
+
+
+def test_a_subject_on_a_voiced_chunk_is_rejected():
+    """The beats stage has `chunks` in scope, so this is checkable here --
+    "a lint that guesses loses to a stage that knows"."""
+    reply = _reply(_entry(1), _entry(2, subject="Jan"), _entry(3))
+
+    with pytest.raises(BeatsValidationError, match="voiced"):
+        validate_beats(reply, _mixed_chunks(), cast_names=_CAST_NAMES)
+
+
+def test_a_subject_round_trips():
+    reply = _reply(_entry(1, subject="Jan"), _entry(2), _entry(3))
+    beats = validate_beats(reply, _mixed_chunks(), cast_names=_CAST_NAMES)
+
+    assert tuple(Beat.from_dict(b.to_dict()) for b in beats) == beats
+
+
+def test_from_dict_tolerates_a_persisted_beat_sheet_with_no_subject_key():
+    """A pre-#82 persisted beat sheet has no `subject` key at all --
+    `payload.get`, exactly as `location` tolerates its own pre-#78 absence."""
+    beats = validate_beats(_three_beat_gag(), _chunks())
+    payload = beats[0].to_dict()
+    del payload["subject"]
+
+    restored = Beat.from_dict(payload)
+
+    assert restored.subject is None
+
+
+def test_generate_beats_threads_the_cast_into_validation(tmp_path):
+    """`config.cast` is already in scope in `generate_beats` -- the cast
+    membership check must use it without a caller threading anything extra."""
+    bad = _reply(
+        _entry(1, subject="Not A Cast Member"),
+        _entry(2),
+        _entry(3),
+    )
+    good = _reply(_entry(1, subject="Marcus"), _entry(2), _entry(3))
+    driver = ScriptedDriver([bad, good])
+
+    result = generate_beats(_config(tmp_path), _mixed_chunks(), CONCEPT, driver)
+
+    assert len(driver.calls) == 2
+    assert "cast members" in driver.calls[1]["prompt"]
+    assert next(b for b in result.beats if b.chunk_id == 1).subject == "Marcus"
+
+
+def test_the_beats_preamble_documents_subject():
+    from music_video_maker.authoring.prompts import BEATS_PREAMBLE
+
+    lowered = BEATS_PREAMBLE.lower()
+    assert "subject" in lowered
+    assert "instrumental" in lowered
+    assert "#82" in BEATS_PREAMBLE or "82" in BEATS_PREAMBLE
+
+
+def test_the_user_prompt_names_the_default_lead_vocalist(tmp_path):
+    """The model can only apply "someone other than the default lead
+    vocalist" if it is told who that is."""
+    config = _config(tmp_path)
+
+    prompt = build_beats_prompt(config, _chunks(), CONCEPT)
+
+    assert config.default_lead_vocalist in prompt
 
 
 # --------------------------------------------------------------------------- #

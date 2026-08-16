@@ -78,7 +78,7 @@ BEATS_SCHEMA: dict[str, Any] = {
                 "type": "object",
                 "additionalProperties": False,
                 "required": [
-                    "chunk_id", "beat", "beat_role", "beat_group", "focus", "location",
+                    "chunk_id", "beat", "beat_role", "beat_group", "focus", "location", "act",
                 ],
                 "properties": {
                     "chunk_id": {"type": "integer"},
@@ -94,6 +94,17 @@ BEATS_SCHEMA: dict[str, Any] = {
                     # hint below covers only "is this a string", the way
                     # `--json-schema` covers every other field here.
                     "location": {"type": "string", "minLength": 1},
+                    # Issue #84: which of the concept's ordered `acts` this
+                    # beat belongs to. Required the same way `location` is,
+                    # and checked against the concept's closed vocabulary in
+                    # `_parse_entries` -- never guessed, never left blank.
+                    "act": {"type": "string", "minLength": 1},
+                    # Issue #82: whose shot this is, on an INSTRUMENTAL beat
+                    # only. Optional -- most beats leave it out entirely --
+                    # and checked against both the cast and this chunk's
+                    # voiced/instrumental status in `_parse_entries`, never
+                    # just "is this a string" the way this schema hint is.
+                    "subject": {"type": "string", "minLength": 1},
                 },
             },
         }
@@ -136,6 +147,40 @@ class Beat:
     against it in :func:`_parse_entries` -- never guessed from finished shot
     text (see ``shot_plan.py``'s "a lint that guesses loses to a stage that
     knows")."""
+    act: str = ""
+    """Which of the concept's ordered ``acts`` (issue #84) this beat belongs
+    to, e.g. ``"situation"`` or ``"resolution"``. Assigned from the concept's
+    closed act vocabulary and validated against it in :func:`_parse_entries`,
+    the same treatment ``location`` gets. Defaults to ``""`` -- unlike
+    ``location``, this field is given a dataclass default rather than made
+    positionally required: a persisted pre-#84 beat sheet has no ``act`` key
+    at all, and ``""`` is the same "not authored" default already used for an
+    absent optional field elsewhere in this class, not a fabricated act. The
+    actual gate is :data:`BEATS_SCHEMA` plus :func:`_parse_entries`, which
+    require a real, non-empty ``act`` on every entry a *fresh* model reply
+    produces -- the dataclass default only covers reading old data back in."""
+    subject: str | None = None
+    """Whose shot an INSTRUMENTAL beat is (issue #82) -- the field that
+    replaces the render's ``default_lead_vocalist`` fallback (composed as
+    "is the focus of this shot") when a beat on a chunk nobody sings is
+    actually about someone else. ``None`` by default, unlike ``location``/
+    ``act``'s ``""`` sentinel: those two are REQUIRED on every beat and
+    ``""`` means "an old sheet predating the field", whereas ``subject`` is
+    OPTIONAL on every beat and absent on almost all of them, so ``None`` --
+    the same "not stated" default :attr:`length_seconds` already uses -- is
+    the honest value, not a fabricated placeholder standing in for a real
+    field the model chose not to set.
+
+    Emitted by THIS stage rather than inferred later from pronouns, per the
+    issue's own instruction: "the beats stage already knows whose beat it
+    is". Legal only when this beat's chunk is instrumental -- checked in
+    :func:`_parse_entries`, which has ``chunks`` in scope and so does not
+    have to guess -- and refused by the render's own
+    :func:`~music_video_maker.shot_plan.lint_subject_on_voiced_chunk` a
+    second time as defence in depth. Not
+    :attr:`~music_video_maker.shot_plan.ShotPlanEntry.subject_is_focus`
+    (issue #26): that is a boolean asking whether the focus member is the
+    sentence's grammatical subject; this says WHO the focus member is."""
     focus: str = FOCUS_SUBJECT
     length_seconds: float | None = None
     merged_from: tuple[int, ...] = ()
@@ -152,6 +197,8 @@ class Beat:
             "beat_role": self.beat_role,
             "beat_group": self.beat_group,
             "location": self.location,
+            "act": self.act,
+            "subject": self.subject,
             "focus": self.focus,
             "length_seconds": self.length_seconds,
             "merged_from": list(self.merged_from),
@@ -171,6 +218,13 @@ class Beat:
             # already uses for an absent optional field, not a fabricated
             # place.
             location=str(payload.get("location") or ""),
+            # Pre-#84 persisted beat sheets have no `act` key at all -- same
+            # "not authored" default as `location` above.
+            act=str(payload.get("act") or ""),
+            # Pre-#82 persisted beat sheets have no `subject` key at all;
+            # `None` -- not `""` -- is the correct "not stated" value here,
+            # see the field's own docstring.
+            subject=(None if payload.get("subject") is None else str(payload["subject"])),
             focus=str(payload.get("focus", FOCUS_SUBJECT)),
             length_seconds=(
                 None if payload.get("length_seconds") is None else float(payload["length_seconds"])
@@ -193,12 +247,12 @@ class BeatsResult:
 # --------------------------------------------------------------------------- #
 
 
-def _canonical_locations(locations: Sequence[str]) -> dict[str, str]:
-    """``{normalized: as-written}`` for the concept's closed vocabulary
-    (issue #78), keyed by a case/whitespace-insensitive form so a model that
-    varies capitalization across beats ("Mill" vs "mill") does not fragment
-    one place into two in the written plan."""
-    return {loc.strip().lower(): loc.strip() for loc in locations if loc and loc.strip()}
+def _canonical_vocabulary(values: Sequence[str]) -> dict[str, str]:
+    """``{normalized: as-written}`` for a closed vocabulary (``locations``,
+    issue #78; ``acts``, issue #84), keyed by a case/whitespace-insensitive
+    form so a model that varies capitalization across beats ("Mill" vs
+    "mill") does not fragment one entry into two in the written plan."""
+    return {v.strip().lower(): v.strip() for v in values if v and v.strip()}
 
 
 def _parse_entries(
@@ -206,6 +260,8 @@ def _parse_entries(
     chunks: Sequence[AudioChunk],
     problems: list[str],
     locations: Sequence[str] = (),
+    acts: Sequence[str] = (),
+    cast_names: Sequence[str] = (),
 ) -> tuple[Beat, ...]:
     """Shape-check each entry and pin it to a real chunk. Appends to
     ``problems`` rather than raising, so one round reports everything.
@@ -217,8 +273,19 @@ def _parse_entries(
     beat's ``location`` outside it is a validation problem sent back to the
     model, the same "a generated anchor is never trusted" treatment
     ``chunk_id`` gets above: never silently accepted, never silently
-    dropped."""
-    canonical = _canonical_locations(locations)
+    dropped.
+
+    ``acts`` is issue #84's closed, ordered vocabulary for ``act`` -- the
+    same "empty means no vocabulary supplied" convention ``locations``
+    follows.
+
+    ``cast_names`` is issue #82's known-cast set for ``subject``, exactly
+    the same "empty means no vocabulary supplied" degradation -- a caller
+    that has not threaded the cast through (most tests) must not be blocked
+    from parsing at all."""
+    canonical = _canonical_vocabulary(locations)
+    canonical_acts = _canonical_vocabulary(acts)
+    known_cast = {n.strip() for n in cast_names if n and n.strip()}
     if not isinstance(data, dict):
         raise BeatsValidationError(
             f"beats reply must be a JSON object, got {type(data).__name__}"
@@ -313,7 +380,50 @@ def _parse_entries(
         else:
             location = location.strip()
 
+        act = entry.get("act")
+        if not isinstance(act, str) or not act.strip():
+            problems.append(f"chunk_id={chunk_id} act must be a non-empty string")
+            continue
+        if canonical_acts:
+            resolved_act = canonical_acts.get(act.strip().lower())
+            if resolved_act is None:
+                problems.append(
+                    f"chunk_id={chunk_id} act={act!r} is not one of this song's approved "
+                    f"acts {sorted(canonical_acts.values())}. Every beat's `act` has to be "
+                    "exactly one of the concept's ordered acts -- pick the closest match, "
+                    "or say in your reply why the concept's act structure needs revising"
+                )
+                continue
+            act = resolved_act
+        else:
+            act = act.strip()
+
         chunk = by_id[chunk_id]
+
+        subject = entry.get("subject")
+        if subject is not None:
+            if not isinstance(subject, str) or not subject.strip():
+                problems.append(
+                    f"chunk_id={chunk_id} subject={subject!r} must be a single non-blank "
+                    "cast name naming whose shot this is, or omitted entirely"
+                )
+                continue
+            subject = subject.strip()
+            if known_cast and subject not in known_cast:
+                problems.append(
+                    f"chunk_id={chunk_id} subject={subject!r} is not one of this song's "
+                    f"cast members {sorted(known_cast)}"
+                )
+                continue
+            if not chunk.is_instrumental:
+                problems.append(
+                    f"chunk_id={chunk_id} sets subject={subject!r} but this chunk is "
+                    "voiced -- the singer already owns the frame on a voiced chunk "
+                    "(issues #58, #59, #60); `subject` is legal only on an instrumental "
+                    "chunk"
+                )
+                continue
+
         beats.append(
             Beat(
                 chunk_id=chunk_id,
@@ -323,6 +433,8 @@ def _parse_entries(
                 beat_role=role,
                 beat_group=group,
                 location=location,
+                act=act,
+                subject=subject,
                 focus=focus,
                 length_seconds=length,
             )
@@ -388,17 +500,124 @@ def check_beat_structure(
                 )
 
 
+def check_act_structure(
+    beats: Sequence[Beat], acts: Sequence[str], problems: list[str]
+) -> None:
+    """Issue #84's four mechanical arc checks, all independent and all
+    appended to ``problems`` rather than raised on the first -- the same "one
+    retry round costs a whole model call" convention :func:`check_beat_structure`
+    already follows, one level up.
+
+    ``acts`` is the concept's closed, ORDERED vocabulary. Empty means no
+    vocabulary was supplied (a pre-#84 concept, or a caller not using the
+    field) -- the same "empty means no check" convention ``locations``
+    follows -- so this function does nothing at all in that case rather than
+    inventing an order to check beats against.
+
+    The four checks, each independently testable and independently failing:
+
+    1. **Coverage** -- every declared act has at least one beat. An act named
+       in the concept but never used is not part of this video's shape.
+    2. **Order** -- the acts' first appearances, walking beats in song-time
+       order, follow the concept's own stated sequence. This can fail even
+       when every act's beats are individually contiguous (e.g. acts visited
+       C, A, B when the concept declared A, B, C).
+    3. **Contiguity** -- once a beat sequence leaves an act, that act must
+       never come back. This can fail even when the *overall* order of first
+       appearances is correct (e.g. A, B, A, C -- A's second appearance does
+       not change when A/B/C were each *first* seen).
+    4. **Payoff** -- the only real test of an arc, and the issue says so in
+       as many words: the FINAL act must contain at least one ``consequence``
+       beat whose ``beat_group`` also contains a ``plant`` from an EARLIER
+       act. Skipped when there is only one act: with nothing earlier to plant
+       from, the check would be unsatisfiable by construction rather than a
+       real test of anything.
+    """
+    if not acts:
+        return
+
+    ordered = sorted(beats, key=lambda b: b.start)
+    index = {name: position for position, name in enumerate(acts)}
+
+    used = {beat.act for beat in ordered}
+    empty_acts = [name for name in acts if name not in used]
+    if empty_acts:
+        problems.append(
+            f"these act(s) from the concept's structure have no beat assigned to them: "
+            f"{empty_acts}. Every act in {list(acts)} has to actually happen somewhere in "
+            "the song, or it is not part of this video's shape"
+        )
+
+    # Collapse consecutive same-act beats into "runs" so order and
+    # contiguity can be checked on the sequence of distinct blocks.
+    runs: list[str] = []
+    for beat in ordered:
+        if not runs or runs[-1] != beat.act:
+            runs.append(beat.act)
+
+    seen: set[str] = set()
+    reappeared: list[str] = []
+    for act in runs:
+        if act in seen and act not in reappeared:
+            reappeared.append(act)
+        seen.add(act)
+    if reappeared:
+        problems.append(
+            f"act(s) {reappeared} reappear after a later act had already started. Each act's "
+            "beats must form ONE unbroken run across the song -- an act that starts, stops "
+            "for another act, then starts again is not one continuous movement of the story"
+        )
+
+    first_seen = list(dict.fromkeys(runs))
+    positions = [index[act] for act in first_seen if act in index]
+    if positions != sorted(positions):
+        problems.append(
+            f"the beats visit the acts in the order {first_seen}, which does not follow the "
+            f"concept's stated order {list(acts)}. Acts must unfold in the order the concept "
+            "declared them"
+        )
+
+    if len(acts) > 1:
+        final_act = acts[-1]
+        final_index = index[final_act]
+        plant_groups_before_final = {
+            beat.beat_group
+            for beat in ordered
+            if beat.beat_role == "plant" and index.get(beat.act, final_index) < final_index
+        }
+        payoff = any(
+            beat.beat_role == "consequence" and beat.beat_group in plant_groups_before_final
+            for beat in ordered
+            if beat.act == final_act
+        )
+        if not payoff:
+            problems.append(
+                f"the final act ({final_act!r}) contains no consequence beat whose beat_group "
+                "also has a plant in an earlier act. This is the only real test of an arc: "
+                "something planted earlier has to be paid off at the end, not just a sequence "
+                "of events"
+            )
+
+
 def validate_beats(
-    data: object, chunks: Sequence[AudioChunk], locations: Sequence[str] = ()
+    data: object,
+    chunks: Sequence[AudioChunk],
+    locations: Sequence[str] = (),
+    acts: Sequence[str] = (),
+    cast_names: Sequence[str] = (),
 ) -> tuple[Beat, ...]:
     """Parse and check a model reply, or raise with everything that is wrong.
 
     ``locations`` is the concept's closed vocabulary for ``location`` (issue
-    #78); empty means no vocabulary was supplied and any non-empty
-    ``location`` string is accepted. See :func:`_parse_entries`."""
+    #78); ``acts`` is the concept's closed, ordered vocabulary for ``act``
+    (issue #84); ``cast_names`` is the known cast for ``subject`` (issue
+    #82). All three empty means no vocabulary was supplied and anything
+    structurally valid is accepted. See :func:`_parse_entries` and
+    :func:`check_act_structure`."""
     problems: list[str] = []
-    beats = _parse_entries(data, chunks, problems, locations)
+    beats = _parse_entries(data, chunks, problems, locations, acts, cast_names)
     check_beat_structure(beats, chunks, problems)
+    check_act_structure(beats, acts, problems)
     if problems:
         raise BeatsValidationError(
             f"beat sheet has {len(problems)} problem(s):\n- " + "\n- ".join(problems)
@@ -428,6 +647,38 @@ def beats_input_hashes(
     }
 
 
+def _reading_block(reading: Mapping[str, Any]) -> list[str]:
+    """Issue #69 requirement 6: beats must actually SEE the reading, not just
+    the concept's own invented pitch -- a field nothing downstream consumes
+    is orphaned observability. Absent entirely for a pre-#69 concept (see
+    :func:`_concept_block`'s caller), never fabricated."""
+    lines = [
+        "## What the song is actually about (read this before the beats below)",
+        f"Subject: {reading.get('subject', '')}",
+        f"Speaker -> addressee: {reading.get('speaker', '')} -> {reading.get('addressee', '')}",
+        f"Situation: {reading.get('situation', '')}",
+        f"What changes across the song: {reading.get('change', '')}",
+        (
+            f"Register/period/place: {reading.get('register', '')} / "
+            f"{reading.get('period', '')} / {reading.get('place', '')}"
+        ),
+    ]
+    nouns = reading.get("nouns") or []
+    if nouns:
+        lines.append("Concrete nouns the lyrics themselves name: " + "; ".join(map(str, nouns)))
+    references = reading.get("references") or []
+    if references:
+        for ref in references:
+            if not isinstance(ref, Mapping):
+                continue
+            imagery = "; ".join(str(i) for i in (ref.get("imagery") or []))
+            lines.append(
+                f"Reference -- {ref.get('reference', '')} ({ref.get('what_it_is', '')}): "
+                f"{imagery}"
+            )
+    return lines
+
+
 def _concept_block(concept: Mapping[str, Any]) -> str:
     parts = [
         f"Logline: {concept.get('logline', '')}",
@@ -446,6 +697,22 @@ def _concept_block(concept: Mapping[str, Any]) -> str:
             "Approved locations -- every beat's `location` MUST be exactly one of these: "
             + "; ".join(str(loc) for loc in locations)
         )
+    acts = concept.get("acts") or []
+    if acts:
+        parts.append(
+            "Approved acts, IN THIS ORDER -- every beat's `act` MUST be exactly one of these, "
+            "the acts must run in this order across the song, and the final act must pay off "
+            "something an earlier act planted: "
+            + "; ".join(
+                f"{a.get('name', '')} ({a.get('function', '')})"
+                for a in acts
+                if isinstance(a, Mapping)
+            )
+        )
+    reading = concept.get("reading")
+    if isinstance(reading, Mapping) and reading:
+        parts.append("")
+        parts.extend(_reading_block(reading))
     return "\n".join(parts)
 
 
@@ -475,6 +742,11 @@ def build_beats_prompt(
         skeleton_table_text(chunks),
         "## Cast",
         cast_lines,
+        (
+            "Default lead vocalist -- who the render frames on an INSTRUMENTAL chunk "
+            f"unless a beat's `subject` names someone else (issue #82): "
+            f"{config.default_lead_vocalist}"
+        ),
     ]
     if config.setting:
         parts += ["", f"## Setting (fixed for the whole video): {config.setting}"]
@@ -514,6 +786,26 @@ def generate_beats(
     # Issue #78: the closed vocabulary `location` is checked against, straight
     # from the approved concept -- never re-derived or guessed here.
     locations = tuple(str(loc) for loc in (concept.get("locations") or ()))
+    # Issue #84: the closed, ORDERED act vocabulary, likewise straight from
+    # the concept. A pre-#84 concept has no "acts" key at all -- `or ()`
+    # degrades to "no vocabulary supplied" (see `check_act_structure`'s own
+    # docstring), never a hard failure; that concept simply produced a beat
+    # sheet with no arc structure to check, which is the same graceful
+    # degradation `locations` already gets for a pre-#78 concept.
+    acts = tuple(
+        str(a["name"])
+        for a in (concept.get("acts") or ())
+        if isinstance(a, Mapping) and a.get("name")
+    )
+    if not acts:
+        logger.warning(
+            "This concept has no `acts` structure (issue #84) -- the beat sheet will have no "
+            "story arc to check against. Re-run the concept stage to pick one up."
+        )
+    # Issue #82: the known cast for `subject`, straight from `config.cast` --
+    # already in scope here, unlike `locations`/`acts` which have to come
+    # from the concept because nothing else carries them.
+    cast_names = tuple(config.cast)
 
     last_error: BeatsValidationError | None = None
     for attempt in range(1, max_validation_attempts + 1):
@@ -521,7 +813,7 @@ def generate_beats(
             system=system, prompt=prompt, model=MODEL_OPUS, schema=BEATS_SCHEMA
         )
         try:
-            beats = validate_beats(result.data, chunks, locations)
+            beats = validate_beats(result.data, chunks, locations, acts, cast_names)
         except BeatsValidationError as exc:
             last_error = exc
             logger.warning(
@@ -591,6 +883,7 @@ __all__ = [
     "beat_length_requests",
     "beats_input_hashes",
     "build_beats_prompt",
+    "check_act_structure",
     "check_beat_structure",
     "generate_beats",
     "validate_beats",

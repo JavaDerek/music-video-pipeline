@@ -129,6 +129,22 @@ def reanchor_beats(
       wins" rule as ``beat_group``, and warned about the same way when
       members disagree: a vanished location boundary is exactly the kind of
       thing this field exists to make loud rather than silently merge away.
+    * **act** (issue #84) -- the first member's, the same "first member wins"
+      rule as ``location``, and warned about the same way when members
+      disagree. A long take that swallows an act boundary would otherwise
+      silently misreport which of the concept's acts the merged chunk
+      belongs to for :func:`.beats.check_act_structure`'s coverage/order/
+      contiguity checks.
+    * **subject** (issue #82) -- the first member that SET one (mirroring
+      ``length_seconds``'s own rule, not ``location``'s: most beats leave
+      ``subject`` unset, so "the literal first member's" would silently drop
+      one set by a later member). Warned about, the same way, when more than
+      one member sets a *different* subject. Then, regardless of which path
+      produced it, **dropped** -- not carried -- if the chunk it lands on is
+      now VOICED: the field is illegal there (issues #58, #59, #60), and a
+      ``length_seconds`` re-cut can change which chunks are voiced, so this
+      has to be re-checked against the retiled timeline every time, not just
+      inherited from whichever beat happened to set it.
     """
     if not chunks:
         raise ValueError("cannot re-anchor beats onto an empty chunk timeline")
@@ -173,10 +189,32 @@ def reanchor_beats(
     )
 
 
+def _drop_subject_if_now_voiced(beat: Beat, chunk: AudioChunk) -> Beat:
+    """Issue #82: a beat carrying ``subject`` may land on a chunk that is now
+    VOICED in the retiled timeline -- ``subject`` is illegal there (issues
+    #58, #59, #60), so it is dropped rather than silently carried through. A
+    ``length_seconds`` re-cut is the mechanism, but the check is against the
+    chunk actually produced, not against whether a re-cut happened, so this
+    applies on both the identity path (one beat, one chunk) and the merge
+    path."""
+    if beat.subject is not None and not chunk.is_instrumental:
+        logger.warning(
+            "Chunk %d re-anchored subject=%r onto a chunk that is now voiced; dropping it "
+            "(issue #82). `subject` is legal only on an instrumental chunk, and a "
+            "length_seconds re-cut can change which chunks are voiced.",
+            chunk.chunk_id,
+            beat.subject,
+        )
+        return replace(beat, subject=None)
+    return beat
+
+
 def _merge(members: Sequence[Beat], chunk: AudioChunk) -> Beat:
     first = members[0]
     if len(members) == 1:
-        return replace(first, chunk_id=chunk.chunk_id, start=chunk.start, end=chunk.end)
+        return _drop_subject_if_now_voiced(
+            replace(first, chunk_id=chunk.chunk_id, start=chunk.start, end=chunk.end), chunk
+        )
 
     groups = {member.beat_group for member in members}
     if len(groups) > 1:
@@ -216,6 +254,32 @@ def _merge(members: Sequence[Beat], chunk: AudioChunk) -> Beat:
             first.location,
         )
 
+    acts = {member.act for member in members}
+    if len(acts) > 1:
+        logger.warning(
+            "Chunk %d merges beats naming %d different act(s) (%s); keeping %r (issue #84). "
+            "A vanished act boundary silently attaches one act's beat to another's -- if this "
+            "long take really does cross an act boundary, consider a shorter length_seconds "
+            "instead so the boundary survives.",
+            chunk.chunk_id,
+            len(acts),
+            sorted(acts),
+            first.act,
+        )
+
+    with_subject = [m for m in members if m.subject is not None]
+    if len({m.subject for m in with_subject}) > 1:
+        logger.warning(
+            "Chunk %d merges beats naming %d different subject(s) (%s); keeping %r "
+            "(issue #82). A vanished subject is how the render's own "
+            "default_lead_vocalist fallback silently reclaims a shot that was actually "
+            "about someone else.",
+            chunk.chunk_id,
+            len(with_subject),
+            [(m.chunk_id, m.subject) for m in with_subject],
+            with_subject[0].subject,
+        )
+
     role = max(
         (m.beat_role for m in members),
         key=lambda r: _ROLE_PRECEDENCE.index(r) if r in _ROLE_PRECEDENCE else -1,
@@ -225,7 +289,7 @@ def _merge(members: Sequence[Beat], chunk: AudioChunk) -> Beat:
         if any(m.focus == FOCUS_ACTION or m.beat_role == "consequence" for m in members)
         else first.focus
     )
-    return Beat(
+    merged = Beat(
         chunk_id=chunk.chunk_id,
         start=chunk.start,
         end=chunk.end,
@@ -233,10 +297,13 @@ def _merge(members: Sequence[Beat], chunk: AudioChunk) -> Beat:
         beat_role=role,
         beat_group=first.beat_group,
         location=first.location,
+        act=first.act,
+        subject=with_subject[0].subject if with_subject else None,
         focus=focus,
         length_seconds=with_length[0].length_seconds if with_length else None,
         merged_from=tuple(m.chunk_id for m in members),
     )
+    return _drop_subject_if_now_voiced(merged, chunk)
 
 
 # --------------------------------------------------------------------------- #

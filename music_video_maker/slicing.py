@@ -82,6 +82,19 @@ latent volume, and the song's length fixes the total frame count, so a longer
 shot means fewer shots, not more work. What is *not* free is VRAM --
 see :data:`~music_video_maker.shot_plan.MEASURED_MAX_FRAMES`.
 
+A sixth, always-on refinement runs on top of pass 4's final timeline (issue
+#79): **leading vocal offset**. H3 starts the mouth at frame 0 of a chunk
+regardless of where in that chunk the voice actually starts -- a chunk
+prompted with a lyric that begins seconds into its own span is out of phase
+for the whole chunk, not just the silent lead-in. ``_prefer_vocal_onset``
+moves what boundaries it safely can, one boundary at a time, by transferring
+whole grid steps from a chunk to its predecessor -- compensated so the pair's
+combined duration, and every other boundary in the timeline, is untouched;
+this is deliberately not the kind of filler-tiling change #70 was closed
+without making. ``_log_leading_vocal_offset`` then reports whatever offset
+survives, unconditionally, so a leftover offset is visible before GPU time
+even where the refinement had no room to act.
+
 Timeline integrity is non-negotiable: every chunk's ``start``/``end`` stays
 anchored to the original ``AlignedSegment`` timeline as closely as the frame
 grid allows, ``source_segment_indices`` records exactly which original
@@ -107,6 +120,7 @@ from music_video_maker.contracts import (
     AudioChunk,
     FrameGrid,
     HardwareProfile,
+    WordTiming,
 )
 from music_video_maker.shot_plan import MEASURED_MAX_FRAMES, ShotLength
 
@@ -944,7 +958,7 @@ def _apply_shot_lengths(
     min_frames: int,
     max_frames: int,
     grid: FrameGrid,
-) -> list[tuple[float, int, bool]]:
+) -> tuple[list[tuple[float, int, bool]], frozenset[int]]:
     """Retile a contiguous timeline so each request's anchor gets its length.
 
     A request says "the shot starting at T runs for L seconds". Honouring it
@@ -975,12 +989,23 @@ def _apply_shot_lengths(
     or one swallowed by an earlier, longer take -- is warned about by name and
     skipped. Silence there would mean authored direction that reads as applied
     and is not, which is the failure mode this whole file is built against.
+
+    Returns ``(boundaries, pinned_indices)``. ``pinned_indices`` names every
+    final-list position that is an honoured request's own shot chunk (never
+    the retiled tail behind it, which is not itself an authored length) --
+    issue #79's :func:`_prefer_vocal_onset` must never nudge a boundary an
+    author explicitly set, so it needs to know which ones those are. Stable
+    across every later request in this same call: requests are applied in
+    ascending start order and an honoured one's match can only ever fall at
+    or after the previous one's ``applied_until``, so a later splice never
+    touches a position an earlier request already pinned.
     """
     frames = [count for _, count, _ in boundaries]
     continuations = [flag for _, _, flag in boundaries]
     original_total = sum(frames)
     applied_until = -1.0  # end of the last honoured shot, in seconds
     last_applied_index = -1
+    pinned: set[int] = set()
     shift = 0.0
     """How far honouring the requests so far has moved every boundary after
     them, in seconds. Anchors authored against the *un-retiled* timeline --
@@ -1097,6 +1122,7 @@ def _apply_shot_lengths(
         continuations[index:end] = [continuations[index], *([False] * len(tail))]
         applied_until = starts[index] + grid.frames_to_seconds(target)
         last_applied_index = index
+        pinned.add(index)
         shift += grid.frames_to_seconds(target + sum(tail) - run_total)
 
     _rebalance_tail(
@@ -1110,10 +1136,13 @@ def _apply_shot_lengths(
     )
 
     starts = _boundary_starts(frames, grid)
-    return [
-        (start, count, flag)
-        for start, count, flag in zip(starts, frames, continuations, strict=True)
-    ]
+    return (
+        [
+            (start, count, flag)
+            for start, count, flag in zip(starts, frames, continuations, strict=True)
+        ],
+        frozenset(pinned),
+    )
 
 
 def _rebalance_tail(
@@ -1196,6 +1225,20 @@ def _segments_overlapping(
     return tuple(s for s in segments if s.start < end - _EPS and s.end > start + _EPS)
 
 
+def _words_attributed_to(
+    member: AlignedSegment, start: float, end: float
+) -> list[WordTiming]:
+    """Words of ``member`` whose MIDPOINT lands in ``[start, end)``.
+
+    This is the word-midpoint attribution rule itself, factored out so
+    :func:`_text_within` and :func:`_first_prompted_word_onset` (issue #79)
+    share exactly one implementation of "which words belong to this chunk" --
+    two independent copies of that rule is exactly the kind of drift
+    CLAUDE.md warns a second implementation invites within a month.
+    """
+    return [w for w in member.words if start - _EPS <= (w.start + w.end) / 2.0 < end - _EPS]
+
+
 def _text_within(members: tuple[AlignedSegment, ...], start: float, end: float) -> str:
     """The lyric words actually audible in ``[start, end)``.
 
@@ -1212,25 +1255,51 @@ def _text_within(members: tuple[AlignedSegment, ...], start: float, end: float) 
     all twelve words, H3 sang all twelve in each, and the mouth was still on
     "so much better now" six seconds after the audio had finished saying it.
 
-    A word belongs to the chunk containing its **midpoint**. Chunks tile
-    contiguously and without overlap, so every word lands in exactly one
-    chunk: none duplicated, none dropped. Segments with no word timings fall
-    back to their full text -- there is nothing to slice by, and dropping them
-    silently would be worse than a slightly wide attribution.
+    A word belongs to the chunk containing its **midpoint** (see
+    :func:`_words_attributed_to`). Chunks tile contiguously and without
+    overlap, so every word lands in exactly one chunk: none duplicated, none
+    dropped. Segments with no word timings fall back to their full text --
+    there is nothing to slice by, and dropping them silently would be worse
+    than a slightly wide attribution.
     """
     parts: list[str] = []
     for member in members:
         if not member.words:
             parts.append(member.text)
             continue
-        kept = [
-            w.word.strip()
-            for w in member.words
-            if start - _EPS <= (w.start + w.end) / 2.0 < end - _EPS
-        ]
+        kept = [w.word.strip() for w in _words_attributed_to(member, start, end)]
         if kept:
             parts.append(" ".join(kept))
     return " ".join(p for p in parts if p).strip()
+
+
+def _first_prompted_word_onset(
+    members: tuple[AlignedSegment, ...], start: float, end: float
+) -> float | None:
+    """The earliest start time of a word this chunk is actually prompted to
+    sing -- issue #79's "leading vocal offset", measured from the *same*
+    attribution rule :func:`_text_within` uses (:func:`_words_attributed_to`),
+    so this can never disagree with what a chunk is actually prompted with.
+
+    A segment with no word timings falls back to its own start clamped into
+    the window, mirroring :func:`_text_within`'s whole-segment fallback --
+    there is nothing finer to attribute for it either.
+
+    Returns ``None`` when nothing attributes to this window at all: an
+    instrumental chunk has no leading vocal offset to report.
+    """
+    best: float | None = None
+    for member in members:
+        if not member.words:
+            candidate = max(member.start, start)
+        else:
+            words = _words_attributed_to(member, start, end)
+            if not words:
+                continue
+            candidate = min(w.start for w in words)
+        if best is None or candidate < best:
+            best = candidate
+    return best
 
 
 def _voiced_seconds_within(
@@ -1304,6 +1373,265 @@ def _log_final_boundary_segment_cuts(
         )
 
 
+LEADING_VOCAL_OFFSET_WARN_SECONDS = 1.0
+"""Above this many seconds between a voiced chunk's own start and the first
+word it is actually prompted to sing, issue #79's leading-vocal-offset is
+reported at WARNING rather than only folded into the INFO summary.
+
+H3 starts the mouth at frame 0 of a chunk regardless of where in that chunk
+the voice actually starts, so this many seconds of a chunk's start is always
+out of phase with what is prompted.
+
+Measured on the real 80-chunk "Deathless" timeline (41 voiced chunks, before
+:func:`_prefer_vocal_onset` gets a chance to reduce any of them): offset >
+0.5s on 15 chunks, > 1.0s on 6 (chunk ids 20, 27, 37, 38, 41, 74), > 2.0s on
+2 (chunk 20 at 4.07s, chunk 38 at 3.30s). The issue that reported this by ear
+named exactly two chunks -- 38 (3.30s) and 41 (1.61s) -- and both clear 1.0s
+comfortably, while none of the other 13 chunks sitting between 0.5s and
+1.0s were ever reported as audible. That is exactly the line the issue's own
+proposal drew ("an offset above ~1s is probably always a defect"), and the
+corpus does not support tightening it to 0.5s -- the wider net would catch
+nothing the measurement can confirm is actually a problem.
+"""
+
+
+def _log_leading_vocal_offset(
+    covered: Sequence[_Piece], segments: tuple[AlignedSegment, ...]
+) -> None:
+    """Issue #79: name every voiced chunk whose first prompted word starts
+    measurably after the chunk's own start -- H3 starts the mouth at frame 0
+    regardless, so a chunk like that is out of phase for however long the
+    gap lasts.
+
+    Runs on the *final* ``covered`` timeline (called from
+    :func:`_cover_instrumentals` right beside
+    :func:`_log_final_boundary_segment_cuts`), after
+    :func:`_prefer_vocal_onset` has already moved whatever boundaries it
+    could -- this reports whatever offset survives that pass, not the
+    pre-refinement position. Uses :func:`_first_prompted_word_onset`, which
+    shares its word-midpoint attribution rule with :func:`_text_within`, so
+    this can never name an offset against a lyric the chunk is not actually
+    prompted with.
+
+    A chunk with no prompted words at all -- ``piece.members`` empty, which
+    is also true of a chunk demoted below :data:`_MIN_VOICED_FRACTION` and
+    prompted as instrumental -- has no leading vocal offset to report and is
+    skipped.
+    """
+    voiced_count = 0
+    over_count = 0
+    worst: tuple[int, float, _Piece] | None = None
+
+    for idx, piece in enumerate(covered):
+        if not piece.members:
+            continue
+        onset = _first_prompted_word_onset(piece.members, piece.start, piece.end)
+        if onset is None:
+            continue
+        voiced_count += 1
+        offset = onset - piece.start
+        if offset <= _EPS:
+            continue
+        if worst is None or offset > worst[1]:
+            worst = (idx, offset, piece)
+        if offset > LEADING_VOCAL_OFFSET_WARN_SECONDS:
+            over_count += 1
+            text = _text_within(piece.members, piece.start, piece.end)
+            logger.warning(
+                "Chunk %d (%.3f-%.3fs) is prompted to sing starting %.3fs into its own span "
+                "(first word onset %.3fs) -- H3 starts the mouth at frame 0 regardless, so "
+                "the chunk is out of phase for its first %.3fs: %r (issue #79).",
+                idx,
+                piece.start,
+                piece.end,
+                offset,
+                onset,
+                offset,
+                text,
+            )
+
+    if not voiced_count:
+        return
+    if worst is None:
+        logger.info(
+            "Leading vocal offset: %d voiced chunk(s), all start at their own first prompted "
+            "word.",
+            voiced_count,
+        )
+        return
+    worst_idx, worst_offset, worst_piece = worst
+    logger.info(
+        "Leading vocal offset: %d voiced chunk(s), %d over the %.2fs warning threshold; "
+        "worst is chunk %d at %.3fs (%.3f-%.3fs).",
+        voiced_count,
+        over_count,
+        LEADING_VOCAL_OFFSET_WARN_SECONDS,
+        worst_idx,
+        worst_offset,
+        worst_piece.start,
+        worst_piece.end,
+    )
+
+
+def _is_instrumental_span(
+    segments: tuple[AlignedSegment, ...], start: float, end: float
+) -> bool:
+    """True when a chunk covering ``[start, end)`` would be prompted as
+    instrumental -- either nothing overlaps it at all, or the overlap is too
+    thin to count. The latter is the same :data:`_MIN_VOICED_FRACTION` rule
+    ``_cover_instrumentals`` applies when it builds the final ``covered``
+    pieces (below), so this can never disagree with what a chunk in that
+    position will actually be prompted with.
+
+    Used by :func:`_prefer_vocal_onset` to choose which ceiling applies to a
+    neighbouring chunk -- a filler chunk's is ``filler_max_frames``, a lyric
+    chunk's is ``max_frames``.
+    """
+    members = _segments_overlapping(segments, start, end)
+    if not members:
+        return True
+    voiced = _voiced_seconds_within(segments, start, end)
+    return voiced < _MIN_VOICED_FRACTION * (end - start)
+
+
+def _prefer_vocal_onset(
+    boundaries: list[tuple[float, int, bool]],
+    segments: tuple[AlignedSegment, ...],
+    pinned_indices: frozenset[int],
+    min_frames: int,
+    max_frames: int,
+    filler_max_frames: int,
+    grid: FrameGrid,
+) -> list[tuple[float, int, bool]]:
+    """Prefer a voiced chunk's start at its own leading vocal onset (issue
+    #79), by transferring whole grid steps from the chunk to its
+    predecessor.
+
+    H3 starts the mouth at frame 0 of a chunk regardless of where in that
+    chunk the voice actually begins, so a chunk prompted with a lyric that
+    starts seconds into its own span is out of phase for the whole chunk
+    (measured on "Deathless": 4.07s on chunk 20, 3.30s on chunk 38). This is
+    a *local, zero-cascade* boundary refinement, never a re-plan: moving
+    boundary ``i`` later by ``k`` grid steps grows chunk ``i-1`` by exactly
+    the frames it shrinks chunk ``i`` by, so the two chunks' combined
+    duration -- and every OTHER boundary's start in the whole timeline -- is
+    untouched (the combined duration of chunks ``i-1`` and ``i`` is
+    invariant under the transfer, so chunk ``i-1``'s own start and chunk
+    ``i``'s own end never move; only the shared boundary between them does).
+    #70 was closed unfixed because biasing the filler-tiling maths itself
+    risked exactly the kind of cascade this sidesteps entirely: this pass
+    never touches the tiling, only redistributes frames across one
+    already-decided boundary at a time.
+
+    A boundary is left exactly where it was -- silently, since
+    :func:`_log_leading_vocal_offset` already reports whatever is left --
+    whenever any of these hold:
+
+    * either neighbouring chunk's start was pinned by an honoured
+      :class:`~music_video_maker.shot_plan.ShotLength` request (see
+      ``pinned_indices``, from :func:`_apply_shot_lengths`) -- an author's
+      explicit length must never be silently overridden;
+    * chunk ``i`` is not itself going to be prompted with a lyric (nothing
+      overlaps it, or the overlap is too thin -- :func:`_is_instrumental_span`
+      to match), or its first prompted word already starts at its own start;
+    * the preceding chunk has no headroom below its own ceiling
+      (``max_frames`` for a lyric chunk, ``filler_max_frames`` for an
+      instrumental one), or chunk ``i`` has no headroom above ``min_frames``;
+    * every grid step count that would move the boundary closer to the
+      onset, from the largest permitted down to one, still lands the new
+      boundary inside an aligned segment (:func:`_segment_containing`) --
+      trading a leading-offset defect for a mid-utterance cut is not a
+      preference, it is the other bug.
+
+    The move never overshoots the onset: the largest candidate ``k`` is
+    bounded so ``k`` grid steps is never more than the offset itself, so the
+    boundary only ever approaches the vocal onset and never passes it --
+    clipping the start of the very phrase this exists to protect would just
+    relocate issue #79's defect rather than fix it.
+    """
+    if len(boundaries) < 2:
+        return boundaries
+
+    frames = [count for _, count, _ in boundaries]
+    continuations = [flag for _, _, flag in boundaries]
+    starts = [start for start, _, _ in boundaries]
+    step = grid.step_frames
+    step_seconds = grid.frames_to_seconds(step)
+
+    for i in range(1, len(frames)):
+        if (i - 1) in pinned_indices or i in pinned_indices:
+            continue
+
+        start_i = starts[i]
+        end_i = start_i + grid.frames_to_seconds(frames[i])
+        members_i = _segments_overlapping(segments, start_i, end_i)
+        if not members_i:
+            continue
+        voiced_i = _voiced_seconds_within(segments, start_i, end_i)
+        if voiced_i < _MIN_VOICED_FRACTION * (end_i - start_i):
+            continue  # will be prompted as instrumental -- no offset applies
+
+        onset = _first_prompted_word_onset(members_i, start_i, end_i)
+        if onset is None:
+            continue
+        offset = onset - start_i
+        if offset <= _EPS:
+            continue
+
+        start_prev = starts[i - 1]
+        ceiling_prev = (
+            filler_max_frames
+            if _is_instrumental_span(segments, start_prev, start_i)
+            else max_frames
+        )
+
+        max_k_offset = int(math.floor((offset + _EPS) / step_seconds))
+        max_k_prev = (ceiling_prev - frames[i - 1]) // step
+        max_k_i = (frames[i] - min_frames) // step
+        max_k = min(max_k_offset, max_k_prev, max_k_i)
+        if max_k < 1:
+            continue
+
+        accepted_k = None
+        for k in range(max_k, 0, -1):
+            candidate_start = start_i + k * step_seconds
+            if _segment_containing(candidate_start, segments) is not None:
+                continue
+            accepted_k = k
+            break
+        if accepted_k is None:
+            continue
+
+        k = accepted_k
+        new_prev_frames = frames[i - 1] + k * step
+        new_i_frames = frames[i] - k * step
+        assert grid.is_valid(new_prev_frames) and grid.is_valid(new_i_frames)
+        assert grid.trained_min_frames <= new_prev_frames <= grid.trained_max_frames
+        assert grid.trained_min_frames <= new_i_frames <= grid.trained_max_frames
+
+        new_start_i = start_i + k * step_seconds
+        frames[i - 1] = new_prev_frames
+        frames[i] = new_i_frames
+        starts[i] = new_start_i
+
+        logger.info(
+            "Leading vocal offset: boundary %d moved later by %d frame(s) (%.3fs: %.3fs -> "
+            "%.3fs), cutting chunk %d's leading vocal offset from %.3fs to %.3fs toward its "
+            "onset at %.3fs (issue #79).",
+            i,
+            k * step,
+            k * step_seconds,
+            start_i,
+            new_start_i,
+            i,
+            offset,
+            onset - new_start_i,
+            onset,
+        )
+
+    return list(zip(starts, frames, continuations, strict=True))
+
+
 def _cover_instrumentals(
     pieces: list[_Piece],
     segments: tuple[AlignedSegment, ...],
@@ -1373,9 +1701,15 @@ def _cover_instrumentals(
         _emit_filler(track_duration - running)
 
     if shot_lengths:
-        boundaries = _apply_shot_lengths(
+        boundaries, pinned_indices = _apply_shot_lengths(
             boundaries, shot_lengths, min_frames, max_frames, grid
         )
+    else:
+        pinned_indices = frozenset()
+
+    boundaries = _prefer_vocal_onset(
+        boundaries, segments, pinned_indices, min_frames, max_frames, filler_max_frames, grid
+    )
 
     covered: list[_Piece] = []
     for start, frame_count, is_continuation in boundaries:
@@ -1403,6 +1737,7 @@ def _cover_instrumentals(
         )
 
     _log_final_boundary_segment_cuts(covered, segments)
+    _log_leading_vocal_offset(covered, segments)
 
     voiced = sum(1 for p in covered if p.members)
     logger.info(
