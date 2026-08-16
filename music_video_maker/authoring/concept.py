@@ -41,13 +41,18 @@ the retry that feeds the validator's own error back into the prompt."""
 CONCEPT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["logline", "setting", "tone", "motifs", "avoid"],
+    "required": ["logline", "setting", "tone", "motifs", "avoid", "locations"],
     "properties": {
         "logline": {"type": "string", "minLength": 1},
         "setting": {"type": "string", "minLength": 1},
         "tone": {"type": "string", "minLength": 1},
         "motifs": {"type": "array", "items": {"type": "string"}},
         "avoid": {"type": "array", "items": {"type": "string"}},
+        "locations": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "minItems": 1,
+        },
     },
 }
 """Handed to the driver for ``--json-schema`` -- a hint to the model, not a
@@ -82,6 +87,17 @@ def validate_concept(data: object) -> None:
             raise ConceptValidationError(
                 f"concept.{key} must be a list of strings, got {value!r}"
             )
+    locations = data["locations"]
+    if (
+        not isinstance(locations, list)
+        or not locations
+        or not all(isinstance(v, str) and v.strip() for v in locations)
+    ):
+        raise ConceptValidationError(
+            "concept.locations must be a non-empty list of non-empty strings (issue #78: "
+            f"the beats stage has no vocabulary to assign `location` from otherwise), got "
+            f"{locations!r}"
+        )
 
 
 @dataclass(frozen=True)

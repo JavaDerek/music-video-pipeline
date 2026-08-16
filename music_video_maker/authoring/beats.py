@@ -77,7 +77,9 @@ BEATS_SCHEMA: dict[str, Any] = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["chunk_id", "beat", "beat_role", "beat_group", "focus"],
+                "required": [
+                    "chunk_id", "beat", "beat_role", "beat_group", "focus", "location",
+                ],
                 "properties": {
                     "chunk_id": {"type": "integer"},
                     "beat": {"type": "string", "minLength": 1},
@@ -85,6 +87,13 @@ BEATS_SCHEMA: dict[str, Any] = {
                     "beat_group": {"type": "integer", "minimum": 1},
                     "focus": {"enum": list(FOCUS_VALUES)},
                     "length_seconds": {"type": "number", "exclusiveMinimum": 0},
+                    # Issue #78: where the active cast member is inside the
+                    # run's `setting` at this beat. Required, and checked at
+                    # generation time against the concept's own closed
+                    # `locations` list (see `_parse_entries`) -- the schema
+                    # hint below covers only "is this a string", the way
+                    # `--json-schema` covers every other field here.
+                    "location": {"type": "string", "minLength": 1},
                 },
             },
         }
@@ -116,6 +125,17 @@ class Beat:
     beat: str
     beat_role: str
     beat_group: int
+    location: str
+    """Where the active cast member is inside the run's ``setting`` at this
+    beat (issue #78), e.g. ``"switchback"`` or ``"mill"``. Required, like
+    ``beat_role`` -- ``setting`` fixes the world's geography for the whole
+    video, but says nothing about where a character is inside it at a given
+    moment, and this is the beats stage's answer, checkable the same way
+    ``beat_role``/``beat_group`` are: structurally, before any prose exists.
+    Assigned from the concept's closed ``locations`` list and validated
+    against it in :func:`_parse_entries` -- never guessed from finished shot
+    text (see ``shot_plan.py``'s "a lint that guesses loses to a stage that
+    knows")."""
     focus: str = FOCUS_SUBJECT
     length_seconds: float | None = None
     merged_from: tuple[int, ...] = ()
@@ -131,6 +151,7 @@ class Beat:
             "beat": self.beat,
             "beat_role": self.beat_role,
             "beat_group": self.beat_group,
+            "location": self.location,
             "focus": self.focus,
             "length_seconds": self.length_seconds,
             "merged_from": list(self.merged_from),
@@ -145,6 +166,11 @@ class Beat:
             beat=str(payload["beat"]),
             beat_role=str(payload["beat_role"]),
             beat_group=int(payload["beat_group"]),
+            # Pre-#78 persisted beat sheets have no `location` key at all;
+            # "" is the same "not authored" default `shot_plan.ShotPlanEntry`
+            # already uses for an absent optional field, not a fabricated
+            # place.
+            location=str(payload.get("location") or ""),
             focus=str(payload.get("focus", FOCUS_SUBJECT)),
             length_seconds=(
                 None if payload.get("length_seconds") is None else float(payload["length_seconds"])
@@ -167,11 +193,32 @@ class BeatsResult:
 # --------------------------------------------------------------------------- #
 
 
+def _canonical_locations(locations: Sequence[str]) -> dict[str, str]:
+    """``{normalized: as-written}`` for the concept's closed vocabulary
+    (issue #78), keyed by a case/whitespace-insensitive form so a model that
+    varies capitalization across beats ("Mill" vs "mill") does not fragment
+    one place into two in the written plan."""
+    return {loc.strip().lower(): loc.strip() for loc in locations if loc and loc.strip()}
+
+
 def _parse_entries(
-    data: object, chunks: Sequence[AudioChunk], problems: list[str]
+    data: object,
+    chunks: Sequence[AudioChunk],
+    problems: list[str],
+    locations: Sequence[str] = (),
 ) -> tuple[Beat, ...]:
     """Shape-check each entry and pin it to a real chunk. Appends to
-    ``problems`` rather than raising, so one round reports everything."""
+    ``problems`` rather than raising, so one round reports everything.
+
+    ``locations`` is the concept's closed vocabulary (issue #78, empty means
+    no vocabulary supplied -- e.g. a pre-#78 concept, or a caller not using
+    the field -- in which case any non-empty ``location`` string is accepted
+    structurally and nothing is checked against a set). When non-empty, a
+    beat's ``location`` outside it is a validation problem sent back to the
+    model, the same "a generated anchor is never trusted" treatment
+    ``chunk_id`` gets above: never silently accepted, never silently
+    dropped."""
+    canonical = _canonical_locations(locations)
     if not isinstance(data, dict):
         raise BeatsValidationError(
             f"beats reply must be a JSON object, got {type(data).__name__}"
@@ -248,6 +295,24 @@ def _parse_entries(
                 continue
             length = float(length)
 
+        location = entry.get("location")
+        if not isinstance(location, str) or not location.strip():
+            problems.append(f"chunk_id={chunk_id} location must be a non-empty string")
+            continue
+        if canonical:
+            resolved = canonical.get(location.strip().lower())
+            if resolved is None:
+                problems.append(
+                    f"chunk_id={chunk_id} location={location!r} is not one of this song's "
+                    f"approved locations {sorted(canonical.values())}. Every location a "
+                    "chunk uses has to be on that list -- pick the closest match, or say "
+                    "in your reply why a new one is needed so the concept can be revised"
+                )
+                continue
+            location = resolved
+        else:
+            location = location.strip()
+
         chunk = by_id[chunk_id]
         beats.append(
             Beat(
@@ -257,6 +322,7 @@ def _parse_entries(
                 beat=beat_text.strip(),
                 beat_role=role,
                 beat_group=group,
+                location=location,
                 focus=focus,
                 length_seconds=length,
             )
@@ -322,10 +388,16 @@ def check_beat_structure(
                 )
 
 
-def validate_beats(data: object, chunks: Sequence[AudioChunk]) -> tuple[Beat, ...]:
-    """Parse and check a model reply, or raise with everything that is wrong."""
+def validate_beats(
+    data: object, chunks: Sequence[AudioChunk], locations: Sequence[str] = ()
+) -> tuple[Beat, ...]:
+    """Parse and check a model reply, or raise with everything that is wrong.
+
+    ``locations`` is the concept's closed vocabulary for ``location`` (issue
+    #78); empty means no vocabulary was supplied and any non-empty
+    ``location`` string is accepted. See :func:`_parse_entries`."""
     problems: list[str] = []
-    beats = _parse_entries(data, chunks, problems)
+    beats = _parse_entries(data, chunks, problems, locations)
     check_beat_structure(beats, chunks, problems)
     if problems:
         raise BeatsValidationError(
@@ -368,6 +440,12 @@ def _concept_block(concept: Mapping[str, Any]) -> str:
         parts.append("Motifs to plant and pay off: " + "; ".join(str(m) for m in motifs))
     if avoid:
         parts.append("Deliberately NOT on screen: " + "; ".join(str(a) for a in avoid))
+    locations = concept.get("locations") or []
+    if locations:
+        parts.append(
+            "Approved locations -- every beat's `location` MUST be exactly one of these: "
+            + "; ".join(str(loc) for loc in locations)
+        )
     return "\n".join(parts)
 
 
@@ -433,6 +511,9 @@ def generate_beats(
     prompt = build_beats_prompt(config, chunks, concept, notes=notes)
     if extra_instructions and extra_instructions.strip():
         prompt = f"{prompt}\n\n{extra_instructions.strip()}"
+    # Issue #78: the closed vocabulary `location` is checked against, straight
+    # from the approved concept -- never re-derived or guessed here.
+    locations = tuple(str(loc) for loc in (concept.get("locations") or ()))
 
     last_error: BeatsValidationError | None = None
     for attempt in range(1, max_validation_attempts + 1):
@@ -440,7 +521,7 @@ def generate_beats(
             system=system, prompt=prompt, model=MODEL_OPUS, schema=BEATS_SCHEMA
         )
         try:
-            beats = validate_beats(result.data, chunks)
+            beats = validate_beats(result.data, chunks, locations)
         except BeatsValidationError as exc:
             last_error = exc
             logger.warning(

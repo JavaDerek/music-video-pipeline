@@ -76,7 +76,7 @@ def _chunks(n: int = 3, width: float = 6.0):
     )
 
 
-def _beat(chunk_id, *, group=1, role="transition", focus="subject"):
+def _beat(chunk_id, *, group=1, role="transition", focus="subject", location="the room"):
     start = (chunk_id - 1) * 6.0
     return Beat(
         chunk_id=chunk_id,
@@ -85,6 +85,7 @@ def _beat(chunk_id, *, group=1, role="transition", focus="subject"):
         beat=f"beat {chunk_id}",
         beat_role=role,
         beat_group=group,
+        location=location,
         focus=focus,
     )
 

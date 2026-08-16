@@ -36,19 +36,22 @@ additive concatenation of, in order:
    background member such as the drummer injected for a specific shot, or --
    issue #33 levels 1-2 -- more than one name at once, e.g. two vocalists
    singing the same words). One active member composes exactly as before:
-   name, role, then that member's **appearance direction** (issue #31) in
-   the same clause -- ``config.global_appearance`` (whole-cast presentation)
-   followed by ``member.appearance`` (this performer's own direction), both
-   optional, comma-joined, either or both silently omitted if ``None``.
+   name, role, then that member's **appearance direction** (issue #31) and
+   **demeanour direction** (issue #74) in the same clause -- appearance first
+   (``config.global_appearance`` then ``member.appearance``), demeanour
+   second (``config.global_demeanour`` then this member's own
+   ``member.demeanour``), all optional, comma-joined, any or all silently
+   omitted if ``None``.
 
    **More than one active member** composes as one shared clause, never one
    clause per person: each member contributes its own ``name, role[,
-   appearance]`` fragment (that member's own appearance stays attached to
-   that member, per #33's decision that resolution is incremental but
-   per-character data must not blur together), the fragments are joined into
-   a natural list ("A and B are the focus of this shot" / "A, B, and C are
-   the focus of this shot"), and ``config.global_appearance`` -- being a
-   whole-cast property, not a per-member one -- is appended exactly once at
+   appearance][, demeanour]`` fragment (that member's own appearance and
+   demeanour stay attached to that member, per #33's decision that
+   resolution is incremental but per-character data must not blur together),
+   the fragments are joined into a natural list ("A and B are the focus of
+   this shot" / "A, B, and C are the focus of this shot"), and
+   ``config.global_appearance``/``config.global_demeanour`` -- being
+   whole-cast properties, not per-member ones -- are appended exactly once at
    the end of the shared clause rather than once per person.
 
    This clause **never asserts staging**. Per #33's recorded decision, `&`
@@ -65,6 +68,12 @@ additive concatenation of, in order:
    than one) -- this is the only change multiple active characters make to
    part 6, which otherwise stays exactly what it always was: the sole
    authority on whether anyone is singing (see the rule below).
+7. **The avoid list** (issue #73) -- ``config.avoid``, a whole-video "must
+   never depict" list, composed as one final clause after the lyric and any
+   counterpoint clauses. See :func:`_avoid_clause` for the honest caveat:
+   this is textual negation in the same single ``prompt`` channel that #73
+   measured failing for ``role``'s "never holding anything", so it is a
+   best-effort hint, not a guarantee. ``()`` (the default) composes nothing.
 
 **A cast `role` must describe who the character *is*, never what they are
 doing vocally.** The role is injected into *every* chunk, so "singing
@@ -74,8 +83,17 @@ performer sings straight through the instrumental breaks. Observed on a real
 run: 15 of 39 chunks carried both "singing continuously and directly to
 camera" and "Instrumental passage: the character performs silently" in the
 same prompt. Whether someone is singing is per-chunk state; parts 5 and 6
-must not both try to own it. Appearance, wardrobe and demeanour belong in the
-role/appearance fields; vocal action does not.
+must not both try to own it. Appearance and demeanour belong in the
+role/appearance/demeanour fields; vocal action does not.
+
+**A `role`/`demeanour` prohibition does not work, and now warns (issue
+#73/#74).** ``config.py``'s ``_warn_if_prohibition`` logs, at load time,
+when either field reads as a negation ("never", "no", "without") -- the
+exact shape that let a bass guitar back into two shots after the field
+carrying the prohibition was in force for the entire render. This module
+composes whatever text it is given without judging it; the warning is the
+project's only defence against shipping another unenforceable prohibition,
+and it fires before any GPU time is spent, not after.
 
 The same trap reopens with more than one active character: it would be easy
 to compose something like "both singing together" into the shared clause
@@ -130,6 +148,20 @@ composer -- ``_compose_prompt`` (and everything it calls down to
 ``_appearance_text`` / ``_global_appearance_text``) takes an
 ``include_appearance`` flag, so the two variants can never drift out of step
 with each other the way two independent implementations could.
+
+**Demeanour (issue #74) is deliberately NOT gated by ``include_appearance``.**
+It survives on both prompt variants, restated every chunk exactly like
+``role`` already is. This is not an oversight -- appearance is stripped
+because it describes how to read a *photo* the chained path does not have;
+demeanour is behavioural direction about who the character is being right
+now, the same kind of statement as ``role``, and the model still needs that
+on the chained path just as it still needs the name and role. It is also
+safe to restate: :attr:`~music_video_maker.config.RunConfig.global_demeanour`
+and :attr:`~music_video_maker.contracts.CastMember.demeanour` are required
+to be phrased as an endpoint, never a displacement (see those fields'
+docstrings and :func:`~music_video_maker.config._warn_if_displacement`), and
+an endpoint restated against a frame that already embodies it changes
+nothing -- unlike a relative directive, it does not compound.
 
 When neither the member nor the run has any appearance text, both variants
 compose to the same string, and ``chained_prompt`` is still populated (never
@@ -334,7 +366,6 @@ def _resolve_present_members(
 
 
 def _present_clause(
-    config: RunConfig,
     present: tuple[CastMember, ...],
     include_appearance: bool = True,
 ) -> str | None:
@@ -349,7 +380,9 @@ def _present_clause(
 
     ``config.global_appearance`` is whole-cast and is already composed once
     in the character clause, so it is not repeated here -- the same reasoning
-    :func:`_multi_character_clause` applies to its own members.
+    :func:`_multi_character_clause` applies to its own members. No
+    ``RunConfig`` is needed here at all: everything this function composes is
+    a plain ``CastMember`` attribute.
 
     ``include_appearance=False`` is issue #46's chained-path switch, and it
     applies to everyone in frame, not just the lead: on the chained path
@@ -358,9 +391,7 @@ def _present_clause(
     """
     if not present:
         return None
-    descriptors = tuple(
-        _member_descriptor(member, include_appearance) for member in present
-    )
+    descriptors = tuple(_member_descriptor(member, include_appearance) for member in present)
     return f"Also in shot, silent: {_join_member_list(descriptors)}"
 
 
@@ -389,9 +420,14 @@ def _compose_prompt(
         None if subject_is_focus else REFOCUS_SENTENCE,
         _setting_clause(config.setting),
         character_clause,
-        _present_clause(config, present, include_appearance),
+        _present_clause(present, include_appearance),
         lyric_clause,
         *_counterpoint_clauses(chunk),
+        # Issue #73: composed last, deliberately -- see _avoid_clause's own
+        # docstring for why this is a best-effort textual hint rather than a
+        # guarantee, and why late position (away from any subject-establishing
+        # slot) is the safest available placement for it.
+        _avoid_clause(config.avoid),
     )
     return _join_sentences(parts)
 
@@ -533,21 +569,31 @@ def _character_clause(
 def _single_character_clause(
     config: RunConfig, member: CastMember, include_appearance: bool = True
 ) -> str:
-    """Appearance rides in the same clause as the role rather than as its own
-    sentence: it is a different *kind* of statement than "who this character
-    is", but it is still a statement about this same character, not the
-    scene or the shot.
+    """Appearance and demeanour ride in the same clause as the role rather
+    than as their own sentences: each is a different *kind* of statement than
+    "who this character is", but each is still a statement about this same
+    character, not the scene or the shot.
 
     ``include_appearance=False`` (issue #46) skips the appearance fragment
     entirely -- the chained path has no photo for it to describe, and the
-    seed frame already embodies whatever it would have said."""
+    seed frame already embodies whatever it would have said. Demeanour is
+    NOT gated by this flag (issue #74): it is behavioural direction, the same
+    kind of statement as ``role``, not a photo description, and it is safe to
+    restate every chunk because it is required to be phrased as an endpoint
+    -- see the module docstring's "Demeanour is deliberately NOT gated"
+    paragraph."""
     base = f"{member.name}, {member.role}, is the focus of this shot"
-    if not include_appearance:
+    fragments = []
+    if include_appearance:
+        appearance = _appearance_text(config, member)
+        if appearance:
+            fragments.append(appearance)
+    demeanour = _demeanour_text(config, member)
+    if demeanour:
+        fragments.append(demeanour)
+    if not fragments:
         return base
-    appearance = _appearance_text(config, member)
-    if appearance:
-        return f"{base}, {appearance}"
-    return base
+    return f"{base}, {', '.join(fragments)}"
 
 
 def _appearance_text(config: RunConfig, member: CastMember) -> str | None:
@@ -565,17 +611,36 @@ def _appearance_text(config: RunConfig, member: CastMember) -> str | None:
     return ", ".join(fragments)
 
 
+def _demeanour_text(config: RunConfig, member: CastMember) -> str | None:
+    """Whole-cast demeanour direction followed by this member's own,
+    comma-joined -- the demeanour counterpart of :func:`_appearance_text`
+    (issue #74). Either or both may be ``None``.
+
+    ``member.demeanour`` is a plain ``CastMember`` attribute, matching
+    ``member.appearance``'s own shape. Unlike appearance, this function is
+    never skipped for the chained path; see the module docstring."""
+    fragments = [
+        p.strip().rstrip(".")
+        for p in (config.global_demeanour, member.demeanour)
+        if p and p.strip()
+    ]
+    if not fragments:
+        return None
+    return ", ".join(fragments)
+
+
 def _multi_character_clause(
     config: RunConfig, members: tuple[CastMember, ...], include_appearance: bool = True
 ) -> str:
     """Two or more active characters, composed as one shared clause.
 
-    Each member contributes its own ``name, role[, appearance]`` fragment --
-    that member's *own* appearance stays attached to it, never blurred into a
-    combined block -- and the fragments are joined into a natural list ("A
-    and B are the focus of this shot" / "A, B, and C are the focus of this
-    shot"). ``config.global_appearance`` is whole-cast, not per-member, so it
-    is appended exactly once at the end of the shared clause rather than once
+    Each member contributes its own ``name, role[, appearance][, demeanour]``
+    fragment -- that member's *own* appearance and demeanour stay attached to
+    it, never blurred into a combined block -- and the fragments are joined
+    into a natural list ("A and B are the focus of this shot" / "A, B, and C
+    are the focus of this shot"). ``config.global_appearance`` and
+    ``config.global_demeanour`` are whole-cast, not per-member, so each is
+    appended exactly once at the end of the shared clause rather than once
     per person.
 
     Deliberately does **not** say anything about how these characters are
@@ -587,31 +652,47 @@ def _multi_character_clause(
 
     ``include_appearance=False`` (issue #46) strips both the per-member
     fragments' appearance text AND the trailing ``global_appearance``
-    fragment -- every appearance source, not just the primary member's."""
+    fragment -- every appearance source, not just the primary member's.
+    Demeanour is unaffected by this flag (issue #74) -- see the module
+    docstring."""
     descriptors = tuple(_member_descriptor(m, include_appearance) for m in members)
     clause = f"{_join_member_list(descriptors)} are the focus of this shot"
-    if not include_appearance:
+    global_fragments = []
+    if include_appearance:
+        global_appearance = _global_appearance_text(config)
+        if global_appearance:
+            global_fragments.append(global_appearance)
+    global_demeanour = _global_demeanour_text(config)
+    if global_demeanour:
+        global_fragments.append(global_demeanour)
+    if not global_fragments:
         return clause
-    global_appearance = _global_appearance_text(config)
-    if global_appearance:
-        return f"{clause}, {global_appearance}"
-    return clause
+    return f"{clause}, {', '.join(global_fragments)}"
 
 
 def _member_descriptor(member: CastMember, include_appearance: bool = True) -> str:
-    """This member's own ``name, role[, appearance]`` fragment -- the atomic
-    unit :func:`_multi_character_clause` lists out, keeping each performer's
-    appearance attached to that performer.
+    """This member's own ``name, role[, appearance][, demeanour]`` fragment --
+    the atomic unit :func:`_multi_character_clause` (and :func:`_present_clause`)
+    list out, keeping each performer's appearance and demeanour attached to
+    that performer.
 
-    ``include_appearance=False`` (issue #46) drops the appearance fragment
-    and returns just ``name, role``."""
+    ``include_appearance=False`` (issue #46) drops the appearance fragment.
+    Demeanour is never dropped (issue #74) -- see the module docstring for
+    why it behaves like ``role`` rather than like ``appearance`` here.
+    ``member.appearance`` and ``member.demeanour`` are both plain
+    ``CastMember`` attributes, so this needs no ``RunConfig`` at all."""
     base = f"{member.name}, {member.role}"
-    if not include_appearance:
+    fragments = []
+    if include_appearance:
+        appearance = member.appearance.strip().rstrip(".") if member.appearance else ""
+        if appearance:
+            fragments.append(appearance)
+    demeanour = member.demeanour
+    if demeanour and demeanour.strip():
+        fragments.append(demeanour.strip().rstrip("."))
+    if not fragments:
         return base
-    appearance = member.appearance.strip().rstrip(".") if member.appearance else ""
-    if appearance:
-        return f"{base}, {appearance}"
-    return base
+    return f"{base}, {', '.join(fragments)}"
 
 
 def _join_member_list(descriptors: tuple[str, ...]) -> str:
@@ -632,6 +713,42 @@ def _global_appearance_text(config: RunConfig) -> str | None:
     if config.global_appearance and config.global_appearance.strip():
         return config.global_appearance.strip().rstrip(".")
     return None
+
+
+def _global_demeanour_text(config: RunConfig) -> str | None:
+    """Whole-cast demeanour direction, applied once regardless of how many
+    characters are active on this chunk -- the demeanour counterpart of
+    :func:`_global_appearance_text` (issue #74). ``None`` when nobody set
+    it -- never a fabricated default."""
+    if config.global_demeanour and config.global_demeanour.strip():
+        return config.global_demeanour.strip().rstrip(".")
+    return None
+
+
+def _avoid_clause(avoid: tuple[str, ...]) -> str | None:
+    """Issue #73: things this video must never depict, anywhere, composed as
+    one final clause. See :attr:`~music_video_maker.config.RunConfig.avoid`'s
+    docstring for the full reasoning; the short version repeated here because
+    it is the load-bearing caveat for this function specifically:
+
+    **This is textual negation in the same single positive-conditioning
+    ``prompt`` channel that #73 measured failing for `role`.** The corrected
+    role "...never holding anything" rendered a bass guitar into the same
+    hands twice, because the only tokens a diffusion prompt actually sees in
+    that phrase are "holding" and "anything" -- there is no dedicated
+    negative-conditioning input on the committed workflow graphs for this
+    list to use instead (see ``config.py``'s ``avoid`` docstring for the
+    graph-level detail). This clause is a best-effort hint, shipped because
+    it is strictly better than the dead weight the concept's own ``avoid``
+    list was before (#73's F13 finding: composed into the *authoring* prompt
+    only, never the render), not because it is expected to reliably work.
+
+    ``()`` (the default) composes nothing, so a config that never sets
+    ``avoid`` renders byte-identical to before this function existed."""
+    items = [item.strip() for item in avoid if item and item.strip()]
+    if not items:
+        return None
+    return f"This shot must never depict, anywhere in frame: {', '.join(items)}"
 
 
 def _lyric_clause(

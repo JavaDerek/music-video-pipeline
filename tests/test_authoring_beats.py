@@ -101,13 +101,16 @@ def _reply(*entries: dict) -> dict:
     return {"beats": list(entries)}
 
 
-def _entry(chunk_id, *, role="transition", group=1, focus="subject", **extra) -> dict:
+def _entry(
+    chunk_id, *, role="transition", group=1, focus="subject", location="the room", **extra
+) -> dict:
     return {
         "chunk_id": chunk_id,
         "beat": f"beat {chunk_id}",
         "beat_role": role,
         "beat_group": group,
         "focus": focus,
+        "location": location,
         **extra,
     }
 
@@ -190,6 +193,9 @@ def test_a_missing_beats_array_is_rejected():
         {"focus": "the performer"},
         {"length_seconds": 0},
         {"length_seconds": "nine"},
+        {"location": ""},
+        {"location": None},
+        {"location": 5},
     ],
 )
 def test_malformed_fields_are_rejected(bad):
@@ -197,6 +203,80 @@ def test_malformed_fields_are_rejected(bad):
     entry.update(bad)
     with pytest.raises(BeatsValidationError):
         validate_beats(_reply(entry, _entry(2), _entry(3)), _chunks())
+
+
+# --------------------------------------------------------------------------- #
+# `location` -- issue #78's closed vocabulary. `beat_role` is checked
+# against a fixed enum; `location` is checked against the concept's own
+# `locations` list, which is why it takes a separate `locations=` argument
+# rather than living in BEAT_ROLES-style module constant.
+# --------------------------------------------------------------------------- #
+
+_APPROVED_LOCATIONS = ("the valley floor", "the switchback", "the mill", "the watch-post")
+
+
+def test_a_location_outside_the_approved_list_is_rejected():
+    reply = _three_beat_gag()
+    reply["beats"][0]["location"] = "a shopping mall"
+
+    with pytest.raises(BeatsValidationError, match="approved locations"):
+        validate_beats(reply, _chunks(), _APPROVED_LOCATIONS)
+
+
+def test_a_location_on_the_approved_list_is_accepted():
+    reply = _three_beat_gag()
+    for entry in reply["beats"]:
+        entry["location"] = "the mill"
+
+    beats = validate_beats(reply, _chunks(), _APPROVED_LOCATIONS)
+
+    assert [b.location for b in beats] == ["the mill"] * 3
+
+
+def test_location_matching_is_case_and_whitespace_insensitive_and_canonicalizes():
+    """A model that varies capitalization across beats must not fragment one
+    place into two in the written plan -- every match resolves to the
+    concept's own exact spelling."""
+    reply = _three_beat_gag()
+    reply["beats"][0]["location"] = "  The Mill  "
+    reply["beats"][1]["location"] = "the mill"
+    reply["beats"][2]["location"] = "THE MILL"
+
+    beats = validate_beats(reply, _chunks(), _APPROVED_LOCATIONS)
+
+    assert [b.location for b in beats] == ["the mill"] * 3
+
+
+def test_an_empty_locations_vocabulary_accepts_anything_non_empty():
+    """No vocabulary supplied (a pre-#78 concept, or a caller not using the
+    field) means no closed-set check at all -- only "is this a non-empty
+    string", same as every other required field's presence check."""
+    reply = _three_beat_gag()
+    for entry in reply["beats"]:
+        entry["location"] = "anywhere at all"
+
+    beats = validate_beats(reply, _chunks(), ())
+
+    assert [b.location for b in beats] == ["anywhere at all"] * 3
+
+
+def test_generate_beats_threads_the_concepts_locations_into_validation(tmp_path):
+    """The concept dict IS the source of the vocabulary -- `generate_beats`
+    must derive it from `concept["locations"]` without a caller having to
+    pass it separately."""
+    concept_with_locations = {**CONCEPT, "locations": list(_APPROVED_LOCATIONS)}
+    bad = _three_beat_gag()
+    bad["beats"][0]["location"] = "somewhere not on the list"
+    good = _three_beat_gag()
+    for entry in good["beats"]:
+        entry["location"] = "the mill"
+    driver = ScriptedDriver([bad, good])
+
+    result = generate_beats(_config(tmp_path), _chunks(), concept_with_locations, driver)
+
+    assert len(driver.calls) == 2
+    assert "approved locations" in driver.calls[1]["prompt"]
+    assert len(result.beats) == 3
 
 
 def test_every_named_beat_role_is_accepted():
@@ -336,6 +416,18 @@ def test_notes_reach_the_prompt(tmp_path):
     prompt = build_beats_prompt(_config(tmp_path), _chunks(), CONCEPT, notes="stop using doorways")
 
     assert "stop using doorways" in prompt
+
+
+def test_the_concepts_locations_reach_the_prompt(tmp_path):
+    """The model can only assign a `location` it has been shown -- the
+    approved list has to be composed into the prompt, not just checked
+    after the fact."""
+    concept_with_locations = {**CONCEPT, "locations": ["the pier", "the boardwalk"]}
+
+    prompt = build_beats_prompt(_config(tmp_path), _chunks(), concept_with_locations)
+
+    assert "the pier" in prompt
+    assert "the boardwalk" in prompt
 
 
 def test_input_hashes_cover_the_concept_so_editing_it_makes_beats_stale(tmp_path):

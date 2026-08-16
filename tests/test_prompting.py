@@ -1184,3 +1184,247 @@ def test_no_lora_means_no_trigger_word_even_if_one_is_set(config: RunConfig):
     chunk = _chunk(chunk_id=4, text="I'm the lucky one", character="Dianne")
 
     assert "r34l1sm" not in expand_prompt(config, chunk).prompt
+
+
+# --------------------------------------------------------------------------- #
+# Demeanour (issue #74) -- follows the appearance/global_appearance precedent
+# (#31) exactly, one field over. Composed alongside role/appearance exactly
+# as the module docstring's part 5 describes.
+# --------------------------------------------------------------------------- #
+
+
+def test_member_demeanour_is_composed_alongside_the_role_and_appearance_clause(
+    config: RunConfig, cast
+):
+    dianne = dataclasses.replace(
+        cast["Dianne"], appearance="in her late forties", demeanour="grave and unsmiling"
+    )
+    cfg = dataclasses.replace(config, cast={**cast, "Dianne": dianne})
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+
+    result = expand_prompt(cfg, chunk)
+
+    assert (
+        "Dianne, Lead Vocalist, smiling constantly, oblivious, is the focus of this "
+        "shot, in her late forties, grave and unsmiling. The character is actively "
+        "singing the lyric: 'the lucky ones'."
+    ) in result.prompt
+
+
+def test_global_demeanour_and_member_demeanour_both_compose(config: RunConfig, cast):
+    dianne = dataclasses.replace(cast["Dianne"], demeanour="grave and unsmiling, exhausted")
+    cfg = dataclasses.replace(
+        config,
+        global_demeanour="nobody smiles; this is a war",
+        cast={**cast, "Dianne": dianne},
+    )
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+
+    result = expand_prompt(cfg, chunk)
+
+    assert (
+        "is the focus of this shot, nobody smiles; this is a war, grave and "
+        "unsmiling, exhausted." in result.prompt
+    )
+
+
+def test_global_demeanour_alone_applies_to_a_member_with_no_demeanour_of_their_own(
+    config: RunConfig, cast
+):
+    cfg = dataclasses.replace(config, global_demeanour="nobody smiles; this is a war")
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+
+    result = expand_prompt(cfg, chunk)
+
+    assert (
+        "is the focus of this shot, nobody smiles; this is a war. The character"
+        in result.prompt
+    )
+
+
+def test_demeanour_survives_on_an_instrumental_chunk(config: RunConfig, cast):
+    """Like appearance, demeanour is character-attached (part 5) so it must
+    compose whether or not the chunk carries a lyric -- and, like appearance,
+    it must never itself assert singing."""
+    dianne = dataclasses.replace(cast["Dianne"], demeanour="grave and unsmiling")
+    cfg = dataclasses.replace(config, cast={**cast, "Dianne": dianne})
+    chunk = _chunk(text="", character="Dianne")
+
+    result = expand_prompt(cfg, chunk)
+
+    character_clause = result.prompt.split(". Instrumental passage")[0]
+    assert "sing" not in character_clause.lower()
+    assert "grave and unsmiling" in result.prompt
+    assert result.prompt.endswith(
+        "Instrumental passage: the character performs silently, no lyric to sing."
+    )
+
+
+def test_no_doubled_separators_with_demeanour_and_no_appearance(config: RunConfig, cast):
+    dianne = dataclasses.replace(cast["Dianne"], demeanour="grave and unsmiling")
+    cfg = dataclasses.replace(config, cast={**cast, "Dianne": dianne})
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+
+    result = expand_prompt(cfg, chunk)
+
+    assert ".." not in result.prompt
+    assert ",," not in result.prompt
+    assert ", ." not in result.prompt
+    assert ". ." not in result.prompt
+
+
+def test_each_members_own_demeanour_stays_attached_to_that_member(config: RunConfig, cast):
+    dianne = dataclasses.replace(cast["Dianne"], demeanour="grave and unsmiling")
+    marcus = dataclasses.replace(cast["Marcus"], demeanour="hollow-eyed, unspeaking")
+    cfg = dataclasses.replace(config, cast={**cast, "Dianne": dianne, "Marcus": marcus})
+    chunk = _chunk(chunk_id=14, text="the lucky ones", characters=("Dianne", "Marcus"))
+
+    result = expand_prompt(cfg, chunk)
+
+    assert (
+        "Dianne, Lead Vocalist, smiling constantly, oblivious, grave and unsmiling, "
+        "and Marcus, Backup Vocalist, watching from the wings, hollow-eyed, "
+        "unspeaking are the focus of this shot." in result.prompt
+    )
+
+
+def test_global_demeanour_applies_once_for_the_whole_cast_not_once_per_person(
+    config: RunConfig, cast
+):
+    cfg = dataclasses.replace(config, global_demeanour="nobody smiles; this is a war")
+    chunk = _chunk(chunk_id=15, text="the lucky ones", characters=("Dianne", "Marcus"))
+
+    result = expand_prompt(cfg, chunk)
+
+    assert result.prompt.count("nobody smiles; this is a war") == 1
+    assert "are the focus of this shot, nobody smiles; this is a war." in result.prompt
+
+
+def test_present_cast_member_demeanour_is_composed(config: RunConfig, cast):
+    rex = dataclasses.replace(cast["Rex"], demeanour="impassive, watching")
+    cfg = dataclasses.replace(config, cast={**cast, "Rex": rex})
+    chunk = _chunk(chunk_id=4, text="I'm the lucky one", character="Dianne")
+
+    result = expand_prompt(cfg, chunk, present=("Rex",))
+
+    assert (
+        "Also in shot, silent: Rex, Drummer, background, never sings, impassive, "
+        "watching" in result.prompt
+    )
+
+
+def test_demeanour_survives_the_chained_variant_unlike_appearance(config: RunConfig, cast):
+    """The load-bearing difference from appearance (issue #46 vs #74):
+    appearance describes how to read a photo the chained path does not have
+    and is stripped; demeanour is behavioural direction, the same kind of
+    statement as role, and is required to be phrased as an endpoint so
+    restating it every chunk does not compound."""
+    dianne = dataclasses.replace(
+        cast["Dianne"],
+        appearance="looking a few years younger",
+        demeanour="grave and unsmiling",
+    )
+    cfg = dataclasses.replace(config, cast={**cast, "Dianne": dianne})
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+
+    result = expand_prompt(cfg, chunk)
+
+    assert "looking a few years younger" in result.prompt
+    assert "grave and unsmiling" in result.prompt
+    assert result.chained_prompt is not None
+    assert "looking a few years younger" not in result.chained_prompt
+    assert "grave and unsmiling" in result.chained_prompt
+
+
+def test_global_demeanour_survives_the_chained_variant_too(config: RunConfig, cast):
+    cfg = dataclasses.replace(config, global_demeanour="nobody smiles; this is a war")
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+
+    result = expand_prompt(cfg, chunk)
+
+    assert result.chained_prompt is not None
+    assert "nobody smiles; this is a war" in result.chained_prompt
+
+
+def test_demeanour_survives_the_chained_variant_for_multi_character_clause(
+    config: RunConfig, cast
+):
+    """Mirrors test_chained_prompt_strips_appearance_for_multi_character_clause,
+    proving demeanour is exempt from that stripping for every active member,
+    not just the primary one."""
+    dianne = dataclasses.replace(
+        cast["Dianne"],
+        appearance="looking a few years younger",
+        demeanour="grave and unsmiling",
+    )
+    marcus = dataclasses.replace(cast["Marcus"], demeanour="hollow-eyed")
+    cfg = dataclasses.replace(config, cast={**cast, "Dianne": dianne, "Marcus": marcus})
+    chunk = _chunk(chunk_id=14, text="the lucky ones", characters=("Dianne", "Marcus"))
+
+    result = expand_prompt(cfg, chunk)
+    assert result.chained_prompt is not None
+
+    assert "looking a few years younger" not in result.chained_prompt
+    assert "grave and unsmiling" in result.chained_prompt
+    assert "hollow-eyed" in result.chained_prompt
+
+
+def test_no_demeanour_fields_set_leaves_the_prompt_byte_identical(config: RunConfig, cast):
+    """The established rule this module follows everywhere: an untouched new
+    field must not change anything for a config written before it existed."""
+    assert config.global_demeanour is None
+    assert all(member.demeanour is None for member in cast.values())
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+
+    result = expand_prompt(config, chunk)
+
+    assert "focus of this shot." in result.prompt
+
+
+# --------------------------------------------------------------------------- #
+# The render-side avoid list (issue #73)
+# --------------------------------------------------------------------------- #
+
+
+def test_avoid_list_is_composed_as_a_final_clause(config: RunConfig, cast):
+    cfg = dataclasses.replace(config, avoid=("bass guitar", "microphone"))
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+
+    result = expand_prompt(cfg, chunk)
+
+    assert result.prompt.endswith(
+        "This shot must never depict, anywhere in frame: bass guitar, microphone."
+    )
+
+
+def test_avoid_list_composes_on_an_instrumental_chunk_too(config: RunConfig, cast):
+    cfg = dataclasses.replace(config, avoid=("bass guitar",))
+    chunk = _chunk(text="", character="Dianne")
+
+    result = expand_prompt(cfg, chunk)
+
+    assert result.prompt.endswith(
+        "This shot must never depict, anywhere in frame: bass guitar."
+    )
+
+
+def test_avoid_list_composes_on_the_chained_variant_too(config: RunConfig, cast):
+    """Not gated by include_appearance -- this is an exclusion list, not a
+    photo description, so both render paths need it equally."""
+    cfg = dataclasses.replace(config, avoid=("bass guitar",))
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+
+    result = expand_prompt(cfg, chunk)
+
+    assert result.chained_prompt is not None
+    assert "This shot must never depict, anywhere in frame: bass guitar." in result.chained_prompt
+
+
+def test_empty_avoid_list_produces_no_avoid_clause(config: RunConfig, cast):
+    assert config.avoid == ()
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+
+    result = expand_prompt(config, chunk)
+
+    assert "must never depict" not in result.prompt
+    assert "must never depict" not in result.chained_prompt

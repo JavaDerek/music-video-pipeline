@@ -135,6 +135,84 @@ for the subject slot -- see ``prompting._apply_camera_clause``. Resolved by
 :func:`resolve_camera`, independently of whether ``shot`` itself is filled
 in: camera direction is just as meaningful paired with the global
 ``narrative_concept`` fallback as with an authored shot line.
+
+**Referent-based companion lint (issue #72).** ``present`` (issue #59) and
+the #64 lint above both ask a question about the *prompt*: does some cast
+member's name appear somewhere in it? Chunk 65 of a real "Deathless" render
+passed that question -- ``present = ["Dianne"]`` -- and still invented a
+stranger, because Dianne was already the singer: naming her again binds
+nothing that was not already bound, and the shot's ``he``/``his`` pointed at
+Jan, who was in no field at all. The question that actually matters is about
+the *sentence*: does this pronoun have a bound referent, distinct from
+whoever is already accounted for? :func:`lint_unbound_companion_referent`
+answers it structurally rather than by gender (no cast field carries gender
+-- see the function's own docstring for the exact field this would need and
+why the shipped version does not depend on one): it unions ``chunk.characters``
+(who is actually singing; empty on an instrumental chunk, matching
+``prompting._resolve_active_members``'s own fallback rule) with
+``entry.present`` into one "who is already bound" set, and warns only when
+that set names exactly one person while the shot's own prose insists on a
+*second* one ("a few paces off", "between them", "just behind him"/"her").
+Two or more bound names are left alone -- ambiguous, perhaps, but nobody is
+missing an identity, appearance or reference photo. Measured against the
+real 80-chunk "Deathless" plan: 2 of 80 chunks fire (chunk 65 itself, plus
+chunk 66's mirror image -- Jan's own "he" left unbound while the approaching
+"ash-crusted figure...just behind him" is Dianne, correctly bound). See the
+function's docstring for the phrases measured and discarded, most notably
+"beside her"/"beside him" -- suggested by the issue itself, and dropped after
+it fired on a shadow, a roof beam and a rock face "beside her" with nobody
+there at all (the very failure mode issue #64's own test suite already
+documents for that phrase, one section up).
+
+**Role-prohibition-vs-shot lint (issue #73).** A ``role`` written as a
+prohibition -- ``"...never holding anything"`` -- does not work: it was in
+force for an entire real render and a bass guitar still appeared in the same
+two hands twice, because a diffusion prompt has no way to condition on the
+*absence* of a token, only the presence of "holding" and "anything"
+(``config._warn_if_prohibition`` now warns about this at load time).
+:func:`lint_role_prohibition_contradiction` is the other half: it catches the
+render actually asserting the forbidden thing. Chunk 72's shot line has
+Dianne "close his fingers over" a needle she has just pressed into Jan's
+palm -- text that never says "hold" at all, which is exactly why this lint
+is honest about being narrow. It extracts the word right after
+``never``/``no``/``without`` in a present cast member's ``role`` and checks
+for it (or, for the specific and twice-measured "holding" concept only, a
+small curated set of physical-contact synonyms -- grip, grasp, clutch,
+cradle, "close(s) ... fingers") in that member's shot lines. Measured on the
+same 80-chunk plan restricted to ``shot`` text only: the plain verb "hold" in
+its many idiomatic and cinematographic senses ("holds his stance", "holding
+steady" as a *camera* direction) produced double-digit false positives, and
+even the exact word "holding" alone still caught two camera-direction uses
+before ``camera`` was dropped from what this lint reads. What survived that
+cutting -- the curated contact-verb pattern, ``shot`` text only -- fires
+on exactly one chunk in the whole plan: chunk 72. This is a literal (or
+near-literal, for the one concept measured twice) collision check, not
+semantic understanding of what a `role` forbids; a differently-worded
+violation of a differently-worded prohibition will still slip through, which
+is why issue #73's own conclusion -- positive phrasing, plus the render-side
+``avoid`` list -- is the durable fix and this lint is a backstop, not it.
+
+**Voiced-framing keyword re-score (issue #76).** :func:`lint_voiced_framing`'s
+keyword sets (:data:`_GAZE_AWAY_KEYWORDS`, :data:`_BEHIND_CAMERA_KEYWORDS`,
+what was :data:`_FOOT_LEVEL_KEYWORDS`) were all scored mid-render, on a
+partial "Deathless" corpus -- issue #60's own lesson, arriving one level up.
+The finished 80-chunk render (41 voiced chunks, corpus mean face presence
+53.3%, ``docs/deathless-render-corpus.md``) does not support them as
+shipped: the gaze set separated at 0.72x, not the 3.5x it was justified at;
+the foot-level set at 0.99x, statistically indistinguishable from noise; and
+``"in profile"``, deliberately left unshipped at n=3, turned out to be the
+one predictor with no counter-example across all 5 occurrences (0.41x).
+Three changes followed, each backed by the full-corpus numbers rather than a
+fresh guess: ``"in profile"`` now ships; ``_FOOT_LEVEL_KEYWORDS`` is retired
+(the observation behind it was real, the keyword list did not generalise);
+and ``_GAZE_AWAY_KEYWORDS`` is cut from 9 words to the 6 whose one measured
+occurrence actually landed below the corpus mean, with every excluded
+candidate recorded next to the chunk that falsified or never tested it. See
+the constants themselves for the full per-word accounting, and
+``docs/deathless-render-corpus.md`` for the numbers behind every one of
+these calls, including the "does the camera clause name the face" hypothesis
+tested and rejected at n=41 -- it runs backward from the hypothesis, not
+merely absent.
 """
 
 from __future__ import annotations
@@ -151,7 +229,7 @@ if sys.version_info >= (3, 11):
 else:
     import tomli as tomllib
 
-from music_video_maker.contracts import H3_FRAME_GRID, AudioChunk
+from music_video_maker.contracts import H3_FRAME_GRID, AudioChunk, CastMember
 
 logger = logging.getLogger(__name__)
 
@@ -322,6 +400,39 @@ class ShotPlanEntry:
     optional field here. Independent of ``shot``: a blank ``shot`` still lets
     ``camera`` apply to whatever concept text this chunk falls back to."""
 
+    location: str | None = None
+    """Where the active cast member is inside the run's ``setting`` at this
+    moment (issue #78), e.g. ``"switchback"`` or ``"mill"``.
+
+    ``setting`` (issue #32) anchors the world's *contents* -- one geography
+    for the whole video -- but nothing said where each character is inside
+    that world at a given moment, and a viewer's first note on a real render
+    was exactly this gap: "Diane climbs a hill where Jan is, cuts to her on
+    the top of a different hill where Jan isn't, cuts to a windmill tower
+    where they both are." A shot line may not reference another shot (issue
+    #61: each chunk renders from its own prompt, for a model that has never
+    seen any other), so nothing in the render itself can hold continuity of
+    *position* the way ``setting`` holds continuity of *place*. This is that
+    field's per-moment counterpart.
+
+    Authored by the beats stage (``authoring/beats.py``) from a small closed
+    vocabulary the concept stage defines for the song -- the same shape as
+    ``beat_role``/``beat_group``: checkable before a word of prose exists,
+    never guessed from finished text. A generated value is validated against
+    that vocabulary at generation time and anything outside it is rejected,
+    the same "a generated anchor is never trusted" rule ``chunk_id`` follows.
+    Re-emitted here from the frozen timeline exactly like every other
+    beat-derived field ``render_plan_toml`` writes.
+
+    Purely a checkable field, not a rendered one: nothing in this module or
+    ``prompting.py`` composes ``location`` into a prompt. It exists for
+    :func:`~music_video_maker.shot_plan.lint_present_location_mismatch` and
+    the load-time landmark-contradiction lint below to check consistency
+    against, the same way ``beat_role`` exists to be checked rather than
+    spoken. ``None`` (the default) is "not authored", never a fabricated
+    value -- true of every pre-#78 entry and every hand-written plan that
+    does not use the field."""
+
 
 def load_shot_plan(
     path: str | Path,
@@ -370,6 +481,7 @@ def load_shot_plan(
 
     logger.info("Loaded shot plan from %s: %d chunk(s) directed", path, len(plan))
     _lint_setting_consistency(setting, plan, cast_names, path)
+    _lint_landmark_position_contradiction(setting, plan, path)
     _lint_consequence_focus(plan, path)
     _lint_shot_lengths(plan, path)
     _lint_camera_double_composition(plan, path)
@@ -448,6 +560,149 @@ def _lint_setting_consistency(
                 locale.title(),
                 setting,
             )
+
+
+# --------------------------------------------------------------------------- #
+# Landmark position-contradiction lint (issue #78)
+# --------------------------------------------------------------------------- #
+
+LANDMARK_CONTRADICTION_WINDOW_SECONDS = 60.0
+"""How close two mentions of the same landmark must be in song time before a
+FAR-vs-NEAR contradiction between them counts as one (issue #78).
+
+A landmark legitimately reads as far away in one shot and close enough to
+touch in another an act of the song later -- that is the character closing
+the distance, not a defect. The real "Deathless" true positive (chunk 7's
+mill "in the valley below" at 54.583s, chunk 13's mill "at shoulder height"
+at 91.958s, with every line between them describing continued climbing) is
+37.4s apart; measured against the real 80-chunk plan, a window from 45s to
+90s catches exactly that pair and nothing past it -- 120s starts pulling in
+chunk 24 (157.583s later), which is a real arrival at the mill, not a
+contradiction. 60s sits comfortably inside the gap that works."""
+
+_LANDMARK_FAR_KEYWORDS: frozenset[str] = frozenset({
+    # Deliberately excludes bare "below": measured against the real 80-chunk
+    # "Deathless" plan, restricting candidate words to `setting`'s own
+    # vocabulary (see `_landmark_candidates`) but keeping bare "below" in
+    # this set still produced 32 fired pairs, the overwhelming majority
+    # false -- "below" overwhelmingly describes some OTHER noun in the same
+    # sentence (the valley, the battlefield) than the landmark word it
+    # happens to share a shot line with. Every phrase below is specific
+    # enough about elevation/distance that it survived that measurement with
+    # the true positive (chunk 7's mill) intact and nothing else firing.
+    "far below", "in the valley below", "far off", "far away",
+    "in the distance", "far behind", "far above",
+})
+
+_LANDMARK_NEAR_KEYWORDS: frozenset[str] = frozenset({
+    # Same measurement, same exclusion logic: generic body-part-contact
+    # phrases ("her palm", "her fingertips", "beneath her boot") were cut
+    # after they matched unrelated hand action (guiding a needle through a
+    # sleeve cuff) that happened to share a sentence with a landmark mention
+    # elsewhere in the plan. What survives are phrases specific enough to
+    # the landmark itself -- a hand or body actually reaching a structure --
+    # that they held the true positive (chunk 13's "at shoulder height...
+    # trailing along its worn wood grain") with zero false positives across
+    # the real 80-chunk plan.
+    "at shoulder height", "trailing along", "close beside",
+    "climbs up onto", "climbs onto", "reaches out and touches",
+    "inches from", "at head height",
+})
+
+
+def _landmark_candidates(setting: str) -> frozenset[str]:
+    """Candidate "landmark" words: content words that also appear in
+    ``setting`` (issue #78).
+
+    Restricting to ``setting``'s own vocabulary -- the same field #32 already
+    uses to anchor geography -- is what keeps this lint from re-exploding
+    into the noisy version measured and rejected during development: without
+    it, any two chunks sharing an ordinary repeated word (a verb like "lies"
+    or "rising", not a landmark at all) were candidates, and the false-
+    positive count went from 1 to double digits on the same 80-chunk plan.
+    A word the run has already named as fixed and significant in its own
+    setting is a much stronger landmark signal than mere repetition."""
+    return frozenset(_singularish(w) for w in _content_words(setting))
+
+
+def _lint_landmark_position_contradiction(
+    setting: str | None, plan: Mapping[int, ShotPlanEntry], path: Path
+) -> None:
+    """Warn (never raise) when two chunks close together in song time
+    describe the same named landmark at contradictory distances (issue #78).
+
+    The defect this exists for: chunk 7 of a real "Deathless" render put
+    Volokov's mill "in the valley below" while she was still climbing toward
+    it, and chunk 13 -- 37.4s later, with every line between them describing
+    continued ascent -- had her palm "trailing along its worn wood grain" at
+    shoulder height. She cannot be climbing away from a landmark and arrive
+    at it. See the module's CLAUDE.md entry and
+    :data:`LANDMARK_CONTRADICTION_WINDOW_SECONDS`'s docstring for exactly how
+    narrow the surviving keyword sets and candidate-word restriction had to
+    become before this stopped firing on ordinary prose: an early version
+    matched any repeated word plus a bare "below" and fired on ~30 pairs
+    across a third of the same 80-chunk plan, almost all of them a FAR/NEAR
+    phrase attaching to some OTHER noun in the same sentence than the shared
+    landmark word. What ships here fires on exactly the one true positive.
+
+    Silent whenever ``setting`` is unset (nothing to derive landmark
+    candidates from) -- the same convention :func:`_lint_setting_consistency`
+    uses for the same reason.
+    """
+    if not setting:
+        return
+    candidates = _landmark_candidates(setting)
+    if not candidates:
+        return
+
+    word_chunks: dict[str, list[int]] = {}
+    for chunk_id, entry in plan.items():
+        for word in _content_words(entry.shot):
+            stem = _singularish(word)
+            if stem in candidates:
+                word_chunks.setdefault(stem, []).append(chunk_id)
+
+    warned_pairs: set[tuple[int, int]] = set()
+    for word in sorted(word_chunks):
+        ordered = sorted(set(word_chunks[word]))
+        for i, a in enumerate(ordered):
+            for b in ordered[i + 1 :]:
+                if abs(plan[a].start - plan[b].start) > LANDMARK_CONTRADICTION_WINDOW_SECONDS:
+                    continue
+                shot_a = plan[a].shot.lower()
+                shot_b = plan[b].shot.lower()
+                far_a = next((k for k in _LANDMARK_FAR_KEYWORDS if k in shot_a), None)
+                near_a = next((k for k in _LANDMARK_NEAR_KEYWORDS if k in shot_a), None)
+                far_b = next((k for k in _LANDMARK_FAR_KEYWORDS if k in shot_b), None)
+                near_b = next((k for k in _LANDMARK_NEAR_KEYWORDS if k in shot_b), None)
+                if far_a and near_b:
+                    far_id, far_hit, near_id, near_hit = a, far_a, b, near_b
+                elif near_a and far_b:
+                    far_id, far_hit, near_id, near_hit = b, far_b, a, near_a
+                else:
+                    continue
+                pair_key = (min(a, b), max(a, b))
+                if pair_key in warned_pairs:
+                    continue
+                warned_pairs.add(pair_key)
+                logger.warning(
+                    "Shot plan %s: chunk_id=%d and chunk_id=%d both mention %r within "
+                    "%.0fs of each other in the song, but these read at contradictory "
+                    "distances: chunk_id=%d reads it far away (%r) while chunk_id=%d "
+                    "reads it close enough to touch (%r). A landmark cannot be both at "
+                    "once this close together in the timeline (issue #78) -- reword one, "
+                    "or space them further apart if the character genuinely closed the "
+                    "distance in between.",
+                    path,
+                    a,
+                    b,
+                    word,
+                    LANDMARK_CONTRADICTION_WINDOW_SECONDS,
+                    far_id,
+                    far_hit,
+                    near_id,
+                    near_hit,
+                )
 
 
 # --------------------------------------------------------------------------- #
@@ -930,15 +1185,25 @@ _WIDE_FRAMING_KEYWORDS: frozenset[str] = frozenset({
     "high and wide", "from a distance", "establishing",
 })
 
-_FOOT_LEVEL_KEYWORDS: frozenset[str] = frozenset({
-    # Body parts and surfaces below the chin. Each one anchors a frame that
-    # cannot also hold a face. "hands" is deliberately NOT here: hands come up
-    # to the face, and a close shot of hands often keeps the head in frame --
-    # measured, a chunk framed on a needle in a raised fist kept the face for
-    # 80% of its frames.
-    "boots", "boot", "feet", "ankles", "underfoot", "knees", "hem",
-    "at his feet", "at her feet", "soil", "the ground", "the floor",
-})
+# _FOOT_LEVEL_KEYWORDS is RETIRED (issue #76). It shipped as: "boots",
+# "boot", "feet", "ankles", "underfoot", "knees", "hem", "at his feet",
+# "at her feet", "soil", "the ground", "the floor" -- body parts and
+# surfaces below the chin, on the real finding that a chunk framed on a
+# needle in a raised fist kept the face for 80% of its frames while a line
+# reading "pushing up between his boots" rendered legs, boots and perfect
+# mushrooms with no face anywhere. That underlying observation was real and
+# never retested here -- it's the KEYWORD LIST that failed to generalise,
+# not the observation. Re-derived against all 41 voiced chunks of the
+# finished "Deathless" render: only two of the twelve words ever occur.
+# "the ground" fires on chunk 43 (33% face) and chunk 68 (92% face) -- the
+# same phrase, a near-60-point spread, no separation at all. "underfoot"
+# fires once, on chunk 22 (33% face) -- a single data point, the same thin
+# evidence #60 warns against generalising from. Combined the shipped set
+# scored 0.99x against the rest of the voiced corpus: statistically
+# indistinguishable from noise. Retired rather than re-derived down to one
+# thin word, on the standing warning that a weak lint costs nothing at
+# runtime and a great deal the moment somebody rewrites a correct shot to
+# please it. Full numbers: docs/deathless-render-corpus.md Part 3.
 
 _GAZE_AWAY_KEYWORDS: frozenset[str] = frozenset({
     # A gaze that SETTLES on something in the scene turns the head away from
@@ -946,16 +1211,45 @@ _GAZE_AWAY_KEYWORDS: frozenset[str] = frozenset({
     # asked for "medium close, her face centre" and read "as she looks back
     # down at them", and she was back-to-camera throughout.
     #
-    # Scored against the 41 sung lines of a real generated plan before
-    # shipping, the way issue #60 requires. These matched the 8 lines that
-    # send the gaze away and none of the lines that rendered well.
-    "looks out", "looks back", "looks down", "looks up at", "looks over",
-    "looking back", "looking down", "looking out",
-    "staring down", "staring out", "staring up", "stares down", "stares out",
-    "gaze drops", "gaze lifts", "gaze fixed", "gaze drifts",
-    "lifts her gaze", "lifts his gaze", "keeps her gaze", "keeps his gaze",
-    "turns back", "turns away",
-    # DELIBERATELY EXCLUDED, with reasons:
+    # RE-SCORED against the full 41 voiced chunks of the finished "Deathless"
+    # render (issue #76), superseding the mid-render n=9 set this replaced --
+    # that set separated at only 0.72x on the full corpus, not the 3.5x it
+    # was justified at. Kept below: each word's one measured occurrence in
+    # this corpus landed BELOW the voiced-corpus mean (53.3%). The 6 kept
+    # words together score 15.3% avg / ~0.26x vs the rest of the corpus --
+    # a much cleaner separation than the original 9-word set ever had.
+    "looks back",   # chunk 9,  0% face
+    "looks up at",  # chunk 26, 0% face
+    "staring up",   # chunk 20, 0% face
+    "looks out",    # chunk 59, 25% face
+    "gaze fixed",   # chunk 65, 25% face
+    "turns back",   # chunk 15, 42% face -- below the mean, the weakest survivor
+    #
+    # EXCLUDED -- measured ABOVE the corpus mean: the gaze verb fired, but
+    # the camera clause in the same entry also named the face, and the
+    # camera won. These are false positives on this corpus, not merely
+    # untested, so they are cut rather than kept on faith:
+    #   "gaze drops"     -- chunk 42, 100% face ("close, straight on, static")
+    #   "gaze lifts"     -- chunk 73, 83% face ("close on his face, low, from
+    #                        the horizon side")
+    #   "lifts her gaze" -- chunk 64, 92% face ("close on her face, low, the
+    #                        light band behind her")
+    #
+    # EXCLUDED -- only ever co-occur with an already-kept word on the same
+    # chunk (65, alongside "gaze fixed"), so keeping them tests nothing this
+    # corpus didn't already test via that word:
+    #   "keeps his gaze", "staring down"
+    #
+    # EXCLUDED -- never occur in any of this song's 41 voiced shot lines, so
+    # this corpus has no evidence for or against them (#60's discipline
+    # applies to absence, too: a word this run never exercised has not been
+    # measured, and does not get to ship on the strength of the words that
+    # did):
+    #   "gaze drifts", "keeps her gaze", "lifts his gaze", "looking back",
+    #   "looking down", "looking out", "looks down", "looks over",
+    #   "stares down", "stares out", "staring out", "turns away"
+    #
+    # STILL DELIBERATELY EXCLUDED, unaffected by this re-score:
     #   "glancing" -- the highest-scoring chunk of the whole run (80-89% face
     #     presence) reads "glancing up at a motionless figure". A glance
     #     returns to camera; a gaze settles. Including it would have flagged
@@ -965,16 +1259,41 @@ _GAZE_AWAY_KEYWORDS: frozenset[str] = frozenset({
     #     on both is noise, and noise is what makes a lint block get skipped.
 })
 
+_IN_PROFILE_KEYWORDS: frozenset[str] = frozenset({
+    # SHIPPED (issue #76), superseding the earlier decision to leave this
+    # out at n=3 (8%, 0%, 45% -- "a real risk but not a reliable one"). A
+    # larger sample reversed that call rather than silently changing it: on
+    # the finished 80-chunk render this is the one predictor of the four
+    # tested (gaze-away, behind-camera, foot-level, in-profile) with NO
+    # counter-example across all 5 occurrences -- chunks 18, 21, 37, 43, 59,
+    # face presence 8%/8%/42%/33%/25%, worst case 8%, best case 42%, every
+    # one below the 53.3% corpus mean. Scores 23.3% avg / 0.41x vs the rest
+    # of the corpus. Checked on `camera`, ahead of the close-framing check:
+    # all 5 real occurrences also contain "close" or "medium close", so a
+    # profile shot IS a close shot and would otherwise pass silently.
+    "in profile",
+})
+
 _BEHIND_CAMERA_KEYWORDS: frozenset[str] = frozenset({
     # Where the lens is relative to the FACE, which is not the same as the
     # direction of travel. Measured on one run: "travelling with her" up a
     # climb gave 0% face presence, while "ahead of her" on the same run gave
     # 89% -- so a moving camera is fine and a following one is not.
     #
-    # "in profile" is NOT here, deliberately: it measured 8%, 0% and 45% on
-    # three sung chunks, which is a real risk but not a reliable one, and a
-    # profile close-up is a legitimate shot. Recorded in the run findings
-    # instead of shipped as a keyword that fires on a defensible choice.
+    # "in profile" now ships as its own check, _IN_PROFILE_KEYWORDS above --
+    # not here (issue #76 reversed the earlier decision to leave it out).
+    #
+    # NOT re-scored against the full render, unlike the gaze and foot-level
+    # sets above -- issue #76 did not ask for it, and this set's own two
+    # measured hits on the full corpus are BOTH the same phrase,
+    # "travelling with", on chunk 7 (83% face, "her closed fist and her face
+    # held in the same frame") and chunk 25 (0% face, "the sails passing
+    # through the background") -- the same word, opposite outcomes, one
+    # combined score of 0.77x. That is the same shape of evidence that
+    # retired the foot-level set above, and this set was left untouched only
+    # because it was out of this issue's stated scope; flagged in
+    # docs/deathless-render-corpus.md as a candidate for a future pass
+    # rather than changed here.
     "travelling with", "tracking behind", "from behind", "following her",
     "following him", "behind her shoulder", "over her shoulder from behind",
 })
@@ -1030,12 +1349,9 @@ def lint_voiced_framing(
                 chunk_id,
             )
             continue
-        # Near is not the same as in frame with the face. #58's rule -- stage
-        # the object near, not far -- is right and says nothing about height,
-        # so a sung chunk can satisfy it with an object at the performer's
-        # feet and lose the head out of the top of frame. Measured: a line
-        # reading "pushing up between his boots" rendered legs, boots and
-        # perfect mushrooms, over his own vocal, with no face anywhere.
+        # A gaze verb in the shot line settles the head away from the lens
+        # regardless of what `camera` asks for -- the sentence outranks the
+        # field. See _GAZE_AWAY_KEYWORDS for the full re-scored list.
         shot_lower = plan[chunk_id].shot.lower()
         gaze = next((k for k in sorted(_GAZE_AWAY_KEYWORDS) if k in shot_lower), None)
         if gaze:
@@ -1060,16 +1376,21 @@ def lint_voiced_framing(
                 behind,
             )
             continue
-        blob = f"{camera} {shot_lower}"
-        low = next((k for k in sorted(_FOOT_LEVEL_KEYWORDS) if re.search(rf"\b{k}\b", blob)), None)
-        if low:
+        # Checked before the close-framing check below: every one of this
+        # song's 5 real "in profile" occurrences also contains "close" or
+        # "medium close", so a profile shot IS a close shot and would
+        # otherwise pass silently. Measured at 23.3% avg face presence / 0.41x
+        # vs the rest of the voiced corpus, no counter-example (issue #76).
+        profile = next((k for k in sorted(_IN_PROFILE_KEYWORDS) if k in camera), None)
+        if profile:
             logger.warning(
-                "Shot plan: chunk_id=%d carries a lyric but stages %r, which pulls the "
-                "frame down off the singer's head -- near is not the same as in frame "
-                "with the face. Put the object at hand or head height on a sung chunk, "
-                "or move the beat to an instrumental one.",
+                "Shot plan: chunk_id=%d carries a lyric but the camera is %r -- a "
+                "profile framing loses the face far more often than a close shot "
+                "generally does (23%% avg face presence across every measured "
+                "occurrence on a real render, vs 53%% overall). Face the lens more "
+                "directly, or move the profile framing to an instrumental chunk.",
                 chunk_id,
-                low,
+                profile,
             )
             continue
         if any(k in camera for k in _CLOSE_FRAMING_KEYWORDS):
@@ -1283,8 +1604,364 @@ def lint_camera_face_away_on_voiced_chunks(
             break  # one warning per entry is enough
 
 
+# --------------------------------------------------------------------------- #
+# Referent-based companion lint (issue #72)
+# --------------------------------------------------------------------------- #
+
+_THIRD_PERSON_PRONOUN_PATTERN = re.compile(r"\b(he|him|his|she|her|hers)\b", re.IGNORECASE)
+"""Every third-person singular personal pronoun this lint resolves. Wider
+than issue #64's own list (which has no ``she``/``her`` at all, because #64
+was built from an audit that happened to find only ``him``/``he`` cases) --
+this lint needs both, since the case it exists for (chunk 65) is "he" left
+unbound while "Dianne" (a ``she``) is the one already accounted for, and the
+mirror case (chunk 66) is exactly the reverse."""
+
+_SECOND_PERSON_DISTANCE_KEYWORDS: frozenset[str] = frozenset({
+    # A small, deliberately curated set, matched case-insensitively against
+    # `shot` text -- the same technique as `_DISTANT_STAGING_KEYWORDS` and
+    # every other lint in this file. Each phrase has to assert TWO distinct
+    # entities occupying different points in space, not merely something
+    # near the one entity everybody already knows about.
+    #
+    # Measured against the real 80-chunk "Deathless" plan, gated to chunks
+    # where exactly one cast member is already bound (see the function
+    # docstring): "a few paces off" fires once, on chunk 65 -- the chunk this
+    # lint exists for. "just behind him" fires once, on chunk 66, the mirror
+    # case: Jan's own "He" is the unbound one there, while the "ash-crusted
+    # figure...just behind him" (Dianne, correctly bound via `present`) is
+    # what supplies the second-person evidence. "just behind her" is added
+    # as the obvious symmetric form; it does not occur in the measured plan
+    # in either direction.
+    "a few paces off", "just behind him", "just behind her",
+    "between them",
+    # "between them" appears twice in the measured plan (chunks 69 and 71)
+    # and is silent both times -- correctly, since both chunks already bind
+    # two real names via `present`, so the single-candidate gate below never
+    # reaches the phrase check for either. Kept because it is one of the
+    # phrases issue #72 itself proposes and nothing in the corpus argues
+    # against it.
+    #
+    # DELIBERATELY EXCLUDED, with reasons -- also proposed by issue #72:
+    #   "beside her" / "beside him" / "next to her" / "next to him" /
+    #   "at her side" / "at his side" -- measured 3 for 3 false positive on
+    #   this same plan: "her shadow sprawling up the rock face beside her"
+    #   (chunk 18, a shadow), "its roof beams collapsed and blackened close
+    #   beside her" (chunk 24, a ruined terrace), "the sheer summit wall
+    #   rising close beside her" (chunk 30, a cliff). "Beside" attaches to
+    #   whatever inanimate noun is nearest in a landscape-heavy plan far more
+    #   often than it introduces a second person -- this file's own #64 test
+    #   suite already has a case for exactly this ("The printer lies smashed
+    #   in a snowbank...beside her" must stay silent), which is the same
+    #   lesson landing a second time.
+    #   "a few steps away" / "a short distance away" / "off to the side" /
+    #   "just ahead of her" / "just ahead of him" -- same shape as the
+    #   shipped phrases, but never occur in the measured plan in either
+    #   direction, so there is no evidence either way. Left out per issue
+    #   #60's rule against shipping an unscored keyword; add them once a real
+    #   plan supplies a case.
+})
+
+
+def lint_unbound_companion_referent(
+    plan: Mapping[int, ShotPlanEntry], chunks: Sequence[AudioChunk]
+) -> None:
+    """Warn (never raise) when a shot's only bound cast member is not who a
+    pronoun in the shot actually refers to (issue #72).
+
+    Issue #64 (one section up) asks a question about the *prompt*: does some
+    cast member's name appear in it at all? ``present = ["Dianne"]`` answers
+    yes and #64 stays silent -- but on chunk 65 of a real "Deathless" render,
+    Dianne was already the singer, so naming her again bound nothing that was
+    not already bound, and the shot's own "he"/"his" pointed at Jan, who was
+    in no field anywhere. The question that matters is about the *sentence*:
+    is there a pronoun with no distinct referent among the names the prompt
+    actually carries?
+
+    The "candidates" a pronoun could resolve to are ``chunk.characters``
+    (who is actually singing -- empty on an instrumental chunk, which is
+    also exactly when ``prompting._resolve_active_members`` falls back to
+    ``config.default_lead_vocalist``, so an instrumental chunk is never
+    truly "nobody": it is whoever that fallback would compose) unioned with
+    ``entry.present``. When that union names two or more people, a pronoun
+    has somewhere real to land even if it is ambiguous which -- both
+    identities are in the prompt regardless -- so this lint is silent. It
+    only fires when exactly **one** name is bound and the shot's own prose
+    still insists on a second, distinct entity via
+    :data:`_SECOND_PERSON_DISTANCE_KEYWORDS`.
+
+    **On gender.** The issue that motivated this lint proposes a cheaper
+    version: warn when the only bound candidate's gender does not match the
+    pronoun's. Nothing in this project's cast configuration carries a
+    gender -- :class:`~music_video_maker.contracts.CastMember` has ``name``,
+    ``role``, ``image`` and ``appearance``, and none of those is a
+    structured "how do this member's own pronouns read" field. Rather than
+    guess it from a name (unreliable, and the issue explicitly warns against
+    exactly that), this lint uses the structural signal above instead, which
+    needs no gender at all. If gender ever becomes worth adding formally,
+    the field this lint would consume is a per-member
+    ``CastMember.pronoun`` (or similar) that a lint could compare against
+    the pronoun actually used -- until then, the phrase-based check above is
+    the best available version, not a placeholder for a better one already
+    in hand.
+
+    Warning tier, like every lint in this file: a false positive on prose a
+    human wrote deliberately must never be able to block a run.
+    """
+    for chunk in chunks:
+        entry = plan.get(chunk.chunk_id)
+        if entry is None:
+            continue
+        shot_lower = entry.shot.lower()
+        if not _THIRD_PERSON_PRONOUN_PATTERN.search(shot_lower):
+            continue
+        candidates = set(chunk.characters) | set(entry.present)
+        if len(candidates) != 1:
+            continue
+        hit = next(
+            (k for k in sorted(_SECOND_PERSON_DISTANCE_KEYWORDS) if k in shot_lower), None
+        )
+        if hit is None:
+            continue
+        (only_bound,) = candidates
+        logger.warning(
+            "Shot plan chunk_id=%d: the only cast member bound to this shot is %r, but "
+            "the shot line says %r -- which reads as a SECOND, distinct person, and this "
+            "shot's own pronoun has nowhere else to resolve to (issue #72). If somebody "
+            "else is meant to be on screen, add them to present = [...]; if %r is meant "
+            "to be alone, reword so the pronoun clearly refers back to them.",
+            chunk.chunk_id,
+            only_bound,
+            hit,
+            only_bound,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Role-prohibition-vs-shot lint (issue #73)
+# --------------------------------------------------------------------------- #
+
+_PROHIBITION_TRIGGER_PATTERN = re.compile(r"\b(?:never|without|no)\s+([a-z]+)", re.IGNORECASE)
+"""Same trigger words as ``config._PROHIBITION_PATTERN`` (issue #73) --
+"never"/"no"/"without" are what a human reaches for to write a prohibition.
+This pattern additionally captures the single content word right after the
+trigger, which is the term this lint tries to find asserted elsewhere."""
+
+_PROHIBITION_EXTRACTION_STOPWORDS: frozenset[str] = frozenset({
+    # Words a prohibition trigger is very often followed by that name nothing
+    # concrete -- extracting these would just search for a stopword. "never
+    # holding anything" must yield "holding", not "anything".
+    "anything", "something", "nothing", "one", "ones", "it", "that", "this",
+    "a", "an", "the", "one's",
+})
+
+_HOLD_CONTACT_TERMS: frozenset[str] = frozenset({"hold", "holds", "holding", "held"})
+"""The one prohibited concept this lint has TWO independent measured real
+bugs for (#31's "Bass player" role and #73's "never holding anything" role,
+both on the same character, both putting an object in his hands) -- see
+:data:`_HOLD_CONTACT_PATTERN` for why the plain words above are matched only
+via a curated synonym set rather than searched for literally."""
+
+_HOLD_CONTACT_PATTERN = re.compile(
+    r"\b(?:grip|grips|gripping|gripped|grasp|grasps|grasping|grasped|"
+    r"clutch|clutches|clutching|clutched|cradles|cradling|cradled)\b"
+    r"|\bclose[sd]?\s+\w+\s+fingers\b|\bclosing\s+\w+\s+fingers\b",
+    re.IGNORECASE,
+)
+"""What actually gets searched for when a `role` prohibits "holding"
+something, instead of the bare words in :data:`_HOLD_CONTACT_TERMS`.
+
+Chunk 72 of the real "Deathless" plan -- the clean test case issue #73 names
+-- never uses the word "hold" at all: "Her fingers press the needle into his
+open palm and close his fingers over it." A literal search for "hold" would
+miss it entirely.
+
+The opposite failure is just as real: searching `shot` text for the bare verb
+"hold" in all its forms, measured against the same plan restricted to chunks
+where Jan (the character whose role carries the prohibition) is present,
+matched double digits of chunks -- "he holds his stance", "he holds his
+ground", "the valley holds no armies now" -- none of which are Jan holding an
+OBJECT. Even the single exact word "holding" (not the wider family) still
+matched two `camera` values ("holding the far dust columns", "holding
+steady") that are cinematography jargon for framing, not a hand. That is why
+this pattern is (a) restricted to `shot` text only, never `camera`, and (b) a
+small curated set of unambiguous physical-contact synonyms plus the specific
+"closes ... fingers" construction, not the word "hold" itself. Scored
+against the same 80-chunk plan, restricted to `shot` text on Jan's chunks:
+exactly one match, chunk 72."""
+
+
+def _extract_prohibited_terms(role: str) -> frozenset[str]:
+    """Every content word immediately following a prohibition trigger
+    ("never"/"no"/"without") in ``role``, singularized. See
+    :data:`_PROHIBITION_TRIGGER_PATTERN`."""
+    terms = set()
+    for match in _PROHIBITION_TRIGGER_PATTERN.finditer(role):
+        word = match.group(1).lower()
+        if word in _PROHIBITION_EXTRACTION_STOPWORDS:
+            continue
+        terms.add(_singularish(word))
+    return frozenset(terms)
+
+
+def lint_role_prohibition_contradiction(
+    plan: Mapping[int, ShotPlanEntry],
+    chunks: Sequence[AudioChunk],
+    cast: Mapping[str, CastMember],
+) -> None:
+    """Warn (never raise) when a chunk's ``shot`` text asserts something a
+    present cast member's ``role`` says they never do (issue #73).
+
+    The corrected `role` "...never holding anything" was in force for an
+    entire real render and a bass guitar still appeared in the same hands
+    twice, because a diffusion prompt has no channel for negation -- the only
+    tokens it sees are "holding" and "anything"
+    (``config._warn_if_prohibition`` now warns about the field in isolation,
+    at load time). This is the other half: catching the shot line that
+    actually describes the forbidden thing happening.
+
+    For each cast member bound to a chunk (``chunk.characters | entry.present``
+    -- the same union :func:`lint_unbound_companion_referent` uses), every
+    prohibited term extracted from that member's ``role`` is checked against
+    the chunk's ``shot`` text only, never ``camera`` -- see
+    :data:`_HOLD_CONTACT_PATTERN`'s docstring for why ``camera`` was measured
+    and dropped. A term that is a form of "hold" uses the curated
+    physical-contact synonym set in :data:`_HOLD_CONTACT_PATTERN`, the one
+    concept this project has two independent measured bugs for; every other
+    extracted term is searched for literally (singularized, word-boundary).
+
+    **Honesty about how far this generalises.** This is a literal (or, for
+    "holding" specifically, near-literal) collision check on the term
+    immediately following the prohibition trigger -- not comprehension of
+    what a `role` forbids. A prohibition worded around a different concept
+    ("no modern equipment") will only be caught if the shot text uses a
+    plainly cognate word; a paraphrase will slip through exactly as "close
+    his fingers over it" would have slipped through a literal "hold" search.
+    Issue #73's own conclusion is that the durable fix is positive phrasing
+    in `role` plus the render-side `avoid` list actually reaching the prompt
+    -- this lint is a backstop for the one shape of violation it can see,
+    not a substitute for either.
+
+    Warning tier, like every lint in this file: a false positive on prose a
+    human wrote deliberately must never be able to block a run.
+    """
+    for chunk in chunks:
+        entry = plan.get(chunk.chunk_id)
+        if entry is None:
+            continue
+        candidates = set(chunk.characters) | set(entry.present)
+        if not candidates:
+            continue
+        shot_lower = entry.shot.lower()
+        for name in sorted(candidates):
+            member = cast.get(name)
+            if member is None:
+                continue
+            terms = _extract_prohibited_terms(member.role)
+            if not terms:
+                continue
+            for term in sorted(terms):
+                if term in _HOLD_CONTACT_TERMS:
+                    match = _HOLD_CONTACT_PATTERN.search(shot_lower)
+                else:
+                    match = re.search(rf"\b{re.escape(term)}s?\b", shot_lower)
+                if match is None:
+                    continue
+                logger.warning(
+                    "Shot plan chunk_id=%d: %s's role says %r (a prohibition -- issue "
+                    "#73), but this chunk's shot line says %r, which reads as %s doing "
+                    "exactly that (matched %r). A diffusion prompt cannot condition on "
+                    "the ABSENCE of a token, so the prohibition in role has no effect "
+                    "here; reword the shot, or reword the role to say what IS true "
+                    "instead of what is not.",
+                    chunk.chunk_id,
+                    name,
+                    member.role,
+                    entry.shot,
+                    name,
+                    match.group(0),
+                )
+                break  # one warning per (chunk, member) is enough
+
+
+# --------------------------------------------------------------------------- #
+# present-vs-location mismatch lint (issue #78)
+# --------------------------------------------------------------------------- #
+
+
+def lint_present_location_mismatch(
+    plan: Mapping[int, ShotPlanEntry], chunks: Sequence[AudioChunk]
+) -> None:
+    """Warn (never raise) when ``present`` stages a companion at a location
+    that contradicts where their own singing chunks have placed them
+    (issue #78).
+
+    ``present`` (issue #59) answers "is this cast member on screen here"; it
+    never answered "does the run even know the two characters are in the
+    same place". Chunk 7 of a real "Deathless" render set
+    ``present = ["Jan"]`` on a hillside scene that never mentions him -- the
+    "hill where Jan is" a viewer's first note complained about -- while Jan's
+    own singing chunks, dozens of chunks later, place him at the watch-post.
+    Nothing caught that the two locations disagree.
+
+    Structural, not textual: this compares the STRUCTURED ``location`` tag
+    alone, never prose. For every name, ``own_locations`` is the set of
+    ``location`` values recorded on the chunks where that name is actually
+    singing (``chunk.characters``) -- the only chunks a name's location can
+    be established from without guessing. A chunk that stages someone via
+    ``present`` at a ``location`` outside that set, when the set is
+    non-empty, is a genuine contradiction: nothing shows how they got from
+    one place to the other, and #61 already rules out a shot line saying so
+    itself.
+
+    Deliberately silent when a present companion has **no** singing chunk of
+    their own at all -- not a gap, a design choice. A companion who never
+    sings solo (very common in a two-hander) would otherwise trip this on
+    nearly every use of ``present``, for exactly the reason "absence of
+    evidence" lints are excluded throughout this module: warning on "nothing
+    is known yet" is not the same claim as warning on "this contradicts what
+    is known", and only the second one is worth a human's attention.
+
+    Silent, too, whenever ``location`` is unset on either side -- true of
+    every plan authored before issue #78, including the real 80-chunk
+    "Deathless" plan this project has on hand, which predates the field
+    entirely and resolves every ``location`` to ``None``.
+    """
+    own_locations: dict[str, set[str]] = {}
+    for chunk in chunks:
+        entry = plan.get(chunk.chunk_id)
+        if entry is None or not entry.location:
+            continue
+        for name in chunk.characters:
+            own_locations.setdefault(name, set()).add(entry.location)
+
+    for chunk in chunks:
+        entry = plan.get(chunk.chunk_id)
+        if entry is None or not entry.location or not entry.present:
+            continue
+        for name in entry.present:
+            locations = own_locations.get(name)
+            if not locations or entry.location in locations:
+                continue
+            logger.warning(
+                "Shot plan chunk_id=%d: present=[%r] stages %s at location=%r, but %s's "
+                "own singing chunk(s) elsewhere in the plan put them at %s -- nothing "
+                "shows how %s got from one to the other, and a shot line may not "
+                "reference another shot to explain it (issue #78, issue #61). Either "
+                "%s is not really here, or an earlier/later chunk needs to show the "
+                "move.",
+                chunk.chunk_id,
+                name,
+                name,
+                entry.location,
+                name,
+                sorted(locations),
+                name,
+                name,
+            )
+
+
 ENTRY_KEYS = frozenset(
-    {"chunk_id", "start", "shot", "focus", "length_seconds", "camera", "present"}
+    {"chunk_id", "start", "shot", "focus", "length_seconds", "camera", "present", "location"}
 )
 """Every key this module actually reads out of a ``[[shot]]`` table."""
 
@@ -1363,6 +2040,7 @@ def _parse_entry(raw: object, index: int, path: Path) -> ShotPlanEntry:
         length_seconds=_parse_length_seconds(raw, chunk_id, path),
         camera=_parse_camera(raw, chunk_id, path),
         present=_parse_present(raw, chunk_id, path),
+        location=_parse_location(raw, chunk_id, path),
     )
 
 
@@ -1423,6 +2101,30 @@ def _parse_camera(raw: dict, chunk_id: object, path: Path) -> str | None:
             f"shot plan {path}: chunk_id={chunk_id} has camera={camera!r}; it must be a string"
         )
     return camera.strip() or None
+
+
+def _parse_location(raw: dict, chunk_id: object, path: Path) -> str | None:
+    """Read the optional ``location`` field (issue #78). Absent/blank means
+    "not authored" -- never a fabricated default, same convention as
+    ``camera``. Not validated against any closed vocabulary here: this
+    module never sees the concept that defines one, and a hand-written plan
+    is free to use the field or not at all. The generation-time closed-set
+    check lives in ``authoring/beats.py``, where the vocabulary actually is."""
+    location = raw.get("location")
+    if location is None:
+        return None
+    if not isinstance(location, str):
+        logger.error(
+            "Shot plan %s: chunk_id=%s has location=%r, which is not a string",
+            path,
+            chunk_id,
+            location,
+        )
+        raise ShotPlanError(
+            f"shot plan {path}: chunk_id={chunk_id} has location={location!r}; it must be "
+            "a string"
+        )
+    return location.strip() or None
 
 
 def _parse_length_seconds(raw: dict, chunk_id: object, path: Path) -> float | None:
@@ -1598,6 +2300,22 @@ def resolve_present(
     return entry.present if entry is not None else ()
 
 
+def resolve_location(
+    plan: Mapping[int, ShotPlanEntry] | None, chunk: AudioChunk
+) -> str | None:
+    """This chunk's authored location tag (issue #78), or ``None`` when the
+    plan has no entry for it, the entry never set ``location``, or (via
+    :func:`_resolve_entry`) the plan itself is absent.
+
+    Shares :func:`_resolve_entry`'s drift check for the same reason
+    :func:`resolve_camera`/:func:`resolve_present` do: a stale plan must
+    refuse every field the same way, not just the ones the render loop
+    consumes directly. ``location`` is never composed into a prompt -- this
+    exists only so the two lints below have something to compare."""
+    entry = _resolve_entry(plan, chunk)
+    return entry.location if entry is not None else None
+
+
 # --------------------------------------------------------------------------- #
 # Skeleton generation for --prepare (issue #52)
 # --------------------------------------------------------------------------- #
@@ -1691,8 +2409,12 @@ def write_shot_plan_skeleton(
 
 __all__ = [
     "lint_camera_face_away_on_voiced_chunks",
+    "lint_present_location_mismatch",
+    "lint_role_prohibition_contradiction",
     "lint_shots_against_lyrics",
+    "lint_unbound_companion_referent",
     "ENTRY_KEYS",
+    "LANDMARK_CONTRADICTION_WINDOW_SECONDS",
     "MEASURED_MAX_FRAMES",
     "PROVENANCE_ENTRY_KEYS",
     "START_TOLERANCE_SECONDS",
@@ -1705,6 +2427,7 @@ __all__ = [
     "load_shot_plan",
     "render_shot_plan_skeleton",
     "resolve_camera",
+    "resolve_location",
     "resolve_shot",
     "shot_length_requests",
     "write_shot_plan_skeleton",

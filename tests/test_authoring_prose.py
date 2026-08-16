@@ -74,7 +74,9 @@ def _chunks(texts: list[str], width: float = 6.0):
     )
 
 
-def _beat(chunk_id, *, group=1, role="transition", start=None, focus="subject"):
+def _beat(
+    chunk_id, *, group=1, role="transition", start=None, focus="subject", location="the room"
+):
     start = (chunk_id - 1) * 6.0 if start is None else start
     return Beat(
         chunk_id=chunk_id,
@@ -83,6 +85,7 @@ def _beat(chunk_id, *, group=1, role="transition", start=None, focus="subject"):
         beat=f"beat {chunk_id}",
         beat_role=role,
         beat_group=group,
+        location=location,
         focus=focus,
     )
 
@@ -712,3 +715,30 @@ def test_the_preamble_says_a_sung_shot_belongs_to_the_singer():
     assert "carries a lyric" in lowered or "sung shot" in lowered
     # The measured numbers, so a future editor cannot mistake it for taste.
     assert "0 of 35" in PROSE_PREAMBLE
+
+
+# --------------------------------------------------------------------------- #
+# An idiom that names a physical object gets rendered as that object
+# (issue #75).
+#
+# H3 has no idiom dictionary -- every noun in a shot line is a candidate for
+# the frame. Measured on "Deathless": "as she holds her line above the
+# crumbling rock" is climbing idiom for a route or a rope, and H3 rendered an
+# actual rope, plus the harness and hardware that go with it, into a video
+# whose `role` names no equipment at all. Whether a *lint* should also catch
+# this is a separate question (issue #75's own corpus is n=1 -- one measured
+# hit, several measured non-hits) -- the preamble rule is the fix that works
+# at the stage that writes the sentence, and is shipped regardless.
+# --------------------------------------------------------------------------- #
+
+
+def test_the_preamble_warns_that_every_noun_renders_literally():
+    """A rule the validator cannot enforce -- "does this idiom happen to name
+    an object" is not mechanically decidable -- so, like the singer/action
+    rule above, the preamble is the only place it can live."""
+    from music_video_maker.authoring.prompts import PROSE_PREAMBLE
+
+    lowered = PROSE_PREAMBLE.lower()
+    assert "rendered literally" in lowered or "idiom" in lowered
+    # The measured example, so a future editor cannot mistake it for taste.
+    assert "holds her line" in PROSE_PREAMBLE

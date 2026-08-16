@@ -35,6 +35,11 @@ VALID_CONCEPT = {
     "tone": "elegiac, quiet",
     "motifs": ["gathering clouds", "an empty chair"],
     "avoid": ["literal lightning strikes"],
+    # Issue #78: the closed vocabulary the beats stage assigns `location`
+    # from -- a small, distinct set of places within `setting` the story
+    # actually visits, not a monotonic progress scalar (the issue's own
+    # "probably the version to build" framing).
+    "locations": ["the boardwalk", "the empty pier", "her front porch"],
 }
 
 
@@ -100,6 +105,38 @@ def test_motifs_must_be_a_list_of_strings():
     bad2 = {**VALID_CONCEPT, "motifs": [1, 2]}
     with pytest.raises(ConceptValidationError, match="motifs"):
         validate_concept(bad2)
+
+
+# --------------------------------------------------------------------------- #
+# `locations` -- the closed vocabulary issue #78's beats stage assigns
+# `location` from. Required and non-empty: unlike `motifs`/`avoid`, an empty
+# list here would leave the beats stage with no vocabulary at all to check
+# against, silently disabling issue #78's whole mechanism.
+# --------------------------------------------------------------------------- #
+
+
+def test_locations_is_required():
+    bad = {k: v for k, v in VALID_CONCEPT.items() if k != "locations"}
+    with pytest.raises(ConceptValidationError, match="locations"):
+        validate_concept(bad)
+
+
+def test_locations_must_be_a_non_empty_list_of_strings():
+    bad = {**VALID_CONCEPT, "locations": []}
+    with pytest.raises(ConceptValidationError, match="locations"):
+        validate_concept(bad)
+
+    bad2 = {**VALID_CONCEPT, "locations": "the pier"}
+    with pytest.raises(ConceptValidationError, match="locations"):
+        validate_concept(bad2)
+
+    bad3 = {**VALID_CONCEPT, "locations": [1, 2]}
+    with pytest.raises(ConceptValidationError, match="locations"):
+        validate_concept(bad3)
+
+    bad4 = {**VALID_CONCEPT, "locations": ["  "]}
+    with pytest.raises(ConceptValidationError, match="locations"):
+        validate_concept(bad4)
 
 
 # --------------------------------------------------------------------------- #

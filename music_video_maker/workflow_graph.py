@@ -74,13 +74,14 @@ import copy
 import hashlib
 import json
 import logging
+from collections.abc import Mapping
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING
 
 from music_video_maker.contracts import H3_FRAME_GRID, Workflow
 
 if TYPE_CHECKING:
-    from music_video_maker.contracts import ExpandedPrompt, StagedAssets
+    from music_video_maker.contracts import ExpandedPrompt, StagedAssets, WorkflowMutator
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +174,66 @@ happens to hold at the time."""
 
 MAX_NOISE_SEED = 0xFFFFFFFFFFFFFFFF
 """``RandomNoise.noise_seed``'s ``max`` in ComfyUI (``0 .. 2**64-1``)."""
+
+RESEED_GENERATION_STRIDE = 2**32
+"""Per-generation offset :func:`resolve_chunk_seed` adds for ``cli.py``'s
+``--reseed`` (issue #38 CLI). Chosen to sit comfortably between the two
+things it must never collide with: a real song's chunk_id range (H3's
+minimum chunk length is ~5s, so even an hours-long track is only in the low
+thousands of chunks) on one side, and :data:`MAX_NOISE_SEED`'s ~1.8e19 range
+on the other. A reseed's generation bump and another chunk's ordinary
+chunk_id offset can therefore never land on the same value by coincidence --
+see :func:`resolve_chunk_seed`."""
+
+
+def resolve_chunk_seed(base_seed: int, chunk_id: int, *, reseed_generation: int = 0) -> int:
+    """Derive one chunk's ``RandomNoise.noise_seed`` from a run-wide base
+    (issue #38's variation half).
+
+    ``seed = (base_seed + chunk_id + reseed_generation * RESEED_GENERATION_STRIDE)
+    mod (MAX_NOISE_SEED + 1)``
+
+    Deliberately a pure function of three plain integers, with no run state
+    to read: a resumed run recomposes the exact same value for the exact
+    same chunk without consulting anything, which is what lets ``--resume``
+    keep 38 of 39 chunks as cache hits when only one was reseeded --
+    ``resilience.py``'s content-tier fingerprint comparison is what actually
+    decides that, and it can only work if this function always answers the
+    same question the same way.
+
+    ``chunk_id`` is added, not hashed or multiplied, so neighbouring chunks
+    get close-but-different numbers -- legible while debugging a run, and
+    harmless: nothing about H3's sampling makes nearby seeds produce
+    nearby-looking frames, so this function only has to be *different* per
+    chunk, not *dispersed*. The noise generator's own mixing supplies the
+    dispersion.
+
+    ``reseed_generation`` (default 0 -- what every chunk in an ordinary run
+    gets) is ``cli.py``'s ``--reseed``/``--reseed-generation``: naming a
+    chunk in that mapping bumps its generation, which shifts the result by a
+    multiple of :data:`RESEED_GENERATION_STRIDE` -- far outside the range any
+    chunk_id offset reaches, so a reseeded chunk's new take can never
+    reproduce its own previous take, a neighbour's ordinary seed, or another
+    generation's value for the same chunk.
+
+    Wraps modulo ``MAX_NOISE_SEED + 1`` rather than raising on overflow: the
+    result is always a value :class:`WorkflowGraphMutator` (and ComfyUI)
+    would accept outright, so a caller near the top of a large base seed's
+    range never has to special-case anything. Every input this project
+    validates (``config.py``'s ``noise_seed``, a chunk_id, a
+    ``--reseed-generation``) is non-negative, so the result is too --
+    Python's ``%`` returns a non-negative value for a non-negative modulus
+    regardless.
+
+    A seed is not a promise about *pixels* across anything but this exact
+    numeric identity: it does not transport a composition across a change in
+    precision, GPU, attention kernel, or resolution (diffusion sampling is
+    chaotic with respect to all four) -- only across a re-run of the same
+    graph, on the same hardware and settings, under the same derived number.
+    """
+    return (base_seed + chunk_id + reseed_generation * RESEED_GENERATION_STRIDE) % (
+        MAX_NOISE_SEED + 1
+    )
 
 REF_IMAGES_AUTOGROW_FIELD = "ref_images"
 """The ``COMFY_AUTOGROW_V3`` field name on ``MiniMaxH3ReferenceToVideo``
@@ -1224,6 +1285,68 @@ class WorkflowGraphMutator:
         )
 
         return workflow
+
+
+class PerChunkSeedMutator:
+    """Decorates any :class:`~music_video_maker.contracts.WorkflowMutator`,
+    replacing whatever ``noise_seed`` its caller passes with the per-chunk
+    value :func:`resolve_chunk_seed` derives (issue #38, variation half).
+
+    Why this exists rather than a change to the caller: the one place a run
+    actually threads a seed into a chunk's graph today is
+    ``continuity.py``'s ``ContinuityWorkflowProvider``, which -- by design,
+    the same way it treats ``text_encoder`` and ``lora`` -- takes a single
+    flat ``noise_seed`` for the whole run and passes it unchanged to every
+    ``mutate()`` call (see its own constructor docstring). That module is
+    outside this file's ownership for this change. Its constructor already
+    exposes exactly the seam this needs, though: ``mutator: WorkflowMutator
+    | None``. This class sits at that seam -- ``cli.py`` hands the provider a
+    ``PerChunkSeedMutator`` wrapping the usual :class:`WorkflowGraphMutator`
+    instead of the plain one, and every ``mutate()`` call the provider makes
+    is intercepted here first. Nothing about ``continuity.py`` has to know
+    this exists; it keeps calling ``mutate(..., noise_seed=self._noise_seed)``
+    exactly as before, and gets a *different* number back in the graph than
+    the one it asked for.
+
+    ``reseed_generations`` (default empty) is how ``cli.py``'s ``--reseed``
+    reaches this class: a chunk id present in the mapping renders at that
+    generation instead of 0, so :func:`resolve_chunk_seed` guarantees it a
+    seed that differs from every ordinary chunk's -- while every chunk *not*
+    named stays on generation 0, the exact value it would have gotten
+    without ``--reseed`` at all. That is what keeps the rest of a resumed
+    run's chunks cache hits: their expected fingerprint doesn't move, only
+    the reseeded chunk's does.
+    """
+
+    def __init__(
+        self,
+        inner: WorkflowMutator,
+        *,
+        base_seed: int,
+        reseed_generations: Mapping[int, int] | None = None,
+    ) -> None:
+        self._inner = inner
+        self._base_seed = base_seed
+        self._reseed_generations = dict(reseed_generations or {})
+
+    def mutate(
+        self,
+        template: Workflow,
+        prompt: ExpandedPrompt,
+        assets: StagedAssets,
+        **kwargs: object,
+    ) -> Workflow:
+        """Delegate to the wrapped mutator with ``noise_seed`` replaced.
+
+        Every other keyword argument -- ``length_frames``, ``text_encoder``,
+        ``lora``, ``cast_image_title``, and anything a future caller adds --
+        passes through untouched; this class only ever looks at
+        ``prompt.chunk_id`` and the ``noise_seed`` key."""
+        generation = self._reseed_generations.get(prompt.chunk_id, 0)
+        kwargs["noise_seed"] = resolve_chunk_seed(
+            self._base_seed, prompt.chunk_id, reseed_generation=generation
+        )
+        return self._inner.mutate(template, prompt, assets, **kwargs)
 
 
 def _validate_length_frames(length_frames: int, chunk_id: int) -> None:

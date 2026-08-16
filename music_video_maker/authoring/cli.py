@@ -315,6 +315,11 @@ def _cmd_concept(args: argparse.Namespace) -> int:
     print(f"logline: {result.data['logline']}")
     print(f"setting: {result.data['setting']}")
     print(f"tone: {result.data['tone']}")
+    # Issue #78: the closed vocabulary everything downstream is validated
+    # against -- worth this review point's attention just as much as the
+    # logline, since a bad or missing entry here is a bad or missing entry
+    # for the whole rest of the video.
+    print(f"locations: {', '.join(result.data.get('locations', []))}")
     return EXIT_SUCCESS
 
 
@@ -422,7 +427,7 @@ def _cmd_beats(args: argparse.Namespace) -> int:
         merged = f"  [merged {list(beat.merged_from)}]" if beat.merged_from else ""
         print(
             f"{beat.chunk_id:>4}  {beat.start:>8.3f}  {beat.beat_role:<13}"
-            f"g{beat.beat_group:<3} {beat.beat}{merged}"
+            f"g{beat.beat_group:<3} [{beat.location}] {beat.beat}{merged}"
         )
     return EXIT_SUCCESS
 

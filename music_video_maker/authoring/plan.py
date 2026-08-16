@@ -52,7 +52,10 @@ from music_video_maker.contracts import AudioChunk
 from music_video_maker.shot_plan import (
     ShotPlanError,
     lint_camera_face_away_on_voiced_chunks,
+    lint_present_location_mismatch,
+    lint_role_prohibition_contradiction,
     lint_shots_against_lyrics,
+    lint_unbound_companion_referent,
     lint_voiced_framing,
     load_shot_plan,
     resolve_camera,
@@ -211,6 +214,15 @@ def render_plan_toml(
                 block.append('focus = "action"')
             if beat.length_seconds is not None:
                 block.append(f"length_seconds = {beat.length_seconds}")
+            # Issue #78: re-emitted from the beat, never from anything a
+            # later stage (prose) could inject -- the same "anchors are
+            # copied from the chunks/beats" rule every other beat-derived
+            # field here follows. `beat.location` is always set on a
+            # validated beat sheet; the guard is defensive for a hand-built
+            # Beat (a test, a pre-#78 persisted sheet) that predates the
+            # field entirely.
+            if beat.location:
+                block.append(f"location = {_toml_string(beat.location)}")
         if chunk.chunk_id in camera:
             block.append(f"camera = {_toml_string(camera[chunk.chunk_id])}")
         # Issue #59: omitted entirely when nobody else is in shot, the same
@@ -320,6 +332,15 @@ def check_plan(
             lint_shots_against_lyrics(plan, chunks)
             lint_camera_face_away_on_voiced_chunks(plan, chunks)
             lint_voiced_framing(plan, chunks)
+            # Issue #72: a pronoun with only one bound candidate but text
+            # that insists on a second, distinct person.
+            lint_unbound_companion_referent(plan, chunks)
+            # Issue #73: a role written as a prohibition, contradicted by
+            # the shot line actually describing the forbidden thing.
+            lint_role_prohibition_contradiction(plan, chunks, config.cast)
+            # Issue #78: `present` staging a companion at a location that
+            # contradicts where their own singing chunks place them.
+            lint_present_location_mismatch(plan, chunks)
         except ShotPlanError as exc:
             # Drift, a duplicate chunk_id, a malformed entry: by construction
             # none of these can come from the model -- anchors are copied from

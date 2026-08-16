@@ -124,7 +124,11 @@ def reanchor_beats(
     * **focus** -- ``action`` if any member had it, or was a consequence;
     * **length** -- the first member that requested one. A later member's
       request was swallowed by the earlier take and is warned about, the same
-      event ``slicing`` already warns about from the other side.
+      event ``slicing`` already warns about from the other side;
+    * **location** (issue #78) -- the first member's, the same "first member
+      wins" rule as ``beat_group``, and warned about the same way when
+      members disagree: a vanished location boundary is exactly the kind of
+      thing this field exists to make loud rather than silently merge away.
     """
     if not chunks:
         raise ValueError("cannot re-anchor beats onto an empty chunk timeline")
@@ -199,6 +203,19 @@ def _merge(members: Sequence[Beat], chunk: AudioChunk) -> Beat:
             with_length[0].length_seconds,
         )
 
+    locations = {member.location for member in members}
+    if len(locations) > 1:
+        logger.warning(
+            "Chunk %d merges beats naming %d different location(s) (%s); keeping %r "
+            "(issue #78). A vanished location boundary silently attaches one place's "
+            "beat to another's -- if this long take really does cross two places, "
+            "consider a shorter length_seconds instead so the boundary survives.",
+            chunk.chunk_id,
+            len(locations),
+            sorted(locations),
+            first.location,
+        )
+
     role = max(
         (m.beat_role for m in members),
         key=lambda r: _ROLE_PRECEDENCE.index(r) if r in _ROLE_PRECEDENCE else -1,
@@ -215,6 +232,7 @@ def _merge(members: Sequence[Beat], chunk: AudioChunk) -> Beat:
         beat="; ".join(m.beat for m in members),
         beat_role=role,
         beat_group=first.beat_group,
+        location=first.location,
         focus=focus,
         length_seconds=with_length[0].length_seconds if with_length else None,
         merged_from=tuple(m.chunk_id for m in members),

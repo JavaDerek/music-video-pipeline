@@ -40,6 +40,7 @@ from music_video_maker.workflow_graph import (
     CLASS_TYPE_H3_REFERENCE_TO_VIDEO,
     find_nodes_by_class_type,
     find_one_node,
+    resolve_chunk_seed,
 )
 from tests.harness.comfyui_mock import FakeComfyUISession, make_fake_png_bytes
 from tests.harness.factories import make_workflow_baseline, make_workflow_i2v, write_silent_wav
@@ -67,11 +68,18 @@ class SequencedWSFactory:
 
 
 class FakeFfmpegRunner:
-    """Stands in for both continuity's ffprobe/ffmpeg frame extraction and
-    Stage 5's concat/mux ffmpeg calls -- no real binary anywhere."""
+    """Stands in for continuity's ffprobe/ffmpeg frame extraction, Stage 5's
+    concat/mux ffmpeg calls, and issue #77's raw-frame luminance probe -- no
+    real binary anywhere.
 
-    def __init__(self, frame_count: int = 124) -> None:
+    ``luminance_level`` is the grey value every probed frame reports. The
+    default sits well above ``luminance.DEFAULT_DARK_FLOOR`` so an ordinary
+    pipeline test does not trip the darkness check; a test that wants the
+    check to fire sets it below the floor."""
+
+    def __init__(self, frame_count: int = 124, luminance_level: int = 128) -> None:
         self.frame_count = frame_count
+        self.luminance_level = luminance_level
         self.calls: list[list[str]] = []
 
     def __call__(self, args: Any) -> subprocess.CompletedProcess:
@@ -79,6 +87,16 @@ class FakeFfmpegRunner:
         self.calls.append(args)
         if args[0] == "ffprobe":
             return subprocess.CompletedProcess(args, 0, stdout=f"{self.frame_count}\n".encode())
+        # "-" is ffmpeg's name for stdout, not a file. Writing it as a path
+        # both litters the repo root with a file called "-" and hands the
+        # luminance check empty stdout, so it degrades and the test proves
+        # nothing. Emulate the pipe instead (issue #77).
+        if args[-1] == "-":
+            width, height = 32, 18
+            if "-s" in args:
+                width, height = (int(part) for part in args[args.index("-s") + 1].split("x"))
+            frame = bytes([self.luminance_level]) * (width * height)
+            return subprocess.CompletedProcess(args, 0, stdout=frame, stderr=b"")
         dest = Path(args[-1])
         dest.parent.mkdir(parents=True, exist_ok=True)
         if "-vf" in args:
@@ -149,12 +167,16 @@ each other -- no pad/merge/split enforcement kicks in, keeping this module
 focused on CLI wiring rather than re-testing Stage 2's slicing edge cases."""
 
 
-def _ALLOW_ANY_SEED(_frame_path) -> bool:
+def _ALLOW_ANY_SEED(_frame_path, _reference_photo=None) -> bool:
     """The rig's fake seed frames are solid-colour PNGs with no face in them,
     so the real #47 gate would (correctly) refuse to chain from every one of
     them. These tests are about the chaining wiring, not the detector, so they
     substitute a permissive predicate -- the gate's own behaviour is pinned by
-    the tests below and by tests/test_faces.py."""
+    the tests below and by tests/test_faces.py.
+
+    Takes an optional second argument (issue #49's reference photo) purely so
+    it matches the real gate's shape -- ``ContinuityWorkflowProvider`` always
+    calls a configured gate with both arguments now."""
     return True
 
 
@@ -240,6 +262,8 @@ class Rig:
         *,
         resume: bool = False,
         only_chunks: tuple[int, ...] | None = None,
+        reseed_chunk_ids: tuple[int, ...] | None = None,
+        reseed_generation: int = cli.DEFAULT_RESEED_GENERATION,
         seed_face_gate: Any = _ALLOW_ANY_SEED,
     ) -> cli.RunReport:
         self.run_report = cli.run_pipeline(
@@ -253,6 +277,8 @@ class Rig:
             disk_usage=_abundant_disk,
             clock=self.clock,
             only_chunks=only_chunks,
+            reseed_chunk_ids=reseed_chunk_ids,
+            reseed_generation=reseed_generation,
             seed_face_gate=seed_face_gate,
         )
         return self.run_report
@@ -689,6 +715,32 @@ def test_main_ignore_prompt_changes_flag_overrides_the_config(tmp_path: Path, mo
     assert captured["config"].resume_ignore_prompt_changes is True
 
 
+def test_main_passes_reseed_flags_through(tmp_path: Path, monkeypatch):
+    config_path = _make_config_file(tmp_path)
+    captured = {}
+
+    def fake_run_pipeline(config, *, resume, **kwargs):
+        captured["resume"] = resume
+        captured["reseed_chunk_ids"] = kwargs.get("reseed_chunk_ids")
+        captured["reseed_generation"] = kwargs.get("reseed_generation")
+        return _fake_report()
+
+    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+
+    cli.main(["--config", str(config_path)])
+    assert captured["reseed_chunk_ids"] is None
+    assert captured["reseed_generation"] == cli.DEFAULT_RESEED_GENERATION
+
+    cli.main(["--config", str(config_path), "--reseed", "12,29", "--reseed-generation", "2"])
+    assert captured["reseed_chunk_ids"] == (12, 29)
+    assert captured["reseed_generation"] == 2
+    # main() passes --resume through as given; run_pipeline itself is what
+    # treats --reseed as implying resume (see test_reseed_implies_resume_...
+    # in the run_pipeline-level tests below), the same way it already does
+    # for --only-chunks.
+    assert captured["resume"] is False
+
+
 def test_main_strict_alignment_flag_overrides_the_config(tmp_path: Path, monkeypatch):
     config_path = _make_config_file(tmp_path)
     captured = {}
@@ -1034,26 +1086,31 @@ def test_run_pipeline_without_a_stem_stages_the_mix_unchanged(tmp_path: Path):
 
 
 # --------------------------------------------------------------------------- #
-# Issue #38: one config seed, two consumers -- both must read the same value
+# Issue #38: one config seed, derived per chunk, two consumers reading the
+# same derivation -- and a way to re-roll a single chunk.
 # --------------------------------------------------------------------------- #
 
 
-def test_run_pipeline_threads_the_config_seed_to_both_the_graph_and_the_fingerprint(
+def test_run_pipeline_threads_the_derived_seed_to_both_the_graph_and_the_fingerprint(
     tmp_path: Path,
 ):
     """The seed reaches ComfyUI via the workflow mutation (continuity ->
-    workflow_graph) and reaches run_state.json via ChunkFingerprint.of (cli).
-    If either path stops reading config.noise_seed, the run records a seed the
+    workflow_graph, wrapped in a PerChunkSeedMutator) and reaches
+    run_state.json via ChunkFingerprint.of (cli). If either path stops
+    deriving from config.noise_seed the same way, the run records a seed the
     render did not use -- a lie in the very record issue #38 added. This test
-    pins both ends of both paths in one run."""
+    pins both ends of both paths in one run, and pins that chunks differ from
+    each other -- the variation issue #38 actually asked for, not just a
+    single config value copied everywhere."""
     rig = Rig(tmp_path)
     rig.config = replace(rig.config, noise_seed=42)
     sequences = [build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)]
 
     rig.run(sequences)
 
-    # Path 1: every submitted graph carries the config seed.
+    # Path 1: every submitted graph carries this chunk's own derived seed.
     assert rig.submitted, "no workflows reached ComfyUI"
+    submitted_seeds: dict[int, int] = {}
     for submission in rig.submitted:
         workflow = submission["workflow"]
         noise_nodes = [
@@ -1061,13 +1118,73 @@ def test_run_pipeline_threads_the_config_seed_to_both_the_graph_and_the_fingerpr
             if isinstance(node, dict) and node.get("class_type") == "RandomNoise"
         ]
         assert len(noise_nodes) == 1
-        assert noise_nodes[0]["inputs"]["noise_seed"] == 42
+        chunk_id = _submitted_chunk_id(submission)
+        expected = resolve_chunk_seed(base_seed=42, chunk_id=chunk_id)
+        assert noise_nodes[0]["inputs"]["noise_seed"] == expected
+        submitted_seeds[chunk_id] = expected
 
-    # Path 2: every persisted fingerprint records the same seed.
+    # Chunks actually differ -- the whole point of per-chunk derivation.
+    assert len(set(submitted_seeds.values())) == len(submitted_seeds)
+
+    # Path 2: every persisted fingerprint records that same per-chunk value.
     state = json.loads(rig.config.run_state_file.read_text())
-    fingerprints = [r.get("fingerprint") for r in state["results"].values()]
-    assert fingerprints and all(fp is not None for fp in fingerprints)
-    assert all(fp["noise_seed"] == 42 for fp in fingerprints)
+    for result in state["results"].values():
+        fp = result["fingerprint"]
+        assert fp is not None
+        assert fp["noise_seed"] == resolve_chunk_seed(base_seed=42, chunk_id=result["chunk_id"])
+
+
+def test_reseed_gives_the_named_chunk_a_different_seed_and_forces_a_re_render(tmp_path: Path):
+    """The common case from the issue: chunk 1 was the only bad one after
+    watching a render. ``--reseed`` must force just that chunk to re-render,
+    under a provably different seed, while every other chunk stays a cache
+    hit -- composing with ``--resume`` rather than re-rendering the song."""
+    rig = Rig(tmp_path)
+    first_sequences = [build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)]
+    rig.run(first_sequences)
+    first_seeds = {
+        result.chunk_id: result.fingerprint.noise_seed
+        for result in rig.run_report.run_state.results.values()
+    }
+
+    second = rig.run(
+        [build_success_sequence(rig.seed_success(4, 1))],
+        resume=True,
+        reseed_chunk_ids=(1,),
+    )
+
+    assert second.rendered == 1
+    assert second.cached == 2
+    reseeded = second.run_state.results[1]
+    assert reseeded.fingerprint.noise_seed != first_seeds[1]
+    assert reseeded.fingerprint.noise_seed == resolve_chunk_seed(
+        base_seed=rig.config.noise_seed, chunk_id=1, reseed_generation=1
+    )
+    # Untouched chunks kept their original seed -- their expected fingerprint
+    # never moved, so resume reused them rather than re-rendering the song.
+    for chunk_id in (0, 2):
+        assert second.run_state.results[chunk_id].fingerprint.noise_seed == first_seeds[chunk_id]
+    submitted_workflow = rig.submitted[-1]["workflow"]
+    noise_node = find_one_node(submitted_workflow, "RandomNoise")[1]
+    assert noise_node["inputs"]["noise_seed"] == reseeded.fingerprint.noise_seed
+
+
+def test_reseed_implies_resume_even_when_the_flag_is_not_passed(tmp_path: Path):
+    rig = Rig(tmp_path)
+    first_sequences = [build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)]
+    rig.run(first_sequences)
+
+    second = rig.run(
+        [build_success_sequence(rig.seed_success(4, 1))],
+        reseed_chunk_ids=(1,),
+    )
+
+    assert second.rendered == 1
+    assert second.cached == 2
+
+
+def test_reseed_generation_defaults_to_one():
+    assert cli.DEFAULT_RESEED_GENERATION == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -1111,6 +1228,95 @@ def test_run_pipeline_passes_shot_lengths_from_the_plan_into_slicing(
     assert requests, "the plan's length request never reached slice_audio"
     assert requests[0].start == pytest.approx(0.0)
     assert requests[0].length_seconds == pytest.approx(10.0)
+
+
+# --------------------------------------------------------------------------- #
+# Two lints built and tested in isolation by an earlier pass but never wired
+# into run_pipeline's own plan/chunks -- "the render's own loaders" only
+# means something if these actually run there. Each gets a real trigger
+# through the full pipeline, caught via caplog the same way
+# test_run_pipeline_logs_an_alignment_quality_summary already does.
+# --------------------------------------------------------------------------- #
+
+
+def test_run_pipeline_wires_the_unbound_companion_referent_lint(tmp_path: Path, caplog):
+    """Issue #72: exactly one bound name (Dianne, via `present`), but the
+    shot's own prose insists on a second, distinct person."""
+    rig = Rig(tmp_path)
+    plan_path = tmp_path / "shot_plan.toml"
+    plan_path.write_text(
+        '[[shot]]\n'
+        'chunk_id = 0\n'
+        'start = 0.0\n'
+        'present = ["Dianne"]\n'
+        'shot = "A few paces off, an ash-crusted figure stands motionless, as he keeps '
+        'his gaze fixed on the drop."\n'
+    )
+    rig.config = replace(rig.config, shot_plan=plan_path)
+    sequences = [build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)]
+
+    with caplog.at_level(logging.WARNING):
+        rig.run(sequences)
+
+    assert any("issue #72" in r.getMessage() for r in caplog.records)
+
+
+def test_run_pipeline_wires_the_role_prohibition_contradiction_lint(tmp_path: Path, caplog):
+    """Issue #73: a `role` written as a prohibition, contradicted by the shot
+    line actually describing the forbidden thing."""
+    rig = Rig(tmp_path)
+    prohibited = replace(
+        rig.config.cast["Dianne"],
+        role="Lead Vocalist, smiling constantly, oblivious, never holding anything",
+    )
+    plan_path = tmp_path / "shot_plan.toml"
+    plan_path.write_text(
+        '[[shot]]\n'
+        'chunk_id = 0\n'
+        'start = 0.0\n'
+        'shot = "Her hand clutches the needle tightly, ash drifting past."\n'
+    )
+    rig.config = replace(
+        rig.config, shot_plan=plan_path, cast={"Dianne": prohibited},
+    )
+    sequences = [build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)]
+
+    with caplog.at_level(logging.WARNING):
+        rig.run(sequences)
+
+    assert any("issue #73" in r.getMessage() for r in caplog.records)
+
+
+def test_run_pipeline_wires_the_present_location_mismatch_lint(tmp_path: Path, monkeypatch):
+    """Issue #78's own new lint, wired in beside the two hand-offs above.
+    Two different singers (needed to give two different names their own
+    established `location`) are not reachable through this rig's single-cast
+    fixture without real per-line tags, so wiring is verified with a spy --
+    the same technique this file already uses for `slice_audio` -- rather
+    than re-deriving a trigger scenario duplicating test_shot_plan.py's."""
+    rig = Rig(tmp_path)
+    plan_path = tmp_path / "shot_plan.toml"
+    plan_path.write_text(
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks alone."\n'
+    )
+    rig.config = replace(rig.config, shot_plan=plan_path)
+
+    calls = []
+    real_lint = cli.lint_present_location_mismatch
+
+    def spy(plan, chunks):
+        calls.append((plan, chunks))
+        return real_lint(plan, chunks)
+
+    monkeypatch.setattr(cli, "lint_present_location_mismatch", spy)
+    sequences = [build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)]
+
+    rig.run(sequences)
+
+    assert len(calls) == 1
+    plan_arg, chunks_arg = calls[0]
+    assert 0 in plan_arg
+    assert len(chunks_arg) == 3
 
 
 # --------------------------------------------------------------------------- #
@@ -1342,6 +1548,94 @@ def test_a_run_holds_a_host_sleep_assertion_for_its_duration(tmp_path: Path, mon
     assert spawned[0][0] == "caffeinate"
 
 
+# --------------------------------------------------------------------------- #
+# Issue #49: _resolve_seed_face_gate's recognition on/off decision
+# --------------------------------------------------------------------------- #
+
+
+def _recording_gate_factory():
+    """A stand-in for ``faces.build_seed_face_gate`` that records the
+    ``min_fraction``/``min_similarity`` it was built with and, separately,
+    every ``(frame_path, reference_photo)`` pair its returned gate is called
+    with -- so a test can assert both "was recognition configured" and "was
+    the photo actually used" without touching OpenCV or a model file."""
+    build_calls: list[dict[str, Any]] = []
+    gate_calls: list[tuple[Path, Path | None]] = []
+
+    def fake_build_seed_face_gate(*, min_fraction, min_similarity=None, **_kwargs):
+        build_calls.append({"min_fraction": min_fraction, "min_similarity": min_similarity})
+
+        def gate(frame_path: Path, reference_photo: Path | None = None) -> bool:
+            gate_calls.append((frame_path, reference_photo))
+            return True
+
+        return gate
+
+    return fake_build_seed_face_gate, build_calls, gate_calls
+
+
+def test_resolve_seed_face_gate_ignores_the_photo_when_similarity_is_not_set(
+    tmp_path: Path, monkeypatch
+):
+    """Recognition OFF (the default): continuity always threads a reference
+    photo down, but a run that never opted in must not have it silently
+    upgraded to a recognition check just because a photo was available."""
+    fake_build, build_calls, gate_calls = _recording_gate_factory()
+    monkeypatch.setattr(cli, "build_seed_face_gate", fake_build)
+
+    rig = Rig(tmp_path, i2v_continuity=True)
+    assert rig.config.i2v_min_seed_face_similarity is None
+
+    resolved = cli._resolve_seed_face_gate(rig.config, None)
+    resolved(Path("frame.png"), Path("some_cast_photo.png"))
+
+    assert build_calls == [
+        {"min_fraction": rig.config.i2v_min_seed_face_fraction, "min_similarity": None}
+    ]
+    assert gate_calls == [(Path("frame.png"), None)], (
+        "the underlying gate must never see the reference photo when this run "
+        "did not opt into recognition"
+    )
+
+
+def test_resolve_seed_face_gate_passes_the_photo_through_when_similarity_is_set(
+    tmp_path: Path, monkeypatch
+):
+    """Recognition ON (opted in): the photo threaded down by continuity must
+    reach the real gate, and the configured similarity floor must reach
+    ``build_seed_face_gate``."""
+    fake_build, build_calls, gate_calls = _recording_gate_factory()
+    monkeypatch.setattr(cli, "build_seed_face_gate", fake_build)
+
+    rig = Rig(tmp_path, i2v_continuity=True)
+    rig.config = replace(rig.config, i2v_min_seed_face_similarity=0.5)
+
+    resolved = cli._resolve_seed_face_gate(rig.config, None)
+    resolved(Path("frame.png"), Path("some_cast_photo.png"))
+
+    assert build_calls == [
+        {"min_fraction": rig.config.i2v_min_seed_face_fraction, "min_similarity": 0.5}
+    ]
+    assert gate_calls == [(Path("frame.png"), Path("some_cast_photo.png"))]
+
+
+def test_resolve_seed_face_gate_returns_none_when_the_feature_is_off(tmp_path: Path):
+    rig = Rig(tmp_path, i2v_continuity=False)
+
+    assert cli._resolve_seed_face_gate(rig.config, None) is None
+
+
+def test_resolve_seed_face_gate_prefers_an_injected_gate_over_config(tmp_path: Path):
+    """The injection seam wins outright -- used by every other test in this
+    file (``_ALLOW_ANY_SEED``) to bypass OpenCV entirely, regardless of what
+    ``i2v_min_seed_face_similarity`` says."""
+    rig = Rig(tmp_path, i2v_continuity=True)
+    rig.config = replace(rig.config, i2v_min_seed_face_similarity=0.5)
+
+    injected = lambda _f, _r=None: True  # noqa: E731
+    assert cli._resolve_seed_face_gate(rig.config, injected) is injected
+
+
 def test_a_faceless_seed_frame_is_not_chained_from(tmp_path: Path):
     """Issue #47: the chained node has no ``ref_images``, so the seed frame is
     the whole identity conditioning. When the previous shot ends on the back of
@@ -1352,7 +1646,7 @@ def test_a_faceless_seed_frame_is_not_chained_from(tmp_path: Path):
     rig.config = replace(rig.config, i2v_chain_scope="all")
     sequences = [build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)]
 
-    rig.run(sequences, seed_face_gate=lambda _p: False)
+    rig.run(sequences, seed_face_gate=lambda _p, _r=None: False)
 
     workflows = [contracts.Workflow(s["workflow"]) for s in rig.submitted]
     assert all(_is_base(w) for w in workflows), (
@@ -1370,7 +1664,7 @@ def test_the_seed_face_gate_decides_per_boundary_not_per_run(tmp_path: Path):
     sequences = [build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)]
 
     # Reject only the frame bridging chunk 1 -> chunk 2.
-    rig.run(sequences, seed_face_gate=lambda p: "seed_0001_into_0002" not in p.name)
+    rig.run(sequences, seed_face_gate=lambda p, _r=None: "seed_0001_into_0002" not in p.name)
 
     workflows = [contracts.Workflow(s["workflow"]) for s in rig.submitted]
     assert _is_base(workflows[0]), "chunk 0 has no predecessor"
@@ -1399,7 +1693,7 @@ def test_a_raising_seed_face_gate_degrades_instead_of_killing_the_run(tmp_path: 
     rig.config = replace(rig.config, i2v_chain_scope="all")
     sequences = [build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)]
 
-    def exploding_gate(_p):
+    def exploding_gate(_p, _r=None):
         raise RuntimeError("model file is corrupt")
 
     with caplog.at_level(logging.ERROR):
@@ -1433,7 +1727,7 @@ def test_resume_reuses_a_chunk_whose_chain_was_refused_at_render_time(tmp_path: 
     sequences = [build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)]
 
     # Chunk 2's seed is refused; chunk 1's is fine.
-    gate = lambda p: "seed_0001_into_0002" not in p.name  # noqa: E731
+    gate = lambda p, _r=None: "seed_0001_into_0002" not in p.name  # noqa: E731
     first = rig.run(sequences, seed_face_gate=gate)
     assert first.rendered == 3
 

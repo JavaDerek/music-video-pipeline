@@ -77,7 +77,10 @@ from music_video_maker.shot_plan import (
     ShotLength,
     ShotPlanError,
     lint_camera_face_away_on_voiced_chunks,
+    lint_present_location_mismatch,
+    lint_role_prohibition_contradiction,
     lint_shots_against_lyrics,
+    lint_unbound_companion_referent,
     lint_voiced_framing,
     load_shot_plan,
     resolve_camera,
@@ -90,9 +93,12 @@ from music_video_maker.slicing import slice_audio
 from music_video_maker.staging import ComfyUIAssetStager
 from music_video_maker.stems import slice_stem_for_chunks
 from music_video_maker.workflow_graph import (
+    PerChunkSeedMutator,
+    WorkflowGraphMutator,
     graph_fingerprint,
     load_workflow_template,
     read_text_encoder,
+    resolve_chunk_seed,
 )
 
 logger = logging.getLogger(__name__)
@@ -101,6 +107,14 @@ EXIT_SUCCESS = 0
 EXIT_ERROR = 1
 EXIT_PARTIAL_FAILURE = 2
 """Some chunk(s) dead-lettered; the run finished but is incomplete."""
+
+DEFAULT_RESEED_GENERATION = 1
+"""``--reseed``'s default alternate take (issue #38 CLI). Generation 0 is
+what every chunk gets without ``--reseed`` at all, so 1 is the first value
+guaranteed (see ``workflow_graph.resolve_chunk_seed``) to differ from a
+chunk's existing take. A chunk reseeded once and still wrong can be reseeded
+again with ``--reseed-generation 2``, 3, ... rather than silently repeating
+the same alternate seed forever."""
 
 
 class PipelineError(RuntimeError):
@@ -123,19 +137,37 @@ def chain_scope_ids(scope: str, chunks: Sequence[Any]) -> frozenset[int] | None:
 
 
 def _resolve_seed_face_gate(
-    config: RunConfig, injected: Callable[[Path], bool] | None
-) -> Callable[[Path], bool] | None:
+    config: RunConfig, injected: Callable[[Path, Path], bool] | None
+) -> Callable[[Path, Path], bool] | None:
     """The seed-face predicate this run should use (issue #47), or ``None`` to
     chain from whatever the previous shot ended on.
 
     Injectable like every other I/O seam in this module, so the offline test
     suite exercises the *decision* without OpenCV, a model file, or a real face
-    anywhere -- the detector itself is unit-tested separately."""
+    anywhere -- the detector itself is unit-tested separately.
+
+    Issue #49: ``ContinuityWorkflowProvider`` always threads the active cast
+    member's reference photo down to whatever gate it holds (see
+    ``continuity.py``'s ``_stage_seed_frame``) -- that is just a field read
+    and costs nothing to do unconditionally. Whether the photo actually gets
+    *used* for recognition is decided here, from
+    ``config.i2v_min_seed_face_similarity``, which defaults to ``None``
+    (recognition off, matching every config written before this knob
+    existed). When it is ``None`` the returned gate discards whatever photo
+    it is handed and answers detection-only, exactly as issue #47 shipped
+    it -- a chunk's reference photo happening to be available must not
+    silently upgrade a run to a stricter check nobody asked for."""
     if injected is not None:
         return injected
     if not (config.i2v_continuity and config.i2v_require_seed_face):
         return None
-    return build_seed_face_gate(min_fraction=config.i2v_min_seed_face_fraction)
+    if config.i2v_min_seed_face_similarity is None:
+        base_gate = build_seed_face_gate(min_fraction=config.i2v_min_seed_face_fraction)
+        return lambda frame_path, _reference_photo=None: base_gate(frame_path)
+    return build_seed_face_gate(
+        min_fraction=config.i2v_min_seed_face_fraction,
+        min_similarity=config.i2v_min_seed_face_similarity,
+    )
 
 
 def _select_render_ids(chunks: Sequence[Any], only_chunks: Sequence[int] | None) -> list[int]:
@@ -325,6 +357,32 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--reseed",
+        type=_parse_chunk_ids,
+        default=None,
+        metavar="IDS",
+        help=(
+            "Re-roll these chunk ids (comma-separated) under a different, deterministic "
+            "seed (issue #38) and re-render just them, reusing every other cached chunk -- "
+            "the common case of watching a render and finding one chunk bad. Implies "
+            "--resume. The new seed is derived from --reseed-generation, never random, so a "
+            "resumed --reseed run recomposes the same value rather than drifting further "
+            "each time it is interrupted and restarted."
+        ),
+    )
+    parser.add_argument(
+        "--reseed-generation",
+        type=int,
+        default=DEFAULT_RESEED_GENERATION,
+        metavar="N",
+        help=(
+            f"Which alternate take --reseed's chunks render (default {DEFAULT_RESEED_GENERATION}"
+            "). Bump this if a previous --reseed of the same chunk(s) still was not right -- "
+            "each generation is a distinct, reproducible seed, never the same one repeated. "
+            "Ignored without --reseed."
+        ),
+    )
+    parser.add_argument(
         "--prepare",
         action="store_true",
         help=(
@@ -373,17 +431,19 @@ def build_parser() -> argparse.ArgumentParser:
 def _parse_chunk_ids(raw: str) -> tuple[int, ...]:
     """``"32,33, 35"`` -> ``(32, 33, 35)``, rejecting anything else loudly.
 
-    Deliberately not a range syntax: a validation slice is usually a
-    hand-picked set of the chunks that exercise the change (a re-anchor plus
-    the chunks chained off it, say), not a contiguous run."""
+    Deliberately not a range syntax: a validation slice (``--only-chunks``) or
+    a re-roll (``--reseed``) is usually a hand-picked set of chunks, not a
+    contiguous run. Shared by both flags -- argparse prefixes any error this
+    raises with the flag it was parsing for, so the message itself names
+    neither."""
     try:
         ids = tuple(int(part) for part in raw.split(",") if part.strip())
     except ValueError:
         raise argparse.ArgumentTypeError(
-            f"--only-chunks expects comma-separated integers, got {raw!r}"
+            f"expects comma-separated integers, got {raw!r}"
         ) from None
     if not ids:
-        raise argparse.ArgumentTypeError("--only-chunks was given no chunk ids")
+        raise argparse.ArgumentTypeError("no chunk ids given")
     return ids
 
 
@@ -399,7 +459,9 @@ def run_pipeline(
     disk_usage: DiskUsage = shutil.disk_usage,
     clock: Callable[[], float] = time.monotonic,
     only_chunks: Sequence[int] | None = None,
-    seed_face_gate: Callable[[Path], bool] | None = None,
+    reseed_chunk_ids: Sequence[int] | None = None,
+    reseed_generation: int = DEFAULT_RESEED_GENERATION,
+    seed_face_gate: Callable[[Path, Path], bool] | None = None,
 ) -> RunReport:
     """Run Stages 1-5 end-to-end against an already-loaded, validated config.
 
@@ -414,6 +476,18 @@ def run_pipeline(
     every stage's own typed exception (``ConfigError`` is the caller's
     problem, not this function's) propagate otherwise -- :func:`main` is
     where those turn into a log line and an exit code.
+
+    ``reseed_chunk_ids`` is issue #38's ``--reseed``: force just these chunks
+    to re-render under a seed that :func:`~music_video_maker.workflow_graph.
+    resolve_chunk_seed` guarantees differs from ``reseed_generation``'s
+    predecessors and from every other chunk's ordinary (generation-0) seed --
+    the common "chunk 12 was the only bad one" case. Every chunk not named
+    keeps generation 0, the exact seed it would have gotten without
+    ``--reseed`` at all, so its fingerprint is unchanged and ``--resume``
+    reuses it rather than re-rendering the whole song. Implies ``resume``
+    (like ``only_chunks`` already does): a reseed with nothing to resume from
+    just renders every chunk once, the named ones at their alternate
+    generation.
     """
     start = clock()
     session = comfyui_session if comfyui_session is not None else requests.Session()
@@ -488,6 +562,15 @@ def run_pipeline(
             # A sung chunk framed wide (or not framed at all) has no face big
             # enough to read a mouth -- the one thing the whole pipeline is for.
             lint_voiced_framing(plan, chunks)
+            # Issue #72: a pronoun with only one bound candidate but text
+            # that insists on a second, distinct person.
+            lint_unbound_companion_referent(plan, chunks)
+            # Issue #73: a role written as a prohibition, contradicted by
+            # the shot line actually describing the forbidden thing.
+            lint_role_prohibition_contradiction(plan, chunks, config.cast)
+            # Issue #78: `present` staging a companion at a location that
+            # contradicts where their own singing chunks place them.
+            lint_present_location_mismatch(plan, chunks)
 
         prompts = {
             chunk.chunk_id: expand_prompt(
@@ -514,6 +597,41 @@ def run_pipeline(
             for chunk in chunks
         }
 
+        # Issue #38 CLI: --reseed names which chunks render at an alternate
+        # generation (see workflow_graph.resolve_chunk_seed). Validated here,
+        # against the real chunk timeline, rather than left to fail as an
+        # unknown key deep inside the mutator -- same reasoning as
+        # _select_render_ids' --only-chunks check just above.
+        reseed_generations: dict[int, int] = {}
+        if reseed_chunk_ids:
+            if reseed_generation < 1:
+                raise PipelineError(
+                    f"--reseed-generation must be >= 1 (0 is the seed every chunk already "
+                    f"has without --reseed, not a re-roll of it), got {reseed_generation}"
+                )
+            available = [chunk.chunk_id for chunk in chunks]
+            unknown = sorted(set(reseed_chunk_ids) - set(available))
+            if unknown:
+                logger.error(
+                    "--reseed names chunk id(s) %s that this song does not have; it has %d "
+                    "chunk(s), %s..%s",
+                    unknown,
+                    len(available),
+                    available[0],
+                    available[-1],
+                )
+                raise PipelineError(
+                    f"--reseed names unknown chunk id(s) {unknown}; this run has "
+                    f"{len(available)} chunk(s), {available[0]}..{available[-1]}"
+                )
+            reseed_generations = {chunk_id: reseed_generation for chunk_id in reseed_chunk_ids}
+            logger.info(
+                "Re-seeding chunk(s) %s at generation %d -- every other chunk keeps its "
+                "existing seed and stays a cache hit under --resume",
+                sorted(reseed_generations),
+                reseed_generation,
+            )
+
         base_template = load_workflow_template(config.workflow_template)
         i2v_template = (
             load_workflow_template(config.i2v_workflow_template)
@@ -529,6 +647,20 @@ def run_pipeline(
         }
         logger.info("Stage 3 complete: %d chunk(s) staged to %s", len(assets), config.comfyui_url)
 
+        # Issue #38 (variation half): ContinuityWorkflowProvider passes one
+        # flat noise_seed to every mutate() call, by design -- see its own
+        # docstring. Per-chunk variation happens here instead, at the
+        # mutator seam the provider already exposes: PerChunkSeedMutator
+        # wraps the ordinary WorkflowGraphMutator and substitutes
+        # resolve_chunk_seed's per-chunk answer for whatever flat seed the
+        # provider hands it, so every chunk still renders through the same
+        # class_type-based node lookups, just under a different number.
+        seeded_mutator = PerChunkSeedMutator(
+            WorkflowGraphMutator(),
+            base_seed=config.noise_seed,
+            reseed_generations=reseed_generations,
+        )
+
         provider = ContinuityWorkflowProvider(
             base_template=base_template,
             i2v_template=i2v_template,
@@ -537,6 +669,7 @@ def run_pipeline(
             asset_stager=stager,
             frames_dir=config.chunks_dir / "frames",
             continuity_enabled=config.i2v_continuity,
+            mutator=seeded_mutator,
             subprocess_runner=ffmpeg_runner,
             chunk_frame_counts={c.chunk_id: c.frame_count for c in chunks},
             render_width=config.render_width,
@@ -584,9 +717,17 @@ def run_pipeline(
                 prompts[chunk.chunk_id],
                 render_width=config.render_width,
                 render_height=config.render_height,
-                # Issue #38: the same config value the provider injects into
-                # RandomNoise -- two paths, one truth, pinned by test.
-                noise_seed=config.noise_seed,
+                # Issue #38: the same per-chunk value PerChunkSeedMutator
+                # injects into RandomNoise for this chunk_id -- two paths, one
+                # derivation (workflow_graph.resolve_chunk_seed), pinned by
+                # test. Not config.noise_seed directly: that is the run-wide
+                # base every chunk derives from, and reseed_generations may
+                # shift this particular chunk_id's derivation off generation 0.
+                noise_seed=resolve_chunk_seed(
+                    config.noise_seed,
+                    chunk.chunk_id,
+                    reseed_generation=reseed_generations.get(chunk.chunk_id, 0),
+                ),
                 # Issue #25: which audio drove the mouth. Never escapable on
                 # resume -- it is the stem A/B's experiment variable.
                 conditioning_source=(
@@ -643,17 +784,25 @@ def run_pipeline(
         }
 
         render_ids = _select_render_ids(chunks, only_chunks)
+        # --reseed forces its chunks to render even when only_chunks narrows
+        # the render list to something else entirely; --only-chunks already
+        # forces its own. Union, deduplicated, order-preserved -- neither flag
+        # needs to know the other exists.
+        force_chunk_ids = tuple(
+            dict.fromkeys((*(only_chunks or ()), *(reseed_chunk_ids or ())))
+        )
 
         run_state = runner.render_run(
             render_ids,
             provider,
             config.chunks_dir,
-            # A slice always loads prior state so it augments the run rather
-            # than replacing it, and always re-renders its own chunks -- see
-            # force_chunk_ids. Writing a state file containing only the sliced
-            # chunks destroyed the record of every other chunk in the run.
-            resume=resume or bool(only_chunks),
-            force_chunk_ids=only_chunks,
+            # A slice or a reseed always loads prior state so it augments the
+            # run rather than replacing it, and always re-renders its own
+            # chunks -- see force_chunk_ids. Writing a state file containing
+            # only those chunks destroyed the record of every other chunk in
+            # the run.
+            resume=resume or bool(only_chunks) or bool(reseed_chunk_ids),
+            force_chunk_ids=force_chunk_ids,
             fingerprints=fingerprints,
             # ...and record what actually happened, degradations included: a
             # chunk whose predecessor dead-lettered fell back to unchained,
@@ -830,7 +979,13 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_SUCCESS
 
     try:
-        report = run_pipeline(config, resume=args.resume, only_chunks=args.only_chunks)
+        report = run_pipeline(
+            config,
+            resume=args.resume,
+            only_chunks=args.only_chunks,
+            reseed_chunk_ids=args.reseed,
+            reseed_generation=args.reseed_generation,
+        )
     except Exception:
         logger.exception("Pipeline run failed")
         return EXIT_ERROR

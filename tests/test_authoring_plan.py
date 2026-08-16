@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 if sys.version_info >= (3, 11):
@@ -88,7 +89,10 @@ def _chunks(texts: list[str], width: float = 5.875):
     )
 
 
-def _beat(chunk_id, *, group=1, role="transition", focus="subject", length=None, width=5.875):
+def _beat(
+    chunk_id, *, group=1, role="transition", focus="subject", length=None, width=5.875,
+    location="the street",
+):
     start = (chunk_id - 1) * width
     return Beat(
         chunk_id=chunk_id,
@@ -97,6 +101,7 @@ def _beat(chunk_id, *, group=1, role="transition", focus="subject", length=None,
         beat=f"beat {chunk_id}",
         beat_role=role,
         beat_group=group,
+        location=location,
         focus=focus,
         length_seconds=length,
     )
@@ -158,7 +163,12 @@ def test_anchors_come_from_the_chunks_not_from_the_beats(tmp_path):
     """A beat's own span is where it *was*; the chunk's is where the render
     will put it. Only one of those can be the drift anchor."""
     chunks = _chunks(["a line"])
-    stale = (Beat(chunk_id=1, start=999.0, end=1005.0, beat="b", beat_role="plant", beat_group=1),)
+    stale = (
+        Beat(
+            chunk_id=1, start=999.0, end=1005.0, beat="b", beat_role="plant", beat_group=1,
+            location="the street",
+        ),
+    )
 
     text = render_plan_toml(chunks, stale, {1: LINES[1]}, provenance=PROVENANCE, camera=CAMERAS)
     path = tmp_path / "shot_plan.toml"
@@ -199,6 +209,22 @@ def test_a_beat_with_no_opinion_emits_no_focus_or_length(tmp_path):
     text = path.read_text()
     assert "focus" not in text
     assert "length_seconds" not in text
+
+
+def test_location_comes_from_the_beat(tmp_path):
+    """Issue #78: `location` is re-emitted from the frozen beat, the same
+    "anchors are copied from the chunks/beats" rule every other beat-derived
+    field here follows -- never something a later stage (prose) could
+    inject."""
+    chunks = _chunks(["a line", ""])
+    beats = (_beat(1, location="the mill"), _beat(2, location="the watch-post"))
+
+    path = tmp_path / "shot_plan.toml"
+    path.write_text(render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, camera=CAMERAS))
+    plan = load_shot_plan(path)
+
+    assert plan[1].location == "the mill"
+    assert plan[2].location == "the watch-post"
 
 
 def test_provenance_records_hashes_never_content(tmp_path):
@@ -297,6 +323,86 @@ def test_a_real_lint_warning_is_captured_and_attributed(tmp_path):
     assert check.ok  # a warning must never block
     assert any("central park" in issue.message.lower() for issue in check.warnings)
     assert 1 in {issue.chunk_id for issue in check.warnings}
+
+
+# --------------------------------------------------------------------------- #
+# Two lints wired into check_plan by this change (issue #78's hand-off): both
+# were built and tested in isolation by an earlier pass but never reached the
+# render's own loaders. "A generated plan is checked by the render's own
+# loaders, never a copy of them" only holds if these are actually in the
+# loop, so each gets a real trigger here, not a mock.
+# --------------------------------------------------------------------------- #
+
+
+def test_the_unbound_companion_referent_lint_is_wired_into_check_plan(tmp_path):
+    """Issue #72: exactly one bound name (Dianne, via `present`), but the
+    shot's own prose insists on a second, distinct person."""
+    chunks = _chunks(["a first line"])
+    shots = {
+        1: (
+            "A few paces off, an ash-crusted figure stands motionless, staring down "
+            "into the valley, as he keeps his gaze fixed on the drop."
+        ),
+    }
+    text = render_plan_toml(
+        chunks, (_beat(1),), shots, provenance=PROVENANCE, present={1: ["Dianne"]},
+    )
+
+    check = check_plan(text, _config(tmp_path), chunks)
+
+    assert check.ok  # a warning must never block
+    assert any("issue #72" in issue.message for issue in check.warnings)
+
+
+def test_the_role_prohibition_contradiction_lint_is_wired_into_check_plan(tmp_path):
+    """Issue #73: a `role` written as a prohibition, contradicted by the shot
+    line actually describing the forbidden thing."""
+    config = _config(tmp_path)
+    prohibited = replace(
+        config.cast["Dianne"],
+        role="Lead Vocalist, smiling constantly, oblivious, never holding anything",
+    )
+    config = replace(config, cast={**config.cast, "Dianne": prohibited})
+
+    chunks = _chunks(["a first line"])
+    shots = {1: "Her fingers close his fingers over the needle, ash drifting past."}
+    text = render_plan_toml(
+        chunks, (_beat(1),), shots, provenance=PROVENANCE, present={1: ["Dianne"]},
+    )
+
+    check = check_plan(text, config, chunks)
+
+    assert check.ok  # a warning must never block
+    assert any("issue #73" in issue.message for issue in check.warnings)
+
+
+def test_the_present_location_mismatch_lint_is_wired_into_check_plan(tmp_path):
+    """Issue #78: `present` stages a companion at a location that contradicts
+    where their own singing chunks place them elsewhere in the same plan."""
+    config = _config(tmp_path)
+    chunks = (
+        contracts.AudioChunk(
+            chunk_id=1, audio_file=Path("c1.wav"), start=0.0, end=5.875,
+            text="a first line", characters=("Dianne",),
+        ),
+        contracts.AudioChunk(
+            chunk_id=2, audio_file=Path("c2.wav"), start=5.875, end=11.75,
+            text="a second line", characters=("Rex",),
+        ),
+    )
+    beats = (
+        _beat(1, location="the valley approach"),
+        _beat(2, location="the watch-post"),
+    )
+    shots = {1: LINES[1], 2: LINES[2]}
+    text = render_plan_toml(
+        chunks, beats, shots, provenance=PROVENANCE, present={1: ["Rex"]},
+    )
+
+    check = check_plan(text, config, chunks)
+
+    assert check.ok  # a warning must never block
+    assert any("issue #78" in issue.message for issue in check.warnings)
 
 
 def test_malformed_toml_is_reported_as_an_unattributed_error(tmp_path):

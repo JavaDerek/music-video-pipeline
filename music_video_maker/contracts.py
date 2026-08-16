@@ -55,6 +55,33 @@ class CastMember:
     so a retouched ``image`` moves the likeness far more than any adjective
     here. ``None`` means no direction, never a fabricated default."""
 
+    demeanour: str | None = None
+    """Deliberate expression/mood direction for this member (issue #74) --
+    e.g. 'grave and unsmiling, exhausted'. The per-member sibling of
+    :attr:`~music_video_maker.config.RunConfig.global_demeanour`; see that
+    field's docstring for why demeanour needed its own field (two of the
+    three cast-facing fields push toward a pleasant, relaxed face and none
+    said anything about mood, so a reference photo's own smile silently
+    carried across an entire video about massacre) and for the two hard-won
+    rules governing its text: state an endpoint, never a prohibition (#73
+    measured a role prohibition failing outright) or a displacement (#46
+    measured one compounding on the chained I2V path).
+
+    Composed alongside ``role`` and :attr:`appearance` in the same clause
+    (see ``prompting.py``'s ``_single_character_clause``/``_member_descriptor``).
+    Unlike ``appearance``, it is **not** stripped from the chained I2V prompt
+    variant: appearance describes how to read a reference *photo*, which the
+    chained path has none of, but demeanour is behavioural direction the same
+    shape as ``role`` -- what the character is like, not how to interpret an
+    image -- so it stays composed and restated on every chunk exactly like
+    ``role`` always has. ``None`` means no direction, never a fabricated
+    default: the reference photo's own expression decides, as it always has.
+
+    This was originally a stand-in sibling dict on ``RunConfig``
+    (``cast_demeanour``) because this module was locked at the time issue #74
+    landed; it lives here now, matching :attr:`appearance`'s own shape (#31),
+    which is the only place a per-member field like this belongs."""
+
 
 @dataclass(frozen=True)
 class LyricLine:

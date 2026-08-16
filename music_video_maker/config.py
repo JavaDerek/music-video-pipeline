@@ -15,6 +15,8 @@ against the *config file's* directory, not the process cwd)::
     narrative_concept   = "Wandering through a surgery, kicking a life support plug out"
     setting             = "London, UK -- contemporary, overcast winter"   # issue #32
     global_appearance   = "everyone slim, trim and healthy looking"       # issue #31
+    global_demeanour    = "nobody smiles; this is a war"                  # issue #74
+    avoid               = ["bass guitar", "microphone", "stage"]          # issue #73
     default_lead_vocalist = "Dianne"
     comfyui_url         = "http://127.0.0.1:8188"     # optional, this is the default
     workflow_template   = "workflow_api.json"
@@ -45,6 +47,7 @@ against the *config file's* directory, not the process cwd)::
     role  = "Lead Vocalist, smiling constantly, oblivious"
     image = "cast/dianne_ref_01.jpg"
     appearance = "looking a few years younger, softly lit"   # optional, issue #31
+    demeanour  = "grave and unsmiling, exhausted"             # optional, issue #74
 
     [cast.Rex]
     role  = "Drummer, background, never sings"
@@ -68,6 +71,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass
 from dataclasses import fields as dc_fields
@@ -76,7 +80,13 @@ from typing import NoReturn
 from urllib.parse import urlparse
 
 from music_video_maker.contracts import AlignmentOverride, CastMember, HardwareProfile
-from music_video_maker.faces import DEFAULT_MIN_FACE_FRACTION
+from music_video_maker.faces import (
+    DEFAULT_MIN_FACE_FRACTION,
+    DEFAULT_MIN_FACE_SIMILARITY,
+    RECOGNITION_MODEL_SHA256,
+    RECOGNITION_MODEL_SOURCE,
+    resolve_recognition_model_path,
+)
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -262,15 +272,25 @@ class RunConfig:
     that ``docs/shot-writing-guide.md`` reserves for what the shot is about."""
 
     noise_seed: int = 0
-    """Issue #38: the ``RandomNoise.noise_seed`` every chunk of this run is
-    rendered with, and the value recorded in each chunk's fingerprint.
+    """Issue #38: the run-wide base seed each chunk of this run derives its
+    own ``RandomNoise.noise_seed`` from -- see
+    :func:`music_video_maker.workflow_graph.resolve_chunk_seed`, which adds
+    the chunk id (and, for ``cli.py``'s ``--reseed``, a generation offset) so
+    chunks differ deterministically instead of all rendering under this one
+    value. The *derived* per-chunk value, not this field verbatim, is what
+    reaches ``RandomNoise`` and what each chunk's fingerprint records.
 
     0 is what both committed templates have always incidentally carried, so
-    the default renders byte-for-byte what this project has always rendered
-    -- but the value now comes from the run and is written down, instead of
-    being whatever the template file happened to hold. Bounded to ComfyUI's
-    ``0 .. 2**64-1`` at load: an out-of-range value would be clamped
-    server-side and the recorded seed would be a lie."""
+    chunk 0 of the default run renders byte-for-byte what this project has
+    always rendered -- but the value now comes from the run and is written
+    down, instead of being whatever the template file happened to hold.
+    Bounded to ComfyUI's ``0 .. 2**64-1`` at load: an out-of-range value
+    would be clamped server-side and the recorded seed would be a lie.
+
+    A seed does not transport a composition across a change in precision,
+    GPU, attention kernel, or resolution -- diffusion sampling is chaotic
+    with respect to all four, so the same derived number on different
+    numerics is a different video, not a higher-fidelity version of one."""
 
     alignment_overrides: tuple[AlignmentOverride, ...] = ()
     """Issue #42: authored corrections pinning specific aligned segments'
@@ -329,6 +349,98 @@ class RunConfig:
     The per-member equivalent is :attr:`contracts.CastMember.appearance`. Both
     are separate from ``global_style`` (which is about the film, not the
     people) and from ``role`` (which is about who a character is)."""
+
+    global_demeanour: str | None = None
+    """Issue #74: expression/mood direction applying to the whole cast, e.g.
+    ``"nobody smiles; this is a war"``.
+
+    Follows the ``global_appearance``/``CastMember.appearance`` precedent
+    (#31) exactly, one field over: two of the three cast-facing fields
+    (``appearance``, ``global_appearance``) push toward a pleasant, relaxed
+    face and none of them says anything about mood, so on a real render
+    ("Deathless") the reference photo's own smile silently carried across
+    eight and a half minutes of a video about massacre. This is the fix --
+    composed into every prompt exactly where ``global_appearance`` is (see
+    ``prompting.py``'s ``_single_character_clause``/``_multi_character_clause``).
+
+    The per-member equivalent is
+    :attr:`~music_video_maker.contracts.CastMember.demeanour`, matching
+    :attr:`~music_video_maker.contracts.CastMember.appearance`'s own shape
+    (#31's precedent, followed exactly).
+
+    **State an endpoint, never a prohibition or a displacement.** Two
+    findings drive this, both hard-won on this project:
+
+    - *Prohibition does not hold.* #73 measured this directly: the corrected
+      role ``"...never holding anything"`` rendered a bass guitar anyway,
+      twice, because the tokens a diffusion prompt actually sees are
+      "holding" and "anything" -- the negation itself carries no weight.
+      ``"never amused"`` is the same shape and is expected to fail the same
+      way. Say what IS true instead: ``"grave and unsmiling"``, not
+      ``"never amused"``.
+    - *Displacement compounds on the chained path* (#46). ``"looking a few
+      years younger"`` reapplies to a frame that is already its own output,
+      once per chained chunk, and drifts further each time. ``"increasingly
+      grim"`` is the same shape. ``"grave, unsmiling"`` is a fixed point:
+      restating it against a frame that already looks that way changes
+      nothing, which is what makes it safe to restate every chunk.
+
+    :func:`load_config` warns (never refuses -- a false positive here costs
+    nothing but a log line) when a demeanour value matches either an
+    unenforceable-prohibition pattern or a compounding-displacement pattern.
+
+    Unlike ``appearance``, demeanour is **not** stripped from the chained I2V
+    prompt variant (issue #46's ``include_appearance=False``): appearance
+    describes how to read a *photo*, which the chained path has none of, but
+    demeanour is behavioural direction the same shape as ``role`` -- it says
+    what the character is like, not how to interpret a reference image -- so
+    it stays composed on both paths, restated every chunk exactly like
+    ``role`` always has been. ``None`` means no direction, never a
+    fabricated default: the reference photo's own expression decides, as it
+    always has."""
+
+    avoid: tuple[str, ...] = ()
+    """Issue #73: things this video must never depict, anywhere, e.g.
+    ``["bass guitar", "microphone", "stage"]`` -- composed into *every*
+    prompt exactly like :attr:`setting` (a whole-video property, so it must
+    not be able to drift chunk to chunk).
+
+    **The render-side field the authoring concept's own ``avoid`` list never
+    had.** ``music_video_maker/authoring/concept.py`` already collects an
+    ``avoid`` list per song and ``authoring/beats.py`` and
+    ``authoring/prose.py`` both compose it into the *authoring* model's own
+    prompt ("Deliberately NOT on screen: ...") -- but that only ever
+    influences what the LLM writes into a shot line at authoring time. It
+    never reached the deterministic render prompt Stage 2b actually
+    conditions H3 with, and nothing checked a shot against it either (issue
+    #73's F13 finding: an orphaned field, dead weight). This is that
+    connection's render-side half: an operator (or, in a future
+    ``authoring/write.py`` change outside this field's scope -- see the
+    project report for the exact diff) copies the concept's ``avoid`` list
+    into this run-config field, and from there it reaches every prompt.
+
+    **Read this honestly: composing a negative list into the positive prompt
+    is not expected to reliably prevent the thing it names.** The committed
+    workflow templates (``workflow_api.json``, ``workflow_i2v_api.json`)
+    give ``MiniMaxH3ReferenceToVideo``/``MiniMaxH3ImageToVideo`` exactly one
+    ``prompt`` input feeding a single ``BasicGuider`` -- there is no second,
+    negative-conditioning channel the way an SDXL-style graph would have one
+    (a ``CFGGuider`` with a negative ``CLIPTextEncode``). So this list has
+    the identical mechanism, and therefore the identical unreliability, as
+    ``role``'s failed ``"never holding anything"`` (#73): the tokens present
+    are the forbidden object's own name. It is shipped anyway because it is
+    strictly better than dead weight -- the concept's own list already reads
+    "no instruments, stages, or microphones" and *something* composing it in
+    beats nothing composing it in -- but the durable fix for a *specific*
+    contradiction (a shot line that hands the character the forbidden
+    object, as chunk 72's needle did) is a lint comparing the authored shot
+    text against this list, symmetric to the ``role``-prohibition lint
+    ``shot_plan.py`` owns; see the project report for that exact diff. A
+    dedicated negative-conditioning graph path is the mechanism-level fix and
+    is out of scope here (``workflow_graph.py``, needs a render to validate).
+
+    ``()`` (the default) composes nothing, so every config written before
+    this field existed renders byte-identical to before."""
 
     cinematography: str | None = None
     """Issue #53: the whole-video film-direction language -- stock, lens,
@@ -472,6 +584,40 @@ class RunConfig:
     :data:`music_video_maker.faces.DEFAULT_MIN_FACE_FRACTION` for how the
     default was calibrated against real seed frames."""
 
+    i2v_min_seed_face_similarity: float | None = None
+    """Issue #49: minimum SFace cosine similarity between a seed frame's
+    largest face and the active cast member's reference photo, for that frame
+    to be trusted as *her* face rather than merely *a* face -- a third floor
+    on top of :attr:`i2v_min_seed_face_fraction`'s area check and
+    :func:`music_video_maker.faces.detect_faces`'s own confidence floor.
+
+    ``None`` (the default) means recognition is OFF: the gate behaves exactly
+    as issue #47 shipped it, detection-only. This is deliberately **not**
+    defaulted to the calibrated
+    :data:`music_video_maker.faces.DEFAULT_MIN_FACE_SIMILARITY`, even though
+    that value is ready to use: doing so would silently change the behaviour
+    of every config written before this key existed. The SFace weights this
+    check needs are 38.7 MB and deliberately not committed to this repository
+    (issue #51, ``docs/seed-face-recognition.md``), so defaulting it on would
+    make every pre-existing config with ``i2v_continuity`` enabled start
+    refusing every chain boundary the next time it runs, until its operator
+    fetches a model they never asked for. Same "a new knob leaves every
+    pre-existing config byte-identical" rule :attr:`alignment_model_size`
+    follows.
+
+    An operator opts in explicitly by setting this to
+    :data:`~music_video_maker.faces.DEFAULT_MIN_FACE_SIMILARITY` (0.34, the
+    measured recommendation) or their own value -- see that constant's
+    docstring and ``docs/seed-face-recognition.md`` for the calibration.
+    Once set, :func:`load_config` refuses to start a run that cannot honour
+    it: see the SFace pre-flight check inside :func:`_validate`. A checkout
+    with no model on disk must fail loudly before any GPU time is spent, not
+    hand the operator a silently weaker detection-only gate while reporting
+    success -- the run-time per-frame failure path (`degrade, never raise`)
+    is for *unpredictable* things like an unreadable frame or a reference
+    photo with no detectable face, not for a model file the operator could
+    have checked at load time."""
+
     i2v_chain_scope: str = "instrumental"
     """Issue #28: which chunks may take the chained (fl2va) path when
     ``i2v_continuity`` is on -- ``"instrumental"``, ``"all"`` or ``"none"``.
@@ -582,10 +728,87 @@ def _resolve_path(value: object, base_dir: Path) -> Path:
     return candidate if candidate.is_absolute() else base_dir / candidate
 
 
-CAST_KEYS = frozenset({"role", "image", "appearance"})
+CAST_KEYS = frozenset({"role", "image", "appearance", "demeanour"})
 """Every key a ``[cast.<Name>]`` table may contain. Closed set, for the same
 reason :data:`HARDWARE_KEYS` is: a misspelled ``appearence`` that is silently
 ignored is config that reads as applied but never reaches a prompt."""
+
+_PROHIBITION_PATTERN = re.compile(r"\b(never|without|no)\b", re.IGNORECASE)
+"""Issue #73's own list of prohibition markers, applied to ``role`` and
+``demeanour`` text. The corrected ``role`` that still rendered a bass guitar
+read '...never holding anything' -- 'never'/'no'/'without' are the words a
+human reaches for to write a prohibition, and none of them survive as tokens
+a diffusion prompt actually conditions on."""
+
+_VOCAL_EXCEPTION_PATTERN = re.compile(
+    r"\b(sing|sings|singing|sung|vocal|vocalist)\b", re.IGNORECASE
+)
+"""Exempts the one prohibition pattern this project already relies on and
+that already works for a completely different reason: 'never sings' /
+'background, never sings' describes who is *audible*, which is decided by
+``chunk.characters`` (issue #6/#33), never by the literal text of ``role`` --
+so the #73 finding (a prohibition's tokens carry no weight in the rendered
+prompt) does not apply to it and warning here would be a false alarm on the
+project's own shipped example."""
+
+_DISPLACEMENT_PATTERN = re.compile(
+    r"\b(less|more|increasingly|gradually|growing|fading|slowly)\b", re.IGNORECASE
+)
+"""Issue #46's endpoint-not-displacement lesson, applied to demeanour text.
+'looking a few years younger' is the appearance-field precedent for what a
+displacement looks like and how it compounds on the chained I2V path, where
+each chunk conditions on its own predecessor's output; 'increasingly grim' is
+the same shape for demeanour."""
+
+
+def _warn_if_prohibition(owner: str, field_label: str, text: str) -> None:
+    """Issue #73: warn (never refuse -- false positives here cost nothing but
+    a log line) when ``role`` or ``demeanour`` text reads as a prohibition.
+
+    Measured, not guessed: the corrected ``role`` "...weathered, patient and
+    unhurried, never holding anything" was in force for the entire "Deathless"
+    render and rendered a bass guitar into Jan's hands twice anyway, because
+    the only tokens a diffusion prompt actually sees in that phrase are
+    'holding' and 'anything'. Nothing warned that the fix did not work: this
+    closes that gap at the next config load, not after the next full render.
+    """
+    if not _PROHIBITION_PATTERN.search(text) or _VOCAL_EXCEPTION_PATTERN.search(text):
+        return
+    logger.warning(
+        "%s (%s) reads as a prohibition: %r. This project measured that a prohibition "
+        "is not enforceable in a diffusion prompt (issue #73) -- the corrected role "
+        "'...never holding anything' rendered a bass guitar into the same hands twice "
+        "anyway, because 'holding'/'anything' are the only tokens actually present. "
+        "Say what IS true instead of what is not (e.g. 'empty-handed, hands at his "
+        "sides' rather than 'never holding anything'). For a whole-video exclusion, "
+        "the render-side `avoid` list is the supported lever, though it shares the "
+        "same textual limitation; a shot-plan lint catching a contradicting shot line "
+        "is the durable fix (see shot_plan.py).",
+        owner,
+        field_label,
+        text,
+    )
+
+
+def _warn_if_displacement(owner: str, field_label: str, text: str) -> None:
+    """Issue #74/#46: warn when demeanour text names a displacement rather
+    than an endpoint -- the same compounding risk ``appearance`` already
+    documents, applied to the new field before a render ever exercises it."""
+    if not _DISPLACEMENT_PATTERN.search(text):
+        return
+    logger.warning(
+        "%s (%s) reads as a displacement, not an endpoint: %r. On the chained I2V "
+        "path each chunk conditions on the PREVIOUS chunk's own output, so a "
+        "relative directive re-applies to a frame that already embodies it and "
+        "drifts further each time (issue #46, measured on 'looking a few years "
+        "younger' compounding across chained chunks). State a fixed point instead "
+        "(e.g. 'grave and unsmiling' rather than 'increasingly grim') -- restating "
+        "an endpoint against a frame that already looks that way changes nothing, "
+        "which is what makes it safe to restate every chunk.",
+        owner,
+        field_label,
+        text,
+    )
 
 
 def _optional_text(entry: dict, key: str) -> str | None:
@@ -603,6 +826,7 @@ def _optional_text(entry: dict, key: str) -> str | None:
 
 
 def _build_cast(raw_cast: object, base_dir: Path) -> dict[str, CastMember]:
+    """Build the cast dictionary from the parsed ``[cast.<Name>]`` tables."""
     if isinstance(raw_cast, dict) and raw_cast and all(
         isinstance(v, CastMember) for v in raw_cast.values()
     ):
@@ -635,11 +859,17 @@ def _build_cast(raw_cast: object, base_dir: Path) -> dict[str, CastMember]:
             _fail(f"cast.{name}.role", "missing required 'role'")
         if not image:
             _fail(f"cast.{name}.image", "missing required 'image'")
+        _warn_if_prohibition(f"cast.{name}", "role", role)
+        member_demeanour = _optional_text(entry, "demeanour")
+        if member_demeanour:
+            _warn_if_prohibition(f"cast.{name}", "demeanour", member_demeanour)
+            _warn_if_displacement(f"cast.{name}", "demeanour", member_demeanour)
         cast[name] = CastMember(
             name=name,
             role=role,
             image=_resolve_path(image, base_dir),
             appearance=_optional_text(entry, "appearance"),
+            demeanour=member_demeanour,
         )
     return cast
 
@@ -917,6 +1147,26 @@ def _validate(config: RunConfig) -> None:
     if config.i2v_workflow_template is not None:
         _validate_file("i2v_workflow_template", config.i2v_workflow_template)
 
+    if config.i2v_min_seed_face_similarity is not None:
+        # Issue #49: recognition was explicitly requested. Refuse loudly and
+        # early rather than silently degrade to detection-only at render time
+        # -- that would hand the operator a weaker guard than they asked for
+        # while reporting success, hours into a run this same stat() call
+        # could have caught for free.
+        recognition_model = resolve_recognition_model_path()
+        if not recognition_model.exists():
+            _fail(
+                "i2v_min_seed_face_similarity",
+                f"is set to {config.i2v_min_seed_face_similarity!r}, which requires the "
+                f"SFace face-recognition model, but it is not present at "
+                f"{recognition_model}. It is deliberately NOT committed to this "
+                f"repository (issue #49, ~38.7 MB -- see docs/seed-face-recognition.md): "
+                f"fetch it from {RECOGNITION_MODEL_SOURCE} (sha256 "
+                f"{RECOGNITION_MODEL_SHA256}) and place it at that path, or unset "
+                "i2v_min_seed_face_similarity to render with the detection-only gate "
+                "instead",
+            )
+
 
 def load_config(path: Path, **overrides: object) -> RunConfig:
     """Load, merge overrides onto, and validate a run config TOML file.
@@ -1061,6 +1311,28 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
     values["setting"] = _optional_text(merged, "setting")
     values["global_appearance"] = _optional_text(merged, "global_appearance")
     values["cinematography"] = _optional_text(merged, "cinematography")
+
+    global_demeanour = _optional_text(merged, "global_demeanour")
+    if global_demeanour:
+        _warn_if_prohibition("run config", "global_demeanour", global_demeanour)
+        _warn_if_displacement("run config", "global_demeanour", global_demeanour)
+    values["global_demeanour"] = global_demeanour
+
+    raw_avoid = merged.get("avoid", [])
+    if raw_avoid is None:
+        raw_avoid = []
+    if not isinstance(raw_avoid, list):
+        raise ConfigError(
+            f"avoid must be a list of strings, got {type(raw_avoid).__name__} (issue #73)"
+        )
+    avoid_items = []
+    for i, item in enumerate(raw_avoid):
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigError(
+                f"avoid[{i}] must be a non-empty string, got {item!r} (issue #73)"
+            )
+        avoid_items.append(item.strip())
+    values["avoid"] = tuple(avoid_items)
 
     shot_plan_path = merged.get("shot_plan")
     if shot_plan_path:
@@ -1226,6 +1498,27 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
             f"got {face_fraction!r}"
         )
     values["i2v_min_seed_face_fraction"] = float(face_fraction)
+
+    # Issue #49: unset (None) means recognition is OFF -- see the field's own
+    # docstring for why that default cannot be the calibrated
+    # DEFAULT_MIN_FACE_SIMILARITY. Validated the same shape as the fraction
+    # above it, but against a cosine similarity's -1.0..1.0 range rather than
+    # a fraction's 0..1.
+    face_similarity = merged.get("i2v_min_seed_face_similarity")
+    if face_similarity is not None:
+        if isinstance(face_similarity, bool) or not isinstance(face_similarity, (int, float)):
+            raise ConfigError(
+                f"i2v_min_seed_face_similarity must be a number, got {face_similarity!r}"
+            )
+        if not -1.0 <= float(face_similarity) <= 1.0:
+            raise ConfigError(
+                f"i2v_min_seed_face_similarity is a cosine similarity, so it must be "
+                f"between -1.0 and 1.0 (the calibrated recommendation is "
+                f"faces.DEFAULT_MIN_FACE_SIMILARITY = {DEFAULT_MIN_FACE_SIMILARITY} -- see "
+                f"docs/seed-face-recognition.md); got {face_similarity!r}"
+            )
+        face_similarity = float(face_similarity)
+    values["i2v_min_seed_face_similarity"] = face_similarity
 
     chain_scope = merged.get("i2v_chain_scope", "instrumental")
     if chain_scope not in ("instrumental", "all", "none"):

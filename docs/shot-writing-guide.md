@@ -440,6 +440,39 @@ sequences above are also easier to keep coherent when every beat in the
 sequence is understood to happen in the same real place, not just the same
 `shot` line.
 
+## Track where each character is, not just where the world is (issue #78)
+
+`setting` is one fact for the whole video; it says nothing about where a
+character IS inside it at a given moment, and a shot may not reference
+another shot to say so (issue #61 — each chunk renders from its own prompt,
+for a model that has never seen any other). A real "Deathless" render made
+the gap concrete: chunk 7 (0:54) put Volokov's mill "in the valley below"
+while she was still climbing toward it; chunk 13 (1:32), 37 seconds later
+with every line between them describing continued ascent, had her palm
+"trailing along its worn wood grain" at shoulder height. She cannot be
+climbing away from a landmark and touching it a minute later. The same plan
+put `present = ["Jan"]` on a hillside chunk that never mentions him, and
+dropped him from the two chunks right after — the "hill where Jan is, cuts
+to a different hill where Jan isn't" a viewer's first note complained about.
+
+The fix is `ShotPlanEntry.location` — a tag drawn from a small closed set
+the concept stage names for the song (`"valley floor"`, `"switchback"`,
+`"mill"`, `"watch-post"`), assigned per chunk by the beats stage the same way
+`beat_role`/`beat_group` already are: checkable before a word of prose
+exists, never guessed from finished text afterward. It is not composed into
+the rendered prompt — it exists purely so two mechanical checks can run:
+
+* a chunk naming the same landmark as another chunk close by in song time,
+  at contradictory distances (the mill "below" then "at shoulder height");
+* `present` staging a companion at a location that contradicts where their
+  own singing chunks elsewhere in the plan put them.
+
+Both are warnings, not errors, for the reason every lint in this guide is:
+a false positive on prose written deliberately must never block a run.
+`location` has no bearing on wording — keep writing shot lines exactly as
+the rest of this guide describes; just give each beat an honest answer to
+"where is this happening" and let the two checks do the rest.
+
 ## Make the effect the grammatical subject
 
 This is the single highest-leverage sentence-level rule in this guide, and it
@@ -621,6 +654,57 @@ is still checked for the chunks that spell it out. Both are warnings, never
 errors, same bar as every other lint here, and the evidence base is one true
 positive, so treat it as a prompt to look rather than a verdict.
 
+## Framing choices on a voiced chunk, re-scored against the full render (issue #76)
+
+`lint_voiced_framing`'s keyword sets (above, and the ones covering "camera
+too far from the face") were scored mid-render, on a partial "Deathless"
+corpus. The finished 80-chunk render — 41 voiced chunks, corpus mean face
+presence 53.3% — does not support them as originally shipped. This is #60's
+own lesson arriving one level up: a generalisation from a partial sample is
+a hypothesis, and the full render is the experiment.
+
+**Avoid framing a voiced chunk in profile.** Left out of the shipped keyword
+list at first sample (three chunks, 8%/0%/45% face presence — "a real risk
+but not a reliable one"), and reversed on a larger sample rather than
+silently changed: across all 5 occurrences on the finished render (chunks
+18, 21, 37, 43, 59) face presence never once cleared the corpus mean — worst
+case 8%, best case 42%. It is the one framing choice tested here with no
+counter-example, and it fires even on an otherwise-close shot: a profile
+close-up is still a profile shot.
+
+**A gaze verb that settles the eyes on something in the scene is still
+risky, but the list is narrower than it was.** Of the original 9 gaze
+phrases, only 6 actually separated on the full corpus (each one's single
+measured occurrence landed below the 53.3% mean); the other 3 — "gaze
+drops", "gaze lifts", "lifts her gaze" — measured *above* the mean, because
+in each case the `camera` field also named the face directly and the camera
+field won. The lesson isn't "gaze verbs are safe now" — it's that a gaze
+verb only costs the face when nothing else in the entry is holding it there.
+
+**Framing an object at foot level is no longer a checked keyword.** The
+underlying finding was real — a line that read "pushing up between his
+boots" once rendered legs, boots and mushrooms with no face anywhere — but
+the keyword list built from it (boots, feet, ankles, the ground, …) scored
+0.99x against the rest of the voiced corpus on the full render:
+indistinguishable from noise. "the ground" alone ranged from 33% to 92%
+face presence across its two occurrences, the same phrase in both. If a
+sung chunk stages something at the performer's feet, treat it as a judgment
+call rather than something the tooling will catch.
+
+**A hypothesis that was tested and rejected: does the `camera` field name
+the face at all?** Proposed from two examples where the identical camera
+phrase "travelling with her" scored 83% face presence in one chunk and 0% in
+another — one of the two named "her face... in the same frame", the other
+did not. Tested as a literal keyword match for "face" across all 41 voiced
+chunks: chunks whose `camera` names the face averaged **50.8%**, chunks that
+don't averaged **59.8%** — backwards from the hypothesis. The best-scoring
+chunk in the whole corpus (100% face) never says "face" at all. Naming the
+face in the camera clause is not, on its own, a usable predictor; don't
+re-propose it as a literal keyword without a different operationalisation.
+
+Full numbers, per-chunk detail, and the excluded candidates for every one of
+these decisions: `docs/deathless-render-corpus.md`.
+
 ## Never refer to another shot (issue #61)
 
 Each chunk is rendered on its own, from its own prompt, by a model that has
@@ -649,6 +733,66 @@ above covers and which the same edit fixes.
 
 Re-describe the thing in full every time. The repetition costs you nothing:
 nobody reads two shot lines side by side except you.
+
+## An idiom that names a physical object gets rendered as that object (issue #75)
+
+H3 has no idiom dictionary. Every noun in a shot line is a candidate for the
+frame, whether you meant it literally or not — and idiom, metaphor and
+figurative compression are exactly the constructions that make prose read
+well, so a stage optimising for good writing is optimising straight into this
+trap.
+
+Measured on a real render. A viewer asked why the singer suddenly had
+mountain-climbing safety equipment:
+
+```toml
+# Wrong -- "holds her line" is climbing idiom for a route or a rope. H3
+# rendered the rope, and the harness and hardware that go with it. Her
+# `role` describes no equipment anywhere, and no other chunk in the video
+# has any:
+shot = "Rock dust and loose stones hiss down the cracked face in a
+        spreading sheet, spattering off the ledge just beneath her grip
+        as she holds her line above the crumbling rock."
+
+# Right -- the same beat, with nothing left that names an object you don't
+# want on screen:
+shot = "Rock dust and loose stones hiss down the cracked face in a
+        spreading sheet, spattering off the ledge just beneath her grip
+        as she keeps climbing, steady, above the crumbling rock."
+```
+
+The rule: **if a phrase names a physical object, H3 will render it.** Before
+a line ships, ask what a viewer with no access to your intent would see if
+every noun were taken at face value. If the answer includes something you did
+not mean to put on screen, rewrite the line so it doesn't name that thing —
+you rarely lose anything: "keeps climbing, steady" carries the same beat as
+"holds her line" without inviting a harness into frame.
+
+This is not a reason to write flat, literal prose everywhere. A shadow, a
+worn-down mountain, and a smeared sense of time all survive contact with H3
+just fine in the same render this example comes from — none of the following
+misfired:
+
+```toml
+# Fine -- "shadow" names a real, intended visual; nothing here reads as
+# hardware or equipment:
+shot = "She climbs on through a slow fall of grey ash as firelight throws
+        her shadow sprawling up the rock face beside her."
+
+# Fine -- "worn down... to a hill" is the mountain itself changing over the
+# song, which is the actual story, not an idiom smuggling in a second object:
+shot = "A band of pre-dawn light lies unchanged along the horizon as she
+        lifts her gaze to it, the climb behind her worn down now to little
+        more than a bare hill."
+```
+
+and `setting = "...where time is smeared: medieval hosts, industrial armies,
+and nuclear glow all visible from the same watch-post..."` composes into
+*every* prompt in that render with no misfire anywhere, because "smeared" is
+describing an actual visual quality of the scene, not standing in for an
+unrelated object the way "line" stands in for a rope. The test is not "did I
+use a figure of speech" — it's "does this figure of speech happen to be the
+name of a physical thing I don't want in frame."
 
 ## Say who else is on screen, in `present` (issue #59)
 
@@ -778,6 +922,12 @@ Run down this list before committing a shot plan:
 - [ ] Where the lyric names a concrete object, is that object on screen, or
       have you decided deliberately that it should not be? If the verse
       repeats, is the first mention a plant and the second a payoff?
+- [ ] Does any idiom or figure of speech in the line happen to name a
+      physical object you don't want on screen ("holds her line", "draws
+      the line")? H3 has no idiom dictionary and will render the noun.
+- [ ] Is a voiced chunk's `camera` framed "in profile"? Measured with no
+      counter-example on a real render (issue #76) — prefer facing the lens
+      more directly, or move the profile framing to an instrumental chunk.
 - [ ] Does the `shot` line avoid restating things the render loop already
       composes — character identity, appearance, the lyric line, whether
       the character is singing?

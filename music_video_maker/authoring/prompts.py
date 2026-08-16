@@ -64,8 +64,20 @@ Reply with a single JSON object, no other text, matching exactly:
   "setting": "where and when this takes place",
   "tone": "the emotional register -- comic, elegiac, tense, etc.",
   "motifs": ["a short list of recurring visual ideas the shot plan can plant and pay off"],
-  "avoid": ["things this concept deliberately does NOT want on screen"]
+  "avoid": ["things this concept deliberately does NOT want on screen"],
+  "locations": ["a small closed list of DISTINCT places within `setting` the story actually visits"]
 }
+
+`locations` matters more than its size suggests. `setting` fixes the whole \
+video's geography, but says nothing about where a character IS inside it at \
+a given moment, and nothing downstream can answer that unless you name the \
+places here first. Keep the list SMALL (typically 3-8 entries) and each \
+entry a DISTINCT, nameable place inside your `setting` -- "the valley floor", \
+"the switchback path", "the mill", "the watch-post" -- never a vague \
+gradient like "closer to the summit" or a duplicate of another entry under a \
+different name. Every chunk's `location` in the next stage is assigned from \
+exactly this list, and a place that is not on it cannot be used -- so name \
+everywhere the story actually goes, and nothing it does not.
 
 This is the tightest review point in the whole pipeline -- a human reads \
 this paragraph in seconds and decides whether to proceed. Write something \
@@ -80,13 +92,15 @@ in each chunk of the song -- the structure of the story across shots, not the \
 prose that will describe them. A later stage writes the shot lines; if you \
 write finished prose here it will be thrown away.
 
-You will be given the approved concept, the song's chunk skeleton, the cast, \
-and possibly notes from the person reviewing this.
+You will be given the approved concept (including its closed `locations` \
+list), the song's chunk skeleton, the cast, and possibly notes from the \
+person reviewing this.
 
 Reply with a single JSON object, no other text:
 {"beats": [
   {"chunk_id": 12, "beat": "the printer erupts", "beat_role": "consequence",
-   "beat_group": 3, "focus": "action", "length_seconds": 9.0}
+   "beat_group": 3, "focus": "action", "location": "the office aisle",
+   "length_seconds": 9.0}
 ]}
 
 Rules your reply is CHECKED against -- a violation is sent straight back to \
@@ -102,6 +116,21 @@ Every `consequence` needs a `plant` AND a `contact` earlier in ITS OWN group. \
 A consequence alone in its group is rejected: that is one shot asked to carry \
 both a cause and its effect, which is the exact defect the shot-writing guide \
 below exists to fix.
+3a. `location` MUST be exactly one of the concept's approved `locations` -- \
+copy the string verbatim, do not paraphrase or invent a new one. This is \
+where the active cast member is inside the run's `setting` at this beat. \
+`setting` fixes the world's geography for the whole video; it says nothing \
+about where anyone is inside it at a given moment, and nothing else tracks \
+that -- a real render put `present = ["Jan"]` on a hillside shot that never \
+mentioned him, and the same plan had one character climbing steadily toward \
+a landmark in one chunk and touching it a minute of story time later with \
+nothing in between to explain the jump. Get this right by treating it as \
+continuity, not decoration: read the chunk immediately before and after each \
+beat you assign a `location` to, and change `location` only where the story \
+actually moves the character somewhere else. If a `location` you need is not \
+on the approved list, say so in your reply instead of inventing one -- the \
+concept can be revised, the render cannot silently absorb an unapproved \
+place.
 4. Every `consequence` sets `focus` to "action". Everything else uses \
 "subject". This is not stylistic -- "action" is what stops the composed \
 "X is the focus of this shot" clause from competing with the state change. \
@@ -364,7 +393,22 @@ A glance is fine, because a glance returns. If she has to look at something, \
 put the something near her. Better still, make the \
 beat about her action. This does not soften \
 rule 2: an OBJECT may still be the grammatical subject of a consequence, and \
-usually should be.\
+usually should be.
+12. EVERY NOUN IN A SHOT LINE WILL BE RENDERED LITERALLY. H3 has no idiom \
+dictionary, so a figure of speech that happens to name a physical object gets \
+that object put on screen, not the meaning you intended. Measured on a real \
+render: "as she holds her line above the crumbling rock" -- climbing idiom \
+for a route or a rope -- rendered an actual rope, and the harness and \
+hardware that go with it, into a shot whose `role` describes no equipment at \
+all and where no other chunk in the video has any. Before a line ships, ask \
+what a viewer with no access to your intent would see if every noun were \
+taken at face value; if a phrase you reached for names something you did not \
+mean to put in frame, rewrite it. This is not a call for flat prose -- "her \
+shadow sprawling up the rock face", a mountain "worn down now to little more \
+than a bare hill", a whole video's `setting` describing time itself as \
+"smeared" all render exactly as intended in the same song. The test is not \
+whether a line uses a figure of speech; it's whether that figure of speech \
+happens to be the name of a physical thing you don't want in the frame.\
 """
 
 

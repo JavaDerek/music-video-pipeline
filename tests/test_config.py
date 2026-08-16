@@ -25,6 +25,7 @@ from music_video_maker.config import (
     load_config,
 )
 from music_video_maker.contracts import CastMember, HardwareProfile
+from music_video_maker.faces import DEFAULT_MIN_FACE_SIMILARITY, resolve_recognition_model_path
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "config"
 
@@ -274,6 +275,19 @@ def test_unknown_override_key_raises(tmp_path: Path, caplog: pytest.LogCaptureFi
         load_config(config_path, not_a_real_field="oops")
 
     assert "overrides" in caplog.text
+
+
+def test_cast_demeanour_override_no_longer_exists(tmp_path: Path) -> None:
+    """Issue #74's completed migration: ``cast_demeanour`` was a stand-in
+    sibling dict on ``RunConfig`` because ``contracts.py`` was locked at the
+    time. It is gone now that ``CastMember.demeanour`` is the one real field,
+    so passing it as an override must be refused exactly like any other
+    unknown override key -- there must be exactly one way to express this."""
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path)
+
+    with pytest.raises(ConfigError, match="overrides"):
+        load_config(config_path, cast_demeanour={"Dianne": "grave and unsmiling"})
 
 
 # --------------------------------------------------------------------------- #
@@ -561,6 +575,222 @@ appearence = "typo'd on purpose"
         load_config(config_path)
 
     assert "appearence" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------- #
+# Demeanour (issue #74)
+# --------------------------------------------------------------------------- #
+
+
+def test_global_demeanour_is_read(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(
+        tmp_path, extra_toml='global_demeanour = "nobody smiles; this is a war"'
+    )
+
+    assert load_config(config_path).global_demeanour == "nobody smiles; this is a war"
+
+
+def test_global_demeanour_defaults_to_none(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path)
+
+    assert load_config(config_path).global_demeanour is None
+
+
+def test_an_empty_global_demeanour_is_treated_as_unset(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path, extra_toml='global_demeanour = "   "')
+
+    assert load_config(config_path).global_demeanour is None
+
+
+def test_member_demeanour_is_read_and_is_separate_from_role_and_appearance(
+    tmp_path: Path,
+) -> None:
+    """Follows the appearance/global_appearance precedent (#31): demeanour
+    applies to every chunk the member is in, exactly like role and
+    appearance, which is why it must not live inside either of them (#74).
+    A plain ``CastMember.demeanour`` attribute, matching ``appearance``'s own
+    shape -- not a sibling dict on ``RunConfig``."""
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Dianne]
+role = "Lead Vocalist, smiling constantly, oblivious"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+appearance = "in her late forties, softly lit"
+demeanour = "grave and unsmiling, exhausted"
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block)
+
+    cfg = load_config(config_path)
+
+    assert cfg.cast["Dianne"].demeanour == "grave and unsmiling, exhausted"
+    assert "grave" not in cfg.cast["Dianne"].role
+    assert "grave" not in (cfg.cast["Dianne"].appearance or "")
+
+
+def test_member_demeanour_defaults_to_none_when_nobody_sets_one(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path)
+
+    cfg = load_config(config_path)
+
+    assert cfg.cast["Dianne"].demeanour is None
+    assert cfg.cast["Rex"].demeanour is None
+
+
+def test_only_members_with_a_demeanour_have_one_set(tmp_path: Path) -> None:
+    """Rex (no demeanour) must resolve to ``None`` -- absence, not an empty
+    string, is how "nobody set one" is represented."""
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Dianne]
+role = "Lead Vocalist, smiling constantly, oblivious"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+demeanour = "grave and unsmiling"
+
+[cast.Rex]
+role = "Drummer, background, never sings"
+image = "{tmp_path / "cast" / "rex_ref.jpg"}"
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block)
+
+    cast = load_config(config_path).cast
+
+    assert cast["Dianne"].demeanour == "grave and unsmiling"
+    assert cast["Rex"].demeanour is None
+
+
+def test_role_prohibition_warns_at_load(tmp_path: Path, caplog) -> None:
+    """The #73 finding: 'never holding anything' rendered a bass guitar twice
+    anyway. Nothing warned that the fix did not work -- this closes that gap
+    at load time."""
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Dianne]
+role = "Weathered watchman, patient and unhurried, never holding anything"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block)
+
+    with caplog.at_level(logging.WARNING):
+        load_config(config_path)
+
+    assert any(
+        "prohibition" in r.getMessage().lower() and "Dianne" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_role_prohibition_about_singing_does_not_warn(tmp_path: Path, caplog) -> None:
+    """'never sings' is not the #73 bug: whether a member sings is decided by
+    chunk.characters, never by the literal text of role, so the prohibition
+    warning must not fire on the project's own shipped example."""
+    _create_default_assets(tmp_path)  # DEFAULT_CAST_TOML's Rex reads "never sings"
+    config_path = _write_config(tmp_path)
+
+    with caplog.at_level(logging.WARNING):
+        load_config(config_path)
+
+    assert not any(
+        "prohibition" in r.getMessage().lower() and "Rex" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_demeanour_prohibition_warns(tmp_path: Path, caplog) -> None:
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Dianne]
+role = "Lead Vocalist"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+demeanour = "never amused"
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block)
+
+    with caplog.at_level(logging.WARNING):
+        load_config(config_path)
+
+    assert any(
+        "prohibition" in r.getMessage().lower() and "demeanour" in r.getMessage().lower()
+        for r in caplog.records
+    )
+
+
+def test_demeanour_displacement_warns(tmp_path: Path, caplog) -> None:
+    """Issue #46: a displacement compounds on the chained I2V path, where each
+    chunk conditions on the previous chunk's own output."""
+    _create_default_assets(tmp_path)
+    config_path = _write_config(
+        tmp_path, extra_toml='global_demeanour = "increasingly grim as the war drags on"'
+    )
+
+    with caplog.at_level(logging.WARNING):
+        load_config(config_path)
+
+    assert any(
+        "displacement" in r.getMessage().lower() and "global_demeanour" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_demeanour_endpoint_phrasing_does_not_warn(tmp_path: Path, caplog) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path, extra_toml='global_demeanour = "grave and unsmiling"')
+
+    with caplog.at_level(logging.WARNING):
+        load_config(config_path)
+
+    assert not any(
+        ("prohibition" in r.getMessage().lower() or "displacement" in r.getMessage().lower())
+        for r in caplog.records
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The render-side avoid list (issue #73)
+# --------------------------------------------------------------------------- #
+
+
+def test_avoid_defaults_to_empty_tuple(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path)
+
+    assert load_config(config_path).avoid == ()
+
+
+def test_avoid_is_read_from_toml(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(
+        tmp_path, extra_toml='avoid = ["bass guitar", "microphone", "stage"]'
+    )
+
+    assert load_config(config_path).avoid == ("bass guitar", "microphone", "stage")
+
+
+def test_avoid_rejects_a_non_list(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path, extra_toml='avoid = "bass guitar"')
+
+    with pytest.raises(ConfigError, match="avoid"):
+        load_config(config_path)
+
+
+def test_avoid_rejects_a_non_string_item(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path, extra_toml="avoid = [1, 2]")
+
+    with pytest.raises(ConfigError, match="avoid"):
+        load_config(config_path)
+
+
+def test_avoid_rejects_a_blank_item(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path, extra_toml='avoid = ["   "]')
+
+    with pytest.raises(ConfigError, match="avoid"):
+        load_config(config_path)
 
 
 def test_strict_alignment_defaults_off_and_is_readable(tmp_path: Path) -> None:
@@ -1010,6 +1240,130 @@ def test_unknown_chain_scope_is_refused(tmp_path: Path) -> None:
     _create_default_assets(tmp_path)
     with pytest.raises(ConfigError):
         load_config(_write_config(tmp_path, extra_toml='i2v_chain_scope = "everything"'))
+
+
+# --------------------------------------------------------------------------- #
+# Issue #49: seed-face recognition similarity floor
+# --------------------------------------------------------------------------- #
+
+
+def test_seed_face_similarity_defaults_to_none(tmp_path: Path) -> None:
+    """Recognition is OFF by default -- a config that never sets this key
+    must behave exactly as issue #47 shipped it, detection-only. Defaulting
+    to the calibrated DEFAULT_MIN_FACE_SIMILARITY would silently make every
+    pre-existing config with chaining enabled start refusing chain
+    boundaries the moment it hit a checkout with no SFace model."""
+    _create_default_assets(tmp_path)
+    cfg = load_config(_write_config(tmp_path))
+    assert cfg.i2v_min_seed_face_similarity is None
+
+
+def test_seed_face_similarity_loads_from_toml_when_the_model_is_present(
+    tmp_path: Path, monkeypatch
+) -> None:
+    fake_model = tmp_path / "fake_sface.onnx"
+    fake_model.write_bytes(b"fake")
+    monkeypatch.setattr(
+        config_module, "resolve_recognition_model_path", lambda *a, **k: fake_model
+    )
+    _create_default_assets(tmp_path)
+
+    cfg = load_config(
+        _write_config(
+            tmp_path, extra_toml=f"i2v_min_seed_face_similarity = {DEFAULT_MIN_FACE_SIMILARITY}"
+        )
+    )
+
+    assert cfg.i2v_min_seed_face_similarity == DEFAULT_MIN_FACE_SIMILARITY
+
+
+@pytest.mark.parametrize("value", [1.5, -1.5, "high"])
+def test_seed_face_similarity_out_of_range_or_non_numeric_is_refused(
+    tmp_path: Path, value
+) -> None:
+    """A cosine similarity lives in [-1.0, 1.0] -- unlike the face-AREA
+    fraction, negative values are meaningful (a confidently wrong match), so
+    the floor is -1.0, not 0.0."""
+    _create_default_assets(tmp_path)
+    literal = f'"{value}"' if isinstance(value, str) else value
+    with pytest.raises(ConfigError, match="i2v_min_seed_face_similarity"):
+        load_config(
+            _write_config(tmp_path, extra_toml=f"i2v_min_seed_face_similarity = {literal}")
+        )
+
+
+def test_seed_face_similarity_boundary_values_are_accepted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    fake_model = tmp_path / "fake_sface.onnx"
+    fake_model.write_bytes(b"fake")
+    monkeypatch.setattr(
+        config_module, "resolve_recognition_model_path", lambda *a, **k: fake_model
+    )
+    _create_default_assets(tmp_path)
+
+    assert load_config(
+        _write_config(tmp_path, extra_toml="i2v_min_seed_face_similarity = 1.0")
+    ).i2v_min_seed_face_similarity == 1.0
+    assert load_config(
+        _write_config(tmp_path, extra_toml="i2v_min_seed_face_similarity = -1.0")
+    ).i2v_min_seed_face_similarity == -1.0
+
+
+def test_seed_face_similarity_set_but_recognition_model_missing_refuses_at_load(
+    tmp_path: Path,
+) -> None:
+    """Recognition was explicitly requested but the 38.7 MB SFace model is --
+    correctly -- absent from this checkout (issue #51: it is deliberately not
+    committed). This must refuse loudly at config-load time, before any GPU
+    time is spent, rather than silently degrade to a weaker detection-only
+    gate at render time while reporting success."""
+    _create_default_assets(tmp_path)
+    assert not resolve_recognition_model_path().exists(), (
+        "this test assumes the SFace model is not committed to the repository"
+    )
+
+    with pytest.raises(ConfigError, match="SFace") as excinfo:
+        load_config(
+            _write_config(tmp_path, extra_toml="i2v_min_seed_face_similarity = 0.34")
+        )
+
+    message = str(excinfo.value)
+    assert "not committed" in message.lower()
+    assert "docs/seed-face-recognition.md" in message or "opencv_zoo" in message
+
+
+def test_seed_face_similarity_missing_model_check_is_independent_of_i2v_continuity(
+    tmp_path: Path,
+) -> None:
+    """The pre-flight check fires purely on the knob being set -- the same
+    'explicitly requested but cannot be honoured' logic applies whether or
+    not i2v_continuity is also on, since a config is often prepared ahead of
+    flipping that switch."""
+    _create_default_assets(tmp_path)
+    assert not resolve_recognition_model_path().exists()
+
+    with pytest.raises(ConfigError, match="SFace"):
+        load_config(
+            _write_config(
+                tmp_path,
+                extra_toml="i2v_continuity = false\ni2v_min_seed_face_similarity = 0.34",
+            )
+        )
+
+
+def test_unset_seed_face_similarity_never_touches_the_recognition_model_check(
+    tmp_path: Path,
+) -> None:
+    """A config that never sets this key must load fine regardless of
+    whether the (uncommitted) SFace model happens to be on disk -- the whole
+    point of defaulting to None."""
+    _create_default_assets(tmp_path)
+    assert not resolve_recognition_model_path().exists()
+
+    cfg = load_config(_write_config(tmp_path, extra_toml="i2v_continuity = false"))
+
+    assert cfg.i2v_min_seed_face_similarity is None
 
 
 # --------------------------------------------------------------------------- #

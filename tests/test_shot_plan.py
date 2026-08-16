@@ -26,17 +26,21 @@ from pathlib import Path
 
 import pytest
 
-from music_video_maker.contracts import AudioChunk
+from music_video_maker.contracts import AudioChunk, CastMember
 from music_video_maker.shot_plan import (
     ShotPlanDriftError,
     ShotPlanEntry,
     ShotPlanError,
     lint_camera_face_away_on_voiced_chunks,
+    lint_present_location_mismatch,
+    lint_role_prohibition_contradiction,
     lint_shots_against_lyrics,
+    lint_unbound_companion_referent,
     lint_voiced_framing,
     load_shot_plan,
     render_shot_plan_skeleton,
     resolve_camera,
+    resolve_location,
     resolve_shot,
     write_shot_plan_skeleton,
 )
@@ -297,7 +301,13 @@ def test_no_setting_never_warns_even_with_a_landmark_mismatch(tmp_path, caplog):
 # vocabulary is demonstrably an object they meant to stage.
 # --------------------------------------------------------------------------- #
 
-def _chunk_stub(chunk_id: int, text: str, *, instrumental: bool = False):
+def _chunk_stub(
+    chunk_id: int,
+    text: str,
+    *,
+    instrumental: bool = False,
+    characters: tuple[str, ...] = (),
+):
     return AudioChunk(
         chunk_id=chunk_id,
         audio_file=Path(f"chunk_{chunk_id}.wav"),
@@ -305,6 +315,7 @@ def _chunk_stub(chunk_id: int, text: str, *, instrumental: bool = False):
         end=float(chunk_id) + 5.0,
         text=text,
         is_instrumental=instrumental,
+        characters=characters,
     )
 
 
@@ -1476,18 +1487,27 @@ def test_an_instrumental_chunk_may_be_as_wide_as_it_likes(caplog):
     assert caplog.text == ""
 
 
-def test_a_voiced_chunk_framed_at_foot_level_warns(caplog):
-    """Near is not the same as in-frame-with-the-face. #58 says stage the
-    object near, not far, and that is right -- but on a sung chunk an object
-    staged at the feet pulls the frame down off the head. Measured: a chunk
-    whose line read "pushing up between his boots" rendered his legs and
-    boots, mushrooms perfectly, and no face anywhere, over his own vocal."""
+def test_a_voiced_chunk_framed_at_foot_level_no_longer_warns(caplog):
+    """`_FOOT_LEVEL_KEYWORDS` is retired (issue #76). The underlying idea it
+    encoded was real -- this exact scenario (a shot whose line read "pushing
+    up between his boots") once rendered legs, boots and mushrooms perfectly,
+    with no face anywhere -- but the keyword LIST built from it did not
+    generalise: on the full 80-chunk "Deathless" render, the same keyword set
+    scored 0.99x against the rest of the voiced corpus, indistinguishable
+    from noise ("the ground" alone ranged 33%-92% across its two hits). A
+    weak lint costs nothing at runtime and a great deal the moment somebody
+    acts on it, so it is retired rather than kept as false confidence.
+
+    This camera/shot pair deliberately avoids any other keyword this lint
+    checks (no gaze verb, no "travelling with", no wide/close framing word,
+    no "in profile"), so a silent result here isolates the foot-level
+    retirement specifically rather than being silenced by some other check."""
     plan = {
         3: ShotPlanEntry(
             chunk_id=3,
             start=3.0,
             shot="Pale mushroom caps push up between his boots where he stands",
-            camera="medium close on Jan, the mushrooms at his boots just inside the lower frame",
+            camera="static, the mushrooms breaking up around his boots",
         )
     }
     chunks = [_chunk_stub(3, "Nobody was counting then")]
@@ -1495,8 +1515,7 @@ def test_a_voiced_chunk_framed_at_foot_level_warns(caplog):
     with caplog.at_level(logging.WARNING):
         lint_voiced_framing(plan, chunks)
 
-    assert "chunk_id=3" in caplog.text
-    assert "boots" in caplog.text
+    assert caplog.text == ""
 
 
 def test_an_instrumental_chunk_may_be_framed_at_foot_level(caplog):
@@ -1582,3 +1601,902 @@ def test_a_voiced_chunk_shot_from_ahead_is_quiet(caplog):
     with caplog.at_level(logging.WARNING):
         lint_voiced_framing(plan, [_chunk_stub(3, "Walking the empty road tonight")])
     assert caplog.text == ""
+
+
+# --------------------------------------------------------------------------- #
+# Re-score against the full render (issue #76).
+#
+# `_GAZE_AWAY_KEYWORDS`, `_BEHIND_CAMERA_KEYWORDS` and `_FOOT_LEVEL_KEYWORDS`
+# above were all scored on a partial "Deathless" render, mid-render. The
+# finished 80-chunk render (41 voiced chunks, corpus mean face presence
+# 53.3%) is now available, and does not support all three as shipped:
+#
+#   | keyword set              | shipped n | avg face | vs rest |
+#   |---------------------------|-----------|----------|---------|
+#   | `_GAZE_AWAY_KEYWORDS`      | 9         | 40.7%    | 0.72x   |
+#   | `_BEHIND_CAMERA_KEYWORDS`  | 2         | 41.7%    | 0.77x   |
+#   | `_FOOT_LEVEL_KEYWORDS`     | 3         | 52.8%    | 0.99x   |
+#   | `in profile` (not shipped) | 5         | 23.3%    | 0.41x   |
+#
+# Full numbers and per-chunk detail: docs/deathless-render-corpus.md Part 3.
+# Foot-level's retirement is covered by the test just above this block;
+# behind-camera is intentionally left unchanged (flagged in the docs for a
+# future pass, out of scope for what issue #76 measured and asked for).
+# --------------------------------------------------------------------------- #
+
+
+def test_gaze_away_keywords_excluded_by_the_full_render_no_longer_warn(caplog):
+    """`_GAZE_AWAY_KEYWORDS` was re-scored against all 41 voiced chunks of
+    the finished render (issue #76), keeping only words whose one measured
+    occurrence landed below the 53.3% corpus mean. "gaze drops", "gaze
+    lifts" and "lifts her gaze" all measured ABOVE the mean (100%, 83% and
+    92% face presence respectively) -- the gaze verb fired, but the camera
+    clause in the same entry also named the face, and the camera won. All
+    three are excluded now; this is the "gaze drops" case (chunk 42, 100%
+    face, camera "close, straight on, static" in the real plan)."""
+    plan = {
+        3: ShotPlanEntry(
+            chunk_id=3,
+            start=3.0,
+            shot="Ash drifts past her still form as her gaze drops to the fire below",
+            camera="close, straight on, static",
+        )
+    }
+    chunks = [_chunk_stub(3, "Walking the empty road tonight")]
+
+    with caplog.at_level(logging.WARNING):
+        lint_voiced_framing(plan, chunks)
+
+    assert caplog.text == ""
+
+
+def test_a_voiced_chunk_in_profile_warns(caplog):
+    """`in profile` ships now (issue #76), superseding the earlier n=3
+    decision to leave it out. That decision was reversed by a larger sample,
+    not silently changed: on the finished render it is the one predictor
+    with NO counter-example across all 5 occurrences (18, 21, 37, 43, 59),
+    worst case 8%, best case 42%, corpus mean 53.3%. It has to be checked
+    before the close-framing check below it in this function, since every
+    one of those 5 real camera values also contains "close" or "medium
+    close" -- a profile shot IS a close shot, and a close shot in profile
+    still loses the face far more often than a close shot generally does."""
+    plan = {
+        3: ShotPlanEntry(
+            chunk_id=3,
+            start=3.0,
+            shot="She holds the ridge line as the wind pulls at her coat",
+            camera="medium close in profile, the fire raking one side of her face",
+        )
+    }
+    chunks = [_chunk_stub(3, "Walking the empty road tonight")]
+
+    with caplog.at_level(logging.WARNING):
+        lint_voiced_framing(plan, chunks)
+
+    assert "chunk_id=3" in caplog.text
+    assert "in profile" in caplog.text
+
+
+def test_an_instrumental_chunk_may_be_in_profile(caplog):
+    plan = {
+        3: ShotPlanEntry(
+            chunk_id=3,
+            start=3.0,
+            shot="The ridge line holds steady against the wind",
+            camera="medium close in profile, the fire raking the rock",
+        )
+    }
+    chunks = [_chunk_stub(3, "", instrumental=True)]
+
+    with caplog.at_level(logging.WARNING):
+        lint_voiced_framing(plan, chunks)
+
+    assert caplog.text == ""
+
+
+# --------------------------------------------------------------------------- #
+# Referent-based companion lint (issue #72)
+#
+# Chunk 65 of a real "Deathless" render: Dianne is singing, `present =
+# ["Dianne"]` -- so issue #64's own lint (one section up) is satisfied, since
+# some cast member's name is in the prompt. But naming the singer again binds
+# nothing new, and the shot's own "he"/"his" points at Jan, who is nowhere in
+# any field. H3 invented a stranger and a viewer asked what the statue was.
+# --------------------------------------------------------------------------- #
+
+
+def test_the_real_chunk_65_case_warns(caplog):
+    """Dianne singing, present=["Dianne"] (so #64 is silent), but "a few
+    paces off...he keeps his gaze" names a second, unbound person."""
+    plan = {
+        65: ShotPlanEntry(
+            chunk_id=65,
+            start=422.958,
+            shot=(
+                "A few paces off, an ash-crusted figure stands motionless, staring down "
+                "into the same valley, as he keeps his gaze fixed on the drop from the "
+                "watch-post stone."
+            ),
+            present=("Dianne",),
+        )
+    }
+    chunks = [_chunk_stub(65, "carrying the needle", characters=("Dianne",))]
+
+    with caplog.at_level(logging.WARNING):
+        lint_unbound_companion_referent(plan, chunks)
+
+    assert "chunk_id=65" in caplog.text
+    assert "Dianne" in caplog.text
+    assert "a few paces off" in caplog.text.lower()
+
+
+def test_the_real_chunk_66_mirror_case_warns(caplog):
+    """The reverse of 65: Jan's own "He" is unbound (present=["Dianne"]
+    only), while the "figure...just behind him" is Dianne, correctly bound.
+    Structurally the same defect -- a single bound name plus a shot line that
+    insists on a second person."""
+    plan = {
+        66: ShotPlanEntry(
+            chunk_id=66,
+            start=428.0,
+            shot=(
+                "He stays fixed on the empty valley below, not so much as a glance "
+                "toward the ash-crusted figure now standing just behind him at the "
+                "stone."
+            ),
+            present=("Dianne",),
+        )
+    }
+    chunks = [_chunk_stub(66, "", instrumental=True)]
+
+    with caplog.at_level(logging.WARNING):
+        lint_unbound_companion_referent(plan, chunks)
+
+    assert "chunk_id=66" in caplog.text
+    assert "just behind him" in caplog.text.lower()
+
+
+@pytest.mark.parametrize(
+    "chunk_id,shot",
+    [
+        (
+            42,
+            "His gaze drops back to the valley below without a blink, the watch-post "
+            "stone unyielding beneath him.",
+        ),
+        (
+            43,
+            "A glow over the plain dims and finally goes dark, the last light of a "
+            "scattered battle fading low across the ground just beneath the watch-post, "
+            "while he stands motionless, the plain grown hard to see below him.",
+        ),
+        (
+            44,
+            "The last banner shapes below dissolve into dust, their outlines breaking "
+            "apart over the churned valley floor, as he keeps his post above the valley.",
+        ),
+    ],
+)
+def test_self_referential_pronouns_on_the_singer_do_not_warn(caplog, chunk_id, shot):
+    """The real chunks 42-44: Jan sings, present=["Jan"], and every pronoun
+    points back at Jan himself -- harmless, and #72 is explicit that these
+    must stay quiet."""
+    plan = {
+        chunk_id: ShotPlanEntry(
+            chunk_id=chunk_id, start=float(chunk_id), shot=shot, present=("Jan",)
+        )
+    }
+    chunks = [_chunk_stub(chunk_id, "his ancient watch", characters=("Jan",))]
+
+    with caplog.at_level(logging.WARNING):
+        lint_unbound_companion_referent(plan, chunks)
+
+    assert caplog.records == []
+
+
+@pytest.mark.parametrize(
+    "chunk_id,shot",
+    [
+        (
+            18,
+            "Firelight throws her shadow sprawling up the rock face beside her as she "
+            "presses on along the narrow trail.",
+        ),
+        (
+            24,
+            "She climbs up onto the mill's terrace, its roof beams collapsed and "
+            "blackened close beside her, the mountain's slope rising steeply beyond "
+            "into the grey air.",
+        ),
+        (
+            30,
+            "She picks her way across a long scree traverse, the sheer summit wall "
+            "rising close beside her.",
+        ),
+    ],
+)
+def test_beside_her_naming_an_inanimate_object_does_not_warn(caplog, chunk_id, shot):
+    """"Beside her" was one of issue #72's own suggested phrases and is
+    deliberately NOT in the shipped keyword set: measured on the real plan it
+    fires 3 for 3 on an inanimate noun (a shadow, roof beams, a rock face)
+    with nobody there at all -- the same lesson issue #64's own test suite
+    already recorded for this phrase."""
+    plan = {chunk_id: ShotPlanEntry(chunk_id=chunk_id, start=float(chunk_id), shot=shot)}
+    singer = ("Dianne",) if chunk_id == 18 else ()
+    chunks = [_chunk_stub(chunk_id, "", instrumental=chunk_id != 18, characters=singer)]
+
+    with caplog.at_level(logging.WARNING):
+        lint_unbound_companion_referent(plan, chunks)
+
+    assert caplog.records == []
+
+
+def test_two_bound_names_is_silent_even_with_a_distance_phrase(caplog):
+    """Chunk 69 of the real plan: both Dianne (singing) and Jan (present) are
+    already bound, so a pronoun has somewhere real to land even though it is
+    ambiguous which -- both identities are in the prompt regardless."""
+    plan = {
+        69: ShotPlanEntry(
+            chunk_id=69,
+            start=460.0,
+            shot=(
+                "Her closed fist rises into the space between them, the needle inside "
+                "it that once anchored to the island now lost beneath the horizon, as "
+                "he stands motionless at the cliff's edge facing her."
+            ),
+            present=("Jan",),
+        )
+    }
+    chunks = [_chunk_stub(69, "the needle", characters=("Dianne",))]
+
+    with caplog.at_level(logging.WARNING):
+        lint_unbound_companion_referent(plan, chunks)
+
+    assert caplog.records == []
+
+
+def test_no_pronoun_at_all_is_silent(caplog):
+    plan = {
+        5: ShotPlanEntry(
+            chunk_id=5, start=5.0,
+            shot="The mountain path continues across the burning valley floor, smoke drifts past.",
+        )
+    }
+    chunks = [_chunk_stub(5, "", instrumental=True)]
+
+    with caplog.at_level(logging.WARNING):
+        lint_unbound_companion_referent(plan, chunks)
+
+    assert caplog.records == []
+
+
+def test_a_chunk_missing_from_the_plan_is_silent(caplog):
+    with caplog.at_level(logging.WARNING):
+        lint_unbound_companion_referent({}, [_chunk_stub(1, "")])
+    assert caplog.records == []
+
+
+# --------------------------------------------------------------------------- #
+# Role-prohibition-vs-shot lint (issue #73)
+#
+# The corrected role "...never holding anything" was in force for an entire
+# real render and a bass guitar still appeared in the same hands twice.
+# Chunk 72's own line never uses the word "hold" -- "close his fingers over
+# it" -- which is exactly why the shipped check is a small curated
+# physical-contact synonym set, not a literal search for "hold".
+# --------------------------------------------------------------------------- #
+
+_JAN_PROHIBITED_ROLE = (
+    "Kashay Besmertny the Deathless, an immortal watchman, weathered, patient and "
+    "unhurried, never holding anything"
+)
+
+
+def test_the_real_chunk_72_case_warns(caplog):
+    plan = {
+        72: ShotPlanEntry(
+            chunk_id=72,
+            start=466.208,
+            shot=(
+                "Her fingers press the needle into his open palm and close his fingers "
+                "over it, the ash-grey summit bare around them."
+            ),
+            present=("Jan",),
+        )
+    }
+    chunks = [_chunk_stub(72, "the needle", characters=("Dianne",))]
+    cast = {"Jan": CastMember(name="Jan", role=_JAN_PROHIBITED_ROLE, image=Path("jan.jpg"))}
+
+    with caplog.at_level(logging.WARNING):
+        lint_role_prohibition_contradiction(plan, chunks, cast)
+
+    assert "chunk_id=72" in caplog.text
+    assert "Jan" in caplog.text
+    assert "never holding anything" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "chunk_id,shot,camera",
+    [
+        # "holds his stance"/"holds his ground" -- the plain verb "hold" used
+        # idiomatically, never touching an object.
+        (38, "He holds his stance on the same stretch of ancient stone he has never left, "
+             "the valley's armies rotating through centuries in the haze below him.", None),
+        (49, "The valley below empties out at last, the final stragglers of some ancient "
+             "army dissolving into drifting dust, as he holds his stance at the rock's lip.",
+             None),
+        # "holding" as a CAMERA direction (cinematography jargon for framing,
+        # not a hand) -- this is why `camera` is excluded from what this lint
+        # reads at all.
+        (37, "A fresh column grinds across the churned valley floor below, engines and "
+             "dust replacing the line that broke there, while he remains a still figure "
+             "on the ridge above.", "medium close in profile, holding steady"),
+    ],
+)
+def test_ordinary_uses_of_hold_do_not_warn(caplog, chunk_id, shot, camera):
+    plan = {
+        chunk_id: ShotPlanEntry(
+            chunk_id=chunk_id, start=float(chunk_id), shot=shot, camera=camera,
+            present=("Jan",),
+        )
+    }
+    chunks = [_chunk_stub(chunk_id, "", instrumental=True)]
+    cast = {"Jan": CastMember(name="Jan", role=_JAN_PROHIBITED_ROLE, image=Path("jan.jpg"))}
+
+    with caplog.at_level(logging.WARNING):
+        lint_role_prohibition_contradiction(plan, chunks, cast)
+
+    assert caplog.records == []
+
+
+def test_the_prohibited_member_not_present_is_silent(caplog):
+    """The same shot line as chunk 72, but Jan is not bound to this chunk at
+    all -- nothing to contradict his role with."""
+    plan = {
+        72: ShotPlanEntry(
+            chunk_id=72,
+            start=466.208,
+            shot="Her fingers press the needle into her own palm and close her fingers over it.",
+        )
+    }
+    chunks = [_chunk_stub(72, "the needle", characters=("Dianne",))]
+    cast = {"Jan": CastMember(name="Jan", role=_JAN_PROHIBITED_ROLE, image=Path("jan.jpg"))}
+
+    with caplog.at_level(logging.WARNING):
+        lint_role_prohibition_contradiction(plan, chunks, cast)
+
+    assert caplog.records == []
+
+
+def test_a_role_with_no_prohibition_never_warns(caplog):
+    plan = {
+        72: ShotPlanEntry(
+            chunk_id=72,
+            start=466.208,
+            shot="Her fingers press the needle into his open palm and close his fingers over it.",
+            present=("Jan",),
+        )
+    }
+    chunks = [_chunk_stub(72, "the needle", characters=("Dianne",))]
+    cast = {
+        "Jan": CastMember(
+            name="Jan",
+            role="Kashay Besmertny the Deathless, an immortal watchman, weathered and unhurried",
+            image=Path("jan.jpg"),
+        )
+    }
+
+    with caplog.at_level(logging.WARNING):
+        lint_role_prohibition_contradiction(plan, chunks, cast)
+
+    assert caplog.records == []
+
+
+def test_a_literal_noun_prohibition_still_catches_a_literal_echo(caplog):
+    """The general (non-"hold") path: a plain word right after the trigger,
+    searched for literally, singularized. This is the honestly narrow case
+    this lint can actually generalise to."""
+    plan = {
+        3: ShotPlanEntry(
+            chunk_id=3,
+            start=3.0,
+            shot="He tunes the strings of a battered old instrument, ignoring the war below.",
+        )
+    }
+    chunks = [_chunk_stub(3, "", characters=("Jan",))]
+    cast = {
+        "Jan": CastMember(
+            name="Jan",
+            role="An immortal watchman, weathered and unhurried, no instruments allowed",
+            image=Path("jan.jpg"),
+        )
+    }
+
+    with caplog.at_level(logging.WARNING):
+        lint_role_prohibition_contradiction(plan, chunks, cast)
+
+    assert "chunk_id=3" in caplog.text
+    assert "instrument" in caplog.text.lower()
+
+
+def test_a_chunk_missing_from_the_plan_is_silent_for_the_prohibition_lint(caplog):
+    cast = {"Jan": CastMember(name="Jan", role=_JAN_PROHIBITED_ROLE, image=Path("jan.jpg"))}
+    with caplog.at_level(logging.WARNING):
+        lint_role_prohibition_contradiction({}, [_chunk_stub(1, "", characters=("Jan",))], cast)
+    assert caplog.records == []
+
+
+def test_a_chunk_nobody_is_bound_to_is_silent(caplog):
+    """No `chunk.characters` and no `present` at all -- nothing to check any
+    role against, whatever the cast says."""
+    plan = {
+        9: ShotPlanEntry(
+            chunk_id=9, start=9.0,
+            shot="He holds nothing, an empty stretch of watch-post stone in the wind.",
+        )
+    }
+    chunks = [_chunk_stub(9, "", instrumental=True)]
+    cast = {"Jan": CastMember(name="Jan", role=_JAN_PROHIBITED_ROLE, image=Path("jan.jpg"))}
+
+    with caplog.at_level(logging.WARNING):
+        lint_role_prohibition_contradiction(plan, chunks, cast)
+
+    assert caplog.records == []
+
+
+def test_a_role_with_only_stopword_prohibitions_is_silent(caplog):
+    """`_extract_prohibited_terms` must skip a trigger word followed only by
+    a stopword ("without a care") rather than treat "a" as the forbidden
+    term -- exercised here via a role with no OTHER prohibition to fall back
+    on, so this also proves an empty extraction stays silent."""
+    plan = {
+        72: ShotPlanEntry(
+            chunk_id=72,
+            start=466.208,
+            shot="Her fingers press the needle into his open palm and close his fingers over it.",
+            present=("Jan",),
+        )
+    }
+    chunks = [_chunk_stub(72, "", characters=("Dianne",))]
+    cast = {
+        "Jan": CastMember(
+            name="Jan",
+            role="An immortal watchman who moves without a care, unhurried",
+            image=Path("jan.jpg"),
+        )
+    }
+
+    with caplog.at_level(logging.WARNING):
+        lint_role_prohibition_contradiction(plan, chunks, cast)
+
+    assert caplog.records == []
+
+
+def test_an_unknown_cast_member_in_present_is_silent_not_a_crash(caplog):
+    """`present` names are validated against the cast elsewhere (prompting's
+    UnknownCastMemberError); this lint must not itself explode on a name the
+    `cast` mapping it was given does not have."""
+    plan = {
+        72: ShotPlanEntry(
+            chunk_id=72, start=466.208, shot="Something happens.", present=("Nobody",),
+        )
+    }
+    chunks = [_chunk_stub(72, "", instrumental=True)]
+
+    with caplog.at_level(logging.WARNING):
+        lint_role_prohibition_contradiction(plan, chunks, {})
+
+    assert caplog.records == []
+
+
+# --------------------------------------------------------------------------- #
+# `location` field (issue #78)
+#
+# `setting` (#32) anchors the world's contents; it says nothing about where
+# each character is inside that world at a given moment. `location` is the
+# per-chunk answer -- a tag drawn from a small enumerated set the concept
+# stage defines, assigned by the beats stage (issue #78's authoring-side
+# half) and re-emitted here from the frozen timeline like every other
+# anchor. Purely a checkable field: it is never composed into a prompt (that
+# would need `prompting.py`, outside this module's reach), only used by the
+# two lints below.
+# --------------------------------------------------------------------------- #
+
+
+def test_location_is_none_by_default(tmp_path):
+    path = _write_plan(
+        tmp_path, '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks"\n'
+    )
+    assert load_shot_plan(path)[0].location is None
+
+
+def test_location_is_read_from_the_entry(tmp_path):
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks"\n'
+        'location = "switchback"\n',
+    )
+    assert load_shot_plan(path)[0].location == "switchback"
+
+
+def test_a_non_string_location_is_rejected(tmp_path):
+    path = _write_plan(
+        tmp_path, '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks"\nlocation = 5\n'
+    )
+    with pytest.raises(ShotPlanError):
+        load_shot_plan(path)
+
+
+def test_a_blank_location_is_treated_as_unset(tmp_path):
+    path = _write_plan(
+        tmp_path, '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks"\nlocation = "   "\n'
+    )
+    assert load_shot_plan(path)[0].location is None
+
+
+def test_resolve_location_returns_the_authored_tag(tmp_path):
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks"\nlocation = "mill"\n',
+    )
+    plan = load_shot_plan(path)
+
+    assert resolve_location(plan, _chunk(0, 0.0, 5.167)) == "mill"
+
+
+def test_resolve_location_applies_even_when_shot_is_blank(tmp_path):
+    path = _write_plan(
+        tmp_path, '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = ""\nlocation = "valley floor"\n'
+    )
+    plan = load_shot_plan(path)
+
+    assert resolve_shot(plan, _chunk(0, 0.0, 5.167)) is None
+    assert resolve_location(plan, _chunk(0, 0.0, 5.167)) == "valley floor"
+
+
+def test_resolve_location_with_no_entry_returns_none(tmp_path, caplog):
+    path = _write_plan(
+        tmp_path, '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "only chunk zero"\n'
+    )
+    plan = load_shot_plan(path)
+
+    with caplog.at_level(logging.WARNING):
+        assert resolve_location(plan, _chunk(7, 40.0, 46.0)) is None
+
+
+def test_resolve_location_with_no_plan_returns_none():
+    assert resolve_location(None, _chunk(0, 0.0, 5.167)) is None
+
+
+def test_resolve_location_raises_on_drift_same_as_resolve_shot(tmp_path):
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 3\nstart = 21.17\nshot = "direction"\nlocation = "mill"\n',
+    )
+    plan = load_shot_plan(path)
+
+    with pytest.raises(ShotPlanDriftError):
+        resolve_location(plan, _chunk(3, 21.17 + TOLERANCE_EXCEEDED, 30.0))
+
+
+# --------------------------------------------------------------------------- #
+# Landmark position-contradiction lint (issue #78)
+#
+# The defect: chunk 7 of the real "Deathless" plan (0:54) puts "Volokov's
+# ruined mill and its slow-turning sails standing in the valley below";
+# chunk 13 (1:32), 37.4s later with nothing but continued climbing in
+# between, has "her palm trailing along its worn wood grain" as she crosses
+# "the mill's turning wheel below the watch-post" -- at shoulder height. She
+# cannot be climbing away from the mill and touching it a minute later.
+#
+# This is deliberately narrow, and the module docstring/CLAUDE.md record why:
+# an early version matched any repeated word plus a bare "below" against any
+# other occurrence of it anywhere in the plan and fired on ~30 pairs across a
+# third of a real 80-chunk plan, almost all false -- "below" and "at shoulder
+# height" routinely describe two DIFFERENT nouns in the same sentence (the
+# valley below vs. her fingertips guiding a needle), which a keyword search
+# cannot tell apart. What survives is: (a) candidate "landmark" words are
+# restricted to content words that also appear in `setting` -- the vocabulary
+# of things the run has already named as fixed and significant, not any
+# repeated word; (b) FAR/NEAR keyword sets are curated down to phrases
+# unambiguous enough that they are very rarely about some OTHER noun in the
+# same sentence (no bare "below", no generic "her palm"/"her fingertips");
+# and (c) the two mentions must fall within
+# `LANDMARK_CONTRADICTION_WINDOW_SECONDS` of each other in song time, since a
+# landmark legitimately looks far in one shot and close in another an hour
+# of story time later -- that is the character closing the distance, not a
+# contradiction. Measured against the real 80-chunk plan with these three
+# restrictions: exactly 1 pair fires, chunks 7 and 13, and it is the true
+# positive above.
+# --------------------------------------------------------------------------- #
+
+_DEATHLESS_SETTING = (
+    "A blasted Slavic mountaintop above a ruined mill (Volokov's) and a "
+    "battlefield valley, where time is smeared: medieval hosts, industrial "
+    "armies, and nuclear glow all visible from the same watch-post, ending "
+    "in a post-war, wind-still near-future where the mountain has eroded to "
+    "a hill."
+)
+
+
+def test_the_real_chunk_7_and_13_mill_contradiction_warns(tmp_path, caplog):
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 7\nstart = 54.583\n'
+        'shot = "She climbs a rocky switchback path with the needle glinting tight in '
+        "her closed fist, Volokov's ruined mill and its slow-turning sails standing in "
+        'the valley below, the mountain\'s blasted summit rising ahead of her."\n\n'
+        '[[shot]]\nchunk_id = 13\nstart = 91.958\n'
+        'shot = "A sail vane sweeps low at shoulder height as it turns, her palm '
+        "trailing along its worn wood grain as she crosses past the mill's turning "
+        'wheel below the watch-post."\n',
+    )
+
+    with caplog.at_level(logging.WARNING):
+        load_shot_plan(path, setting=_DEATHLESS_SETTING)
+
+    assert "chunk_id=7" in caplog.text
+    assert "chunk_id=13" in caplog.text
+    assert "mill" in caplog.text.lower()
+
+
+def test_the_full_deathless_plan_fires_on_exactly_the_one_true_positive(tmp_path, caplog):
+    """The measurement claim itself, not just the two-chunk excerpt: replay
+    every `mill`-adjacent shot the real 80-chunk plan carries (chunks 2, 7,
+    13, 24, 25, 26, 55, 67, 79) and confirm only the 7/13 pair fires."""
+    entries = [
+        (2, 8.0, "The mill's four sails turn steadily above the ruined slate roof "
+                 "below, catching what pre-dawn light there is, the watch-post's "
+                 "broken stone standing on the ridge beyond."),
+        (7, 54.583, "She climbs a rocky switchback path with the needle glinting "
+                    "tight in her closed fist, Volokov's ruined mill and its "
+                    "slow-turning sails standing in the valley below, the "
+                    "mountain's blasted summit rising ahead of her."),
+        (13, 91.958, "A sail vane sweeps low at shoulder height as it turns, her "
+                     "palm trailing along its worn wood grain as she crosses past "
+                     "the mill's turning wheel below the watch-post."),
+        (24, 157.0, "She climbs up onto the mill's terrace, its roof beams "
+                    "collapsed and blackened close beside her, the mountain's "
+                    "slope rising steeply beyond into the grey air."),
+        (25, 164.0, "Volokov's weathered mill turns its sails a perceptible notch "
+                    "slower overhead, timber wheel groaning beneath them, as she "
+                    "climbs on past its shadow toward the ridge."),
+        (26, 171.0, "She looks up at the lone watch-post stone, still perched high "
+                    "above the ruined mill on the ridge she has yet to climb."),
+        (55, 360.0, "The mill's four sails stand locked motionless against the "
+                    "sky, each vane furred thick with ice, the wheel beneath "
+                    "rusted still in its housing."),
+        (67, 430.0, "The valley below lies motionless and silent, no armies, no "
+                    "dust, not even wind in the ash, the mill's sails hanging "
+                    "still over the ruin below, as she listens from the mountain "
+                    "path, breath held."),
+        (79, 500.0, "Flat daylight lies across the silent valley and the dead, "
+                    "sail-still mill below the hill, the whole battlefield "
+                    "motionless under the open sky."),
+    ]
+    body = "\n\n".join(
+        f'[[shot]]\nchunk_id = {cid}\nstart = {start}\nshot = {shot!r}\n'
+        for cid, start, shot in entries
+    )
+    path = _write_plan(tmp_path, body)
+
+    with caplog.at_level(logging.WARNING):
+        load_shot_plan(path, setting=_DEATHLESS_SETTING)
+
+    fired_pairs = {
+        (r.args[1], r.args[2])
+        for r in caplog.records
+        if "contradictory distances" in r.getMessage()
+    }
+    assert fired_pairs == {(7, 13)}
+
+
+def test_landmark_contradiction_is_silent_beyond_the_time_window(tmp_path, caplog):
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 7\nstart = 54.583\n'
+        'shot = "Volokov\'s ruined mill stands in the valley below."\n\n'
+        '[[shot]]\nchunk_id = 24\nstart = 300.0\n'
+        'shot = "She climbs up onto the mill\'s terrace, close beside her."\n',
+    )
+
+    with caplog.at_level(logging.WARNING):
+        load_shot_plan(path, setting=_DEATHLESS_SETTING)
+
+    assert "contradictory distances" not in caplog.text
+
+
+def test_landmark_contradiction_is_silent_with_no_setting(tmp_path, caplog):
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 7\nstart = 54.583\n'
+        'shot = "Volokov\'s ruined mill stands in the valley below."\n\n'
+        '[[shot]]\nchunk_id = 13\nstart = 91.958\n'
+        'shot = "Her palm trailing along the mill\'s sail at shoulder height."\n',
+    )
+
+    with caplog.at_level(logging.WARNING):
+        load_shot_plan(path)
+
+    assert "contradictory distances" not in caplog.text
+
+
+def test_landmark_contradiction_is_silent_when_only_one_side_is_curated_far_or_near(
+    tmp_path, caplog
+):
+    """Both chunks name the mill, both are close in time, but neither carries
+    a curated FAR or NEAR phrase -- ordinary variation in wording, not a
+    measured contradiction signal."""
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 7\nstart = 54.583\n'
+        'shot = "Volokov\'s ruined mill turns its old sails."\n\n'
+        '[[shot]]\nchunk_id = 13\nstart = 91.958\n'
+        'shot = "The mill\'s sails groan as she passes."\n',
+    )
+
+    with caplog.at_level(logging.WARNING):
+        load_shot_plan(path, setting=_DEATHLESS_SETTING)
+
+    assert "contradictory distances" not in caplog.text
+
+
+def test_landmark_contradiction_ignores_a_word_not_in_the_setting(tmp_path, caplog):
+    """"below"/"at shoulder height" on a repeated word that is NOT part of
+    `setting`'s own vocabulary must not be treated as a landmark -- the
+    restriction that keeps this lint from re-exploding into the noisy
+    any-repeated-word version measured and rejected above."""
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 7\nstart = 54.583\n'
+        'shot = "Her fingertips guide a needle far below the ridge line."\n\n'
+        '[[shot]]\nchunk_id = 13\nstart = 91.958\n'
+        'shot = "Her fingertips press the needle, trailing along its point."\n',
+    )
+
+    with caplog.at_level(logging.WARNING):
+        load_shot_plan(path, setting=_DEATHLESS_SETTING)
+
+    assert "contradictory distances" not in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# present-vs-location mismatch lint (issue #78)
+#
+# `present` (issue #59) stages a companion without them singing; nothing
+# checked whether the run even knows the two characters are in the same
+# place. Chunk 7 of the real plan sets `present = ["Jan"]` on a hillside
+# scene that never mentions him -- the "hill where Jan is" a viewer's first
+# note complained about. This lint operates on the STRUCTURED `location` tag
+# alone, never on prose: it compares `entry.location` against the set of
+# locations a name's own singing chunks establish, and warns only on an
+# outright contradiction, never on the (very common) case of a companion who
+# simply has no singing chunk of their own to compare against.
+# --------------------------------------------------------------------------- #
+
+
+def test_present_at_a_location_that_contradicts_their_own_singing_chunk_warns(caplog):
+    plan = {
+        7: ShotPlanEntry(
+            chunk_id=7, start=54.583, shot="She climbs alone.",
+            location="valley approach", present=("Jan",),
+        ),
+        40: ShotPlanEntry(
+            chunk_id=40, start=250.0, shot="He keeps his watch.",
+            location="watch-post",
+        ),
+    }
+    chunks = [
+        _chunk_stub(7, "", characters=("Dianne",)),
+        _chunk_stub(40, "his ancient watch", characters=("Jan",)),
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        lint_present_location_mismatch(plan, chunks)
+
+    assert "chunk_id=7" in caplog.text
+    assert "Jan" in caplog.text
+    assert "valley approach" in caplog.text
+    assert "watch-post" in caplog.text
+
+
+def test_present_at_the_same_location_as_their_own_singing_chunk_is_silent(caplog):
+    plan = {
+        24: ShotPlanEntry(
+            chunk_id=24, start=157.0, shot="She climbs onto the terrace.",
+            location="mill", present=("Jan",),
+        ),
+        25: ShotPlanEntry(
+            chunk_id=25, start=164.0, shot="He watches the sails turn.",
+            location="mill",
+        ),
+    }
+    chunks = [
+        _chunk_stub(24, "", characters=("Dianne",)),
+        _chunk_stub(25, "", characters=("Jan",)),
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        lint_present_location_mismatch(plan, chunks)
+
+    assert caplog.records == []
+
+
+def test_present_companion_with_no_singing_chunk_of_their_own_is_silent(caplog):
+    """The common case: a companion who never sings solo has no established
+    location to contradict -- silence here is deliberate, not a gap. Warning
+    on absence rather than contradiction would fire on nearly every use of
+    `present` for a non-singing character."""
+    plan = {
+        7: ShotPlanEntry(
+            chunk_id=7, start=54.583, shot="She climbs alone.",
+            location="valley approach", present=("Jan",),
+        ),
+    }
+    chunks = [_chunk_stub(7, "", characters=("Dianne",))]
+
+    with caplog.at_level(logging.WARNING):
+        lint_present_location_mismatch(plan, chunks)
+
+    assert caplog.records == []
+
+
+def test_present_location_mismatch_is_silent_when_location_unset(caplog):
+    plan = {
+        7: ShotPlanEntry(chunk_id=7, start=54.583, shot="She climbs alone.", present=("Jan",)),
+        40: ShotPlanEntry(
+            chunk_id=40, start=250.0, shot="He keeps his watch.", location="watch-post"
+        ),
+    }
+    chunks = [
+        _chunk_stub(7, "", characters=("Dianne",)),
+        _chunk_stub(40, "", characters=("Jan",)),
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        lint_present_location_mismatch(plan, chunks)
+
+    assert caplog.records == []
+
+
+def test_present_location_mismatch_is_silent_with_no_present(caplog):
+    plan = {
+        7: ShotPlanEntry(chunk_id=7, start=54.583, shot="She climbs alone.", location="valley"),
+    }
+    chunks = [_chunk_stub(7, "", characters=("Dianne",))]
+
+    with caplog.at_level(logging.WARNING):
+        lint_present_location_mismatch(plan, chunks)
+
+    assert caplog.records == []
+
+
+def test_present_location_mismatch_on_the_real_80_chunk_plan_is_silent(caplog):
+    """The real "Deathless" plan predates `location` entirely, so every entry
+    resolves it to `None` -- this lint must be silent, exactly like every
+    other optional-field lint in this module, not fail closed on a field
+    nothing has populated yet."""
+    plan = {
+        7: ShotPlanEntry(
+            chunk_id=7, start=54.583, shot="She climbs a rocky switchback path.",
+            present=("Jan",),
+        ),
+        8: ShotPlanEntry(chunk_id=8, start=61.875, shot="She halts on the trail."),
+        9: ShotPlanEntry(chunk_id=9, start=67.042, shot="She looks back down."),
+    }
+    chunks = [
+        _chunk_stub(7, "", characters=("Dianne",)),
+        _chunk_stub(8, "his ancient watch", characters=("Jan",)),
+        _chunk_stub(9, "", characters=("Dianne",)),
+    ]
+
+    with caplog.at_level(logging.WARNING):
+        lint_present_location_mismatch(plan, chunks)
+
+    assert caplog.records == []
+
+
+def test_present_location_mismatch_ignores_a_chunk_missing_from_the_plan(caplog):
+    with caplog.at_level(logging.WARNING):
+        lint_present_location_mismatch({}, [_chunk_stub(1, "", characters=("Jan",))])
+    assert caplog.records == []

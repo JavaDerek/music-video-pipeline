@@ -32,6 +32,9 @@ VALID_CONCEPT = {
     "tone": "elegiac, quiet",
     "motifs": ["gathering clouds"],
     "avoid": ["literal lightning strikes"],
+    # Issue #78: the closed vocabulary the beats stage assigns `location`
+    # from.
+    "locations": ["the boardwalk", "the empty pier"],
 }
 
 
@@ -189,6 +192,11 @@ def test_concept_prints_a_human_readable_summary(tmp_path, monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert VALID_CONCEPT["logline"] in out
+    # Issue #78: the closed vocabulary is exactly what a human has to review
+    # here -- everything downstream is validated against it, so a bad list
+    # is worth catching at this review point, not forty beats later.
+    assert "the boardwalk" in out
+    assert "the empty pier" in out
 
 
 def test_concept_notes_reach_the_prompt(tmp_path, monkeypatch):
@@ -250,6 +258,10 @@ def _beat_sheet(config_path: Path, *, lengths: dict[int, float] | None = None) -
                 "beat_role": "instrumental" if c.is_instrumental else "transition",
                 "beat_group": c.chunk_id + 1,
                 "focus": "subject",
+                # Issue #78: required, and validated against the concept's
+                # own `locations` list when one is supplied (VALID_CONCEPT's
+                # above, throughout this file).
+                "location": "the boardwalk",
                 **({"length_seconds": lengths[c.chunk_id]} if c.chunk_id in lengths else {}),
             }
             for c in chunks
@@ -307,6 +319,23 @@ def test_beats_writes_the_expected_files(tmp_path, monkeypatch):
     session = json.loads((authoring_dir / "session.json").read_text())
     assert session["stages"]["beats"]["model"] == "claude-opus-5"
     assert "concept" in session["stages"]["beats"]["input_hashes"]
+
+
+def test_beats_prints_each_beats_location(tmp_path, monkeypatch, capsys):
+    """Issue #78: `location` is as much a per-beat review item as
+    `beat_role`/`beat_group` already are -- a human skimming this stage's
+    console output should see where every beat is set, not just what
+    happens."""
+    config_path = _write_config(tmp_path, lyrics_text="")
+    _run_concept(config_path, monkeypatch)
+    sheet = _beat_sheet(config_path)
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([sheet]))
+
+    exit_code = auth_cli.main(["--config", str(config_path), "beats"])
+
+    assert exit_code == auth_cli.EXIT_SUCCESS
+    out = capsys.readouterr().out
+    assert "the boardwalk" in out
 
 
 def test_beats_records_the_re_cut_timeline_when_a_length_moves_it(tmp_path, monkeypatch):

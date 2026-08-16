@@ -41,7 +41,10 @@ def _chunks(spans: list[tuple[float, float]], *, instrumental_from: int | None =
     )
 
 
-def _beat(chunk_id, start, end, *, role="transition", group=1, focus="subject", length=None):
+def _beat(
+    chunk_id, start, end, *,
+    role="transition", group=1, focus="subject", length=None, location="the room",
+):
     return Beat(
         chunk_id=chunk_id,
         start=start,
@@ -49,6 +52,7 @@ def _beat(chunk_id, start, end, *, role="transition", group=1, focus="subject", 
         beat=f"beat {chunk_id}",
         beat_role=role,
         beat_group=group,
+        location=location,
         focus=focus,
         length_seconds=length,
     )
@@ -168,6 +172,53 @@ def test_a_merge_warns_when_it_joins_two_different_beat_groups(caplog):
         reanchor_beats(beats, v1)
 
     assert "beat group" in caplog.text.lower()
+
+
+def test_a_merge_keeps_the_first_members_location():
+    """`location` follows the same "first member wins" rule as `beat_group`
+    -- issue #78's field is a beat-derived anchor like any other, and gets
+    the same merge treatment."""
+    v1 = _chunks([(0.0, 12.0)])
+    beats = (
+        _beat(1, 0.0, 6.0, location="the mill"),
+        _beat(2, 6.0, 12.0, location="the watch-post"),
+    )
+
+    result = reanchor_beats(beats, v1)
+
+    assert result.beats[0].location == "the mill"
+
+
+def test_a_merge_warns_when_it_joins_two_different_locations(caplog):
+    """Not an error, same reason as the beat-group warning above: the
+    timeline really did merge them into one chunk. But two different
+    `location` values folding into one chunk silently is exactly the kind of
+    thing issue #78 exists to make loud instead."""
+    v1 = _chunks([(0.0, 12.0)])
+    beats = (
+        _beat(1, 0.0, 6.0, location="the mill"),
+        _beat(2, 6.0, 12.0, location="the watch-post"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        reanchor_beats(beats, v1)
+
+    assert "location" in caplog.text.lower()
+    assert "the mill" in caplog.text
+    assert "the watch-post" in caplog.text
+
+
+def test_a_merge_with_matching_locations_does_not_warn(caplog):
+    v1 = _chunks([(0.0, 12.0)])
+    beats = (
+        _beat(1, 0.0, 6.0, location="the mill"),
+        _beat(2, 6.0, 12.0, location="the mill"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        reanchor_beats(beats, v1)
+
+    assert "location" not in caplog.text.lower()
 
 
 # --------------------------------------------------------------------------- #
@@ -365,6 +416,7 @@ def _entry(chunk_id, *, length=None) -> dict:
         "beat_role": "transition",
         "beat_group": 1,
         "focus": "subject",
+        "location": "the room",
     }
     if length is not None:
         entry["length_seconds"] = length

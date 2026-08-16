@@ -53,6 +53,42 @@ setting = "London, UK -- contemporary, overcast winter"
 # and the base path re-reads it against the photo every time.
 global_appearance = "everyone slim, trim and healthy looking"
 
+# How the CAST should look on their FACES -- mood, expression. Separate from
+# appearance above (which is presentation: lighting, styling, age) and from
+# role (who they are in the story) for the same reason appearance is: it
+# applies to every chunk they are in, and mixing kinds of statement into one
+# string is the anti-pattern this project keeps re-learning the hard way.
+# Per-member direction goes in [cast.<Name>].demeanour below.
+#
+# STATE AN ENDPOINT, NEVER A PROHIBITION, NEVER A DISPLACEMENT (issues #73,
+# #74, #46). A prohibition ("never smiling") is not enforceable -- see the
+# warning just above [cast.Dianne] below for the measured proof of that. A
+# displacement ("less cheerful") compounds on the chained render path for the
+# same reason appearance's does. "Grave and unsmiling" names a fixed point;
+# either of the other two names a direction with no floor.
+#
+# Leave this out and the only thing left saying anything about mood is the
+# reference photograph's own expression, carried unchanged across the whole
+# video -- on "Deathless", an 8.5-minute video about an army destroying
+# things, the lead cast member smiled throughout because nothing said not to.
+# global_demeanour = "nobody smiles; this is a war"
+
+# Things this video must NEVER show, anywhere, e.g. bass guitar, microphone,
+# stage -- composed into every prompt as a final "must never depict" clause.
+#
+# Read this as a best-effort hint, not a guarantee: it is textual negation in
+# the same prompt channel role's own prohibitions failed in (see the warning
+# below [cast.Dianne]) -- the committed workflow templates give H3 exactly one
+# `prompt` input, with no separate negative-conditioning channel for this list
+# to use instead. It is here because a hint that sometimes works beats an
+# authored "avoid" list that never reaches a prompt at all, which is what this
+# project shipped with until issue #73 -- not because it is expected to
+# reliably prevent the thing it names. A shot line that explicitly stages the
+# forbidden object (a hand closing around a needle, say) will still win; only
+# a lint comparing the authored shot text against this list closes that gap,
+# and this config file cannot see whether one has been run.
+# avoid = ["bass guitar", "microphone", "stage"]
+
 # This is the default (issue #50), so it can be omitted entirely -- it
 # assumes the orchestrator runs on the same host as ComfyUI. Pointing it at a
 # remote host instead is a supported override (e.g. a Tailscale hostname --
@@ -193,13 +229,29 @@ between_chunk_min_free_vram_gb = 1.0
 # simply entries that are never `default_lead_vocalist` and never tagged in the
 # lyrics. Every character tagged in the lyrics file MUST appear here.
 
-# A role describes who the character IS -- appearance, wardrobe, demeanour.
-# It must NOT say what they are doing vocally. The role is injected into every
+# A role describes who the character IS -- identity, position, wardrobe. It
+# must NOT say what they are doing vocally, and (issue #74) it should NOT
+# carry mood or expression either -- that used to be role's only home and now
+# has its own field, `demeanour`, below. The role is injected into every
 # chunk, so "singing to camera" in a role contradicts the pipeline's own
 # instrumental clause on every unvoiced chunk, and the character-attached
 # instruction wins: the performer sings straight through the instrumental
 # breaks. Whether someone is singing is per-chunk state that prompting.py
 # already handles.
+#
+# A PROHIBITION IN ROLE DOES NOT WORK (issue #73). It reads as though it does
+# -- nothing here warns you at a glance -- but it is not enforceable. This
+# project measured it directly: `role` was corrected to "...weathered,
+# patient and unhurried, never holding anything", that corrected text was in
+# force for an entire 8-minute render, and a bass guitar still appeared in
+# the same hands twice, because the only tokens a diffusion prompt actually
+# sees in that phrase are "holding" and "anything" -- the negation itself
+# carries no weight. `music-video-maker` now warns at load time when `role`
+# or `demeanour` reads as a prohibition ("never"/"no"/"without"), but the fix
+# is still yours to make: say what IS true instead ("empty-handed, hands
+# always at his sides"), never what is not. For a whole-video exclusion, see
+# the `avoid` list above -- though read its own comment first: it shares this
+# exact limitation and is a hint, not a guarantee.
 #
 # `appearance` is optional and is how this member should be PRESENTED --
 # lighting, styling, a flattering look. It applies to every chunk they are in,
@@ -215,10 +267,18 @@ between_chunk_min_free_vram_gb = 1.0
 # -- each shot applying "a few years younger" to a frame that was already a few
 # years younger (issue #46). "In her late forties" is the same intent with a
 # floor under it.
+#
+# `demeanour` (issue #74) is optional and is how this member should LOOK ON
+# THEIR FACE -- mood, expression. Separate from `appearance` (presentation)
+# and from `role` (identity) for the same reason those two are separate from
+# each other. Same endpoint rule as appearance, and the same prohibition
+# warning as role above: state what IS true ("grave and unsmiling"), never a
+# negation ("never smiling") -- see the warning above `[cast.Dianne]`.
 [cast.Dianne]
-role       = "Lead Vocalist, smiling constantly, oblivious"
+role       = "Lead Vocalist"
 image      = "cast/dianne_ref_01.jpg"
 appearance = "in her late forties, softly lit, flattering"
+demeanour  = "smiling constantly, oblivious to everything around her"
 
 [cast.Rex]
 role  = "Drummer, background, never sings"

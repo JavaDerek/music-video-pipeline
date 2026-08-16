@@ -1151,6 +1151,191 @@ def test_the_seed_reaches_the_payload_actually_submitted_to_comfyui(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Issue #38 (variation half): per-chunk seed derivation and re-rolling
+#
+# The mutator's ``noise_seed`` is a per-call parameter by design (see
+# ``test_each_chunk_can_carry_its_own_seed`` above) -- deriving *what* value
+# each chunk gets from a single run-wide base is a policy decision that
+# belongs above this module. ``resolve_chunk_seed`` is that policy, and
+# ``PerChunkSeedMutator`` is the seam that applies it without a caller having
+# to compute anything itself.
+# --------------------------------------------------------------------------- #
+
+
+def test_resolve_chunk_seed_varies_by_chunk_id():
+    """The whole point: ten chunks under one base seed must not render as
+    ten copies of the same take."""
+    seeds = {
+        workflow_graph.resolve_chunk_seed(base_seed=1000, chunk_id=cid) for cid in range(10)
+    }
+    assert len(seeds) == 10
+
+
+def test_resolve_chunk_seed_is_a_pure_function_of_its_inputs():
+    """A resumed run must recompose the exact same value for the exact same
+    chunk with no state to read back -- see ``resilience.py``'s content-tier
+    comparison, which is what actually makes a stale chunk re-render."""
+    first = workflow_graph.resolve_chunk_seed(base_seed=777, chunk_id=12)
+    second = workflow_graph.resolve_chunk_seed(base_seed=777, chunk_id=12)
+    assert first == second
+
+
+def test_resolve_chunk_seed_matches_todays_base_seed_at_chunk_zero():
+    """``base_seed + 0 == base_seed``, so a single-chunk run (or chunk 0 of
+    any run) is the identity case -- nothing exotic happens at the origin."""
+    assert workflow_graph.resolve_chunk_seed(base_seed=42, chunk_id=0) == 42
+
+
+def test_resolve_chunk_seed_wraps_within_comfyuis_valid_range():
+    """A base seed near the top of ComfyUI's range plus a chunk_id offset
+    must still land inside 0..MAX_NOISE_SEED, or the mutator's own validation
+    (``InvalidNoiseSeedError``) would refuse the very value this function
+    derived."""
+    seed = workflow_graph.resolve_chunk_seed(
+        base_seed=workflow_graph.MAX_NOISE_SEED, chunk_id=5
+    )
+    assert 0 <= seed <= workflow_graph.MAX_NOISE_SEED
+    assert seed == 4  # wraps: MAX + 5 == (MAX + 1) + 4
+
+
+def test_resolve_chunk_seed_reseed_generation_differs_from_generation_zero():
+    """``--reseed``'s whole job: the same chunk must get a seed that provably
+    differs from the one already on disk."""
+    generation_zero = workflow_graph.resolve_chunk_seed(base_seed=99, chunk_id=12)
+    generation_one = workflow_graph.resolve_chunk_seed(
+        base_seed=99, chunk_id=12, reseed_generation=1
+    )
+    assert generation_one != generation_zero
+
+
+def test_resolve_chunk_seed_reseed_generation_cannot_alias_a_neighbours_seed():
+    """A reseeded chunk 12 must not happen to land on chunk 11 or chunk 13's
+    ordinary (generation 0) seed -- that would look like a coincidence, not a
+    deliberate different take. RESEED_GENERATION_STRIDE is chosen far larger
+    than any real chunk_id range specifically to rule this out."""
+    reseeded_12 = workflow_graph.resolve_chunk_seed(base_seed=99, chunk_id=12, reseed_generation=1)
+    neighbours = {
+        workflow_graph.resolve_chunk_seed(base_seed=99, chunk_id=cid) for cid in range(0, 1000)
+    }
+    assert reseeded_12 not in neighbours
+
+
+def test_resolve_chunk_seed_successive_generations_differ_too():
+    """A chunk re-rolled twice (``--reseed-generation 2`` after generation 1
+    still wasn't right) must get a third distinct value, not flip back to
+    generation 0's or generation 1's."""
+    seeds = {
+        workflow_graph.resolve_chunk_seed(base_seed=5, chunk_id=3, reseed_generation=g)
+        for g in range(4)
+    }
+    assert len(seeds) == 4
+
+
+class _RecordingMutator:
+    """A minimal ``WorkflowMutator`` double that records exactly the kwargs
+    it was called with, so ``PerChunkSeedMutator`` tests can assert what it
+    delegates without depending on ``WorkflowGraphMutator``'s own behaviour."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def mutate(self, template, prompt, assets, **kwargs):
+        self.calls.append({"template": template, "prompt": prompt, "assets": assets, **kwargs})
+        return {"recorded": True}
+
+
+def test_per_chunk_seed_mutator_overrides_whatever_seed_the_caller_passed():
+    """``ContinuityWorkflowProvider`` (continuity.py) passes one flat
+    ``noise_seed`` for the whole run to every ``mutate()`` call -- this is the
+    seam that turns that into a per-chunk value without editing that module,
+    by intercepting the call and substituting its own before delegating."""
+    inner = _RecordingMutator()
+    mutator = workflow_graph.PerChunkSeedMutator(inner, base_seed=1000)
+
+    mutator.mutate(make_workflow_baseline(), _prompt(chunk_id=3), _assets(chunk_id=3), noise_seed=0)
+
+    assert inner.calls[0]["noise_seed"] == workflow_graph.resolve_chunk_seed(
+        base_seed=1000, chunk_id=3
+    )
+    assert inner.calls[0]["noise_seed"] != 0
+
+
+def test_per_chunk_seed_mutator_varies_across_chunks_from_one_flat_caller_value():
+    inner = _RecordingMutator()
+    mutator = workflow_graph.PerChunkSeedMutator(inner, base_seed=2024)
+
+    for cid in range(5):
+        mutator.mutate(
+            make_workflow_baseline(), _prompt(chunk_id=cid), _assets(chunk_id=cid), noise_seed=2024
+        )
+
+    seeds = [call["noise_seed"] for call in inner.calls]
+    assert len(set(seeds)) == 5
+
+
+def test_per_chunk_seed_mutator_passes_through_every_other_kwarg_unchanged():
+    inner = _RecordingMutator()
+    mutator = workflow_graph.PerChunkSeedMutator(inner, base_seed=1)
+
+    mutator.mutate(
+        make_workflow_baseline(),
+        _prompt(chunk_id=1),
+        _assets(chunk_id=1),
+        noise_seed=0,
+        length_frames=141,
+        text_encoder="qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+        lora="h3-realism-people-t2v-i2v-r2v.safetensors",
+        lora_strength=0.8,
+        cast_image_title="Cast Reference",
+    )
+
+    call = inner.calls[0]
+    assert call["length_frames"] == 141
+    assert call["text_encoder"] == "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+    assert call["lora"] == "h3-realism-people-t2v-i2v-r2v.safetensors"
+    assert call["lora_strength"] == 0.8
+    assert call["cast_image_title"] == "Cast Reference"
+
+
+def test_per_chunk_seed_mutator_reseed_generation_only_touches_the_named_chunk():
+    """The heart of ``--reseed``'s composability with ``--resume``: chunks
+    absent from ``reseed_generations`` must derive *exactly* the ordinary
+    generation-0 value, so their fingerprint still matches what's on disk and
+    they stay cache hits."""
+    inner = _RecordingMutator()
+    mutator = workflow_graph.PerChunkSeedMutator(
+        inner, base_seed=500, reseed_generations={12: 1}
+    )
+
+    for cid in (11, 12, 13):
+        mutator.mutate(
+            make_workflow_baseline(), _prompt(chunk_id=cid), _assets(chunk_id=cid), noise_seed=0
+        )
+
+    seeds = {call["prompt"].chunk_id: call["noise_seed"] for call in inner.calls}
+    assert seeds[11] == workflow_graph.resolve_chunk_seed(base_seed=500, chunk_id=11)
+    assert seeds[13] == workflow_graph.resolve_chunk_seed(base_seed=500, chunk_id=13)
+    assert seeds[12] == workflow_graph.resolve_chunk_seed(
+        base_seed=500, chunk_id=12, reseed_generation=1
+    )
+    assert seeds[12] != workflow_graph.resolve_chunk_seed(base_seed=500, chunk_id=12)
+
+
+def test_per_chunk_seed_mutator_delegates_to_a_real_mutator_end_to_end():
+    """Not just a recording double: wired to the real ``WorkflowGraphMutator``,
+    the seed that actually lands in the graph must be the derived one."""
+    mutator = workflow_graph.PerChunkSeedMutator(
+        workflow_graph.WorkflowGraphMutator(), base_seed=10_000
+    )
+
+    result = mutator.mutate(make_workflow_baseline(), _prompt(chunk_id=9), _assets(chunk_id=9))
+
+    assert _noise_inputs(result)["noise_seed"] == workflow_graph.resolve_chunk_seed(
+        base_seed=10_000, chunk_id=9
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Issue #39: which text encoder encoded the prompt
 # --------------------------------------------------------------------------- #
 
