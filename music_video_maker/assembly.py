@@ -14,9 +14,22 @@ Two non-negotiable invariants (see project ``CLAUDE.md``):
    timeline, this gives zero-generative-drift sync as long as every expected
    chunk is present, which is why gaps are validated *before* concat runs.
 
-Nothing here imports ComfyUI, torch, or pydub -- only ``contracts`` and the
-stdlib. The subprocess runner is injectable so unit tests can assert on the
-exact argument lists without ever invoking a real ``ffmpeg`` binary.
+Nothing here imports ComfyUI, torch, or pydub -- only ``contracts``,
+``luminance`` (itself contracts-and-stdlib-only) and the stdlib. The
+subprocess runner is injectable so unit tests can assert on the exact
+argument lists without ever invoking a real ``ffmpeg`` binary.
+
+**Post-render darkness check (issue #77).** Before concat runs, every
+available chunk's video is sampled for its ending luminance via
+:func:`music_video_maker.luminance.check_dark_chunks`, reusing the same
+injected ``runner`` -- so it activates automatically wherever assembly
+already runs against real ffmpeg, with nothing new to wire up. A flagged
+chunk is logged loudly and carried on :class:`AssemblyResult` for a caller to
+report; it never blocks assembly, the same asymmetric-warning discipline
+every lint in ``shot_plan.py`` follows. The whole check is wrapped in its own
+try/except here too, on top of ``luminance``'s own internal guards -- a
+Stage-5 smell test must never be the reason a finished render doesn't get
+written.
 """
 
 from __future__ import annotations
@@ -28,6 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from music_video_maker.contracts import AudioChunk, ChunkResult, ChunkStatus, RunState
+from music_video_maker.luminance import DEFAULT_DARK_FLOOR, DarkChunkWarning, check_dark_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +108,11 @@ class AssemblyResult:
     """Chunk ids actually concatenated, in the chronological order used."""
     concat_args: tuple[str, ...]
     mux_args: tuple[str, ...]
+    dark_chunk_warnings: tuple[DarkChunkWarning, ...] = ()
+    """Chunks whose sampled ending luminance fell below the darkness floor
+    (issue #77) -- informational only. The video was still assembled; a
+    non-empty tuple here means a human should look at these chunks before
+    trusting the final cut, not that anything failed."""
 
 
 def _escape_concat_path(path: Path) -> str:
@@ -229,6 +248,9 @@ def assemble_final_video(
     *,
     output_filename: str = DEFAULT_OUTPUT_FILENAME,
     runner: SubprocessRunner | None = None,
+    check_luminance: bool = True,
+    luminance_floor: float = DEFAULT_DARK_FLOOR,
+    luminance_runner: SubprocessRunner | None = None,
 ) -> AssemblyResult:
     """Concat every chunk's rendered video (chronological ``chunk_id`` order)
     and mux the master audio track over it.
@@ -236,6 +258,13 @@ def assemble_final_video(
     Raises :class:`MissingChunksError` -- before any subprocess runs -- if
     any chunk in ``chunks`` lacks a succeeded, video-bearing result. Raises
     :class:`FfmpegError` if either ffmpeg subprocess exits non-zero.
+
+    ``check_luminance`` (default ``True``) runs the issue #77 darkness check
+    against every available chunk before concat, using ``luminance_runner``
+    if given or ``runner`` otherwise -- so passing the same fake/real ffmpeg
+    runner already used for concat/mux is enough to exercise or disable it in
+    tests. The check never raises and never blocks assembly; see
+    :func:`music_video_maker.luminance.check_dark_chunks`.
     """
     runner = runner or _default_runner
     output_dir = Path(output_dir)
@@ -259,6 +288,30 @@ def assemble_final_video(
     )
     ordered_ids = sorted(available_ids)
     video_paths = [result_map[cid].video_file for cid in ordered_ids]
+
+    dark_chunk_warnings: tuple[DarkChunkWarning, ...] = ()
+    if check_luminance:
+        try:
+            dark_chunk_warnings = check_dark_chunks(
+                [c for c in chunks if c.chunk_id in available_ids],
+                result_map,
+                floor=luminance_floor,
+                runner=luminance_runner or runner,
+            )
+        except Exception:  # noqa: BLE001 - a smell test must never block assembly.
+            logger.exception(
+                "The issue #77 darkness check raised unexpectedly -- skipping it and "
+                "continuing with assembly. This must never abort a run."
+            )
+            dark_chunk_warnings = ()
+        if dark_chunk_warnings:
+            logger.error(
+                "Assembly: %d chunk(s) end below the darkness floor (Y<%.1f) -- a human "
+                "should check these before trusting the final video: %s",
+                len(dark_chunk_warnings),
+                luminance_floor,
+                [w.chunk_id for w in dark_chunk_warnings],
+            )
 
     concat_file = output_dir / CONCAT_LIST_FILENAME
     write_concat_file(video_paths, concat_file)  # type: ignore[arg-type]
@@ -285,4 +338,5 @@ def assemble_final_video(
         chunk_ids=tuple(ordered_ids),
         concat_args=tuple(concat_args),
         mux_args=tuple(mux_args),
+        dark_chunk_warnings=dark_chunk_warnings,
     )

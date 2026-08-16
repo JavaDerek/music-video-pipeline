@@ -318,7 +318,12 @@ def test_assemble_final_video_happy_path_runs_concat_then_mux(tmp_path: Path):
     output_dir = tmp_path / "final"
     runner = _FakeRunner()
 
-    result = assemble_final_video(chunks, results, master_audio, output_dir, runner=runner)
+    # check_luminance=False: this test asserts on the exact concat/mux call
+    # count and sequence; the issue #77 darkness check is exercised by its
+    # own dedicated tests below, using the same injected runner.
+    result = assemble_final_video(
+        chunks, results, master_audio, output_dir, runner=runner, check_luminance=False
+    )
 
     assert isinstance(result, AssemblyResult)
     assert len(runner.calls) == 2
@@ -365,7 +370,9 @@ def test_assemble_final_video_orders_chunks_chronologically_regardless_of_input_
     output_dir = tmp_path / "final"
     runner = _FakeRunner()
 
-    result = assemble_final_video(chunks, results, master_audio, output_dir, runner=runner)
+    result = assemble_final_video(
+        chunks, results, master_audio, output_dir, runner=runner, check_luminance=False
+    )
 
     assert result.chunk_ids == (0, 1, 2)
 
@@ -381,7 +388,9 @@ def test_assemble_final_video_accepts_run_state(tmp_path: Path):
     output_dir = tmp_path / "final"
     runner = _FakeRunner()
 
-    result = assemble_final_video(chunks, run_state, master_audio, output_dir, runner=runner)
+    result = assemble_final_video(
+        chunks, run_state, master_audio, output_dir, runner=runner, check_luminance=False
+    )
 
     assert result.chunk_ids == (0, 1)
 
@@ -395,7 +404,13 @@ def test_assemble_final_video_custom_output_filename(tmp_path: Path):
     runner = _FakeRunner()
 
     result = assemble_final_video(
-        chunks, results, master_audio, output_dir, output_filename="my_video.mp4", runner=runner
+        chunks,
+        results,
+        master_audio,
+        output_dir,
+        output_filename="my_video.mp4",
+        runner=runner,
+        check_luminance=False,
     )
 
     assert result.output_video == output_dir / "my_video.mp4"
@@ -468,7 +483,9 @@ def test_assemble_final_video_raises_ffmpeg_error_on_concat_failure(tmp_path: Pa
     runner = _FakeRunner(fail_at_call=1, stderr=b"concat demuxer: no such file")
 
     with pytest.raises(FfmpegError) as excinfo:
-        assemble_final_video(chunks, results, master_audio, output_dir, runner=runner)
+        assemble_final_video(
+            chunks, results, master_audio, output_dir, runner=runner, check_luminance=False
+        )
 
     assert excinfo.value.returncode == 1
     assert "no such file" in excinfo.value.stderr
@@ -484,7 +501,9 @@ def test_assemble_final_video_raises_ffmpeg_error_on_mux_failure(tmp_path: Path)
     runner = _FakeRunner(fail_at_call=2, stderr=b"Invalid data found when processing input")
 
     with pytest.raises(FfmpegError) as excinfo:
-        assemble_final_video(chunks, results, master_audio, output_dir, runner=runner)
+        assemble_final_video(
+            chunks, results, master_audio, output_dir, runner=runner, check_luminance=False
+        )
 
     assert excinfo.value.returncode == 1
     assert "Invalid data" in excinfo.value.stderr
@@ -504,7 +523,9 @@ def test_assemble_final_video_ffmpeg_failure_is_logged(
         caplog.at_level(logging.ERROR, logger="music_video_maker.assembly"),
         pytest.raises(FfmpegError),
     ):
-        assemble_final_video(chunks, results, master_audio, output_dir, runner=runner)
+        assemble_final_video(
+            chunks, results, master_audio, output_dir, runner=runner, check_luminance=False
+        )
 
     error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert any("boom: disk full" in r.getMessage() for r in error_records)
@@ -525,9 +546,154 @@ def test_ffmpeg_error_handles_str_stderr(tmp_path: Path):
         )
 
     with pytest.raises(FfmpegError) as excinfo:
-        assemble_final_video(chunks, results, master_audio, output_dir, runner=str_stderr_runner)
+        assemble_final_video(
+            chunks,
+            results,
+            master_audio,
+            output_dir,
+            runner=str_stderr_runner,
+            check_luminance=False,
+        )
 
     assert excinfo.value.stderr == "already a string"
+
+
+# --------------------------------------------------------------------------- #
+# assemble_final_video: the issue #77 darkness check, wired in by default
+# --------------------------------------------------------------------------- #
+
+
+def _luminance_capable_runner(*, value: int):
+    """A fake runner that answers BOTH kinds of call assemble_final_video
+    now makes: an issue #77 frame probe (identified by ``-ss`` in the args,
+    matching ``luminance.build_frame_probe_args``) returns ``value`` as every
+    pixel of a 32x18 grayscale frame; anything else (concat/mux) succeeds
+    with empty output, like ``_FakeRunner``'s default."""
+    calls: list[list[str]] = []
+
+    def runner(args):
+        args = list(args)
+        calls.append(args)
+        if "-ss" in args:
+            data = bytes([value]) * (32 * 18)
+            return subprocess.CompletedProcess(args, returncode=0, stdout=data, stderr=b"")
+        return subprocess.CompletedProcess(args, returncode=0, stdout=b"", stderr=b"")
+
+    runner.calls = calls
+    return runner
+
+
+def test_assemble_final_video_flags_a_dark_chunk_but_still_assembles(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    chunks = [_chunk(43, start=277.417, end=282.583)]
+    results = {43: _result(43, video_file=tmp_path / "chunk_43.mp4")}
+    master_audio = tmp_path / "master.wav"
+    output_dir = tmp_path / "final"
+    runner = _luminance_capable_runner(value=10)  # below DEFAULT_DARK_FLOOR
+
+    with caplog.at_level(logging.ERROR, logger="music_video_maker.assembly"):
+        result = assemble_final_video(chunks, results, master_audio, output_dir, runner=runner)
+
+    # The check never blocks assembly -- concat + mux still ran.
+    assert isinstance(result, AssemblyResult)
+    assert len(result.dark_chunk_warnings) == 1
+    assert result.dark_chunk_warnings[0].chunk_id == 43
+    assert any("43" in r.getMessage() for r in caplog.records if r.levelno == logging.ERROR)
+    # concat + mux calls (no -ss) still present alongside the probe calls
+    assert any("-ss" not in c and "-i" in c for c in runner.calls)
+
+
+def test_assemble_final_video_does_not_flag_bright_chunks(tmp_path: Path):
+    chunks = [_chunk(0)]
+    results = {0: _result(0, video_file=tmp_path / "chunk_0.mp4")}
+    master_audio = tmp_path / "master.wav"
+    output_dir = tmp_path / "final"
+    runner = _luminance_capable_runner(value=200)
+
+    result = assemble_final_video(chunks, results, master_audio, output_dir, runner=runner)
+
+    assert result.dark_chunk_warnings == ()
+
+
+def test_assemble_final_video_check_luminance_false_skips_probing_entirely(tmp_path: Path):
+    chunks = [_chunk(0)]
+    results = {0: _result(0, video_file=tmp_path / "chunk_0.mp4")}
+    master_audio = tmp_path / "master.wav"
+    output_dir = tmp_path / "final"
+    runner = _luminance_capable_runner(value=10)  # would be flagged if checked
+
+    result = assemble_final_video(
+        chunks, results, master_audio, output_dir, runner=runner, check_luminance=False
+    )
+
+    assert result.dark_chunk_warnings == ()
+    assert not any("-ss" in c for c in runner.calls)  # no probe calls at all
+
+
+def test_assemble_final_video_luminance_floor_is_configurable(tmp_path: Path):
+    chunks = [_chunk(0)]
+    results = {0: _result(0, video_file=tmp_path / "chunk_0.mp4")}
+    master_audio = tmp_path / "master.wav"
+    output_dir = tmp_path / "final"
+    runner = _luminance_capable_runner(value=60)
+
+    default_result = assemble_final_video(chunks, results, master_audio, output_dir, runner=runner)
+    assert default_result.dark_chunk_warnings == ()  # 60 is above the default floor (25)
+
+    raised_result = assemble_final_video(
+        chunks, results, master_audio, output_dir, runner=runner, luminance_floor=70.0
+    )
+    assert len(raised_result.dark_chunk_warnings) == 1  # 60 < 70
+
+
+def test_assemble_final_video_survives_a_broken_darkness_check(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch
+):
+    # Even if the check itself misbehaves, assembly must still complete --
+    # a Stage 5 smell test is never allowed to be the reason a finished
+    # render doesn't get written.
+    import music_video_maker.assembly as assembly_module
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("darkness check exploded")
+
+    monkeypatch.setattr(assembly_module, "check_dark_chunks", boom)
+
+    chunks = [_chunk(0)]
+    results = {0: _result(0, video_file=tmp_path / "chunk_0.mp4")}
+    master_audio = tmp_path / "master.wav"
+    output_dir = tmp_path / "final"
+    runner = _FakeRunner()
+
+    with caplog.at_level(logging.ERROR, logger="music_video_maker.assembly"):
+        result = assemble_final_video(chunks, results, master_audio, output_dir, runner=runner)
+
+    assert isinstance(result, AssemblyResult)
+    assert result.dark_chunk_warnings == ()
+    assert "darkness check exploded" in caplog.text
+
+
+def test_assemble_final_video_uses_separate_luminance_runner_if_given(tmp_path: Path):
+    chunks = [_chunk(0)]
+    results = {0: _result(0, video_file=tmp_path / "chunk_0.mp4")}
+    master_audio = tmp_path / "master.wav"
+    output_dir = tmp_path / "final"
+    concat_runner = _FakeRunner()  # returns b"" stdout -- unreadable for probes
+    luminance_runner = _luminance_capable_runner(value=10)
+
+    result = assemble_final_video(
+        chunks,
+        results,
+        master_audio,
+        output_dir,
+        runner=concat_runner,
+        luminance_runner=luminance_runner,
+    )
+
+    assert len(result.dark_chunk_warnings) == 1
+    assert len(concat_runner.calls) == 2  # only concat + mux, no probe calls
+    assert any("-ss" in c for c in luminance_runner.calls)
 
 
 # --------------------------------------------------------------------------- #
