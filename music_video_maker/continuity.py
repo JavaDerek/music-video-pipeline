@@ -92,6 +92,19 @@ alone (what a run can predict before rendering), and
 :func:`chain_reuse_blocked` is the one-line rule that stops a cached chunk
 being reused after the chunk it was seeded from has been re-rendered.
 
+**Identity verification (issue #49).** The optional ``seed_face_gate``
+constructor argument decides whether a candidate seed frame carries a usable
+face at all (issue #47); its callable signature grew a second, optional
+argument in #49 -- the active cast member's reference photo -- so a gate
+built with recognition support can also check that the face is *hers*, not
+merely *a* face (the motivating failure: a keyboard player's face, not the
+performer's, passing #47's area/confidence floors while she stood with her
+back to camera in the same frame). This provider is the only thing that
+knows both the extracted seed frame path and which chunk's own
+``ExpandedPrompt.image_ref`` is active, so :meth:`_stage_seed_frame` /
+:meth:`_seed_frame_carries_identity` are what thread the photo down to the
+gate -- see their docstrings.
+
 Index-space guard
 ------------------
 The seed frame comes from chunk **N-1** while the prompt/audio for the
@@ -540,7 +553,7 @@ class ContinuityWorkflowProvider:
         lora: str | None = None,
         lora_strength: float = 1.0,
         graph_hasher: Callable[[Workflow], str] | None = None,
-        seed_face_gate: Callable[[Path], bool] | None = None,
+        seed_face_gate: Callable[[Path, Path], bool] | None = None,
     ) -> None:
         if reanchor_interval is not None and reanchor_interval < 1:
             logger.error(
@@ -598,6 +611,13 @@ class ContinuityWorkflowProvider:
         self._prompt_texts: dict[int, str] = {}
         # Issue #47: may this seed frame be chained from at all? None keeps
         # the pre-#47 behaviour of chaining from whatever the last frame was.
+        # Issue #49 grew the gate's own signature to a second, optional
+        # argument -- the active cast member's reference photo -- so it can
+        # tell a big confident face from *her* big confident face. This
+        # provider is the one place that knows both the extracted seed frame
+        # AND which chunk's ExpandedPrompt (and therefore which photo) is
+        # active, so it is the one that has to thread the photo through; see
+        # _stage_seed_frame/_seed_frame_carries_identity below.
         self._seed_face_gate = seed_face_gate
         # Issue #45: which authored graph each chunk rendered through.
         #
@@ -667,7 +687,14 @@ class ContinuityWorkflowProvider:
         if predecessor_result is None:
             return self._render_unchained(chunk_id, prompt, assets)
 
-        seed_filename = self._stage_seed_frame(chunk_id, predecessor_id, predecessor_result)
+        # Issue #49: chunk_id's own reference photo -- the active cast
+        # member for the shot this seed frame is about to become the first
+        # frame of, not the predecessor's. ``prompt`` is already in hand from
+        # the top of this method, so this is a plain field read, not a second
+        # registry lookup.
+        seed_filename = self._stage_seed_frame(
+            chunk_id, predecessor_id, predecessor_result, prompt.image_ref
+        )
         if seed_filename is None:
             return self._render_unchained(chunk_id, prompt, assets)
 
@@ -847,10 +874,17 @@ class ContinuityWorkflowProvider:
         return result
 
     def _seed_frame_carries_identity(
-        self, chunk_id: int, predecessor_id: int, frame_path: Path
+        self, chunk_id: int, predecessor_id: int, frame_path: Path, reference_photo: Path
     ) -> bool:
         """Whether ``frame_path`` can actually convey who the performer is
         (issue #47), or ``True`` when no gate was configured.
+
+        ``reference_photo`` (issue #49) is ``chunk_id``'s own active cast
+        member's reference photo -- passed to the gate as its second,
+        optional argument, so a gate built with recognition support can also
+        check that the seed frame's face is *hers*, not merely *a* face. A
+        gate that never asks for it (the pre-#49 shape, or one built with
+        recognition off) simply ignores the extra argument.
 
         A gate that raises is treated as a refusal, not a crash: the whole
         point is that an *unverified* seed is the case that loses the likeness,
@@ -859,7 +893,7 @@ class ContinuityWorkflowProvider:
         if self._seed_face_gate is None:
             return True
         try:
-            allowed = self._seed_face_gate(frame_path)
+            allowed = self._seed_face_gate(frame_path, reference_photo)
         except Exception:
             logger.exception(
                 "chunk_id=%s: the seed-face gate raised on %s -- treating it as unchainable "
@@ -884,7 +918,11 @@ class ContinuityWorkflowProvider:
         return allowed
 
     def _stage_seed_frame(
-        self, chunk_id: int, predecessor_id: int, predecessor_result: ChunkResult
+        self,
+        chunk_id: int,
+        predecessor_id: int,
+        predecessor_result: ChunkResult,
+        reference_photo: Path,
     ) -> str | None:
         frame_path = self._frames_dir / f"seed_{predecessor_id:04d}_into_{chunk_id:04d}.png"
         try:
@@ -900,7 +938,9 @@ class ContinuityWorkflowProvider:
             # likeness from and will invent one. Checked here rather than at
             # plan time because it is a fact about rendered pixels, which do
             # not exist until the predecessor has run.
-            if not self._seed_frame_carries_identity(chunk_id, predecessor_id, frame_path):
+            if not self._seed_frame_carries_identity(
+                chunk_id, predecessor_id, frame_path, reference_photo
+            ):
                 return None
             seed_filename = self._asset_stager.upload_image(frame_path)
         except Exception:

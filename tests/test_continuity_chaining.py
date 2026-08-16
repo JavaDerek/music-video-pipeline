@@ -310,6 +310,58 @@ def test_disabled_continuity_does_not_emit_the_lip_sync_warning(tmp_path, caplog
 
 
 # --------------------------------------------------------------------------- #
+# Seed-face recognition wiring (issue #49): the gate's second argument
+# --------------------------------------------------------------------------- #
+
+
+def test_the_gate_is_given_each_chunks_own_reference_photo(tmp_path):
+    """Issue #49: ``build_seed_face_gate``'s returned callable takes an
+    optional second argument -- the active cast member's reference photo --
+    so it can tell a big, confident face from *her* big, confident face.
+    ``ContinuityWorkflowProvider`` is the only thing that knows both the
+    extracted seed frame AND which chunk's ``ExpandedPrompt`` (and therefore
+    which photo) is active, so it is the one that has to thread it through.
+
+    Critically, the photo passed for a chained chunk must be THAT chunk's own
+    ``image_ref`` -- the active cast member for the shot the seed frame is
+    about to become the first frame of -- never the predecessor's."""
+    calls: list[tuple[Path, Path | None]] = []
+
+    def recording_gate(frame_path: Path, reference_photo: Path | None = None) -> bool:
+        calls.append((frame_path, reference_photo))
+        return True
+
+    state = _state_with_rendered(tmp_path, 0, 1)
+    provider = _provider(tmp_path, seed_face_gate=recording_gate)
+
+    provider(1, state)
+    provider(2, state)
+
+    assert [reference_photo for _frame_path, reference_photo in calls] == [
+        Path("cast/ref_1.png"),
+        Path("cast/ref_2.png"),
+    ]
+
+
+def test_a_gate_with_no_reference_photo_configured_still_gets_called(tmp_path):
+    """A gate built without recognition support (issue #47's original shape,
+    or issue #49's off-by-default wiring in ``cli._resolve_seed_face_gate``)
+    still accepts a second argument -- this provider always passes one -- and
+    the decision to actually use it lives in how the gate itself was built,
+    not in whether this module threads the photo down."""
+
+    def detection_only_gate(_frame_path: Path, _reference_photo: Path | None = None) -> bool:
+        return False
+
+    state = _state_with_rendered(tmp_path, 0)
+    provider = _provider(tmp_path, seed_face_gate=detection_only_gate)
+
+    workflow = provider(1, state)
+
+    assert _is_base(workflow), "a gate that refuses must still fall back cleanly"
+
+
+# --------------------------------------------------------------------------- #
 # Provenance: what each chunk was actually chained to
 # --------------------------------------------------------------------------- #
 
