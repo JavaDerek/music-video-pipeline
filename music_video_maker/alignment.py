@@ -370,7 +370,13 @@ def align(
 
     word_confidences = _extract_word_confidences(raw_result)
     quality_report = alignment_quality.evaluate_alignment_quality(
-        result, low_confidence_words=word_confidences
+        result,
+        low_confidence_words=word_confidences,
+        # Issue #71: the master itself is the only thing that can answer "is
+        # there a voice where you just placed this lyric". Every other check
+        # here reasons about timing and text, and all of them passed the
+        # phantom closing line "Deathless" placed 12s into the fadeout.
+        audio_path=audio_path,
     )
     alignment_quality.log_report(quality_report, context=str(audio_path))
     alignment_quality.raise_if_blocking(quality_report, strict=strict_alignment)

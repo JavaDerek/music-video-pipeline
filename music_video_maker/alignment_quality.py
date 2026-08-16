@@ -116,9 +116,15 @@ timing + text heuristics that are necessarily imperfect:
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+import re
+import shutil
+import statistics
+import subprocess
+import tempfile
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
+from pathlib import Path
 
 from music_video_maker.contracts import AlignedSegment, AlignmentResult
 
@@ -200,6 +206,80 @@ CLAUSE_CONTINUATION_WORDS = frozenset(
     }
 )
 
+# The consonant band (issue #71): d/th/l/s/F/v/m/r and most of the rest of
+# English consonant articulation put energy above this frequency; a tonal
+# instrumental fadeout does not. See the "Vocal-energy check" docstring
+# section below and VOCAL_ENERGY_RATIO_THRESHOLD's comment for the
+# measurement this number and the threshold below it are based on.
+CONSONANT_BAND_HZ = 3400.0
+
+# Below this duration, a highpass-filtered RMS estimate is averaging over too
+# few cycles to be trustworthy in either direction -- too short to safely
+# treat as a real measurement of "no voice here" (a false CRITICAL) or to
+# let it distort another segment's baseline (a false negative on that other
+# segment). Every real segment measured for this issue (all >=1.28s, see the
+# docstring) cleared this easily; the ~70ms 5-word pileup this module's own
+# words-per-second check exists to catch would not, and is correctly left to
+# that check instead.
+MIN_SEGMENT_DURATION_FOR_VOCAL_ENERGY_S = 1.0
+
+# A baseline built from fewer than this many other qualifying segments is a
+# guess, not a measurement -- same reasoning as MIN_WORDS_FOR_COLLAPSE_CHECK
+# above. Below this, the check is skipped for that segment entirely rather
+# than compared against noise.
+VOCAL_ENERGY_BASELINE_MIN_SEGMENTS = 3
+
+VOCAL_ENERGY_RATIO_THRESHOLD = 0.10
+"""How small a segment's consonant-band share can be, relative to the
+*median* share across this track's other qualifying placed segments, before
+it is flagged as having no vocal energy at all.
+
+Median rather than mean or max: a track where many placed segments are
+themselves hallucinated (the scenario this constant's docstring is required
+to address) drags a mean down with them and lets a single loud "other"
+segment set an unstably high ceiling for max: the number needs to still mean
+something with a *minority* of the "other" segments contaminated, which is
+what a median gives for free -- see
+test_finding_still_fires_when_two_of_five_other_segments_are_also_phantom.
+
+Calibrated 2026-08-15 against real masters decoded to mono 16kHz (matching
+what this module actually does -- see _decode_to_mono_16khz), consonant band
+>3.4kHz, share = highpass RMS power / total RMS power over each window:
+
+  "Deathless" (issue #71's case), ratio against the median of 23 other real
+  sung windows (0.0026-0.0460, median 0.0157):
+    - quietest REAL vocal window measured, 386-391s ("Now the island is no
+      longer..."): share 0.0026 -> ratio 0.166 (16.6% of baseline)
+    - second-quietest real window, 54-62s: share 0.0057 -> ratio 0.287 (29%)
+    - the phantom itself, "deathless, Forevermore!" `small` placed at
+      495-502s, 12s into the fadeout: share 0.0009 -> ratio 0.057 (5.7%)
+    - the same phantom's tighter 498.73-501.63s span: share 0.0003 ->
+      ratio 0.019 (1.9%)
+
+  "The Lucky Ones" (issue #42's case, already caught by isolated_segment's
+  51s/37s gap -- this check is not required to also catch it, and on the
+  measurement below it does not): ratio against the median of 21 other real
+  sung windows (0.0164-0.0855, median 0.0267):
+    - quietest real window: share 0.0164 -> ratio 0.614 (61%)
+    - the "the lucky one." phantom at 235.68-238.56s: share 0.0135 ->
+      ratio 0.506 (51%) -- NOT caught by this check. Unlike "Deathless"'s
+      fadeout, this window sits inside a still-playing instrumental outro
+      (percussion has its own energy above 3.4kHz), so silence-vs-voice
+      is not this track's phantom's acoustic signature the way it is on
+      "Deathless"; the gap heuristic is what catches it, and it does.
+
+0.10 sits between the worst-measured phantom ratio (5.7%) and the
+lowest-measured real ratio (16.6%) -- closer to the real floor than the
+phantom ceiling, deliberately: a missed phantom costs a viewer-visible
+defect after hours of GPU time, a false positive costs one log line (or,
+under --strict-alignment, a refusal before any of those hours are spent --
+still cheaper than the alternative). 0.15 or higher was rejected: it leaves
+under a 2x margin from the 16.6% real floor, which is too little room for a
+song whose quietest real line is quieter than "Deathless"'s. 0.05 was
+rejected as too conservative given that cost asymmetry -- it would have
+missed this issue's own tighter 1.9%-ratio measurement of the documented
+failure had the wider chunk-level span (5.7%) not been the one evaluated."""
+
 # --------------------------------------------------------------------------- #
 # Finding codes.
 # --------------------------------------------------------------------------- #
@@ -216,6 +296,7 @@ FINDING_LOW_CONFIDENCE = "low_word_confidence"
 FINDING_CONFIDENCE_COLLAPSE = "track_confidence_collapse"
 FINDING_COUNTERPOINT_RATE = "counterpoint_delivery_rate"
 FINDING_COUNTERPOINT_SPAN = "counterpoint_degenerate_span"
+FINDING_NO_VOCAL_ENERGY = "no_vocal_energy_in_placed_segment"
 
 
 class Severity(IntEnum):
@@ -321,11 +402,25 @@ def evaluate_alignment_quality(
     low_word_confidence: float = LOW_WORD_CONFIDENCE,
     critical_word_confidence: float = CRITICAL_WORD_CONFIDENCE,
     track_confidence_collapse_fraction: float = TRACK_CONFIDENCE_COLLAPSE_FRACTION,
+    audio_path: str | Path | None = None,
+    consonant_band_hz: float = CONSONANT_BAND_HZ,
+    vocal_energy_ratio_threshold: float = VOCAL_ENERGY_RATIO_THRESHOLD,
+    vocal_energy_min_duration_s: float = MIN_SEGMENT_DURATION_FOR_VOCAL_ENERGY_S,
+    vocal_energy_min_baseline_segments: int = VOCAL_ENERGY_BASELINE_MIN_SEGMENTS,
+    ffmpeg_runner: FfmpegRunner | None = None,
 ) -> AlignmentQualityReport:
-    """Pure function: no audio, no model, no I/O. Runs every check below over
-    ``result.segments`` (plus the optional ``low_confidence_words`` side
-    channel -- see the module docstring's "Per-word confidence" section) and
-    returns a structured :class:`AlignmentQualityReport`.
+    """Pure function *by default*: no audio, no model, no I/O. Runs every
+    check below over ``result.segments`` (plus the optional
+    ``low_confidence_words`` side channel -- see the module docstring's
+    "Per-word confidence" section) and returns a structured
+    :class:`AlignmentQualityReport`.
+
+    The one exception is the vocal-energy check (issue #71): it is a no-op
+    (and touches no audio, no ffmpeg, nothing) unless ``audio_path`` is
+    given, which is why that parameter defaults to ``None`` -- every
+    existing caller that never passes it keeps the pure-function contract
+    exactly as before. See the module docstring's "Vocal-energy check"
+    section for what it does and why it needs to be the one exception.
 
     Checks:
       - zero-length / near-zero-length segments
@@ -337,6 +432,8 @@ def evaluate_alignment_quality(
       - low-confidence words, if ``low_confidence_words`` is supplied
       - counterpoint segments, if the result carries any (issue #33) --
         on their own terms, see the module docstring
+      - no vocal energy where a segment was placed, if ``audio_path`` is
+        supplied (issue #71) -- see the module docstring
     """
     segments = result.segments
     # Duck-typed rather than imported: this module must not depend on the
@@ -371,6 +468,18 @@ def evaluate_alignment_quality(
     findings.extend(
         _check_counterpoint_segments(
             concurrent, near_zero_duration_s, max_words_per_second, min_words_per_second
+        )
+    )
+
+    findings.extend(
+        _check_vocal_energy(
+            segments,
+            audio_path,
+            consonant_band_hz=consonant_band_hz,
+            ratio_threshold=vocal_energy_ratio_threshold,
+            min_duration_s=vocal_energy_min_duration_s,
+            min_baseline_segments=vocal_energy_min_baseline_segments,
+            runner=ffmpeg_runner,
         )
     )
 
@@ -708,6 +817,280 @@ def _check_track_confidence(
             ),
         )
     ]
+
+
+# --------------------------------------------------------------------------- #
+# Vocal-energy check (issue #71): the one check in this module that looks at
+# the master audio itself. Everything above reasons about timing and text;
+# this asks the question none of them can: is there a voice where a segment
+# claims a lyric was sung?
+#
+# Method (measured, not assumed -- see VOCAL_ENERGY_RATIO_THRESHOLD's
+# comment for the real numbers this is calibrated against):
+#   1. decode the master once to mono 16kHz (ffmpeg is already a hard
+#      project dependency; no new one added);
+#   2. for each placed segment long enough to trust
+#      (MIN_SEGMENT_DURATION_FOR_VOCAL_ENERGY_S), measure the share of its
+#      total spectral energy that sits above CONSONANT_BAND_HZ -- via
+#      ffmpeg's own `highpass` + `astats` filters (RMS power ratio), not a
+#      new FFT dependency;
+#   3. compare each segment's share against the *median* share of this
+#      track's other qualifying segments (its own self-calibrated
+#      baseline -- see VOCAL_ENERGY_RATIO_THRESHOLD's docstring for why
+#      median, not mean or max);
+#   4. flag a segment sitting at a small fraction of that baseline.
+#
+# Impure by necessity (needs ffmpeg + the audio file), which is why it is
+# the one exception to evaluate_alignment_quality's "pure function" contract
+# -- see that function's docstring. Every failure mode degrades to "skip
+# this check" with a logged reason, never a crash: a quality check must
+# never be the thing that takes an alignment run down (global standard).
+# --------------------------------------------------------------------------- #
+
+FfmpegRunner = Callable[[Sequence[str]], "subprocess.CompletedProcess"]
+
+_RMS_LEVEL_DB_RE = re.compile(r"RMS level dB:\s*(-?[\d.]+|-inf)")
+
+
+def _default_ffmpeg_runner(args: Sequence[str]) -> subprocess.CompletedProcess:
+    """Real ffmpeg invocation. Never used by unit tests -- injected out via
+    ``ffmpeg_runner=``, same seam as assembly.py's ``SubprocessRunner``."""
+    return subprocess.run(list(args), capture_output=True, check=False)
+
+
+def _ffmpeg_stderr_text(proc: subprocess.CompletedProcess) -> str:
+    stderr = proc.stderr if proc.stderr is not None else b""
+    return stderr if isinstance(stderr, str) else stderr.decode("utf-8", errors="replace")
+
+
+def _rms_level_db(
+    audio_path: Path,
+    start: float,
+    duration: float,
+    *,
+    highpass_hz: float | None,
+    runner: FfmpegRunner,
+) -> float | None:
+    """Runs ffmpeg's ``astats`` filter over ``[start, start + duration)`` of
+    ``audio_path``, optionally highpass-filtered at ``highpass_hz`` first,
+    and returns the reported Overall RMS level in dB. ``None`` on any
+    failure -- non-zero exit, an OSError launching the process, unparseable
+    output, or pure digital silence (``-inf``, against/of which a ratio is
+    meaningless) -- callers treat that as "this window can't be measured",
+    never as evidence in either direction."""
+    filt = "aformat=channel_layouts=mono"
+    if highpass_hz is not None:
+        filt += f",highpass=f={highpass_hz}"
+    filt += ",astats=metadata=0:length=0"
+    args = [
+        "ffmpeg",
+        "-hide_banner",
+        "-nostdin",
+        "-ss",
+        f"{start:.6f}",
+        "-t",
+        f"{duration:.6f}",
+        "-i",
+        str(audio_path),
+        "-af",
+        filt,
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        proc = runner(args)
+    except OSError:
+        logger.warning(
+            "alignment_quality: ffmpeg invocation failed analyzing %s [%.3fs, %.3fs) -- "
+            "skipping this window's vocal-energy measurement",
+            audio_path,
+            start,
+            start + duration,
+            exc_info=True,
+        )
+        return None
+    if proc.returncode != 0:
+        logger.warning(
+            "alignment_quality: ffmpeg exited %s analyzing %s [%.3fs, %.3fs) -- skipping "
+            "this window's vocal-energy measurement; stderr=%s",
+            proc.returncode,
+            audio_path,
+            start,
+            start + duration,
+            _ffmpeg_stderr_text(proc)[-500:],
+        )
+        return None
+    match = _RMS_LEVEL_DB_RE.search(_ffmpeg_stderr_text(proc))
+    if not match or match.group(1) == "-inf":
+        return None
+    return float(match.group(1))
+
+
+def _consonant_band_share(
+    audio_path: Path,
+    start: float,
+    end: float,
+    *,
+    consonant_band_hz: float,
+    runner: FfmpegRunner,
+) -> float | None:
+    """This window's share of total spectral energy sitting above
+    ``consonant_band_hz``, as a power ratio (``10 ** ((hf_db - total_db) /
+    10)``). ``None`` if either the total or the highpassed measurement
+    failed."""
+    duration = end - start
+    if duration <= 0:
+        return None
+    total_db = _rms_level_db(audio_path, start, duration, highpass_hz=None, runner=runner)
+    if total_db is None:
+        return None
+    hf_db = _rms_level_db(
+        audio_path, start, duration, highpass_hz=consonant_band_hz, runner=runner
+    )
+    if hf_db is None:
+        return None
+    return 10 ** ((hf_db - total_db) / 10)
+
+
+def _check_vocal_energy(
+    segments: tuple[AlignedSegment, ...],
+    audio_path: str | Path | None,
+    *,
+    consonant_band_hz: float,
+    ratio_threshold: float,
+    min_duration_s: float,
+    min_baseline_segments: int,
+    runner: FfmpegRunner | None,
+) -> list[Finding]:
+    """See the section docstring above. No-op (no I/O at all) when
+    ``audio_path`` is ``None`` -- this is what keeps
+    ``evaluate_alignment_quality`` a pure function for every caller that
+    doesn't pass one."""
+    if audio_path is None or not segments:
+        return []
+
+    active_runner: FfmpegRunner = runner if runner is not None else _default_ffmpeg_runner
+    audio_path = Path(audio_path)
+
+    if shutil.which("ffmpeg") is None:
+        logger.warning(
+            "alignment_quality: ffmpeg not found on PATH -- skipping the vocal-energy "
+            "check (issue #71); every other alignment-quality check still ran"
+        )
+        return []
+    if not audio_path.exists():
+        logger.warning(
+            "alignment_quality: master audio %s not found -- skipping the vocal-energy "
+            "check (issue #71); every other alignment-quality check still ran",
+            audio_path,
+        )
+        return []
+
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+            tmp_path = Path(tmp_file.name)
+
+        decode_args = [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostdin",
+            "-y",
+            "-i",
+            str(audio_path),
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            str(tmp_path),
+        ]
+        try:
+            decode_proc = active_runner(decode_args)
+        except OSError:
+            logger.warning(
+                "alignment_quality: could not launch ffmpeg to decode %s to mono 16kHz -- "
+                "skipping the vocal-energy check (issue #71)",
+                audio_path,
+                exc_info=True,
+            )
+            return []
+        if decode_proc.returncode != 0:
+            logger.warning(
+                "alignment_quality: ffmpeg exited %s decoding %s to mono 16kHz -- skipping "
+                "the vocal-energy check (issue #71); stderr=%s",
+                decode_proc.returncode,
+                audio_path,
+                _ffmpeg_stderr_text(decode_proc)[-500:],
+            )
+            return []
+
+        shares: dict[int, float] = {}
+        for segment in segments:
+            if segment.end - segment.start < min_duration_s:
+                continue  # too short for a trustworthy spectral estimate either way
+            share = _consonant_band_share(
+                tmp_path,
+                segment.start,
+                segment.end,
+                consonant_band_hz=consonant_band_hz,
+                runner=active_runner,
+            )
+            if share is not None:
+                shares[segment.index] = share
+
+        findings: list[Finding] = []
+        for segment in segments:
+            if segment.end - segment.start < min_duration_s:
+                continue
+            this_share = shares.get(segment.index)
+            if this_share is None:
+                continue  # this window's own measurement failed -- already logged
+            others = [share for idx, share in shares.items() if idx != segment.index]
+            if len(others) < min_baseline_segments:
+                continue  # not enough of a baseline on this track to calibrate against
+            baseline = statistics.median(others)
+            if baseline <= 0:
+                continue
+            ratio = this_share / baseline
+            if ratio < ratio_threshold:
+                findings.append(
+                    Finding(
+                        segment_index=segment.index,
+                        start=segment.start,
+                        end=segment.end,
+                        severity=Severity.CRITICAL,
+                        code=FINDING_NO_VOCAL_ENERGY,
+                        message=(
+                            f"segment {segment.index} ({segment.start:.3f}s -> "
+                            f"{segment.end:.3f}s) has almost no energy above "
+                            f"{consonant_band_hz:.0f}Hz -- consonant-band share "
+                            f"{this_share:.4f} against this track's own median of "
+                            f"{baseline:.4f} across {len(others)} other placed "
+                            f"segment(s) ({ratio:.0%} of it, threshold "
+                            f"{ratio_threshold:.0%}). Consonants live above this band; a "
+                            "lyric placed where essentially none survive is the acoustic "
+                            "signature of a hallucinated placement, not a quiet one "
+                            "(issue #71)"
+                        ),
+                    )
+                )
+        return findings
+    except Exception:
+        logger.exception(
+            "alignment_quality: vocal-energy check failed unexpectedly for %s -- skipping "
+            "it; every other alignment-quality check still ran",
+            audio_path,
+        )
+        return []
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning(
+                    "alignment_quality: could not remove temp file %s", tmp_path, exc_info=True
+                )
 
 
 # --------------------------------------------------------------------------- #

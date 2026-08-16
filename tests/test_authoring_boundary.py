@@ -46,6 +46,8 @@ SUBPROCESS_ALLOWLIST = frozenset(
         "assembly.py",  # Stage 5: ffmpeg concat/mux (issue #11) -- no model, predates #54
         "custody.py",  # host-sleep prevention around a render (issue #43) -- no model
         "continuity.py",  # ffprobe/ffmpeg frame extraction (issue #12) -- no model
+        "alignment_quality.py",  # ffmpeg astats vocal-energy check (issue #71) -- no model
+        "luminance.py",  # ffmpeg frame sampling for the darkness floor (issue #77) -- no model
     }
 )
 
