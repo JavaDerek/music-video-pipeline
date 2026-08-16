@@ -68,128 +68,12 @@ additive concatenation of, in order:
    than one) -- this is the only change multiple active characters make to
    part 6, which otherwise stays exactly what it always was: the sole
    authority on whether anyone is singing (see the rule below).
-7. **The avoid list** (issue #73) -- ``config.avoid``, a whole-video "must
-   never depict" list, composed as one final clause after the lyric and any
-   counterpoint clauses. See :func:`_avoid_clause` for the honest caveat:
-   this is textual negation in the same single ``prompt`` channel that #73
-   measured failing for ``role``'s "never holding anything", so it is a
-   best-effort hint, not a guarantee. ``()`` (the default) composes nothing.
+7. **The avoid list** (issue #73) -- ``config.avoid`` is *not* composed
+   into a prompt. It was for exactly one render, and it put a climbing
+   harness on a character who had none. H3 has one prompt input and no
+   negative-conditioning channel, so a prohibition can only add its own
+   nouns to the only channel there is. See ``RunConfig.avoid``.
 
-**A cast `role` must describe who the character *is*, never what they are
-doing vocally.** The role is injected into *every* chunk, so "singing
-continuously to camera" in a role contradicts part 6's instrumental clause on
-every unvoiced chunk -- and the character-attached instruction wins, so the
-performer sings straight through the instrumental breaks. Observed on a real
-run: 15 of 39 chunks carried both "singing continuously and directly to
-camera" and "Instrumental passage: the character performs silently" in the
-same prompt. Whether someone is singing is per-chunk state; parts 5 and 6
-must not both try to own it. Appearance and demeanour belong in the
-role/appearance/demeanour fields; vocal action does not.
-
-**A `role`/`demeanour` prohibition does not work, and now warns (issue
-#73/#74).** ``config.py``'s ``_warn_if_prohibition`` logs, at load time,
-when either field reads as a negation ("never", "no", "without") -- the
-exact shape that let a bass guitar back into two shots after the field
-carrying the prohibition was in force for the entire render. This module
-composes whatever text it is given without judging it; the warning is the
-project's only defence against shipping another unenforceable prohibition,
-and it fires before any GPU time is spent, not after.
-
-The same trap reopens with more than one active character: it would be easy
-to compose something like "both singing together" into the shared clause
-when widening part 5 for two names. That is exactly the mistake above, just
-relocated -- who is audible on a given chunk is per-chunk state owned solely
-by part 6's lyric/instrumental clause, never by the character-attached
-clause, no matter how many characters that clause names.
-
-**Appearance direction inherits that same rule and for the same reason.**
-``CastMember.appearance`` and ``config.global_appearance`` are
-character-attached (part 5), so like ``role`` they are injected into every
-chunk that member appears in, voiced or not. Text describing what the
-character is doing vocally -- "mid-note", "singing", "mouth open on a
-lyric" -- belongs nowhere in either field; it would win over part 6's
-instrumental clause exactly as the original role bug did. Appearance is
-presentation only: lighting, styling, grading, apparent age.
-
-**Camera direction (issue #53).** ``ShotPlanEntry.camera`` -- this chunk's
-own framing and movement -- is composed as a **trailing clause** appended to
-the concept/shot sentence (part 3), never as its own sentence. This is not a
-style choice: ``docs/shot-writing-guide.md``'s highest-leverage finding is
-that H3 renders the grammatical subject of a sentence and largely drops what
-sits in subordinate clauses. A camera direction given its own sentence would
-put "camera" (or "the camera") in subject position, competing with whatever
-the shot is actually about for the render's attention -- exactly the bug that
-sentence-position rule exists to prevent. Composed by
-:func:`_apply_camera_clause` before the rest of the sentence assembly runs,
-so the author cannot accidentally give it a sentence of its own by writing it
-that way in ``shot`` -- the field and the render loop own where it lands, not
-the author.
-
-**Chained I2V prompt variant (issue #46).** ``expand_prompt`` composes a
-*second* variant of the prompt -- ``ExpandedPrompt.chained_prompt`` -- for the
-chained-render path, where ``MiniMaxH3ImageToVideo`` has no ``ref_images``
-input at all and identity comes entirely from ``first_frame``, the
-predecessor chunk's own output. Part 4's appearance direction
-(``CastMember.appearance``, ``config.global_appearance``) tells the model how
-to read a cast *photo*; on the chained path there is no photo, and that frame
-is already the output of the appearance clause, so restating it applies the
-clause a second time to its own result. With a relative directive ("looking a
-few years younger") that compounds once per chained chunk. So the chained
-variant omits BOTH appearance sources -- even an absolute clause, since it is
-redundant against the seed frame and only competes with it for influence --
-while keeping everything else byte-identical: global style, concept/shot
-line, setting, the character's name and role, the lyric clause, counterpoint
-clauses, the refocus sentence. The name and role stay because the model still
-needs to know who is on screen and what they are doing; it is only the
-*appearance description* that is chained-path noise.
-
-This is **one composition function parameterised**, not a second hand-written
-composer -- ``_compose_prompt`` (and everything it calls down to
-``_appearance_text`` / ``_global_appearance_text``) takes an
-``include_appearance`` flag, so the two variants can never drift out of step
-with each other the way two independent implementations could.
-
-**Demeanour (issue #74) is deliberately NOT gated by ``include_appearance``.**
-It survives on both prompt variants, restated every chunk exactly like
-``role`` already is. This is not an oversight -- appearance is stripped
-because it describes how to read a *photo* the chained path does not have;
-demeanour is behavioural direction about who the character is being right
-now, the same kind of statement as ``role``, and the model still needs that
-on the chained path just as it still needs the name and role. It is also
-safe to restate: :attr:`~music_video_maker.config.RunConfig.global_demeanour`
-and :attr:`~music_video_maker.contracts.CastMember.demeanour` are required
-to be phrased as an endpoint, never a displacement (see those fields'
-docstrings and :func:`~music_video_maker.config._warn_if_displacement`), and
-an endpoint restated against a frame that already embodies it changes
-nothing -- unlike a relative directive, it does not compound.
-
-When neither the member nor the run has any appearance text, both variants
-compose to the same string, and ``chained_prompt`` is still populated (never
-left ``None``) -- "no appearance to strip" and "no variant composed" are
-different facts, and a caller must not have to infer one from the other to
-decide whether it is safe to call ``ExpandedPrompt.text_for(chained=True)``.
-
-Character resolution happens exactly once, upstream, at lyric-parse time
-(issue #6, widened by #33): ``LyricLine.characters`` -> ``AlignedSegment.characters``
--> ``AudioChunk.characters``, a tuple with the primary vocalist first. By the
-time a chunk reaches this module, ``chunk.characters`` is already
-authoritative -- this module does **not** re-derive it and does **not**
-accept a :class:`~music_video_maker.contracts.CastResolver`. What this module
-*does* still do is turn each name in that tuple into a :class:`CastMember` via
-``config.cast`` (order preserved, unknown name -> :class:`UnknownCastMemberError`
-naming the offender) and fall back to ``config.default_lead_vocalist`` when
-the tuple is empty -- that is name-to-cast-member lookup, not the character
-*assignment* decision, which stays upstream.
-
-(An earlier revision of this module tried to resolve the active character
-itself via ``CastResolver.resolve(chunk.source_segment_indices[0])``. That
-was wrong: ``source_segment_indices`` indexes Stage 1's *AlignedSegment*
-space, which ``regroup=True`` reshapes independently of the LyricLine space
-``CastResolver.resolve`` expects -- one lyric line can become several
-segments or several lines can merge into one, so segment index N is not
-line index N. Mixing the two index spaces silently picked the wrong cast
-member. Do not reintroduce a resolver parameter here; use
-``chunk.characters`` instead.)
 """
 
 from __future__ import annotations
@@ -423,11 +307,9 @@ def _compose_prompt(
         _present_clause(present, include_appearance),
         lyric_clause,
         *_counterpoint_clauses(chunk),
-        # Issue #73: composed last, deliberately -- see _avoid_clause's own
-        # docstring for why this is a best-effort textual hint rather than a
-        # guarantee, and why late position (away from any subject-establishing
-        # slot) is the safest available placement for it.
-        _avoid_clause(config.avoid),
+        # Issue #73: `config.avoid` is deliberately NOT composed here. It was,
+        # for exactly one render, and it manufactured what it forbids -- see
+        # `RunConfig.avoid`'s docstring for the measurement.
     )
     return _join_sentences(parts)
 
@@ -723,32 +605,6 @@ def _global_demeanour_text(config: RunConfig) -> str | None:
     if config.global_demeanour and config.global_demeanour.strip():
         return config.global_demeanour.strip().rstrip(".")
     return None
-
-
-def _avoid_clause(avoid: tuple[str, ...]) -> str | None:
-    """Issue #73: things this video must never depict, anywhere, composed as
-    one final clause. See :attr:`~music_video_maker.config.RunConfig.avoid`'s
-    docstring for the full reasoning; the short version repeated here because
-    it is the load-bearing caveat for this function specifically:
-
-    **This is textual negation in the same single positive-conditioning
-    ``prompt`` channel that #73 measured failing for `role`.** The corrected
-    role "...never holding anything" rendered a bass guitar into the same
-    hands twice, because the only tokens a diffusion prompt actually sees in
-    that phrase are "holding" and "anything" -- there is no dedicated
-    negative-conditioning input on the committed workflow graphs for this
-    list to use instead (see ``config.py``'s ``avoid`` docstring for the
-    graph-level detail). This clause is a best-effort hint, shipped because
-    it is strictly better than the dead weight the concept's own ``avoid``
-    list was before (#73's F13 finding: composed into the *authoring* prompt
-    only, never the render), not because it is expected to reliably work.
-
-    ``()`` (the default) composes nothing, so a config that never sets
-    ``avoid`` renders byte-identical to before this function existed."""
-    items = [item.strip() for item in avoid if item and item.strip()]
-    if not items:
-        return None
-    return f"This shot must never depict, anywhere in frame: {', '.join(items)}"
 
 
 def _lyric_clause(

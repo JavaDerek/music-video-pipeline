@@ -400,47 +400,35 @@ class RunConfig:
     always has."""
 
     avoid: tuple[str, ...] = ()
-    """Issue #73: things this video must never depict, anywhere, e.g.
-    ``["bass guitar", "microphone", "stage"]`` -- composed into *every*
-    prompt exactly like :attr:`setting` (a whole-video property, so it must
-    not be able to drift chunk to chunk).
+    """Issue #73: things this video must never depict. **Read by the
+    authoring layer, never composed into a render prompt.**
 
-    **The render-side field the authoring concept's own ``avoid`` list never
-    had.** ``music_video_maker/authoring/concept.py`` already collects an
-    ``avoid`` list per song and ``authoring/beats.py`` and
-    ``authoring/prose.py`` both compose it into the *authoring* model's own
-    prompt ("Deliberately NOT on screen: ...") -- but that only ever
-    influences what the LLM writes into a shot line at authoring time. It
-    never reached the deterministic render prompt Stage 2b actually
-    conditions H3 with, and nothing checked a shot against it either (issue
-    #73's F13 finding: an orphaned field, dead weight). This is that
-    connection's render-side half: an operator (or, in a future
-    ``authoring/write.py`` change outside this field's scope -- see the
-    project report for the exact diff) copies the concept's ``avoid`` list
-    into this run-config field, and from there it reaches every prompt.
+    It was composed into every render prompt for exactly one full render of
+    "Deathless", and it manufactured what it forbids. Measured as a
+    single-variable A/B at an identical seed, one clause different:
 
-    **Read this honestly: composing a negative list into the positive prompt
-    is not expected to reliably prevent the thing it names.** The committed
-    workflow templates (``workflow_api.json``, ``workflow_i2v_api.json`)
-    give ``MiniMaxH3ReferenceToVideo``/``MiniMaxH3ImageToVideo`` exactly one
-    ``prompt`` input feeding a single ``BasicGuider`` -- there is no second,
-    negative-conditioning channel the way an SDXL-style graph would have one
-    (a ``CFGGuider`` with a negative ``CLIPTextEncode``). So this list has
-    the identical mechanism, and therefore the identical unreliability, as
-    ``role``'s failed ``"never holding anything"`` (#73): the tokens present
-    are the forbidden object's own name. It is shipped anyway because it is
-    strictly better than dead weight -- the concept's own list already reads
-    "no instruments, stages, or microphones" and *something* composing it in
-    beats nothing composing it in -- but the durable fix for a *specific*
-    contradiction (a shot line that hands the character the forbidden
-    object, as chunk 72's needle did) is a lint comparing the authored shot
-    text against this list, symmetric to the ``role``-prohibition lint
-    ``shot_plan.py`` owns; see the project report for that exact diff. A
-    dedicated negative-conditioning graph path is the mechanism-level fix and
-    is out of scope here (``workflow_graph.py``, needs a render to validate).
+    * chunk 72, whose shot has no climbing in it and whose character's
+      ``role`` has no climbing in it -- WITH ``avoid = [..., "modern climbing
+      equipment, ropes, harnesses or safety gear"]`` H3 rendered a full
+      climbing harness, carabiners and a trailing rope on him. WITHOUT it,
+      plain trousers, with the framing, background and both characters
+      otherwise unchanged.
+    * chunk 53, where the shot already has her climbing on a rope, was
+      unaffected by the same clause.
 
-    ``()`` (the default) composes nothing, so every config written before
-    this field existed renders byte-identical to before."""
+    ``MiniMaxH3ReferenceToVideo`` exposes one ``prompt`` input into a single
+    ``BasicGuider``. There is no negative-conditioning channel, so a
+    prohibition cannot subtract; it can only add its own nouns to the only
+    channel there is. Where the scene supplies no other source for those
+    nouns, the prohibition becomes the source -- which is why it does damage
+    precisely where it has nothing to suppress, and why one chunk alone reads
+    as "inert".
+
+    The authoring-side ``avoid`` (concept -> beats/prose) is untouched and
+    still worth setting: a model reading English does treat it as an
+    instruction. This field stays so a run can carry that intent to the
+    authoring layer -- but nothing downstream of Stage 2b may compose it.
+    """
 
     cinematography: str | None = None
     """Issue #53: the whole-video film-direction language -- stock, lens,

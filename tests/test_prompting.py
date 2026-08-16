@@ -1386,38 +1386,43 @@ def test_no_demeanour_fields_set_leaves_the_prompt_byte_identical(config: RunCon
 # --------------------------------------------------------------------------- #
 
 
-def test_avoid_list_is_composed_as_a_final_clause(config: RunConfig, cast):
-    cfg = dataclasses.replace(config, avoid=("bass guitar", "microphone"))
+def test_avoid_list_is_never_composed_into_a_prompt(config: RunConfig, cast):
+    """Issue #73, reversed by measurement on "Deathless" chunk 72.
+
+    An A/B at an identical seed, one clause different: WITH the avoid list
+    ("modern climbing equipment, ropes, harnesses or safety gear") H3 put a
+    full climbing harness, carabiners and a trailing rope on a character
+    whose role has no climbing in it and whose shot line has no climbing in
+    it. WITHOUT it, plain trousers and nothing else changed -- same framing,
+    same background, same people.
+
+    H3 exposes one prompt input into a single BasicGuider; there is no
+    negative-conditioning channel. So a prohibition can only ever ADD its own
+    nouns to the only channel there is, and where the scene supplies no other
+    source for them, that is where they come from. On a chunk that already
+    implied climbing the same clause changed nothing, which is why one chunk
+    alone would have read as "inert" -- it manufactures what it forbids
+    precisely where it has nothing to suppress.
+
+    The authoring-side `avoid` (concept -> beats/prose, where a real model
+    reads it as an instruction) is untouched and still useful. This is only
+    about the render path."""
+    cfg = dataclasses.replace(config, avoid=("bass guitar", "climbing harness"))
     chunk = _chunk(text="the lucky ones", character="Dianne")
 
     result = expand_prompt(cfg, chunk)
 
-    assert result.prompt.endswith(
-        "This shot must never depict, anywhere in frame: bass guitar, microphone."
-    )
+    assert "bass guitar" not in result.prompt.lower()
+    assert "climbing harness" not in result.prompt.lower()
+    assert "never depict" not in result.prompt.lower()
 
 
-def test_avoid_list_composes_on_an_instrumental_chunk_too(config: RunConfig, cast):
-    cfg = dataclasses.replace(config, avoid=("bass guitar",))
-    chunk = _chunk(text="", character="Dianne")
-
-    result = expand_prompt(cfg, chunk)
-
-    assert result.prompt.endswith(
-        "This shot must never depict, anywhere in frame: bass guitar."
-    )
-
-
-def test_avoid_list_composes_on_the_chained_variant_too(config: RunConfig, cast):
-    """Not gated by include_appearance -- this is an exclusion list, not a
-    photo description, so both render paths need it equally."""
-    cfg = dataclasses.replace(config, avoid=("bass guitar",))
+def test_setting_avoid_changes_nothing_about_the_composed_prompt(config: RunConfig, cast):
+    """The whole prompt, byte-for-byte, with and without an avoid list."""
     chunk = _chunk(text="the lucky ones", character="Dianne")
+    with_avoid = dataclasses.replace(config, avoid=("bass guitar", "microphone"))
 
-    result = expand_prompt(cfg, chunk)
-
-    assert result.chained_prompt is not None
-    assert "This shot must never depict, anywhere in frame: bass guitar." in result.chained_prompt
+    assert expand_prompt(with_avoid, chunk).prompt == expand_prompt(config, chunk).prompt
 
 
 def test_empty_avoid_list_produces_no_avoid_clause(config: RunConfig, cast):
