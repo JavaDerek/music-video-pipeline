@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+import music_video_maker.slicing as slicing_module
 from music_video_maker import hardware
 from music_video_maker.contracts import AlignmentResult, AudioChunk, HardwareProfile
 from music_video_maker.slicing import slice_audio
@@ -270,6 +271,388 @@ def test_each_individual_split_piece_never_shrinks_below_its_own_raw_share(tmp_p
     raw_share = 15.2 / 2
     assert chunks[0].duration >= raw_share - _EPS
     assert chunks[0].frame_count == 192  # 8.0s -- rounds UP from 7.6s, not down to 175 (7.29s)
+
+
+# --------------------------------------------------------------------------- #
+# issue #70: interior split boundaries prefer the nearer segment edge over a
+# purely geometric cut point, so a sung phrase isn't split mid-utterance.
+#
+# Before this fix, pass 2 (`_split_for_maximum`) divided an over-long group
+# into geometrically equal pieces with no regard for where the group's own
+# member segments started and ended. On "Deathless" that put 26 of 80 chunk
+# boundaries strictly inside an aligned vocal segment -- cutting the phrase
+# mid-word and rendering the two halves as independent shots, with no error
+# anywhere: every chunk is individually valid, the timeline is contiguous,
+# every fingerprint matches, and the defect exists only in the assembled
+# video's lip-sync.
+#
+# The first three tests exercise `_split_for_maximum` directly (white-box,
+# like the ChunkFrameMismatchError tests above) with hand-built `_Group`s so
+# the exact percentage-through-the-segment a boundary lands at can be
+# controlled precisely -- through the full `slice_audio` pipeline, grid
+# quantization cascades (and pass 1's own merge geometry -- see the
+# integration test at the end of this section) make hitting a specific
+# percentage by construction impractical. A `_Group` built this way is still
+# a fully legitimate input to `_split_for_maximum`, whose contract only cares
+# about `start`/`end`/`members`, never how the group was assembled.
+# --------------------------------------------------------------------------- #
+
+
+def test_boundary_shallow_into_a_segment_snaps_to_its_start(tmp_path, caplog):
+    """The 7:57 lag from the issue: a boundary landing just 15% into a
+    segment snaps backward to that segment's start instead, landing the cut
+    in the instrumental gap before it rather than mid-phrase.
+
+    ``member1``'s start is deliberately grid-exact (226 frames = 9.41666s)
+    so the snap lands with zero grid-rounding residue -- see
+    ``_quantize_split_end``'s ceil-based rounding, which this sidesteps by
+    construction so the "clean escape" case is unambiguous. The
+    duration-window-refusal and floor-clamp-residue cases are covered by the
+    dedicated tests below and by the end-to-end integration test.
+    """
+    member1_start = 226 / 24  # 9.41666...s, exactly grid frame 226
+    member0 = make_aligned_segment(0, "everything before it", 0.0, 9.0, "Dianne")
+    member1 = make_aligned_segment(
+        1, "the war.", member1_start, member1_start + 35 / 9, "Dianne"
+    )
+    group = slicing_module._Group(members=(member0, member1), start=0.0, end=20.0)
+
+    with caplog.at_level(logging.INFO):
+        pieces = slicing_module._split_for_maximum(
+            [group], DEFAULT_HARDWARE.min_chunk_seconds, DEFAULT_HARDWARE.max_chunk_seconds, GRID
+        )
+
+    assert len(pieces) == 2
+    first, second = pieces
+    # The default geometric split (10.0s, the group's midpoint) would have
+    # landed 15% into member1; the snap instead lands exactly on its start.
+    assert first.end == pytest.approx(member1_start, abs=1e-6)
+    assert second.start == first.end
+    assert "snapped to the start edge" in caplog.text
+    assert "issue #70" in caplog.text
+    # No mid-utterance warning: the snap actually escaped the segment.
+    assert "cutting a sung phrase mid-utterance" not in caplog.text
+
+
+def test_boundary_deep_into_a_segment_snaps_to_its_end(tmp_path, caplog):
+    """The 92%-through fragment from the issue (chunk 38): a boundary
+    landing 92% through a segment snaps forward to that segment's end
+    instead, so the whole phrase stays in one chunk rather than handing the
+    final 8% to the next one as an orphan fragment.
+
+    ``member1``'s end is deliberately grid-exact (243 frames = 10.125s) for
+    the same zero-residual reason as the shallow-cut test above.
+    """
+    member0 = make_aligned_segment(0, "everything before it", 0.0, 8.0, "Dianne")
+    member1 = make_aligned_segment(
+        1, "the parts they played in america's war.", 8.5625, 10.125, "Dianne"
+    )
+    group = slicing_module._Group(members=(member0, member1), start=0.0, end=20.0)
+
+    with caplog.at_level(logging.INFO):
+        pieces = slicing_module._split_for_maximum(
+            [group], DEFAULT_HARDWARE.min_chunk_seconds, DEFAULT_HARDWARE.max_chunk_seconds, GRID
+        )
+
+    assert len(pieces) == 2
+    first, second = pieces
+    # The default geometric split (10.0s) would have landed 92% into
+    # member1 (fragmenting the last 8%); the snap lands exactly on its end.
+    assert first.end == pytest.approx(10.125, abs=1e-6)
+    assert second.start == first.end
+    assert "snapped to the end edge" in caplog.text
+    assert "issue #70" in caplog.text
+    assert "cutting a sung phrase mid-utterance" not in caplog.text
+
+
+def test_snap_refused_when_it_would_violate_the_duration_window(tmp_path, caplog):
+    """A snap that would satisfy the segment-edge preference but push the
+    resulting chunk outside the duration window is refused -- the window is
+    a harder constraint than the preference for a clean cut. The unsnapped,
+    geometric boundary is used instead, and it still cuts mid-utterance here,
+    so that gets logged at WARNING with the percentage through the segment.
+    """
+    member = make_aligned_segment(
+        0, "the parts they played in america's war.", 2.0, 8.5, "Dianne"
+    )
+    group = slicing_module._Group(members=(member,), start=0.0, end=15.0)
+
+    with caplog.at_level(logging.WARNING):
+        pieces = slicing_module._split_for_maximum(
+            [group], MAX8_HARDWARE.min_chunk_seconds, MAX8_HARDWARE.max_chunk_seconds, GRID
+        )
+
+    assert len(pieces) == 2
+    first, second = pieces
+    # The nearer edge (the segment's end, 8.5s) would quantize to ~8.708s,
+    # outside the 5.167-8.0s window this profile enforces -- refused. The
+    # unsnapped geometric split (7.5s raw) quantizes to exactly 8.0s instead,
+    # which still lands inside the segment.
+    assert first.end == pytest.approx(8.0, abs=1e-6)
+    assert second.start == first.end
+    assert "snapped to the" not in caplog.text
+    assert "lands 92.3% through segment" in caplog.text
+    assert "duration window" in caplog.text
+    assert "issue #70" in caplog.text
+
+
+def test_snap_refused_when_no_usable_segment_edge_exists(tmp_path, caplog):
+    """A single continuous segment spanning the whole group has no interior
+    edge to offer -- both candidate "edges" collapse onto the group's own
+    start and end, which is not a real split point. The cut still lands
+    inside the segment and is still logged, but no snap is even attempted.
+    """
+    segments = (
+        make_aligned_segment(
+            0,
+            "we started this together side by side and we'll carry on despite the noise "
+            "no matter how far we wander we will always find our way back home again",
+            0.0,
+            18.5,
+            "Dianne",
+        ),
+    )
+    group = slicing_module._Group(members=segments, start=0.0, end=18.5)
+
+    with caplog.at_level(logging.WARNING):
+        pieces = slicing_module._split_for_maximum(
+            [group], DEFAULT_HARDWARE.min_chunk_seconds, DEFAULT_HARDWARE.max_chunk_seconds, GRID
+        )
+
+    assert len(pieces) == 2
+    assert "snapped to the" not in caplog.text
+    assert "lands 50.9% through segment" in caplog.text
+    assert "issue #70" in caplog.text
+
+
+def test_split_for_maximum_on_empty_groups_returns_no_pieces():
+    """The zero-segment / wholly-instrumental case (issue #70's fourth named
+    scenario): with no groups at all -- what `_merge_for_minimum` returns for
+    a zero-segment alignment -- there is nothing to split and nothing to
+    snap. `cover_instrumentals` is what tiles the resulting empty piece list
+    across the whole track; see the "wholly unvoiced track" test in the
+    instrumental-coverage section further down, which confirms that still
+    works end-to-end after this change."""
+    pieces = slicing_module._split_for_maximum(
+        [], DEFAULT_HARDWARE.min_chunk_seconds, DEFAULT_HARDWARE.max_chunk_seconds, GRID
+    )
+    assert pieces == []
+
+
+def test_snap_refused_when_edge_is_closer_to_cursor_than_the_trained_floor(tmp_path, caplog):
+    """Regression test for a real bug found on "Deathless": the acceptance
+    check compared the *clamped* duration against ``[eff_min, eff_max]``,
+    which is vacuous whenever ``eff_min`` sits at (or near) H3's trained
+    floor -- as it does on the real, production ``DEFAULT_HARDWARE``
+    profile -- because ``clamp_to_trained`` forces the duration into that
+    exact range regardless of how far it actually had to move the boundary.
+
+    Measured live: on "Deathless" (57 aligned segments, real ``run.toml``),
+    segment 7's start sat only 1.66s past the cursor. The old code logged
+    "snapped to the start edge (106.630s)" and then, for the very same
+    boundary, "lands 45.7% through segment index=7" -- because clamping
+    had silently relocated the "snapped" boundary 3.5s past the edge it
+    claimed to hit, right back inside the segment. All 6 of that run's
+    snap attempts behaved identically: 6 INFOs, 7 WARNINGs (the 7th had no
+    snap attempt at all), and not one boundary actually reached an edge.
+
+    This reproduces that shape with round numbers: a merge-formed group
+    whose only interior edge sits 1.66s past ``cursor`` -- structurally
+    exactly what ``_merge_for_minimum`` always produces (the merge only
+    happens because that edge is *closer* to the group's start than
+    ``eff_min``, so it can never independently satisfy the padding-alone
+    branch -- see this module's section docstring) -- with
+    ``DEFAULT_HARDWARE``'s trained-floor-pinned ``eff_min``.
+    """
+    member = make_aligned_segment(
+        1, "out of the heat and into the fire,", 1.66, 20.0, "Dianne"
+    )
+    group = slicing_module._Group(members=(member,), start=0.0, end=20.0)
+
+    with caplog.at_level(logging.INFO):
+        pieces = slicing_module._split_for_maximum(
+            [group], DEFAULT_HARDWARE.min_chunk_seconds, DEFAULT_HARDWARE.max_chunk_seconds, GRID
+        )
+
+    assert len(pieces) == 2
+    first = pieces[0]
+    # The edge (1.66s) is far too close to cursor=0 for any grid point that
+    # actually reaches it to clear the 5.167s trained floor, so the snap
+    # must be refused outright -- the boundary used is the untouched,
+    # unsnapped geometric default (raw target 10.0s, quantized up to
+    # 10.125s), identical to what pre-#70 code would have produced.
+    assert first.end == pytest.approx(243 / 24, abs=1e-6)
+    # No accepted-snap claim, ever, for this boundary.
+    assert "snapped to the" not in caplog.text
+    # Exactly one honest report of the cut that could not be avoided.
+    assert caplog.text.count("cutting a sung phrase mid-utterance") == 1
+    assert "trained-range clamp" in caplog.text
+
+
+def test_full_pipeline_never_falsely_claims_a_snap_that_did_not_happen(tmp_path, caplog):
+    """End-to-end version of the regression above, through `slice_audio`
+    rather than `_split_for_maximum` directly: a short segment forces a
+    pass-1 merge, the merged group exceeds the max-duration bound, and pass
+    2's only interior edge (the merged-in segment's own start, 2.3s past
+    the group's start) is too close to the cursor for any snap to survive
+    the trained-floor clamp -- so `slice_audio` must report the resulting
+    mid-utterance cut honestly rather than claim a snap it didn't achieve.
+
+    This is not a hypothetical: on the real "Deathless" alignment, every
+    merge-formed group's interior edges are -- by construction of
+    `_merge_for_minimum` (see this module's section docstring) -- within
+    `eff_min` of that group's own start, which on the real, production
+    hardware profile is pinned to H3's trained floor. So on real material,
+    a pass-2 snap essentially never has room to succeed; what it *can* do
+    is correctly warn about the cut, instead of silently rendering the
+    wrong chunk with no error anywhere (the original defect) or, worse,
+    lying about having fixed it.
+    """
+    segments = (
+        make_aligned_segment(0, "oh yeah", 0.0, 2.0, "Dianne"),
+        make_aligned_segment(
+            1,
+            "the parts they played in america's war and the memories that linger long after",
+            2.3,
+            17.0,
+            "Dianne",
+        ),
+    )
+    alignment = AlignmentResult(segments=segments, track_duration=20.0)
+    master = write_silent_wav(tmp_path / "master.wav", alignment.track_duration)
+
+    with caplog.at_level(logging.INFO):
+        chunks = slice_audio(master, alignment, DEFAULT_HARDWARE, tmp_path / "chunks")
+
+    _assert_timeline_sane(chunks)
+    _assert_frame_grid_exact(chunks)
+
+    # The honest outcome: no claimed snap, and exactly one warning about
+    # the cut it genuinely could not avoid.
+    assert "snapped to the" not in caplog.text
+    assert caplog.text.count("cutting a sung phrase mid-utterance") == 1
+    assert "issue #70" in caplog.text
+
+    # No content lost regardless: every original segment's span is still
+    # fully covered by some chunk's [start, end) window (same invariant
+    # already checked elsewhere in this file for the padding/quantization
+    # passes) -- the preference failing to activate must never regress the
+    # pre-existing "never truncate vocal audio" guarantee.
+    by_index = {seg.index: seg for seg in alignment.segments}
+    covered_end = {}
+    for chunk in chunks:
+        for seg_index in chunk.source_segment_indices:
+            covered_end[seg_index] = max(covered_end.get(seg_index, 0.0), chunk.end)
+    for seg_index, seg in by_index.items():
+        assert seg_index in covered_end
+        assert covered_end[seg_index] >= seg.end - _EPS
+
+
+# --------------------------------------------------------------------------- #
+# issue #70, second mechanism: instrumental-coverage's own re-anchoring can
+# ALSO land a chunk boundary inside a segment -- and measured on the real
+# "Deathless" alignment, this is the *dominant* source (27 final mid-segment
+# boundaries vs. pass 2's 7), not pass 2's max-duration split. This pass
+# only reports it (at the boundary a render will actually use), the same
+# "cut where it must and log" fallback pass 2 uses when no snap is safe --
+# it does not attempt to avoid it; see `_log_final_boundary_segment_cuts`'s
+# docstring for why extending the *avoidance* here is out of scope for a
+# change with no render available to verify it against.
+# --------------------------------------------------------------------------- #
+
+
+def test_retiling_residue_landing_inside_a_segment_is_logged(caplog):
+    """A gap narrower than H3's trained floor (124 frames, 5.167s) cannot
+    host even one filler chunk (`_plan_frames_run` returns `()` for it), so
+    `_cover_instrumentals` absorbs it entirely: the next piece is placed
+    immediately after the previous one's end, with no filler at all, rather
+    than at its own true (pre-retiling) start.
+
+    Here that shifts the second piece 1.0s earlier than where passes 1-3
+    placed it. Its duration is unchanged, so its end also moves 1.0s
+    earlier -- from 14.167s (which fully covered the segment's true
+    8.5-14.0s span) to 13.167s, which now falls *inside* that span. Pass 2
+    never had a boundary anywhere near this piece (it was never part of a
+    max-duration split), so only this pass can see the cut.
+    """
+    seg0 = make_aligned_segment(0, "first line here", 0.0, 7.0, "Dianne")
+    seg1 = make_aligned_segment(1, "second line here", 8.5, 14.0, "Dianne")
+    piece0_end = 175 / 24  # grid-exact, 7.291666...s
+    piece1_true_start = piece0_end + 1.0  # true gap: 1.0s, below the trained floor
+    piece0 = slicing_module._Piece(
+        members=(seg0,), start=0.0, end=piece0_end, is_split_continuation=False, frame_count=175
+    )
+    piece1 = slicing_module._Piece(
+        members=(seg1,),
+        start=piece1_true_start,
+        end=piece1_true_start + 141 / 24,
+        is_split_continuation=False,
+        frame_count=141,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        covered = slicing_module._cover_instrumentals(
+            [piece0, piece1],
+            (seg0, seg1),
+            track_duration=20.0,
+            eff_min=DEFAULT_HARDWARE.min_chunk_seconds,
+            eff_max=DEFAULT_HARDWARE.max_chunk_seconds,
+            grid=GRID,
+        )
+
+    # The gap was fully absorbed: piece1 starts exactly where piece0 ends,
+    # 1.0s earlier than its true start.
+    retiled_piece1 = covered[1]
+    assert retiled_piece1.start == pytest.approx(piece0_end, abs=1e-6)
+    assert retiled_piece1.end == pytest.approx(piece0_end + 141 / 24, abs=1e-6)
+
+    assert "Final chunk boundary" in caplog.text
+    assert "after instrumental-coverage retiling" in caplog.text
+    assert "lands 84.8% through segment index=1" in caplog.text
+    assert "issue #70" in caplog.text
+    # Distinguishable from pass 2's own wording -- this is a different
+    # mechanism reporting a different (the actual, final) position.
+    assert "No segment-edge snap" not in caplog.text
+
+
+def test_no_final_boundary_warning_when_retiling_introduces_no_drift(caplog):
+    """Control case: a gap that exactly matches a valid grid duration (here,
+    the trained floor itself, 124 frames = 5.167s) tiles as a single filler
+    chunk with zero residue, so the following piece lands exactly where
+    passes 1-3 put it -- comfortably covering its own segment, same shape
+    as the drifting case above -- and nothing is logged."""
+    seg0 = make_aligned_segment(0, "first line here", 0.0, 7.0, "Dianne")
+    seg1 = make_aligned_segment(1, "second line here", 12.6, 18.2, "Dianne")
+    piece0_end = 175 / 24  # 7.291666...s
+    gap = 124 / 24  # 5.166666...s -- exactly the trained floor, zero-residue
+    piece1_start = piece0_end + gap  # 12.458333...s
+    piece0 = slicing_module._Piece(
+        members=(seg0,), start=0.0, end=piece0_end, is_split_continuation=False, frame_count=175
+    )
+    piece1 = slicing_module._Piece(
+        members=(seg1,),
+        start=piece1_start,
+        end=piece1_start + 141 / 24,
+        is_split_continuation=False,
+        frame_count=141,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        covered = slicing_module._cover_instrumentals(
+            [piece0, piece1],
+            (seg0, seg1),
+            track_duration=20.0,
+            eff_min=DEFAULT_HARDWARE.min_chunk_seconds,
+            eff_max=DEFAULT_HARDWARE.max_chunk_seconds,
+            grid=GRID,
+        )
+
+    # covered[0] is piece0 (no leading gap, since piece0.start == 0.0);
+    # covered[1] is the single zero-residue filler chunk covering the gap;
+    # covered[2] is piece1, followed by trailing filler out to track_duration.
+    retiled_piece1 = covered[2]
+    assert retiled_piece1.start == pytest.approx(piece1_start, abs=1e-6)
+    assert "Final chunk boundary" not in caplog.text
 
 
 # --------------------------------------------------------------------------- #

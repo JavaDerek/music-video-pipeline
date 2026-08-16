@@ -21,7 +21,17 @@ Three enforcement passes, applied in order:
    longer than the maximum is split into pieces, each landing on a valid H3
    frame-grid point via ``FrameGrid.quantize_up`` (never down -- see
    ``_split_for_maximum``'s docstring for why). 2nd+ pieces get
-   ``is_split_continuation=True``.
+   ``is_split_continuation=True``. An interior split point that would
+   otherwise land inside one of the group's own aligned segments prefers
+   snapping to that segment's nearer edge instead (issue #70) -- a purely
+   geometric split point has no idea a sung phrase is still in progress
+   there, and the two halves render as independent shots with no error
+   anywhere. The snap is only ever a preference: if it would violate the
+   duration window (or there is no usable edge to snap to at all -- a single
+   continuous segment spanning the whole group has none), the geometric
+   point is used exactly as before and the cut is logged at WARNING with how
+   far through the segment it lands, so a 92%-through fragment is visible
+   before hours of GPU time rather than after. See ``_snap_to_segment_edge``.
 3. **Frame-grid quantization** (issue #20): every chunk that pass 2 did
    *not* already grid-quantize (i.e. every un-split single-group chunk) gets
    its duration snapped to the nearest valid H3 ``length`` frame count via
@@ -42,6 +52,20 @@ quantization here instead, and re-slicing the audio to exactly the chosen
 frame count, means the audio duration and the rendered video duration are
 identical by construction -- there is nothing left for a later stage to
 round.
+
+A fourth, opt-in pass (``_cover_instrumentals``, issue #21) re-anchors every
+chunk into a contiguous ``[0, track_duration]`` covering -- see that
+function's docstring. Measured on real material, its own grid-quantized
+filler tiling is issue #70's *larger* source of mid-utterance boundary cuts,
+bigger than pass 2's max-duration split: on "Deathless" it moved every one
+of pass 2's 12 pre-retiling hits to a new position and introduced 15 more
+that pass 2 never touched, for 27 in total. Unlike pass 2, this pass does
+not attempt to *avoid* those cuts -- only report them, at the boundary
+position a render will actually use, via
+``_log_final_boundary_segment_cuts`` -- because doing so safely would mean
+biasing filler-tiling choices without weakening this file's one
+non-negotiable invariant (below): a change not to make without a render to
+verify it against.
 
 A fifth, opt-in pass sits on top of pass 4 (issue #27): **editorial shot
 length**. Passes 1-3 make every shot 5-8 s -- not because anyone chose that
@@ -264,8 +288,139 @@ def _merge_for_minimum(
 # --------------------------------------------------------------------------- #
 
 
+def _quantize_split_end(
+    cursor: float, target_end: float, grid: FrameGrid
+) -> tuple[int, float, bool]:
+    """Grid-quantize a candidate split boundary the way pass 2 always has:
+    ceil, never down, from ``cursor`` to ``target_end``.
+
+    Factored out of :func:`_split_for_maximum`'s main loop so
+    :func:`_snap_to_segment_edge` (issue #70) can trial a segment-edge
+    candidate through exactly the same math the real split uses, rather than
+    a second implementation that could quietly disagree with it. See the
+    ceil-vs-round comment inline in :func:`_split_for_maximum` for why this
+    always rounds up.
+
+    Returns ``(frames, piece_end, was_clamped)``. ``was_clamped`` is True
+    when ``clamp_to_trained`` actually changed the grid-quantized frame
+    count -- i.e. the point that truly reaches ``target_end`` lies outside
+    H3's trained range, so what got returned is *not* that point but the
+    nearest one inside the trained range instead. The unsnapped default
+    path ignores this; :func:`_snap_to_segment_edge` cannot -- see its
+    docstring for why a clamped snap is not a snap at all.
+    """
+    raw_duration = target_end - cursor
+    requested_frames = math.ceil(grid.seconds_to_frames(raw_duration) - _EPS)
+    frames_unclamped = grid.quantize_up(requested_frames)
+    frames = grid.clamp_to_trained(frames_unclamped)
+    return frames, cursor + grid.frames_to_seconds(frames), frames != frames_unclamped
+
+
+def _segment_containing(
+    point: float, members: tuple[AlignedSegment, ...]
+) -> AlignedSegment | None:
+    """The member whose *interior* strictly contains ``point``, or ``None``.
+
+    Touching an edge (within ``_EPS``) is a clean cut between two segments,
+    not a split of one -- so a point exactly equal to ``start`` or ``end``
+    does not count as "inside".
+    """
+    for member in members:
+        if member.start + _EPS < point < member.end - _EPS:
+            return member
+    return None
+
+
+def _percent_through(point: float, segment: AlignedSegment) -> float:
+    """How far ``point`` sits into ``segment``, as a percentage -- e.g. a
+    92%-through fragment is a boundary that lands just before the segment
+    ends, cutting off only its last 8%."""
+    span = segment.end - segment.start
+    if span <= _EPS:
+        return 0.0
+    return 100.0 * (point - segment.start) / span
+
+
+def _snap_to_segment_edge(
+    default_end: float,
+    cursor: float,
+    group_end: float,
+    members: tuple[AlignedSegment, ...],
+    eff_min: float,
+    eff_max: float,
+    grid: FrameGrid,
+) -> tuple[int, float, AlignedSegment, str] | None:
+    """Try snapping a pass-2 split boundary to the nearer edge of whichever
+    aligned segment ``default_end`` falls inside (issue #70).
+
+    A purely geometric split point has no idea a sung phrase is still in
+    progress there: the alignment already knows exactly where every segment
+    starts and ends, and this makes that a *preferred* cut point without
+    ever forcing it -- the caller keeps the original geometric boundary
+    whenever this returns ``None``.
+
+    This function only ever returns a snap that is *actually* clean -- a
+    caller that gets a non-``None`` result never needs to double-check it,
+    and never needs to log both an accepted snap and a mid-utterance warning
+    about the very same boundary. Three independent reasons a snap is
+    refused, all deliberate:
+
+    * The nearer edge doesn't leave room for a real split (``cursor < edge <
+      group_end`` fails) -- a single continuous segment spanning the whole
+      group has no internal edge to offer at all; both of its "edges" are
+      the group's own start and end.
+    * The point that actually reaches the edge would need
+      ``clamp_to_trained`` to relocate it (:func:`_quantize_split_end`'s
+      ``was_clamped``) -- checked *before* comparing against
+      ``[eff_min, eff_max]``, not after. Checking post-clamp is vacuous:
+      clamping forces the duration into the trained range, which for a
+      real profile *is* ``[eff_min, eff_max]``, so the check always passes
+      regardless of how far the clamp actually moved the boundary. On
+      "Deathless" this was measured directly: segment 7's start sits only
+      1.66s past the cursor, clamp_to_trained pushed the "snap" out to the
+      5.167s trained floor, and every one of that run's 6 attempted snaps
+      landed back inside the very segment they claimed to avoid (45.7% and
+      up) -- announced as clean while never once being clean.
+    * Even unclamped, plain grid rounding (``quantize_up``, at most one
+      grid step -- ~0.708s) can still leave the final boundary inside the
+      same segment or push it into a different one close behind. This is
+      checked directly against the *actual* quantized ``piece_end``, not
+      inferred from the duration.
+
+    Returns ``(frames, piece_end, segment, edge_name)`` for an accepted
+    snap; ``piece_end`` is quantized through :func:`_quantize_split_end`,
+    the *same* function the unsnapped path uses, so a caller that accepts
+    this never disagrees with how the rest of this module rounds.
+    """
+    containing = _segment_containing(default_end, members)
+    if containing is None:
+        return None
+
+    to_start = default_end - containing.start
+    to_end = containing.end - default_end
+    edge_name, candidate = (
+        ("start", containing.start) if to_start <= to_end else ("end", containing.end)
+    )
+
+    if not (cursor + _EPS < candidate < group_end - _EPS):
+        return None
+
+    frames, piece_end, was_clamped = _quantize_split_end(cursor, candidate, grid)
+    if was_clamped:
+        return None
+
+    duration = grid.frames_to_seconds(frames)
+    if not (eff_min - _EPS <= duration <= eff_max + _EPS):
+        return None
+
+    if _segment_containing(piece_end, members) is not None:
+        return None
+
+    return frames, piece_end, containing, edge_name
+
+
 def _split_for_maximum(
-    groups: list[_Group], max_chunk_seconds: float, grid: FrameGrid
+    groups: list[_Group], eff_min: float, max_chunk_seconds: float, grid: FrameGrid
 ) -> list[_Piece]:
     """Split any group longer than ``max_chunk_seconds`` into grid-quantized
     pieces.
@@ -285,6 +440,16 @@ def _split_for_maximum(
     once at the tail instead of per piece. If there truly is not enough room
     before the next chunk, ``slice_audio``'s pre-existing timeline-drift
     guard raises rather than silently producing an overlap.
+
+    Every *interior* boundary (every piece but the last -- the last always
+    ends at the group's own true end, which is already a real segment edge)
+    prefers to land on the nearer edge of whichever segment it would
+    otherwise cut through (issue #70), via :func:`_snap_to_segment_edge`.
+    Whether snapped or not, the piece actually emitted is checked again
+    after quantization -- grid rounding can itself push a boundary into a
+    segment it didn't start in, or (rarely) back out of one a snap aimed
+    at -- and a boundary that still lands inside a segment logs a WARNING
+    naming the segment and how far through it the cut falls.
     """
     pieces: list[_Piece] = []
     for group in groups:
@@ -316,8 +481,7 @@ def _split_for_maximum(
         cursor = group.start
         for p in range(piece_count):
             is_last = p == piece_count - 1
-            raw_end = group.end if is_last else cursor + piece_duration
-            raw_duration = raw_end - cursor
+            default_end = group.end if is_last else cursor + piece_duration
 
             # ceil, not round: quantize_up must never imply a duration below
             # raw_duration. A plain round() can land exactly on a valid grid
@@ -325,9 +489,50 @@ def _split_for_maximum(
             # raw_duration's true (unrounded) frame count has a fractional
             # part just above that grid point (e.g. 6.6s = 158.4 frames,
             # where 158 itself is already grid-valid but 0.4 frames short).
-            requested_frames = math.ceil(grid.seconds_to_frames(raw_duration) - _EPS)
-            frames = grid.clamp_to_trained(grid.quantize_up(requested_frames))
-            piece_end = cursor + grid.frames_to_seconds(frames)
+            frames, piece_end, _was_clamped = _quantize_split_end(cursor, default_end, grid)
+
+            if not is_last:
+                # `_snap_to_segment_edge` only ever returns a snap that is
+                # provably clean (see its docstring), so this is an if/else,
+                # not two independent checks: a boundary gets an "accepted
+                # snap" INFO or a "still cuts mid-utterance" WARNING, never
+                # both about the same boundary.
+                snapped = _snap_to_segment_edge(
+                    default_end, cursor, group.end, group.members, eff_min, max_chunk_seconds, grid
+                )
+                if snapped is not None:
+                    frames, piece_end, segment, edge_name = snapped
+                    logger.info(
+                        "Split boundary near %.3fs snapped to the %s edge (%.3fs) of segment "
+                        "index=%d (%r, %.3f-%.3fs), avoiding a mid-utterance cut (issue #70).",
+                        default_end,
+                        edge_name,
+                        getattr(segment, edge_name),
+                        segment.index,
+                        segment.text,
+                        segment.start,
+                        segment.end,
+                    )
+                else:
+                    landed = _segment_containing(piece_end, group.members)
+                    if landed is not None:
+                        pct = _percent_through(piece_end, landed)
+                        logger.warning(
+                            "Split boundary at %.3fs lands %.1f%% through segment index=%d "
+                            "(%r, %.3f-%.3fs) -- cutting a sung phrase mid-utterance; the two "
+                            "halves will render as independent shots with no error anywhere "
+                            "else. No segment-edge snap reaches this segment's edge without "
+                            "either falling outside the %.3fs-%.3fs duration window or being "
+                            "relocated by H3's trained-range clamp (issue #70).",
+                            piece_end,
+                            pct,
+                            landed.index,
+                            landed.text,
+                            landed.start,
+                            landed.end,
+                            eff_min,
+                            max_chunk_seconds,
+                        )
 
             pieces.append(
                 _Piece(
@@ -1038,6 +1243,67 @@ def _voiced_seconds_within(
     )
 
 
+def _log_final_boundary_segment_cuts(
+    covered: Sequence[_Piece], segments: tuple[AlignedSegment, ...]
+) -> None:
+    """Issue #70, second mechanism: even where pass 2's segment-edge
+    preference had nothing to snap to -- or nothing to say at all, since
+    most chunks here were never split -- instrumental-coverage's own
+    re-anchoring can still land a chunk boundary inside a segment.
+
+    ``_cover_instrumentals`` keeps every piece's *duration* exactly as
+    passes 1-3 chose it, but repositions its *start* to wherever the
+    cumulative filler tiling before it lands -- and filler tiling is
+    grid-quantized (:func:`_plan_frames_run`), so each gap it fills can
+    close a few tenths of a second short or long of the gap's true size
+    (worse, up to several seconds, when a gap itself is shorter than H3's
+    trained floor and a filler chunk still has to cover it -- the same
+    :func:`FrameGrid.clamp_to_trained` effect :func:`_snap_to_segment_edge`
+    has to refuse a pass-2 snap over). That residue has nothing to do with
+    where any segment falls, so as it accumulates across a whole song it
+    will, essentially by chance, occasionally land a boundary inside a
+    segment that pass 1-3 never touched and pass 2 never split.
+
+    Measured directly on "Deathless" (57 aligned segments, 80 chunks): pass
+    2 sees 12 mid-segment boundaries pre-retiling; after this pass runs,
+    every one of those 12 has moved to a different position (none survives
+    unchanged) and 15 entirely new ones appear that pass 2 never had a
+    boundary anywhere near -- 27 in total, this pass's own count, against
+    pass 2's 7 (some of the 12 pre-retiling hits resolve after retiling by
+    chance; that is not something this pass, or pass 2, causes on purpose).
+
+    This function does **not** attempt to avoid that. Doing so safely would
+    mean biasing filler-tiling choices -- which piece gets nudged, and by
+    how much -- without weakening the contiguity guarantee above (video
+    offset == audio offset, "by construction"), the load-bearing invariant
+    this whole pass exists to provide, and that is not a change to make
+    without a render to verify against; none is available while this is
+    being written. It only makes every such cut visible, at the *actual*
+    final position a render will use -- unlike pass 2's own warning, whose
+    cited timestamp this pass can, and on real material typically does,
+    move past.
+    """
+    for earlier in covered[:-1]:
+        boundary = earlier.end
+        landed = _segment_containing(boundary, segments)
+        if landed is None:
+            continue
+        pct = _percent_through(boundary, landed)
+        logger.warning(
+            "Final chunk boundary at %.3fs (after instrumental-coverage retiling) lands "
+            "%.1f%% through segment index=%d (%r, %.3f-%.3fs) -- cutting a sung phrase "
+            "mid-utterance; the two halves will render as independent shots with no error "
+            "anywhere else. This position was not visible to pass 2's own segment-edge "
+            "preference, which only ever sees pre-retiling boundaries (issue #70).",
+            boundary,
+            pct,
+            landed.index,
+            landed.text,
+            landed.start,
+            landed.end,
+        )
+
+
 def _cover_instrumentals(
     pieces: list[_Piece],
     segments: tuple[AlignedSegment, ...],
@@ -1070,6 +1336,13 @@ def _cover_instrumentals(
     pre-anchoring piece. Absorbing a sub-minimum hole shifts later chunks
     slightly earlier against the master, and a chunk must be prompted with
     the lyric its audio actually contains, not the one it was planned around.
+
+    This re-anchoring is also, measured on real material, the *dominant*
+    source of issue #70's mid-utterance boundary cuts -- more so than pass
+    2's own max-duration split, which is the only place this file currently
+    *avoids* one (:func:`_snap_to_segment_edge`). See
+    :func:`_log_final_boundary_segment_cuts` for why this pass only reports
+    that, rather than also avoiding it.
     """
     min_frames = _grid_frames_at_or_above(eff_min, grid)
     max_frames = _grid_frames_at_or_below(eff_max, grid)
@@ -1128,6 +1401,8 @@ def _cover_instrumentals(
                 frame_count=frame_count,
             )
         )
+
+    _log_final_boundary_segment_cuts(covered, segments)
 
     voiced = sum(1 for p in covered if p.members)
     logger.info(
@@ -1218,7 +1493,7 @@ def slice_audio(
     segments = tuple(sorted(alignment.segments, key=lambda s: s.start))
 
     groups = _merge_for_minimum(segments, alignment.track_duration, eff_min)
-    raw_pieces = _split_for_maximum(groups, eff_max, grid)
+    raw_pieces = _split_for_maximum(groups, eff_min, eff_max, grid)
 
     # Pass 3: quantize whatever pass 2 left un-split, in order, so each
     # piece's padding room is computed against its *already-finalized*
