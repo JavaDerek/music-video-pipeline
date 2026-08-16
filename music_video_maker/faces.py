@@ -245,6 +245,23 @@ class FaceObservation:
     score: float
     """Detector confidence for that largest face; ``0.0`` when none."""
 
+    def __bool__(self) -> bool:
+        """``bool(observation)`` is "was anything detected at all".
+
+        Without this a ``FaceObservation`` is a plain dataclass instance and
+        therefore *always* truthy, so the obvious-looking
+        ``if detect_faces(frame): hits += 1`` scores every frame as a hit and
+        reports a flat 100% face presence. That is a measurement that cannot
+        fail loudly -- it just quietly agrees with whatever you hoped -- and
+        it was found doing exactly that while comparing two renders. The
+        honest default is the one that makes the obvious usage correct.
+
+        This deliberately answers a *weaker* question than
+        :meth:`carries_identity`, which additionally requires the face to be
+        large enough to condition on. Truthiness is "something is there";
+        conditioning on it is a separate, stricter decision (#47)."""
+        return self.face_count > 0
+
     def carries_identity(self, min_fraction: float = DEFAULT_MIN_FACE_FRACTION) -> bool:
         return self.face_count > 0 and self.largest_fraction >= min_fraction
 

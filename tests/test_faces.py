@@ -383,3 +383,27 @@ def test_the_gate_refuses_a_frame_that_cannot_be_verified_against_a_faceless_ref
     reference = _write_blank_image(tmp_path / "blank.png")
 
     assert build_seed_face_gate()(frame, reference) is False
+
+
+# --------------------------------------------------------------------------- #
+# A FaceObservation in a boolean context (found using this API to measure a
+# render: `if detect_faces(frame):` scored EVERY sampled frame as a hit,
+# silently turning a face-presence measurement into a flat 100%).
+# --------------------------------------------------------------------------- #
+
+
+def test_face_observation_is_falsey_when_nothing_was_detected():
+    assert not faces.FaceObservation(face_count=0, largest_fraction=0.0, score=0.0)
+
+
+def test_face_observation_is_truthy_when_a_face_was_detected():
+    assert faces.FaceObservation(face_count=1, largest_fraction=0.02, score=0.95)
+
+
+def test_face_observation_truthiness_ignores_size_and_confidence():
+    """`bool()` answers "was anything detected", nothing more. The area and
+    confidence floors are `carries_identity`'s job, and conflating the two is
+    how a gate ends up passing a blank wall (#47)."""
+    tiny = faces.FaceObservation(face_count=1, largest_fraction=0.0001, score=0.1)
+    assert tiny
+    assert not tiny.carries_identity()
