@@ -113,6 +113,21 @@ committed ships, and check before adding, not before releasing.
   number is worth more attached to real hardware than sanded into "your GPU".
   What is not fine is a doc where a stranger cannot tell which details are
   essential and which are this setup.
+- **This applies to GitHub issues, which are the most-read thing here.**
+  Song-specific evidence — timestamps, chunk ids, measured dB, a viewer's own
+  words — is *required*: it is what makes a claim checkable instead of an
+  assertion, and this project's whole method is that a finding is a
+  measurement. But lead with the transferable rule: a **`General form:`** line
+  first, and a title shaped "general defect: specific evidence". A stranger
+  should be able to tell from one line whether it applies to their song at all.
+- **Never design the fix around the example.** #69 was very nearly built as
+  "give the concept stage a research tool so it can look up folklore", because
+  the song that exposed it is about Koschey the Deathless. The actual defect is
+  that the authoring layer is handed the lyrics as text to *stage* and never as
+  text to *understand* — which is true of a breakup song with no mythology in
+  it at all. A fix scoped to the example helps one song in fifty and looks
+  finished, which is the expensive kind of wrong. The example proves the bug;
+  it does not define it.
 - **Authoring session state stays out too.** `.authoring/` (issue #54) —
   `session.json`, generated stage JSON, and especially `raw/` (full,
   unredacted model replies, which routinely include the whole lyrics file) —
