@@ -916,6 +916,12 @@ def _cmd_write(args: argparse.Namespace) -> int:
             camera=camera,
             present=present,
             extra_checks=advisory,
+            # Issue #87: the concrete objects this song's lyrics actually
+            # name (issue #69's `reading.nouns`), so the shot-vs-lyric lint
+            # can stop firing on function words -- and so `write`'s one
+            # warning round stops spending a model call rewriting approved
+            # prose to satisfy them.
+            stageable_nouns=tuple((concept.get("reading") or {}).get("nouns") or ()),
         )
     except (PlanError, DriverError, ProseValidationError):
         logger.exception("Could not compose a shot plan that loads cleanly")

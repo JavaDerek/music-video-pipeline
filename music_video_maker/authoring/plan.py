@@ -315,8 +315,17 @@ def check_plan(
     *,
     beats: Sequence[Beat] = (),
     scratch_dir: Path | None = None,
+    stageable_nouns: Sequence[str] = (),
 ) -> PlanCheck:
     """Put a candidate plan through the functions the renderer will use.
+
+    ``stageable_nouns`` (issue #87) is the concept's ``reading.nouns``
+    (issue #69) -- the concrete objects this song's lyrics actually name.
+    Passed straight through to ``lint_shots_against_lyrics``, which without
+    it can only approximate "is this word a prop" and, measured on a real
+    plan, spent most of its warnings on function words. The data flows
+    authoring -> render here, never the reverse, so the import boundary
+    ``tests/test_authoring_boundary.py`` enforces is untouched.
 
     Deliberately writes a temp file and calls ``load_shot_plan`` rather than
     parsing the TOML here: the plan's real behaviour is whatever those
@@ -348,7 +357,7 @@ def check_plan(
             for chunk in chunks:
                 resolve_shot(plan, chunk)
                 resolve_camera(plan, chunk)
-            lint_shots_against_lyrics(plan, chunks)
+            lint_shots_against_lyrics(plan, chunks, stageable_nouns)
             lint_camera_face_away_on_voiced_chunks(plan, chunks)
             lint_voiced_framing(plan, chunks)
             # Issue #72: a pronoun with only one bound candidate but text
@@ -466,6 +475,7 @@ def build_plan(
     present: Mapping[int, Sequence[str]] | None = None,
     extra_checks=None,
     scratch_dir: Path | None = None,
+    stageable_nouns: Sequence[str] = (),
 ) -> BuiltPlan:
     """Compose, check, revise, and annotate -- the loop of design section 6.
 
@@ -503,7 +513,10 @@ def build_plan(
         )
 
     def inspect() -> PlanCheck:
-        found = check_plan(compose(), config, chunks, beats=beats, scratch_dir=scratch_dir)
+        found = check_plan(
+            compose(), config, chunks, beats=beats, scratch_dir=scratch_dir,
+            stageable_nouns=stageable_nouns,
+        )
         if extra_checks is None:
             return found
         advisory = tuple(

@@ -970,10 +970,19 @@ def _lint_implied_companion_without_present(
     Warning tier like every lint here: "a bass line pacing her step" may be
     describing the score rather than a person carrying an instrument, and only
     the author knows which.
+
+    ``subject`` (issue #82) binds a reference exactly as ``present`` does --
+    it composes that cast member's name, role, appearance and reference photo
+    into the prompt, and more strongly, as the shot's focus rather than a
+    bystander. This lint predates that field and knew only about ``present``,
+    so an instrumental chunk whose pronoun ``subject`` had already bound was
+    reported as unbound: measured on "Deathless" chunk 79, the plan's only
+    such chunk. A lint that reports a defect the plan has already fixed
+    teaches the reader to skim.
     """
     for chunk_id in sorted(plan):
         entry = plan[chunk_id]
-        if entry.present:
+        if entry.present or entry.subject:
             continue
         shot_lower = entry.shot.lower()
         for keyword in _IMPLIED_COMPANION_KEYWORDS:
@@ -1174,6 +1183,26 @@ _LINT_STOPWORDS = frozenset({
     # same string, which no amount of matching can tell apart.
     "people", "person", "someone", "everyone", "everybody", "nobody",
     "past", "world", "life", "night", "thing", "things", "everything",
+    # Issue #87, measured on "Deathless" shot_plan_v6.toml: these are the
+    # words this lint actually fired on across a whole generated plan, and
+    # not one of them is a thing that can be put on screen. 21 of that
+    # plan's 45 advisory lints were these, and `write`'s warning round then
+    # spent a model call rewriting approved prose to satisfy them -- so a
+    # precision problem here is not cosmetic, it rewrites the video.
+    #
+    # "always" earns its place twice over: `_singularish` strips a trailing
+    # "s" from anything over four letters, so it reached the operator as the
+    # non-word "alway". Filtering happens before stemming, so listing it
+    # here is enough to stop that.
+    "always", "never", "ever", "upon", "high", "higher", "highest",
+    "little", "free", "left", "right", "many", "most", "least",
+    # Present participles of motion/change verbs. A gerund is an action, not
+    # a prop, and these four fired on this plan ("growing higher", "armies
+    # clashing", "gathering below"). Deliberately NOT a blanket "-ing" rule:
+    # "building", "clothing" and "lightning" are ordinary stageable nouns,
+    # and a rule that swallowed them would trade this false positive for a
+    # false negative on a real object.
+    "growing", "clashing", "gathering", "falling",
 })
 
 _MIN_LINT_WORD_LENGTH = 4
@@ -1197,6 +1226,29 @@ def _singularish(word: str) -> str:
     """Crude 'printers' -> 'printer' so a plural in the lyric still matches a
     singular on screen. Deliberately not a stemmer."""
     return word[:-1] if len(word) > 4 and word.endswith("s") else word
+
+
+def stageable_noun_stems(phrases: Iterable[str]) -> frozenset[str]:
+    """Normalise a concept's ``reading.nouns`` (issue #69) into the single
+    stemmed words :func:`lint_shots_against_lyrics` compares against.
+
+    The concept writes phrases a human reads -- ``"Volokov's mill"``,
+    ``"mushroom glow / mushroom cloud"``, ``"streets with mothers turned
+    out"`` -- while the lint matches one word at a time. Both sides go
+    through this one function, and through the *same* ``_content_words`` /
+    ``_singularish`` pair the lint itself uses, so the two can never drift
+    apart about what "the same word" means. A second implementation of this
+    normalisation would disagree within a month.
+
+    Stopwords are dropped here too, so a connective inside a noun phrase
+    ("with", "without") cannot smuggle itself into the allowed vocabulary.
+    """
+    stems: set[str] = set()
+    for phrase in phrases or ():
+        if not isinstance(phrase, str):
+            continue
+        stems |= {_singularish(word) for word in _content_words(phrase)}
+    return frozenset(stems)
 
 
 LINT_NEIGHBOUR_RADIUS = 2
@@ -1443,6 +1495,7 @@ def lint_voiced_framing(
 def lint_shots_against_lyrics(
     plan: Mapping[int, ShotPlanEntry],
     chunks: Sequence[AudioChunk],
+    stageable_nouns: Iterable[str] = (),
 ) -> None:
     """Warn when a chunk's lyric names an object this plan stages *elsewhere*.
 
@@ -1460,11 +1513,33 @@ def lint_shots_against_lyrics(
     that motivated this, it fires exactly once -- on the printer -- and stays
     silent on the snow plow and the muted mic, both staged where they are sung.
 
+    ``stageable_nouns`` (issue #87) is the closed vocabulary of concrete
+    objects this song's lyrics actually name -- in practice the concept
+    stage's ``reading.nouns`` (issue #69), normalised through
+    :func:`stageable_noun_stems`. When supplied, only those words may fire.
+
+    That is the precision fix this lint needed and could not previously
+    express: with no part-of-speech tagging and no new dependency, "is this
+    word a prop?" was approximated by "does it appear in the author's own
+    shot prose elsewhere?", which cannot tell a noun from a preposition.
+    Measured on "Deathless" ``shot_plan_v6.toml``, 21 of the plan's 45
+    advisory lints were function words, and because ``write``'s warning
+    round spends a model call satisfying warnings, that noise rewrote 37 of
+    80 shot lines away from what the prose stage wrote. #69 made the real
+    list available for the first time -- the model is asked, in as many
+    words, for "concrete nouns the lyrics themselves name".
+
+    Empty (the default) means **no vocabulary was supplied**, not "nothing
+    may fire" -- the same convention ``locations`` and ``acts`` already use,
+    and what keeps every existing call site behaving as it did.
+
     Warning only, never an error: this is a heuristic firing on prose a human
     wrote deliberately, so a false positive must never block a run.
     """
     if not plan or not chunks:
         return
+
+    allowed = stageable_noun_stems(stageable_nouns)
 
     # Every content word the author used anywhere in their own shot text, and
     # which chunks stage it. This is the vocabulary of things meant to be seen.
@@ -1488,6 +1563,8 @@ def lint_shots_against_lyrics(
             nearby = set(range(
                 chunk.chunk_id - LINT_NEIGHBOUR_RADIUS, chunk.chunk_id + LINT_NEIGHBOUR_RADIUS + 1
             ))
+            if allowed and word not in allowed:
+                continue
             elsewhere = sorted(set(staged.get(word, ())) - nearby)
             if word in here or not elsewhere:
                 continue
@@ -2712,6 +2789,7 @@ __all__ = [
     "lint_present_location_mismatch",
     "lint_role_prohibition_contradiction",
     "lint_shots_against_lyrics",
+    "stageable_noun_stems",
     "lint_subject_on_voiced_chunk",
     "lint_unbound_companion_referent",
     "ENTRY_KEYS",

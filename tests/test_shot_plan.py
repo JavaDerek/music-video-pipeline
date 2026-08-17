@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+import music_video_maker.shot_plan as shot_plan_module
 from music_video_maker.contracts import AudioChunk, CastMember
 from music_video_maker.shot_plan import (
     ShotPlanDriftError,
@@ -45,6 +46,7 @@ from music_video_maker.shot_plan import (
     resolve_location,
     resolve_shot,
     resolve_subject,
+    stageable_noun_stems,
     write_shot_plan_skeleton,
 )
 
@@ -2826,3 +2828,141 @@ def test_instrumental_focus_mismatch_ignores_a_chunk_missing_from_the_plan(caplo
             {}, [_chunk_stub(29, "", instrumental=True)], "Dianne"
         )
     assert caplog.records == []
+
+
+# --------------------------------------------------------------------------- #
+# Issue #87: the #37 lint's precision, and what the warning round pays for it.
+#
+# Measured on "Deathless" shot_plan_v6.toml: 21 of the plan's 45 advisory
+# lints were `lint_shots_against_lyrics` firing on function words -- 'upon',
+# 'alway' (which is 'always' after _singularish), 'never', 'left', 'free',
+# 'high', 'higher', 'little' -- and `write`'s one warning round then spent a
+# model call rewriting approved prose to satisfy them, changing 37 of 80 shot
+# lines. A precision problem in a lint became a content problem in the plan.
+# --------------------------------------------------------------------------- #
+
+
+def _lyric_chunk(chunk_id: int, text: str) -> AudioChunk:
+    return AudioChunk(
+        chunk_id=chunk_id,
+        audio_file=Path(f"/tmp/chunk_{chunk_id}.wav"),
+        start=float(chunk_id) * 5.0,
+        end=float(chunk_id) * 5.0 + 5.0,
+        text=text,
+        characters=("Dianne",),
+        source_segment_indices=(chunk_id,),
+        frame_count=124,
+    )
+
+
+def _lyric_plan(**shots: str) -> dict[int, ShotPlanEntry]:
+    return {
+        int(cid): ShotPlanEntry(chunk_id=int(cid), start=float(cid) * 5.0, shot=shot)
+        for cid, shot in shots.items()
+    }
+
+
+@pytest.mark.parametrize("word", ["always", "upon", "never", "free", "little", "higher"])
+def test_function_words_in_a_lyric_never_fire_the_staged_elsewhere_lint(caplog, word):
+    """A function word is not a prop. 'Show <upon> on screen' is not a thing
+    that can be done, and every one of these fired on a real generated plan."""
+    plan = _lyric_plan(
+        **{
+            "0": f"She climbs the switchback {word} the bare rock face.",
+            "9": "A needle glints in the stone.",
+        }
+    )
+    chunks = [_lyric_chunk(9, f"High {word} a mountain")]
+    with caplog.at_level(logging.WARNING):
+        lint_shots_against_lyrics(plan, chunks)
+    assert f"names {word!r}" not in caplog.text
+
+
+def test_always_does_not_reach_the_lint_as_the_non_word_alway(caplog):
+    """`_singularish` strips a trailing 's' from any word over four letters,
+    so 'always' became 'alway' and was reported as a missing object by that
+    name. Filtering happens before stemming, so the stopword entry is enough."""
+    plan = _lyric_plan(
+        **{"0": "He stands always at the watch-post stone.", "9": "A bare ledge."}
+    )
+    chunks = [_lyric_chunk(9, "and he always will")]
+    with caplog.at_level(logging.WARNING):
+        lint_shots_against_lyrics(plan, chunks)
+    assert "alway" not in caplog.text
+
+
+def test_a_real_prop_staged_elsewhere_still_fires(caplog):
+    """The lint's whole reason for existing (issue #37) must survive the
+    precision work: a printer sung here and staged only over there."""
+    plan = _lyric_plan(
+        **{
+            "0": "A beige printer sits blinking on the sill.",
+            "9": "She walks past a bare wall.",
+        }
+    )
+    chunks = [_lyric_chunk(9, "I hoped your printer would explode")]
+    with caplog.at_level(logging.WARNING):
+        lint_shots_against_lyrics(plan, chunks)
+    assert "names 'printer'" in caplog.text
+
+
+def test_stageable_nouns_restricts_the_lint_to_named_objects(caplog):
+    """Issue #87: #69's `reading.nouns` is the list of concrete objects the
+    lyrics actually put on the table, which is what this lint was always
+    approximating. Given it, nothing outside it may fire."""
+    plan = _lyric_plan(
+        **{
+            "0": "A needle glints in a seam of the stone, a banner burning beside it.",
+            "9": "Bare grey water.",
+        }
+    )
+    chunks = [_lyric_chunk(9, "the needle and the banner")]
+    with caplog.at_level(logging.WARNING):
+        lint_shots_against_lyrics(plan, chunks, stageable_nouns=("needle",))
+    assert "names 'needle'" in caplog.text
+    assert "names 'banner'" not in caplog.text
+
+
+def test_stageable_nouns_empty_leaves_todays_behaviour_untouched(caplog):
+    """Absent or empty means 'no vocabulary supplied' -- the same convention
+    `locations` and `acts` use -- never 'nothing may fire'."""
+    plan = _lyric_plan(
+        **{
+            "0": "A beige printer sits blinking on the sill.",
+            "9": "She walks past a bare wall.",
+        }
+    )
+    chunks = [_lyric_chunk(9, "I hoped your printer would explode")]
+    with caplog.at_level(logging.WARNING):
+        lint_shots_against_lyrics(plan, chunks, stageable_nouns=())
+    assert "names 'printer'" in caplog.text
+
+
+def test_stageable_noun_stems_normalises_multiword_phrases():
+    """The concept writes phrases ("Volokov's mill", "mushroom glow /
+    mushroom cloud"), the lint compares single stemmed words. One shared
+    normaliser, because a second implementation drifts within a month."""
+    stems = stageable_noun_stems(
+        ["Volokov's mill", "mushroom glow / mushroom cloud", "armies"]
+    )
+    assert {"volokov", "mill", "mushroom", "glow", "cloud", "armie"} <= stems
+    assert "with" not in stems and "" not in stems
+
+
+def test_subject_binds_a_pronoun_for_the_unbound_companion_lint(caplog):
+    """Issue #82 added `subject`; #64's lint only knew about `present`, so an
+    instrumental chunk whose pronoun is bound by `subject` was reported as
+    unbound. Measured on "Deathless" chunk 79."""
+    plan = {
+        79: ShotPlanEntry(
+            chunk_id=79,
+            start=508.75,
+            shot="The hilltop stone stands hollowed smooth beside him, worn deep by centuries.",
+            subject="Jan",
+        )
+    }
+    chunks = [_chunk_stub(79, "", instrumental=True)]
+    with caplog.at_level(logging.WARNING):
+        lint_shots_against_lyrics(plan, chunks)
+        shot_plan_module._lint_implied_companion_without_present(plan, Path("plan.toml"))
+    assert "implies a second person" not in caplog.text
