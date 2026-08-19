@@ -460,6 +460,24 @@ class ChunkFingerprint:
     a mix-conditioned mp4 inside a stem run hands the A/B its control twice
     and calls it a result. ``None`` means unrecorded (a pre-#25 state file),
     which proves nothing and never compares equal to a named source."""
+    instrumental_audio_gain_db: float | None = None
+    """How far this run attenuated the conditioning stem on *instrumental*
+    chunks, in dB (F26). ``None`` is "unattenuated", which is every run before
+    this field existed.
+
+    Conditioning tier, beside :attr:`conditioning_source`, which is blind to
+    it: that field records *which* audio drove the mouth (mix vs isolated
+    stem) and would report "mix" for both arms of a gain A/B. H3 is
+    audio-driven, so on an instrumental chunk the stem's *level* is what
+    decides whether a mouth moves at all -- measured on "Deathless" v8, an
+    instrumental chunk sat at -15.2 dB against a sung chunk's -16.8 dB, and
+    the mouth moved through both. Reusing a full-level chunk inside a
+    silenced run hands that comparison its control twice.
+
+    A voiced chunk is never attenuated, so on those this field records the
+    run's setting rather than anything done to that stem -- deliberately: it
+    is the run's arm, and a resumed voiced chunk from the other arm belongs
+    to the other experiment."""
     text_encoder: str | None = None
     """Which text encoder turned the prompt into conditioning (issue #39):
     the ``CLIPLoader.clip_name`` the chunk's graph was submitted with, e.g.
@@ -581,6 +599,7 @@ class ChunkFingerprint:
     )
     CONDITIONING_FIELDS: ClassVar[tuple[str, ...]] = (
         "conditioning_source",
+        "instrumental_audio_gain_db",
         "text_encoder",
         "template_hash",
         "lora",
@@ -616,6 +635,7 @@ class ChunkFingerprint:
         render_height: int | None = None,
         noise_seed: int | None = None,
         conditioning_source: str | None = None,
+        instrumental_audio_gain_db: float | None = None,
         text_encoder: str | None = None,
         template_hash: str | None = None,
         lora: str | None = None,
@@ -656,6 +676,7 @@ class ChunkFingerprint:
             ),
             noise_seed=noise_seed,
             conditioning_source=conditioning_source,
+            instrumental_audio_gain_db=instrumental_audio_gain_db,
             text_encoder=text_encoder,
             lora=lora,
             lora_strength=lora_strength,

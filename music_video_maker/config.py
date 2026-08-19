@@ -301,6 +301,30 @@ class RunConfig:
     run data. See :class:`~music_video_maker.contracts.AlignmentOverride`."""
 
     instrumental_shot_seconds: float | None = None
+    instrumental_audio_gain_db: float | None = None
+    """Attenuate the conditioning stem on *instrumental* chunks by this many
+    dB. ``None`` (the default) leaves every stem at the master's own level,
+    which is what every run before F26 did.
+
+    H3 is an audio-driven lip-sync model and the chunk's stem is its
+    conditioning signal, so an instrumental chunk handed full-level music
+    gets a mouth animated to the music. Measured on "Deathless" v8: chunk
+    30, which a viewer reported mouthing words with no audio, sat at
+    -15.2 dB mean against -16.8 dB for a *sung* chunk. Rewording the
+    prompt's instrumental clause (#73) reduced the effect and could not
+    remove it, because the prompt is arguing with the conditioning signal
+    and the conditioning signal wins.
+
+    Attenuation only -- a positive value amplifies the very thing the
+    defect is made of, and is refused at load. A voiced stem is never
+    touched: it is the lip-sync ground truth.
+
+    Safe on audio fidelity by construction: Stage 5 discards all generated
+    audio and muxes the pristine master, so what H3 hears on an
+    instrumental chunk affects pixels only. **Unverified against a
+    render** -- the audio may drive more than the mouth, so a silenced
+    chunk could come out static. Prove it on a ``--only-chunks`` slice
+    before trusting it on a full run."""
     """Issue #27: the longest an *instrumental filler* chunk may run.
 
     ``None`` means the same ceiling sung chunks get (``max_chunk_seconds``)
@@ -1300,6 +1324,22 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
             )
         )
     values["alignment_overrides"] = tuple(parsed_overrides)
+
+    gain = merged.get("instrumental_audio_gain_db")
+    if gain is None:
+        values["instrumental_audio_gain_db"] = None
+    else:
+        if not isinstance(gain, (int, float)) or isinstance(gain, bool):
+            raise ConfigError(
+                f"instrumental_audio_gain_db must be a number, got {gain!r}"
+            )
+        if gain > 0:
+            raise ConfigError(
+                f"instrumental_audio_gain_db must be <= 0 (attenuation only), got "
+                f"{gain!r} -- a positive value amplifies the music H3 is lip-syncing "
+                "on an instrumental chunk, which is the F26 defect made worse"
+            )
+        values["instrumental_audio_gain_db"] = float(gain)
 
     instrumental_shot = merged.get("instrumental_shot_seconds")
     values["instrumental_shot_seconds"] = (

@@ -535,6 +535,9 @@ def run_pipeline(
             cover_instrumentals=config.instrumental_coverage,
             shot_lengths=shot_length_requests(plan),
             instrumental_shot_seconds=config.instrumental_shot_seconds,
+            # F26: H3 lip-syncs whatever audio it is handed, so an
+            # instrumental chunk fed full-level music grows a mouth.
+            instrumental_audio_gain_db=config.instrumental_audio_gain_db,
         )
         if not chunks:
             raise PipelineError(
@@ -756,6 +759,10 @@ def run_pipeline(
                 conditioning_source=(
                     f"stem:{config.vocal_stem.name}" if config.vocal_stem else "mix"
                 ),
+                # F26: same tier, because conditioning_source is blind to level
+                # and reusing a full-level chunk inside a silenced run hands
+                # the comparison its control twice.
+                instrumental_audio_gain_db=config.instrumental_audio_gain_db,
                 # Issue #39: which encoder read the sentence -- the pinned one
                 # if this run pins one, otherwise whatever the template names.
                 # Recorded either way, because the encoder is the one
@@ -936,6 +943,10 @@ def prepare_shot_plan(
         config.chunks_dir,
         cover_instrumentals=config.instrumental_coverage,
         instrumental_shot_seconds=config.instrumental_shot_seconds,
+        # Passed so a stem --prepare writes is the stem a render uses. It
+        # cannot move the timeline (level only), so the skeleton is identical
+        # either way -- this is consistency, not correctness.
+        instrumental_audio_gain_db=config.instrumental_audio_gain_db,
         shot_lengths=shot_lengths,
     )
     if not chunks:

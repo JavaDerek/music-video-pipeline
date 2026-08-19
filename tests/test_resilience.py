@@ -2263,3 +2263,26 @@ def test_text_encoder_round_trips_through_run_state(tmp_path: Path):
     assert state["results"]["0"]["fingerprint"]["text_encoder"] == (
         "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
     )
+
+
+def test_instrumental_audio_gain_is_conditioning_and_never_escapable():
+    """F26: attenuating the instrumental stem changes what H3 was conditioned on.
+
+    ``conditioning_source`` records *which* audio (mix vs isolated stem) and is
+    blind to its level, so without this a ``--resume`` across a gain change
+    would reuse chunks conditioned on full-level music inside a silenced run --
+    handing the A/B its control twice, which is the exact failure that tier
+    exists to prevent.
+
+    ``None`` means unrecorded, and must never compare equal to a recorded value.
+    """
+    from music_video_maker.contracts import ChunkFingerprint
+
+    assert "instrumental_audio_gain_db" in ChunkFingerprint.CONDITIONING_FIELDS
+
+    loud = ChunkFingerprint(start=0.0, end=5.0, instrumental_audio_gain_db=None)
+    quiet = ChunkFingerprint(start=0.0, end=5.0, instrumental_audio_gain_db=-60.0)
+
+    assert "instrumental_audio_gain_db" in quiet.conditioning_differences(loud)
+    assert "instrumental_audio_gain_db" in loud.conditioning_differences(quiet)
+    assert quiet.conditioning_differences(quiet) == ()

@@ -2011,3 +2011,115 @@ def test_cover_instrumentals_does_not_move_a_boundary_pinned_by_a_shot_length():
 
     assert covered[1].start == pytest.approx(124 / 24, abs=1e-6)
     assert covered[1].frame_count == 175
+
+
+def _write_tone_wav(path: Path, seconds: float) -> Path:
+    """A master with real signal in it, so attenuation is measurable.
+
+    The existing helpers write silence, which is fine for timeline assertions
+    and useless for anything about level.
+    """
+    from pydub.generators import Sine
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tone = Sine(220).to_audio_segment(duration=int(seconds * 1000) + 50)
+    tone.export(str(path), format="wav")
+    return path
+
+
+def _stem_dbfs(chunk) -> float:
+    from pydub import AudioSegment
+
+    return AudioSegment.from_wav(str(chunk.audio_file)).dBFS
+
+
+def test_instrumental_audio_gain_is_not_applied_by_default(tmp_path):
+    """Issue #73/F26 follow-up: today's behaviour must be untouched.
+
+    Every existing config renders with the master's own audio under every
+    chunk, and this knob defaults to leaving that exactly as it is.
+    """
+    alignment = make_alignment_result_with_gaps()
+    master = _write_tone_wav(tmp_path / "master.wav", alignment.track_duration)
+
+    chunks = slice_audio(
+        master, alignment, DEFAULT_HARDWARE, tmp_path / "chunks", cover_instrumentals=True
+    )
+
+    instrumental = [c for c in chunks if c.is_instrumental]
+    assert instrumental, "expected the gap to produce instrumental filler"
+    for chunk in instrumental:
+        assert _stem_dbfs(chunk) > -20.0, (
+            "default must leave an instrumental stem at the master's own level"
+        )
+
+
+def test_instrumental_audio_gain_attenuates_only_instrumental_stems(tmp_path):
+    """F26: an instrumental chunk is fed full-level music as lip-sync conditioning.
+
+    Measured on the v8 render of "Deathless": chunk 30 (instrumental, a viewer
+    reported the mouth moving through it) sat at -15.2 dB mean, against -16.8 dB
+    for a *sung* chunk. H3 is audio-driven, so it animates a mouth for whatever
+    it is handed. The prompt cannot win that argument -- issue #73's clause fix
+    reduced the effect and did not remove it.
+
+    Attenuation is applied to the instrumental stems only. A voiced stem is the
+    lip-sync ground truth and must never be touched.
+    """
+    alignment = make_alignment_result_with_gaps()
+    master = _write_tone_wav(tmp_path / "master.wav", alignment.track_duration)
+
+    loud = slice_audio(
+        master, alignment, DEFAULT_HARDWARE, tmp_path / "loud", cover_instrumentals=True
+    )
+    quiet = slice_audio(
+        master,
+        alignment,
+        DEFAULT_HARDWARE,
+        tmp_path / "quiet",
+        cover_instrumentals=True,
+        instrumental_audio_gain_db=-60.0,
+    )
+
+    loud_by_id = {c.chunk_id: c for c in loud}
+    for chunk in quiet:
+        before = _stem_dbfs(loud_by_id[chunk.chunk_id])
+        after = _stem_dbfs(chunk)
+        if chunk.is_instrumental:
+            assert after < before - 50.0, (
+                f"chunk {chunk.chunk_id} is instrumental and should be attenuated"
+            )
+        else:
+            assert after == pytest.approx(before, abs=0.01), (
+                f"chunk {chunk.chunk_id} is voiced -- its stem is the lip-sync "
+                f"ground truth and must not be touched"
+            )
+
+
+def test_instrumental_audio_gain_preserves_the_timeline_exactly(tmp_path):
+    """The audio/video length invariant (issue #20) outranks this knob.
+
+    A stem whose duration moved by a millisecond desyncs its own chunk, so
+    attenuation must change level and nothing else.
+    """
+    alignment = make_alignment_result_with_gaps()
+    master = _write_tone_wav(tmp_path / "master.wav", alignment.track_duration)
+
+    loud = slice_audio(
+        master, alignment, DEFAULT_HARDWARE, tmp_path / "loud", cover_instrumentals=True
+    )
+    quiet = slice_audio(
+        master,
+        alignment,
+        DEFAULT_HARDWARE,
+        tmp_path / "quiet",
+        cover_instrumentals=True,
+        instrumental_audio_gain_db=-60.0,
+    )
+
+    assert [c.chunk_id for c in loud] == [c.chunk_id for c in quiet]
+    for a, b in zip(loud, quiet, strict=True):
+        assert (a.start, a.end, a.frame_count) == (b.start, b.end, b.frame_count)
+        assert _wav_duration_seconds(a.audio_file) == pytest.approx(
+            _wav_duration_seconds(b.audio_file), abs=1e-6
+        )

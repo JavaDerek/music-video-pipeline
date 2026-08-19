@@ -1655,3 +1655,33 @@ def test_config_and_alignment_agree_on_the_default_model():
 
     assert DEFAULT_ALIGNMENT_MODEL_SIZE == DEFAULT_MODEL_SIZE
     assert DEFAULT_ALIGNMENT_MODEL_SIZE in ALIGNMENT_MODEL_SIZES
+
+
+
+def test_instrumental_audio_gain_db_defaults_to_none(tmp_path: Path) -> None:
+    """Every config written before F26 renders instrumental chunks at the
+    master's own level, and this knob must not change that by existing."""
+    _create_default_assets(tmp_path)
+
+    cfg = load_config(_write_config(tmp_path))
+
+    assert cfg.instrumental_audio_gain_db is None
+
+
+def test_instrumental_audio_gain_db_accepts_attenuation(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+
+    cfg = load_config(
+        _write_config(tmp_path, extra_toml="instrumental_audio_gain_db = -60.0\n")
+    )
+
+    assert cfg.instrumental_audio_gain_db == -60.0
+
+
+def test_instrumental_audio_gain_db_refuses_a_boost(tmp_path: Path) -> None:
+    """Attenuation only. A positive value makes the music H3 is lip-syncing
+    *louder*, which is the F26 defect amplified rather than fixed."""
+    _create_default_assets(tmp_path)
+
+    with pytest.raises(ConfigError, match="instrumental_audio_gain_db"):
+        load_config(_write_config(tmp_path, extra_toml="instrumental_audio_gain_db = 6.0\n"))

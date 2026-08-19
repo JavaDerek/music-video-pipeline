@@ -309,6 +309,7 @@ def _serialize_fingerprint(fingerprint: ChunkFingerprint) -> dict[str, Any]:
         "noise_seed": fingerprint.noise_seed,
         "chained_from": fingerprint.chained_from,
         "conditioning_source": fingerprint.conditioning_source,
+        "instrumental_audio_gain_db": fingerprint.instrumental_audio_gain_db,
         "text_encoder": fingerprint.text_encoder,
         "lora": fingerprint.lora,
         "lora_strength": fingerprint.lora_strength,
@@ -346,6 +347,10 @@ def _deserialize_fingerprint(raw: dict[str, Any] | None) -> ChunkFingerprint | N
         # Absent in a file written before issue #25: None = unrecorded, which
         # proves nothing and never compares equal to a named source.
         conditioning_source=raw.get("conditioning_source"),
+        # Absent in a file written before F26: None = unattenuated, which is
+        # what every pre-F26 run actually did, so this one key is a true
+        # default rather than "unrecorded".
+        instrumental_audio_gain_db=raw.get("instrumental_audio_gain_db"),
         # Absent in a file written before issue #39: None = unrecorded, which
         # is not evidence that the chunk was encoded by the encoder this run
         # names. Same no-bump reasoning as noise_seed above -- an early-v2

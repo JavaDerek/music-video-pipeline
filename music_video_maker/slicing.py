@@ -1766,6 +1766,7 @@ def slice_audio(
     *,
     shot_lengths: Sequence[ShotLength] = (),
     instrumental_shot_seconds: float | None = None,
+    instrumental_audio_gain_db: float | None = None,
 ) -> tuple[AudioChunk, ...]:
     """Slice ``audio_path`` per ``alignment`` into ``AudioChunk``s honoring
     ``hardware``'s min/max chunk-duration window (clamped into H3's trained
@@ -1935,11 +1936,36 @@ def slice_audio(
                 duration=shortfall_ms, frame_rate=master.frame_rate
             ).set_channels(master.channels).set_sample_width(master.sample_width)
 
+        text = _text_within(piece.members, piece.start, piece.end)
+        is_instrumental = not piece.members or not text
+
+        # Issue #73 follow-up, measured on the v8 "Deathless" render (F26).
+        # H3 is an audio-driven lip-sync model and this stem is its
+        # conditioning signal, so an instrumental chunk handed full-level
+        # music gets a mouth animated to the music. Measured: chunk 30
+        # (instrumental, a viewer reported it mouthing words with no audio)
+        # at -15.2 dB mean, against -16.8 dB for a *sung* chunk -- the same
+        # level. Rewording the prompt's instrumental clause reduced the
+        # effect and could not remove it, because the prompt is arguing with
+        # the conditioning signal and the conditioning signal wins.
+        #
+        # A VOICED stem is never touched: it is the lip-sync ground truth.
+        # Attenuation only, and level only -- duration and format are
+        # preserved by construction, because a stem whose duration moved
+        # desyncs its own chunk (issue #20).
+        if is_instrumental and instrumental_audio_gain_db is not None:
+            logger.info(
+                "Chunk %d is instrumental; attenuating its conditioning stem by %.1f dB "
+                "so H3 is not handed music to lip-sync (F26).",
+                idx,
+                instrumental_audio_gain_db,
+            )
+            sliced = sliced + instrumental_audio_gain_db
+
         out_path = chunks_dir / f"chunk_{idx:03d}.wav"
         sliced.export(str(out_path), format="wav")
 
-        text = _text_within(piece.members, piece.start, piece.end)
-        if not piece.members or not text:
+        if is_instrumental:
             # Instrumental filler: no lyric, no source segments, and no
             # character of its own -- Stage 2b falls back to the default lead
             # vocalist and its empty-text instrumental clause.
