@@ -86,6 +86,7 @@ from music_video_maker.shot_plan import (
     lint_voiced_framing,
     load_shot_plan,
     resolve_camera,
+    resolve_location,
     resolve_present,
     resolve_shot,
     resolve_subject,
@@ -609,6 +610,12 @@ def run_pipeline(
                 # replaces the default_lead_vocalist fallback with the
                 # actually-authored focus member.
                 subject=resolve_subject(plan, chunk),
+                # Issue #78: this chunk's own authored place, substituted for
+                # config.setting in the "Location continuity" sentence when
+                # set -- narrows a whole-video setting string for a song
+                # whose world changes over its own runtime (the "Deathless"
+                # nuclear-glow finding).
+                location=resolve_location(plan, chunk),
             )
             for chunk in chunks
         }

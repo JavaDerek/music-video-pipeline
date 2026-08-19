@@ -158,7 +158,7 @@ def test_instrumental_padded_segment_falls_back_to_default_lead(config: RunConfi
             "high quality cinematic. Wandering through a surgery, kicking a "
             "life support plug out. Dianne, Lead Vocalist, smiling constantly, "
             "oblivious, is the focus of this shot. Instrumental passage: the "
-            "character performs silently, no lyric to sing."
+            "character stays silent throughout this shot."
         ),
         image_ref=cast["Dianne"].image,
         image_refs=(cast["Dianne"].image,),
@@ -168,7 +168,7 @@ def test_instrumental_padded_segment_falls_back_to_default_lead(config: RunConfi
             "high quality cinematic. Wandering through a surgery, kicking a "
             "life support plug out. Dianne, Lead Vocalist, smiling constantly, "
             "oblivious, is the focus of this shot. Instrumental passage: the "
-            "character performs silently, no lyric to sing."
+            "character stays silent throughout this shot."
         ),
     )
 
@@ -224,7 +224,7 @@ def test_whitespace_only_text_is_treated_as_instrumental(config: RunConfig, cast
     result = expand_prompt(config, chunk)
 
     assert result.prompt.endswith(
-        "Instrumental passage: the character performs silently, no lyric to sing."
+        "Instrumental passage: the character stays silent throughout this shot."
     )
 
 
@@ -371,6 +371,138 @@ def test_setting_none_by_default_omits_any_setting_sentence(config: RunConfig, c
 
 
 # --------------------------------------------------------------------------- #
+# Location (issue #78, composed since the "Deathless" nuclear-glow finding)
+#
+# `setting` is one string composed unchanged into all 80 chunks of a run; a
+# song whose world changes over its own runtime (a detonation, an emptied
+# planet) cannot express that change through a field that cannot vary by
+# chunk. `location` already existed per-chunk (issue #78) but was deliberately
+# never rendered. It is rendered now, substituted into the same guarded
+# "Location continuity" sentence `setting` already uses -- narrowing it for
+# this chunk, never adding a second place-naming sentence next to it, because
+# #73/#74 measured that H3 renders whatever noun it is given regardless of
+# the framing around it, and there is no negative-conditioning channel to
+# retract one once it is named.
+# --------------------------------------------------------------------------- #
+
+CONTAMINATED_SETTING = (
+    "A war-torn valley below a mountain watch-post -- medieval hosts, industrial "
+    "armies, and nuclear glow all visible from the same watch-post, ending in a "
+    "post-war planet eroded to a hill"
+)
+POST_DETONATION_LOCATION = "the eroded hill under a wind-still sky (the summit, after)"
+
+
+def test_location_narrows_the_setting_clause_to_the_authored_place(config: RunConfig, cast):
+    """The direct regression test for the Deathless nuclear-glow leak: a
+    chunk authored with a post-detonation `location` must not still carry
+    `setting`'s arc-locked nouns into the composed prompt."""
+    cfg = dataclasses.replace(config, setting=CONTAMINATED_SETTING)
+    chunk = _chunk(text="", character=None)
+
+    result = expand_prompt(cfg, chunk, shot="Ash settles over the split mill wheel",
+                            location=POST_DETONATION_LOCATION)
+
+    assert POST_DETONATION_LOCATION in result.prompt
+    assert "nuclear glow" not in result.prompt
+    assert "industrial armies" not in result.prompt
+    assert CONTAMINATED_SETTING not in result.prompt
+
+
+def test_location_none_is_byte_identical_to_pre_location_prompt(config: RunConfig, cast):
+    """Every pre-existing caller never passes `location` at all, and every
+    chunk a plan leaves untagged resolves it to `None` -- both must compose
+    exactly the golden string already pinned for the plain-`setting` case."""
+    cfg = dataclasses.replace(config, setting=SETTING)
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+
+    result = expand_prompt(cfg, chunk, shot="An intensive care corridor, monitors either side")
+    explicit_none = expand_prompt(
+        cfg, chunk, shot="An intensive care corridor, monitors either side", location=None
+    )
+
+    golden = (
+        "Refestramus progressive rock music video, atmospheric lighting, "
+        "high quality cinematic. An intensive care corridor, monitors either side. "
+        "Location continuity: wherever the location is identifiable it is "
+        "London, UK -- contemporary, overcast winter, and never anywhere else; "
+        "do not relocate the action or add landmarks to establish it, this shot's "
+        "own described location is what is on screen. Dianne, "
+        "Lead Vocalist, smiling constantly, oblivious, is the focus of this "
+        "shot. The character is actively singing the lyric: 'the lucky ones'."
+    )
+    assert result.prompt == golden
+    assert explicit_none.prompt == golden
+
+
+def test_location_used_when_setting_is_none(config: RunConfig, cast):
+    """`place` must not require `setting` to be present -- an authored
+    per-chunk location composes on its own."""
+    assert config.setting is None
+    chunk = _chunk(text="", character=None)
+
+    result = expand_prompt(
+        config, chunk, shot="Ash settles over the split mill wheel",
+        location=POST_DETONATION_LOCATION,
+    )
+
+    assert POST_DETONATION_LOCATION in result.prompt
+    assert "wherever the location is identifiable" in result.prompt
+
+
+def test_location_composes_on_the_chained_variant_too(config: RunConfig, cast):
+    """Location is about place, not identity, so -- unlike appearance -- it
+    must survive on the chained I2V variant exactly like `camera` does."""
+    cfg = dataclasses.replace(config, setting=CONTAMINATED_SETTING)
+    chunk = _chunk(text="", character=None)
+
+    result = expand_prompt(
+        cfg, chunk, shot="Ash settles over the split mill wheel",
+        location=POST_DETONATION_LOCATION,
+    )
+
+    assert result.chained_prompt is not None
+    assert POST_DETONATION_LOCATION in result.chained_prompt
+    assert "nuclear glow" not in result.chained_prompt
+
+
+def test_location_still_positioned_after_the_shot_line_and_conditionally_phrased(
+    config: RunConfig, cast
+):
+    """#32's protections must survive substitution: still no bare,
+    unconditional place-naming sentence, still phrased as a conditional
+    constraint, still after the shot line."""
+    cfg = dataclasses.replace(config, setting=SETTING)
+    chunk = _chunk(text="x", character="Dianne")
+
+    prompt = expand_prompt(
+        cfg, chunk, shot="A corridor, walking away from camera",
+        location=POST_DETONATION_LOCATION,
+    ).prompt
+
+    assert f". {POST_DETONATION_LOCATION}." not in prompt
+    assert "wherever the location is identifiable" in prompt
+    shot_index = prompt.index("A corridor, walking away from camera")
+    location_index = prompt.index(POST_DETONATION_LOCATION)
+    assert shot_index < location_index
+
+
+def test_location_composes_at_most_one_location_sentence(config: RunConfig, cast):
+    """Guards against ever reintroducing #32 by concatenation: exactly one
+    'Location continuity' sentence, never one for `setting` and a second for
+    `location`."""
+    cfg = dataclasses.replace(config, setting=CONTAMINATED_SETTING)
+    chunk = _chunk(text="", character=None)
+
+    prompt = expand_prompt(
+        cfg, chunk, shot="Ash settles over the split mill wheel",
+        location=POST_DETONATION_LOCATION,
+    ).prompt
+
+    assert prompt.count("Location continuity") == 1
+
+
+# --------------------------------------------------------------------------- #
 # Appearance (issue #31) -- attaches to the character, never to vocal action
 # --------------------------------------------------------------------------- #
 
@@ -431,7 +563,7 @@ def test_appearance_never_mentions_singing_and_survives_instrumental_chunks(
     assert "sing" not in character_clause.lower()
     assert "flattering" in result.prompt
     assert result.prompt.endswith(
-        "Instrumental passage: the character performs silently, no lyric to sing."
+        "Instrumental passage: the character stays silent throughout this shot."
     )
 
 
@@ -669,7 +801,7 @@ def test_instrumental_chunk_with_two_characters(config: RunConfig, cast):
     result = expand_prompt(config, chunk)
 
     assert result.prompt.endswith(
-        "Instrumental passage: the characters perform silently, no lyric to sing."
+        "Instrumental passage: the characters stay silent throughout this shot."
     )
     assert result.characters == ("Dianne", "Marcus")
     assert result.image_refs == (cast["Dianne"].image, cast["Marcus"].image)
@@ -987,7 +1119,7 @@ def test_chained_prompt_omits_appearance_on_an_instrumental_chunk(config: RunCon
     assert result.chained_prompt is not None
     assert "looking a few years younger" not in result.chained_prompt
     assert result.chained_prompt.endswith(
-        "Instrumental passage: the character performs silently, no lyric to sing."
+        "Instrumental passage: the character stays silent throughout this shot."
     )
 
 
@@ -1260,7 +1392,7 @@ def test_demeanour_survives_on_an_instrumental_chunk(config: RunConfig, cast):
     assert "sing" not in character_clause.lower()
     assert "grave and unsmiling" in result.prompt
     assert result.prompt.endswith(
-        "Instrumental passage: the character performs silently, no lyric to sing."
+        "Instrumental passage: the character stays silent throughout this shot."
     )
 
 
@@ -1555,3 +1687,43 @@ def test_empty_avoid_list_produces_no_avoid_clause(config: RunConfig, cast):
 
     assert "must never depict" not in result.prompt
     assert "must never depict" not in result.chained_prompt
+
+
+def test_instrumental_clause_is_a_positive_state_not_a_prohibition():
+    """Issue #73, applied to the most-composed prohibition in the codebase.
+
+    The clause read "the character performs silently, no lyric to sing" for
+    every instrumental chunk -- 39 of 80 on "Deathless". H3 exposes exactly one
+    ``prompt`` input into a single ``BasicGuider``: there is no
+    negative-conditioning channel, so a prohibition cannot subtract, and the
+    tokens actually reaching the model were *lyric* and *sing*. A viewer
+    reported Jan mouthing words through instrumental passages at 3:14, 7:11 and
+    8:27, and "his lips never stop moving after 3:49".
+
+    ``_present_clause`` forty lines below already learned this -- its docstring
+    reads "Says 'silent' positively rather than 'not singing'". This clause
+    never got the same treatment.
+
+    The second assertion is the trap on the other side: issue #74 measured that
+    naming facial anatomy puts a camera on it (100% face presence against
+    83/0/33% for manner-only phrasing). An instrumental chunk is frequently an
+    authored landscape, so "mouth closed" would buy the fix by silently
+    dragging 39 wide shots into close-ups.
+    """
+    from music_video_maker import prompting
+
+    for clause in (
+        prompting._INSTRUMENTAL_CLAUSE_SINGULAR,
+        prompting._INSTRUMENTAL_CLAUSE_PLURAL,
+    ):
+        lowered = clause.lower()
+        for prohibition_token in ("sing", "lyric", " no ", "not "):
+            assert prohibition_token not in lowered, (
+                f"{clause!r} still carries the prohibition token "
+                f"{prohibition_token!r}; say what IS true (issue #73)"
+            )
+        for anatomy in ("mouth", "lips", "jaw", "teeth", "face", "eyes"):
+            assert anatomy not in lowered, (
+                f"{clause!r} names facial anatomy ({anatomy!r}), which pulls the "
+                f"camera onto the face across every instrumental chunk (issue #74)"
+            )

@@ -24,13 +24,16 @@ additive concatenation of, in order:
    clause** on that same sentence, never as a separate one -- see "Camera
    direction" below.
 4. **Setting** -- ``config.setting`` (issue #32), e.g. ``"London, UK --
-   contemporary, overcast winter"``. Composed unconditionally, after the
-   concept/shot sentence -- see ``_setting_clause``'s own docstring for why
-   position matters here too -- so it lands on *every* chunk regardless of
-   whether the chunk carries a lyric, a shot-plan line, or neither. That is
-   the entire point of #32: geography is a whole-video property and must not
-   be able to drift shot to shot. ``None`` omits the sentence entirely; it
-   never fabricates a place.
+   contemporary, overcast winter"``, narrowed to this chunk's own authored
+   ``location`` (issue #78) when one was set -- see ``_setting_clause``'s own
+   docstring for the substitution rule and why it must be substitution, never
+   concatenation. Composed unconditionally, after the concept/shot sentence
+   -- see ``_setting_clause``'s own docstring for why position matters here
+   too -- so it lands on *every* chunk regardless of whether the chunk
+   carries a lyric, a shot-plan line, or neither. That is the entire point of
+   #32: geography is a whole-video property and must not be able to drift
+   shot to shot. ``None``/blank for both ``setting`` and ``location`` omits
+   the sentence entirely; it never fabricates a place.
 5. **Active character state** -- name + role + visual descriptors of
    whichever cast member(s) are active for this chunk (lead vocalist, a
    background member such as the drummer injected for a specific shot, or --
@@ -87,11 +90,43 @@ from music_video_maker.contracts import AudioChunk, CastMember, ExpandedPrompt
 logger = logging.getLogger(__name__)
 
 _INSTRUMENTAL_CLAUSE_SINGULAR = (
-    "Instrumental passage: the character performs silently, no lyric to sing"
+    "Instrumental passage: the character stays silent throughout this shot"
 )
 _INSTRUMENTAL_CLAUSE_PLURAL = (
-    "Instrumental passage: the characters perform silently, no lyric to sing"
+    "Instrumental passage: the characters stay silent throughout this shot"
 )
+"""Issue #73, in the most-composed prohibition in this codebase.
+
+This read ``"the character performs silently, no lyric to sing"`` until
+2026-08-18, and it is composed into every instrumental chunk -- 39 of 80 on
+"Deathless". ``MiniMaxH3ReferenceToVideo`` exposes exactly one ``prompt``
+input into a single ``BasicGuider``, so there is no negative-conditioning
+channel for a prohibition to live in: it cannot subtract, and the tokens
+actually reaching the model were *lyric* and *sing*. Measured consequence, from
+a viewer on the v7 render: Jan mouthing words with no audio at 3:14, 7:11 and
+8:27, and "his lips never stop moving after 3:49". Same shape as the ``avoid``
+list (#73) and ``"never holding anything"`` in ``role``.
+
+:func:`_present_clause` below had already learned this -- read its docstring,
+which says in as many words that it chose "silent" over "not singing". This
+constant simply never got the same fix, which is what a prohibition looks like
+when it has stopped announcing itself.
+
+**Why this does not say "mouth closed".** That is the obvious positive
+phrasing and it is a trap: #74 measured that naming facial anatomy puts a
+camera on it (100% face presence for
+``"mouth set hard, eyes tired"`` against 83/0/33% for manner-only phrasing).
+An instrumental chunk is very often an authored landscape, so buying this fix
+with "mouth closed" would silently drag 39 wide shots into close-ups -- paying
+for #73 with #74, which is exactly the mistake made on ``cast.Jan.appearance``
+the same week.
+
+**Unverified, deliberately.** #73 justifies *removing* the prohibition: that
+much is measured. Whether "stays silent" is *sufficient* to still the mouth is
+a hypothesis, and it needs a render to settle. It is a single-variable change
+against the v7 corpus, so the A/B is: render with this text, sample the
+instrumental chunks a viewer named (30, 66, 78) and check whether the mouth
+moves. Record the result here either way."""
 
 
 class UnknownCastMemberError(ValueError):
@@ -124,6 +159,7 @@ def expand_prompt(
     camera: str | None = None,
     present: Sequence[str] = (),
     subject: str | None = None,
+    location: str | None = None,
 ) -> ExpandedPrompt:
     """Compose the deterministic Stage 2b prompt for one audio chunk.
 
@@ -176,6 +212,20 @@ def expand_prompt(
     the primary gate for this) and :class:`UnknownCastMemberError` if
     ``subject`` is not in ``config.cast``.
 
+    ``location`` is this chunk's authored place tag, from
+    ``ShotPlanEntry.location`` (issue #78, rendered since the "Deathless"
+    nuclear-glow finding). It narrows ``_setting_clause``'s "Location
+    continuity" sentence to this chunk's own place when set, and is
+    substituted for ``config.setting`` in that sentence rather than composed
+    alongside it -- a run whose ``setting`` describes an event that has since
+    changed (a detonation, an emptied planet) would otherwise still name that
+    event's nouns in every later chunk's prompt, and #73/#74 measured that H3
+    renders whatever noun it is given regardless of the framing placed
+    around it, so a second, qualifying sentence cannot retract the first.
+    ``None`` (the default -- every pre-#78-render caller, and any chunk a
+    plan simply never tagged) falls straight through to ``config.setting``,
+    composing byte-identically to before this parameter existed.
+
     Passing the text in rather than looking it up keeps this module free of
     file I/O and keeps it a pure function of its arguments -- resolution
     (including the drift check) happens once, upstream, in ``cli``.
@@ -183,14 +233,22 @@ def expand_prompt(
     members = _resolve_active_members(config, chunk, subject)
     present_members = _resolve_present_members(config, chunk, present, members)
     prompt = _compose_prompt(
-        config, members, chunk, shot, subject_is_focus, camera=camera, present=present_members
+        config,
+        members,
+        chunk,
+        shot,
+        subject_is_focus,
+        camera=camera,
+        present=present_members,
+        location=location,
     )
     # Issue #46: the chained I2V path has no reference photo, so the seed
     # frame (the predecessor's own output) is already the output of the
     # appearance clause -- restating it applies it a second time. Same
     # composition function, appearance omitted, so the two variants cannot
     # drift out of step with each other. Camera direction is about framing,
-    # not identity, so it stays on the chained variant unchanged.
+    # not identity, so it stays on the chained variant unchanged -- and so
+    # does location, for the same reason: it is about place, not identity.
     chained_prompt = _compose_prompt(
         config,
         members,
@@ -200,6 +258,7 @@ def expand_prompt(
         include_appearance=False,
         camera=camera,
         present=present_members,
+        location=location,
     )
 
     logger.debug(
@@ -359,6 +418,7 @@ def _compose_prompt(
     include_appearance: bool = True,
     camera: str | None = None,
     present: tuple[CastMember, ...] = (),
+    location: str | None = None,
 ) -> str:
     character_clause = _character_clause(config, members, subject_is_focus, include_appearance)
     lyric_clause = _lyric_clause(chunk.text, len(members), singers=members if present else ())
@@ -373,7 +433,7 @@ def _compose_prompt(
         config.cinematography,
         concept,
         None if subject_is_focus else REFOCUS_SENTENCE,
-        _setting_clause(config.setting),
+        _setting_clause(config.setting, location),
         character_clause,
         _present_clause(present, include_appearance),
         lyric_clause,
@@ -429,9 +489,11 @@ def _counterpoint_clauses(chunk: AudioChunk) -> tuple[str, ...]:
     return tuple(clauses)
 
 
-def _setting_clause(setting: str | None) -> str | None:
-    """Compose ``setting`` as a *constraint on* the shot, never as a subject
-    *of* it (issue #32, corrected after the first Chicago render).
+def _setting_clause(setting: str | None, location: str | None = None) -> str | None:
+    """Compose the whole-video ``setting`` -- or this chunk's own, more
+    specific ``location`` when one was authored -- as a *constraint on* the
+    shot, never as a subject *of* it (issue #32, corrected after the first
+    Chicago render).
 
     The original implementation dropped the raw setting in as its own
     declarative sentence high in the prompt. A bare noun phrase about a place
@@ -448,12 +510,33 @@ def _setting_clause(setting: str | None) -> str | None:
     showing a location at all. Hence the conditional phrasing, the explicit
     instruction not to relocate or add landmarks, and the position after the
     shot line so the shot leads and this qualifies.
+
+    ``location`` (issue #78, rendered since the "Deathless" nuclear-glow
+    finding) is **substituted** for ``setting`` in this same sentence when it
+    has content, never composed as a second, additional place-naming
+    sentence: ``place = location if location.strip() else setting``. A run's
+    ``setting`` is one string composed unchanged into every chunk; a song
+    whose world changes over its own runtime (a detonation, an emptied
+    planet) has arc-locked nouns in that one string that stay true only for
+    part of the video, and #73/#74 measured that H3 renders whatever noun it
+    is given regardless of the framing placed around it -- so appending a
+    qualifying sentence after ``setting``'s sentence could not have retracted
+    those nouns; there is no negative-conditioning channel to argue with.
+    Substitution instead means the conflicting noun is simply never composed
+    for a chunk whose own place has been authored. The sentence's shape,
+    wording and position are otherwise unchanged: still one sentence, still
+    conditionally phrased, still instructs against relocating the action or
+    adding landmarks, still after the shot line. ``None``/blank ``location``
+    (every pre-#78-render caller, and any chunk a plan left untagged) falls
+    straight through to ``setting``, composing byte-identically to before
+    this parameter existed.
     """
-    if not setting or not setting.strip():
+    place = location if location and location.strip() else setting
+    if not place or not place.strip():
         return None
     return (
         "Location continuity: wherever the location is identifiable it is "
-        f"{setting.strip().rstrip('.')}, and never anywhere else; do not relocate the "
+        f"{place.strip().rstrip('.')}, and never anywhere else; do not relocate the "
         "action or add landmarks to establish it, this shot's own described location "
         "is what is on screen"
     )

@@ -340,7 +340,19 @@ class RunConfig:
     out of a British front door into an American park -- terraced street and
     wheelie bins in one shot, Central Park and US emergency vehicles in the
     next -- because nothing named a place and H3 picked per shot from whatever
-    each description implied. Silence is what produced the drift."""
+    each description implied. Silence is what produced the drift.
+
+    Keep this to what is genuinely invariant for the *whole* video --
+    era, geography, palette. Do not write anything into it that changes over
+    the song's own arc (an army present, a detonation, a world before it is
+    emptied): this string is composed unchanged into all 80-odd chunks, and a
+    "Deathless" render put a still-standing world's own nouns ("medieval
+    hosts, industrial armies, and nuclear glow all visible") into its 17
+    post-detonation shots this way, because there was nowhere per-chunk for
+    the change to live. Anything that changes over the song belongs in
+    ``ShotPlanEntry.location`` (issue #78) instead, which now composes in
+    place of this field for any chunk that sets it -- see
+    ``prompting._setting_clause`` -- or in the `shot` line itself."""
 
     global_appearance: str | None = None
     """Issue #31: presentation direction applying to the whole cast, e.g.

@@ -457,14 +457,31 @@ class ShotPlanEntry:
     Re-emitted here from the frozen timeline exactly like every other
     beat-derived field ``render_plan_toml`` writes.
 
-    Purely a checkable field, not a rendered one: nothing in this module or
-    ``prompting.py`` composes ``location`` into a prompt. It exists for
-    :func:`~music_video_maker.shot_plan.lint_present_location_mismatch` and
-    the load-time landmark-contradiction lint below to check consistency
-    against, the same way ``beat_role`` exists to be checked rather than
-    spoken. ``None`` (the default) is "not authored", never a fabricated
-    value -- true of every pre-#78 entry and every hand-written plan that
-    does not use the field."""
+    Originally documented here as "purely a checkable field, not a rendered
+    one" -- that claim is now false, and deliberately reversed. A
+    "Deathless" render put an already-detonated world's own arc-locked
+    setting text ("medieval hosts, industrial armies, and nuclear glow all
+    visible") into every one of its 17 post-detonation shots, because
+    ``config.setting`` is one string composed unchanged into all 80 chunks
+    and nothing per-chunk could narrow it -- a viewer's report was "the world
+    looks back-to-normal" after the detonation, when the shot lines
+    themselves were correct. ``prompting._setting_clause`` now composes
+    ``location`` in place of ``setting`` (substitution, not an added
+    sentence -- see that function's docstring for why concatenation cannot
+    fix this: #73/#74 measured that H3 renders whatever noun it is given
+    regardless of the framing around it, so a qualifying second sentence
+    cannot retract a noun ``setting`` already named) whenever this field is
+    set, via :func:`resolve_location`.
+
+    It still exists for :func:`~music_video_maker.shot_plan.lint_present_location_mismatch`
+    and the load-time landmark-contradiction lint below to check consistency
+    against, the same way ``beat_role`` exists to be checked -- rendering it
+    only raises the cost of those lints missing something, it does not change
+    what they check. ``None`` (the default) is "not authored", never a
+    fabricated value -- true of every pre-#78 entry and every hand-written
+    plan that does not use the field, and it composes byte-identically to
+    before this field was rendered: falling straight through to
+    ``config.setting`` exactly as it always did."""
 
 
 def load_shot_plan(
@@ -2686,8 +2703,19 @@ def resolve_location(
     Shares :func:`_resolve_entry`'s drift check for the same reason
     :func:`resolve_camera`/:func:`resolve_present` do: a stale plan must
     refuse every field the same way, not just the ones the render loop
-    consumes directly. ``location`` is never composed into a prompt -- this
-    exists only so the two lints below have something to compare."""
+    consumes directly.
+
+    ``location`` **is** composed into a prompt now -- ``cli.py`` passes this
+    function's return value into ``expand_prompt(..., location=...)``, which
+    substitutes it for ``config.setting`` in the "Location continuity"
+    sentence (see ``prompting._setting_clause``). This is a reversal of the
+    field's original design (see ``ShotPlanEntry.location``'s own docstring
+    for the "Deathless" measurement that forced it): it used to exist only so
+    the two lints below had something to compare, and now it also narrows
+    what actually renders. ``None`` still means "fall back to
+    ``config.setting``, unchanged" -- true of every plan that has no entry
+    for this chunk, an entry that never set ``location``, or no plan at
+    all."""
     entry = _resolve_entry(plan, chunk)
     return entry.location if entry is not None else None
 

@@ -459,8 +459,8 @@ The fix is `ShotPlanEntry.location` — a tag drawn from a small closed set
 the concept stage names for the song (`"valley floor"`, `"switchback"`,
 `"mill"`, `"watch-post"`), assigned per chunk by the beats stage the same way
 `beat_role`/`beat_group` already are: checkable before a word of prose
-exists, never guessed from finished text afterward. It is not composed into
-the rendered prompt — it exists purely so two mechanical checks can run:
+exists, never guessed from finished text afterward. It exists so two
+mechanical checks can run:
 
 * a chunk naming the same landmark as another chunk close by in song time,
   at contradictory distances (the mill "below" then "at shoulder height");
@@ -472,6 +472,23 @@ a false positive on prose written deliberately must never block a run.
 `location` has no bearing on wording — keep writing shot lines exactly as
 the rest of this guide describes; just give each beat an honest answer to
 "where is this happening" and let the two checks do the rest.
+
+**`location` is also composed into the render now** (previously it was
+"purely a checkable field, not a rendered one" — a "Deathless" render is why
+that changed: its `setting` string named a detonation's own nouns, medieval
+hosts, industrial armies, nuclear glow, and composed them into all 80
+chunks unchanged, so the 17 shots authored for the aftermath — an eroded
+hill, a bone-dry mill race — still carried the pre-detonation setting text
+verbatim. `location`, when you set it, *substitutes* for `setting` in the
+"Location continuity" sentence for that one chunk — it does not add a
+second, qualifying sentence next to `setting`'s, because H3 renders whatever
+noun it is given regardless of the framing placed around it (issues #73,
+#74), so a second sentence cannot retract a noun the first one already
+named. Practically: still author `location` from the closed vocabulary as
+above, and know that for any chunk whose moment in the song has drifted from
+`setting`'s own text — a war that has ended, a world that has emptied —
+setting `location` is now what actually keeps the render honest, not only
+the two lints.
 
 ## Make the effect the grammatical subject
 
