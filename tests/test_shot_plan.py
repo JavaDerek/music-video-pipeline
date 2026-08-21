@@ -34,6 +34,7 @@ from music_video_maker.shot_plan import (
     ShotPlanError,
     lint_camera_face_away_on_voiced_chunks,
     lint_instrumental_focus_mismatch,
+    lint_mouth_direction_on_instrumental_chunks,
     lint_present_location_mismatch,
     lint_role_prohibition_contradiction,
     lint_shots_against_lyrics,
@@ -2966,3 +2967,68 @@ def test_subject_binds_a_pronoun_for_the_unbound_companion_lint(caplog):
         lint_shots_against_lyrics(plan, chunks)
         shot_plan_module._lint_implied_companion_without_present(plan, Path("plan.toml"))
     assert "implies a second person" not in caplog.text
+
+
+# --- an instrumental chunk must not ask for the mouth it is told to still ---
+
+
+def test_lint_mouth_direction_on_instrumental_chunk_fires_on_a_real_case():
+    """Issue #91/#90 follow-up, found by a viewer on four consecutive renders.
+
+    The composed prompt for an instrumental chunk carries
+    "Instrumental passage: the character stays silent throughout this shot".
+    Chunk 30 of the "Deathless" plan *also* carried
+    ``shot = "His lips form words of a silent prayer..."`` and
+    ``camera = "close on his mouth and jaw..."`` -- so one prompt asked for a
+    mouth forming words, framed tight, on a chunk where nobody sings, while
+    another clause in the same prompt forbade exactly that.
+
+    H3 rendered what was asked for, and a viewer reported "Jan talking
+    silently to the camera" at 3:14 four times running. Two whole hypotheses
+    (an audio-conditioning theory, then a framing-artifact theory) were built
+    and one was rendered before anyone read the shot line.
+
+    This is structural, not a guess about English: "is this chunk
+    instrumental" is known from the timeline, and the anatomy nouns are the
+    same short set #74 measured as pulling a camera onto a face.
+    """
+    plan = {
+        30: ShotPlanEntry(chunk_id=30, start=193.0,
+                          shot="His lips form words of a silent prayer at the watch-post.",
+                          camera="close on his mouth and jaw"),
+    }
+    chunks = [_chunk(chunk_id=30, start=193.0, end=200.0, text="")]  # instrumental
+
+    findings = lint_mouth_direction_on_instrumental_chunks(plan, chunks)
+
+    # both fields are reported: an author has to fix the shot line AND the
+    # camera, and naming only one of them would leave the other in the prompt.
+    assert [f.chunk_id for f in findings] == [30, 30]
+    assert {f.field for f in findings} == {"shot", "camera"}
+    assert {f.matched for f in findings} == {"lips", "mouth"}
+
+
+def test_lint_mouth_direction_is_silent_on_a_voiced_chunk():
+    """A voiced chunk describing a mouth is correct and common -- "her mouth
+    still parted on the last unsung word" is an authored beat, not a defect.
+    The contradiction only exists where the render also composes the
+    stays-silent clause."""
+    plan = {
+        69: ShotPlanEntry(chunk_id=69, start=446.0,
+                          shot="She falls silent mid-phrase, her mouth still parted.",
+                          camera="close on her face"),
+    }
+    chunks = [_chunk(chunk_id=69, start=446.0, end=451.0, text="the last unsung word")]
+
+    assert lint_mouth_direction_on_instrumental_chunks(plan, chunks) == ()
+
+
+def test_lint_mouth_direction_is_silent_when_an_instrumental_chunk_names_no_mouth():
+    plan = {
+        31: ShotPlanEntry(chunk_id=31, start=200.0,
+                          shot="The valley lies bare under a flat grey sky.",
+                          camera="wide on the ridge"),
+    }
+    chunks = [_chunk(chunk_id=31, start=200.0, end=205.0, text="")]
+
+    assert lint_mouth_direction_on_instrumental_chunks(plan, chunks) == ()

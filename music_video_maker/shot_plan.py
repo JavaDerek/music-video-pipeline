@@ -1637,6 +1637,74 @@ _SHOT_WALKS_AWAY_KEYWORDS: frozenset[str] = frozenset({
 })
 
 
+_MOUTH_ANATOMY = ("mouth", "lips", "jaw", "teeth", "tongue")
+"""The same short anatomy set #74 measured as pulling a camera onto a face.
+Deliberately nouns only -- no verbs, no guess at whether English describes
+movement. See :func:`lint_mouth_direction_on_instrumental_chunks`."""
+
+
+@dataclass(frozen=True)
+class MouthDirectionFinding:
+    """One instrumental chunk whose own text asks for the mouth the render
+    is simultaneously telling H3 to keep still."""
+
+    chunk_id: int
+    field: str
+    matched: str
+    text: str
+
+
+def lint_mouth_direction_on_instrumental_chunks(
+    plan: Mapping[int, ShotPlanEntry], chunks: Sequence[AudioChunk]
+) -> tuple[MouthDirectionFinding, ...]:
+    """Report an instrumental chunk whose ``shot`` or ``camera`` names mouth
+    anatomy, because the prompt then contains both halves of a contradiction.
+
+    Every instrumental chunk composes "Instrumental passage: the character
+    stays silent throughout this shot". On "Deathless" chunk 30 the plan also
+    said ``shot = "His lips form words of a silent prayer..."`` and
+    ``camera = "close on his mouth and jaw..."``. H3 was asked for a mouth
+    forming words, framed tight, on a chunk where nobody sings -- and it
+    delivered one. A viewer reported it on four consecutive renders.
+
+    Two hypotheses were built before anyone read the shot line: that the
+    conditioning audio drove the mouth (killed by measurement -- attenuating
+    the stem 60 dB changed nothing), and that the defect was merely a framing
+    artifact making a universal problem legible (true, but downstream of this).
+    **The prompt was asking for it in writing the whole time.**
+
+    Structural, not a language guess. "Is this chunk instrumental" comes from
+    the timeline, not from reading the prose; the anatomy set is nouns only,
+    the same ones #74 measured. A voiced chunk naming a mouth is correct and
+    common and is never reported -- the contradiction exists only where the
+    render also composes the stays-silent clause.
+
+    Returns findings rather than logging so a caller can decide; the
+    orchestrator logs them as warnings, never raises. A false positive must
+    never block a run.
+    """
+    instrumental = {
+        chunk.chunk_id for chunk in chunks if not (chunk.text or "").strip()
+    }
+    findings: list[MouthDirectionFinding] = []
+    for chunk_id in sorted(plan):
+        if chunk_id not in instrumental:
+            continue
+        entry = plan[chunk_id]
+        for field, value in (("shot", entry.shot), ("camera", entry.camera)):
+            if not value:
+                continue
+            lowered = value.lower()
+            for noun in _MOUTH_ANATOMY:
+                if re.search(rf"\b{re.escape(noun)}\b", lowered):
+                    findings.append(
+                        MouthDirectionFinding(
+                            chunk_id=chunk_id, field=field, matched=noun, text=value
+                        )
+                    )
+                    break
+    return tuple(findings)
+
 def lint_camera_face_away_on_voiced_chunks(
     plan: Mapping[int, ShotPlanEntry], chunks: Sequence[AudioChunk]
 ) -> None:

@@ -78,6 +78,7 @@ from music_video_maker.shot_plan import (
     ShotPlanError,
     lint_camera_face_away_on_voiced_chunks,
     lint_instrumental_focus_mismatch,
+    lint_mouth_direction_on_instrumental_chunks,
     lint_present_location_mismatch,
     lint_role_prohibition_contradiction,
     lint_shots_against_lyrics,
@@ -571,6 +572,17 @@ def run_pipeline(
             # Issue #58: a camera direction that turns her away from the
             # lens on a voiced chunk costs that chunk's lip-sync.
             lint_camera_face_away_on_voiced_chunks(plan, chunks)
+            # The mirror of the check above: an INSTRUMENTAL chunk whose own
+            # text asks for the mouth the render is telling H3 to keep still.
+            for finding in lint_mouth_direction_on_instrumental_chunks(plan, chunks):
+                logger.warning(
+                    "Shot plan chunk_id=%d: this chunk is instrumental, so its prompt "
+                    "says the character stays silent -- but its %s names %r (%r). H3 "
+                    "renders the nouns it is given, so the prompt asks for the mouth it "
+                    "also forbids, and a viewer sees someone mouthing words with no "
+                    "audio. Describe what the shot shows without naming the mouth.",
+                    finding.chunk_id, finding.field, finding.matched, finding.text,
+                )
             # A sung chunk framed wide (or not framed at all) has no face big
             # enough to read a mouth -- the one thing the whole pipeline is for.
             lint_voiced_framing(plan, chunks)
