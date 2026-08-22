@@ -71,6 +71,14 @@ apply to their own invariants. Inferring meaning from arbitrary English is
 not legitimate here, and has failed every time it was tried elsewhere in
 this codebase.
 
+:func:`check_location_tags` is the stronger form of the same idea: it needs
+no vocabulary at all, not even the caller's, because it compares *structures*
+rather than text. A place label reused on both sides of an event that changed
+the world is stale by its shape alone -- getting it right looks like two
+labels, getting it wrong looks like one -- so nothing there has to decide
+what any label means. Prefer that shape wherever a defect has one; matching
+words is the fallback, not the default.
+
 **Export/import (spec §6).** :meth:`WorldState.save`/:meth:`WorldState.load`
 serialize the whole timeline -- every fact version ever opened, not just
 what is currently valid -- to a JSON file a consumer depends on, matching
@@ -89,7 +97,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -918,6 +926,119 @@ def check_claim(
     return tuple(hits)
 
 
+@dataclass(frozen=True)
+class LocatedSpan:
+    """One stretch of story time the caller has labelled with a place.
+
+    ``ref`` is **opaque**: carried into a finding untouched and never read,
+    parsed or compared here -- the same contract :class:`Event`'s ``causes``
+    documents. It exists so a caller can report a finding in whatever units
+    it segments its own work into, without this module ever learning what
+    those units are. ``from_t``/``to_t`` stay bare story-time seconds, the
+    axis that survives the caller re-segmenting.
+    """
+
+    location: str | None
+    from_t: float
+    to_t: float
+    ref: Any = None
+
+
+@dataclass(frozen=True)
+class StaleLocationTag:
+    """One finding from :func:`check_location_tags`: a single place label was
+    used both before and after an event the caller classified as changing the
+    world, so the spans after it are labelled with the world as it was.
+
+    Carries exactly **one hop of causality** -- the event's own id and time --
+    for the same reason :class:`Contradiction` does: the reviewer's only
+    decision is "is the label wrong, or is the event wrong", and that is
+    undecidable without knowing which event put the two sides on opposite
+    sides of a change.
+    """
+
+    location: str
+    event_id: str
+    event_at_t: float
+    before_refs: tuple[Any, ...]
+    after_refs: tuple[Any, ...]
+
+
+def check_location_tags(
+    world: WorldState,
+    spans: Sequence[LocatedSpan],
+    *,
+    event_kinds: Collection[str],
+) -> tuple[StaleLocationTag, ...]:
+    """Report a place label reused on both sides of a world-changing event.
+
+    A place label names somewhere **at a time**. When an event changes the
+    world, a place that survives it has a before-state and an after-state,
+    and those need one label each; a caller that enumerates its labels once,
+    up front, has no way to know which of them will later need a second
+    version, because the events that split them may not have been authored
+    yet. The result is silent: spans after the change keep pointing at the
+    world as it was, every label validates, and nothing anywhere disagrees.
+
+    **This needs no vocabulary, because correct and incorrect authoring have
+    different shapes.** Two labels either side of the event is what getting
+    it right looks like; one label spanning it is what getting it wrong looks
+    like. So this never matches words, infers meaning, or asks whether a
+    label and an event concern the same place -- it compares the *structure*
+    of how labels are distributed across time against the *structure* of the
+    event log. Compare :func:`check_claim`, which must be given ``nouns``
+    precisely because it does read text.
+
+    ``event_kinds`` is the caller's own classification of which
+    :attr:`Event.kind` values change the world for **every** place rather
+    than one of them -- required, never defaulted, for the same reason
+    ``nouns`` is: this module ships zero vocabulary of its own. An event kind
+    that changes a single place is deliberately out of scope, because
+    deciding whether a label refers to *that* place is exactly the text
+    matching this avoids.
+
+    A span the event happens *inside* counts as **before** it: that span is
+    the one narrating the change, so its label is legitimately the old one.
+
+    **An empty return means "found nothing to object to", never "these labels
+    are consistent."** It is only ever as complete as the ``event_kinds`` the
+    caller named -- never a completeness guarantee. Read-only; never raises.
+    """
+    kinds = frozenset(event_kinds)
+    if not kinds:
+        return ()
+    events = sorted(
+        (event for event in world.events if event.kind in kinds),
+        key=lambda event: event.at_t,
+    )
+    if not events:
+        return ()
+
+    grouped: dict[str, list[LocatedSpan]] = {}
+    for span in spans:
+        if span.location is None or not str(span.location).strip():
+            continue
+        grouped.setdefault(span.location, []).append(span)
+
+    hits: list[StaleLocationTag] = []
+    for location, group in grouped.items():
+        for event in events:
+            before = tuple(s.ref for s in group if s.from_t < event.at_t)
+            after = tuple(s.ref for s in group if s.from_t >= event.at_t)
+            if not before or not after:
+                continue
+            hits.append(
+                StaleLocationTag(
+                    location=location,
+                    event_id=event.id,
+                    event_at_t=event.at_t,
+                    before_refs=before,
+                    after_refs=after,
+                )
+            )
+    return tuple(hits)
+
+
 __all__ = [
     "EXISTENCE_KEY",
     "WORLDSTATE_SCHEMA_VERSION",
@@ -935,6 +1056,9 @@ __all__ = [
     "Snapshot",
     "ChangeSet",
     "Contradiction",
+    "LocatedSpan",
+    "StaleLocationTag",
     "WorldState",
     "check_claim",
+    "check_location_tags",
 ]

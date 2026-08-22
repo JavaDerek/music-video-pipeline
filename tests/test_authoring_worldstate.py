@@ -33,14 +33,17 @@ from music_video_maker.authoring.worldstate import (
     Event,
     Fact,
     IrreversibleFactViolation,
+    LocatedSpan,
     NonMonotonicFactWriteError,
     ReservedFactKeyError,
     Snapshot,
+    StaleLocationTag,
     UnknownEntityError,
     WorldState,
     WorldStateError,
     WorldStateFileError,
     check_claim,
+    check_location_tags,
 )
 
 # ---------------------------------------------------------------------------
@@ -1127,3 +1130,210 @@ def test_loading_refuses_an_entity_whose_destruction_disagrees_with_its_fact():
 
     with pytest.raises(WorldStateFileError, match="destro"):
         WorldState.from_dict(payload)
+
+
+# ---------------------------------------------------------------------------
+# check_location_tags -- a place label reused across a change to the world.
+# ---------------------------------------------------------------------------
+
+
+def _ended_world() -> tuple[WorldState, str]:
+    """A world with one event the caller classifies as ending it. Every
+    song-specific word stays in this fixture, as everywhere else in this file.
+    """
+    ws = WorldState()
+    ws.create_entity(entity_id="e", kind="place", name="a place", created_at_t=0.0)
+    ending = ws.record_event(
+        at_t=100.0, kind="ending", description="the blast finishes sweeping the valley"
+    )
+    ws.set_fact(
+        entity_id="e",
+        key="state",
+        value="emptied",
+        valid_from_t=100.0,
+        opened_by_event_id=ending.id,
+        irreversible=True,
+    )
+    return ws, ending.id
+
+
+def test_check_location_tags_fires_on_a_tag_used_either_side_of_an_ending():
+    ws, ending_id = _ended_world()
+    hits = check_location_tags(
+        ws,
+        [
+            LocatedSpan(location="the yard", from_t=0.0, to_t=10.0, ref="a"),
+            LocatedSpan(location="the yard", from_t=150.0, to_t=160.0, ref="b"),
+        ],
+        event_kinds=("ending",),
+    )
+    assert len(hits) == 1
+    hit = hits[0]
+    assert hit.location == "the yard"
+    assert hit.event_id == ending_id
+    assert hit.event_at_t == 100.0
+    assert hit.before_refs == ("a",)
+    assert hit.after_refs == ("b",)
+
+
+def test_check_location_tags_is_silent_when_each_side_uses_its_own_tag():
+    """The discriminating property, and the whole reason this needs no
+    vocabulary: correct authoring and incorrect authoring have different
+    shapes. One label spanning the change fires; two labels do not."""
+    ws, _ = _ended_world()
+    hits = check_location_tags(
+        ws,
+        [
+            LocatedSpan(location="the yard", from_t=0.0, to_t=10.0, ref="a"),
+            LocatedSpan(location="the yard, after", from_t=150.0, to_t=160.0, ref="b"),
+        ],
+        event_kinds=("ending",),
+    )
+    assert hits == ()
+
+
+def test_check_location_tags_is_silent_for_a_tag_used_only_before():
+    ws, _ = _ended_world()
+    hits = check_location_tags(
+        ws,
+        [
+            LocatedSpan(location="the yard", from_t=0.0, to_t=10.0, ref="a"),
+            LocatedSpan(location="the yard", from_t=20.0, to_t=30.0, ref="b"),
+        ],
+        event_kinds=("ending",),
+    )
+    assert hits == ()
+
+
+def test_check_location_tags_is_silent_for_a_tag_used_only_after():
+    ws, _ = _ended_world()
+    hits = check_location_tags(
+        ws,
+        [
+            LocatedSpan(location="the yard", from_t=150.0, to_t=160.0, ref="a"),
+            LocatedSpan(location="the yard", from_t=170.0, to_t=180.0, ref="b"),
+        ],
+        event_kinds=("ending",),
+    )
+    assert hits == ()
+
+
+def test_check_location_tags_a_span_containing_the_event_narrates_it_and_counts_as_before():
+    """The span the change happens *inside* is the one describing the change.
+    Its label is legitimately the old one, so it must never be reported --
+    and on its own it must not make the tag look like it spans the event."""
+    ws, _ = _ended_world()
+    hits = check_location_tags(
+        ws,
+        [
+            LocatedSpan(location="the yard", from_t=0.0, to_t=10.0, ref="a"),
+            LocatedSpan(location="the yard", from_t=90.0, to_t=110.0, ref="during"),
+        ],
+        event_kinds=("ending",),
+    )
+    assert hits == ()
+
+
+def test_check_location_tags_ignores_event_kinds_the_caller_did_not_name():
+    """Zero vocabulary of its own: which kinds end a world is the caller's
+    classification, exactly as ``nouns`` is in :func:`check_claim`."""
+    ws, _ = _ended_world()
+    spans = [
+        LocatedSpan(location="the yard", from_t=0.0, to_t=10.0, ref="a"),
+        LocatedSpan(location="the yard", from_t=150.0, to_t=160.0, ref="b"),
+    ]
+    assert check_location_tags(ws, spans, event_kinds=("destruction",)) == ()
+    assert check_location_tags(ws, spans, event_kinds=()) == ()
+
+
+def test_check_location_tags_reports_every_offending_tag_independently():
+    ws, _ = _ended_world()
+    hits = check_location_tags(
+        ws,
+        [
+            LocatedSpan(location="the yard", from_t=0.0, to_t=10.0, ref="a"),
+            LocatedSpan(location="the yard", from_t=150.0, to_t=160.0, ref="b"),
+            LocatedSpan(location="the shed", from_t=5.0, to_t=15.0, ref="c"),
+            LocatedSpan(location="the shed", from_t=155.0, to_t=165.0, ref="d"),
+        ],
+        event_kinds=("ending",),
+    )
+    assert {h.location for h in hits} == {"the yard", "the shed"}
+    assert len(hits) == 2
+
+
+def test_check_location_tags_reports_one_finding_per_tag_and_event():
+    ws, _ = _ended_world()
+    second = ws.record_event(at_t=200.0, kind="ending", description="a later ending")
+    hits = check_location_tags(
+        ws,
+        [
+            LocatedSpan(location="the yard", from_t=0.0, to_t=10.0, ref="a"),
+            LocatedSpan(location="the yard", from_t=250.0, to_t=260.0, ref="b"),
+        ],
+        event_kinds=("ending",),
+    )
+    assert len(hits) == 2
+    assert {h.event_at_t for h in hits} == {100.0, 200.0}
+    assert second.id in {h.event_id for h in hits}
+
+
+def test_check_location_tags_returns_empty_and_never_raises_on_empty_input():
+    ws, _ = _ended_world()
+    assert check_location_tags(ws, [], event_kinds=("ending",)) == ()
+    assert check_location_tags(WorldState(), [], event_kinds=("ending",)) == ()
+
+
+def test_check_location_tags_ignores_spans_with_no_location():
+    ws, _ = _ended_world()
+    hits = check_location_tags(
+        ws,
+        [
+            LocatedSpan(location=None, from_t=0.0, to_t=10.0, ref="a"),
+            LocatedSpan(location=None, from_t=150.0, to_t=160.0, ref="b"),
+        ],
+        event_kinds=("ending",),
+    )
+    assert hits == ()
+
+
+def test_check_location_tags_result_types_are_frozen():
+    ws, _ = _ended_world()
+    hits = check_location_tags(
+        ws,
+        [
+            LocatedSpan(location="the yard", from_t=0.0, to_t=10.0, ref="a"),
+            LocatedSpan(location="the yard", from_t=150.0, to_t=160.0, ref="b"),
+        ],
+        event_kinds=("ending",),
+    )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        hits[0].location = "changed"  # type: ignore[misc]
+    span = LocatedSpan(location="the yard", from_t=0.0, to_t=1.0, ref="a")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        span.location = "changed"  # type: ignore[misc]
+
+
+def test_located_span_ref_is_opaque_and_never_interpreted():
+    """``ref`` is the caller's own annotation, the same contract
+    ``Event.causes`` documents -- carried through to the finding untouched so
+    a reporting caller can name its own units, and never parsed here."""
+    ws, _ = _ended_world()
+    hits = check_location_tags(
+        ws,
+        [
+            LocatedSpan(location="the yard", from_t=0.0, to_t=10.0, ref={"anything": 1}),
+            LocatedSpan(location="the yard", from_t=150.0, to_t=160.0, ref=object),
+        ],
+        event_kinds=("ending",),
+    )
+    assert len(hits) == 1
+    assert hits[0].before_refs == ({"anything": 1},)
+    assert hits[0].after_refs == (object,)
+
+
+def test_check_location_tags_keeps_the_story_time_axis():
+    """The module's axis invariant: findings are in seconds, never in the
+    caller's segmentation units."""
+    assert not (_field_names(StaleLocationTag) & {"chunk_id", "chunk_index", "chunk"})
+    assert not (_field_names(LocatedSpan) & {"chunk_id", "chunk_index", "chunk"})
