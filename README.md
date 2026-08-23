@@ -824,6 +824,22 @@ segments, large gaps inside one lyric line, segments isolated from all vocal
 activity around them, and stable-ts's own per-word confidence where it exposes
 it. `--strict-alignment` turns a critical finding into a refusal.
 
+Two of the checks read the master audio itself rather than only the timings,
+and they are mirrors of each other. `no_vocal_energy_in_placed_segment`
+(CRITICAL) asks *"is there a voice where you put this lyric"* — it compares
+each placed segment's energy above 3.4 kHz, where consonants live, against the
+median across the track's own other segments, and it caught a closing refrain
+placed twelve seconds into a fadeout that every timing-based check waved
+through. `voice_in_unplaced_gap` (WARNING) asks the opposite: *"is there a
+voice where you placed nothing"* — the failure a check attached to placements
+can never see, and the one that told H3 to perform silently over a passage the
+master was audibly singing. The second is deliberately the weaker of the two
+and never refuses a run: a *low* consonant-band share on a placed lyric is
+unambiguous, but a *high* one over an unplaced gap can equally be a cymbal or a
+bright lead guitar, so it ranks candidates and names a four-second window for
+you to listen to. It is also the check that tells you `alignment_model_size` is
+too small for this song, which otherwise only surfaces by ear.
+
 It is report-only by default on purpose — a real song always has some odd
 segments, so refusing by default would be wrong. But alignment takes about six
 seconds and a render takes hours, so for an unattended run `--strict-alignment`
