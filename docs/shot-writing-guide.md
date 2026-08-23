@@ -289,6 +289,45 @@ between the motion (hooking, dragging, sweeping, throwing) and the result
 constrain the actual last frame instead of hoping prose lands on it — but
 it's unbuilt; this is the zero-code version.)
 
+### ...except on a plant (issue #85)
+
+"Describe the end state, not the motion" is advice about a *contact* or a
+*consequence* — the end state it means is the end state of that shot's own
+action. It is exactly backwards for a **plant**, whose whole job is the
+*before*: the object standing, intact, present, not yet touched. A plant
+line that reaches for an end state reaches for the wrong one — its own
+group's consequence hasn't happened yet, so the only end state available to
+describe is the one the consequence is supposed to deliver.
+
+Measured on a real plan: a plant, a contact and a consequence twelve
+seconds apart put an island GONE at 6:26 (the plant), PRESENT at 6:31 (the
+contact), and GONE again at 6:38 (the consequence). Each line was
+internally consistent prose, and nothing that compares a shot line only to
+itself — which is everything upstream of this rule — could see that the
+three of them together tell a broken story.
+
+**Wrong** — this is the PLANT. It already shows the island gone, twelve
+seconds before its own consequence removes it:
+
+```toml
+shot = "She casts a glance out across the flat, grey sea toward the empty
+        horizon where the island once stood, no silhouette left to mark it."
+```
+
+**Right** — the plant shows the before-state; the consequence still lands:
+
+```toml
+shot = "A low dark island holds firm along the horizon across the flat grey
+        sea, filling the middle distance in the pale light, as she glances
+        out toward it."
+```
+
+If the beat you were given is itself ambiguous about tense — "she looks out
+toward the sea where the island stood" reads equally as "has always stood"
+and "used to stand" — resolve it toward the before-state. That is what a
+plant is for, and it's the beat's own ambiguity, not a licence to jump to
+the payoff early.
+
 ## Name the outcome in plain physical terms
 
 Same failure, different cause. One render staged a lyrical defenestration —

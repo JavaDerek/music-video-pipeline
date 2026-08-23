@@ -37,7 +37,7 @@ from music_video_maker.authoring.beats import Beat
 from music_video_maker.authoring.chunks import skeleton_table_text
 from music_video_maker.authoring.driver import MODEL_OPUS, DriverError, DriverResult, ModelDriver
 from music_video_maker.authoring.hashing import sha256_text
-from music_video_maker.authoring.prompts import photography_system_prompt
+from music_video_maker.authoring.prompts import photography_system_prompt, song_facts_block
 from music_video_maker.config import RunConfig
 from music_video_maker.contracts import AudioChunk
 
@@ -205,13 +205,19 @@ def photography_input_hashes(
     concept: Mapping[str, Any],
     beats: Sequence[Beat],
 ) -> dict[str, str]:
-    return {
+    hashes = {
         "skeleton": sha256_text(skeleton_table_text(chunks)),
         "concept": sha256_text(json.dumps(dict(concept), sort_keys=True)),
         "beats": sha256_text(
             json.dumps([b.to_dict() for b in sorted(beats, key=lambda b: b.start)], sort_keys=True)
         ),
     }
+    if config.song_facts:
+        # Issue #86: present only when there are facts -- see
+        # concept.concept_input_hashes for why an unconditional key would
+        # falsely stale every pre-#86 run.
+        hashes["song_facts"] = sha256_text(json.dumps(list(config.song_facts)))
+    return hashes
 
 
 def build_photography_prompt(
@@ -226,7 +232,13 @@ def build_photography_prompt(
     """The Stage 3 user prompt: the concept, every beat, and (for a candidate
     run) the framing stance this one is being asked to hold."""
     by_id = {chunk.chunk_id: chunk for chunk in chunks}
-    parts = [
+    parts: list[str] = []
+    facts = song_facts_block(config.song_facts)
+    if facts:
+        # Issue #86: composed FIRST, same position as
+        # concept.build_concept_prompt -- see that function's comment.
+        parts += [*facts, ""]
+    parts += [
         "## The approved concept",
         f"Logline: {concept.get('logline', '')}",
         f"Tone: {concept.get('tone', '')}",

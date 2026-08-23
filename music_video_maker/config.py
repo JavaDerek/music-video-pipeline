@@ -131,6 +131,23 @@ just for a constant, the same rule :data:`MAX_NOISE_SEED` follows.
 run can *choose*, and changing the default would silently re-cut the timeline
 of every config already committed."""
 
+LYRIC_LITERALNESS_BANDS: tuple[str, ...] = ("free", "thematic", "literal")
+"""Issue #67: how closely this video illustrates its lyrics, as an ORDERED
+ordinal set rather than a number.
+
+``lyric_literalness = 0.37`` implies a resolution no model can act on and
+invites tuning a value with no measurable effect. Three bands with
+documented, distinguishable meanings can each be *acted* on -- see
+:attr:`RunConfig.lyric_literalness`. Ordered free -> literal because callers
+compare position: the shot-vs-lyric lint (#37) is silenced at one end and
+promoted to the error tier at the other, and a web UI's 0-100 slider (#36)
+maps onto these three, not the other way round."""
+
+DEFAULT_LYRIC_LITERALNESS = "thematic"
+"""Today's implicit behaviour, made explicit and chosen rather than inherited
+-- so every config committed before this field existed means exactly what it
+meant before (issue #67)."""
+
 _PATH_FIELDS = ("master_audio", "lyrics_file", "workflow_template", "chunks_dir", "final_video_dir")
 _SCALAR_FIELDS = ("global_style", "narrative_concept", "default_lead_vocalist")
 
@@ -469,6 +486,82 @@ class RunConfig:
     instruction. This field stays so a run can carry that intent to the
     authoring layer -- but nothing downstream of Stage 2b may compose it.
     """
+
+    song_facts: tuple[str, ...] = ()
+    """Issue #86: facts about *this song* the operator has established, which
+    every authoring stage must see. **Read by the authoring layer, never
+    composed into a render prompt** -- the same posture ``avoid`` above ends
+    up in, for the same #73 reason.
+
+    The gap this fills is the project's own recurring one, one level out: a
+    property that must hold across the whole video needs its own field, and
+    an operator's answer to "what is true about this song" had no field at
+    all. The only way to state one was ``mvm-author <stage> --notes "..."``,
+    which is interpolated into exactly one prompt and then gone -- not
+    recorded in ``.authoring/``, not carried to the next stage, not in any
+    input hash, so two concepts generated from identical inputs and different
+    instructions were indistinguishable afterwards. Reviewing "Deathless"
+    ``shot_plan_v6.toml`` the operator wanted two facts fixed -- that
+    "mushroom" turns from literal fungi into a mushroom cloud, and that the
+    island is *vaporised* rather than eroded -- and both happened to be
+    honoured already because #69's ``reading`` had independently spotted the
+    pun. That is luck, and it is the point.
+
+    Short declarative statements, in the config so they are committed and
+    diffable: ``["the narrator is unreliable", "the second character is a
+    memory, never physically present", "the factory closed years ago"]``.
+    Composed into every authoring stage's prompt the way ``global_style`` is,
+    and hashed into every stage's inputs, so editing one reports its
+    descendants stale by the comparison that already catches an edited lyrics
+    file.
+
+    ``--notes`` is unchanged and still the right tool for a one-off objection
+    ("less handheld, hold the wides"). This is for the facts that must not
+    have to be retyped.
+
+    Deliberately **not** accompanied by a check that the plan "honours" a
+    fact: that is not mechanically decidable, and pretending otherwise is the
+    kind of lint this project has already had to retire twice (#60, #76). The
+    value here is durability and visibility, not enforcement.
+
+    Named ``song_facts`` rather than ``facts`` because this is a flat
+    namespace shared with render settings and "facts" alone says nothing
+    about what they are facts *about*; and rather than ``notes`` because
+    ``--notes`` is deliberately the transient one and reusing the word would
+    blur the exact distinction this field draws."""
+
+    lyric_literalness: str = DEFAULT_LYRIC_LITERALNESS
+    """Issue #67: how literally this video reads its lyrics -- one of
+    :data:`LYRIC_LITERALNESS_BANDS`. **A directorial choice, and until this
+    field existed it was one fixed opinion distributed across four preambles
+    and two lints with no way to say "not this time".**
+
+    * ``"free"`` -- the song supplies mood, tempo and title. The video is its
+      own idea and may share nothing else with the words. The shot-vs-lyric
+      lint (#37) is silenced outright, because at this end of the range a
+      lyric naming an object the plan stages elsewhere is the brief, not a
+      defect.
+    * ``"thematic"`` -- the default, and today's behaviour: the video tells a
+      story the song is about, and specific images surface where they land
+      well. Lints exactly as they were.
+    * ``"literal"`` -- every nameable object and action in a line is on
+      screen in the chunk that sings it. The shot-vs-lyric lint is promoted
+      to the error tier *in the authoring layer*, so a generated plan that
+      leaves one unstaged is revised rather than merely annotated.
+
+    **The render path never reads this.** It is tempting to treat
+    ``prompting._lyric_clause`` -- the literal lyric text composed into every
+    prompt -- as the knob and turn it down at ``free``. It is not a
+    literalness knob, it is the lip-sync conditioning: those words are what
+    H3 mouths, and softening them would break sync on every voiced chunk,
+    which is the one thing this project exists for. The dial lives entirely
+    in the authoring layer and in the lints, and this is written down here
+    rather than discovered in a render because the wrong place to put it is
+    the obvious one.
+
+    It reaches a composed prompt only through the ``shot`` text an authored
+    plan carries, so ``ChunkFingerprint.prompt_hash`` already covers its
+    effect and ``--resume`` needs no new fingerprint field."""
 
     cinematography: str | None = None
     """Issue #53: the whole-video film-direction language -- stock, lens,
@@ -1555,6 +1648,47 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
             )
         avoid_items.append(item.strip())
     values["avoid"] = tuple(avoid_items)
+
+    # Issue #86: the operator's own settled facts about the song. Validated
+    # exactly like `avoid` above -- same shape, same messages -- because it is
+    # the same kind of value and a second convention would be one more thing
+    # to remember.
+    raw_facts = merged.get("song_facts", [])
+    if raw_facts is None:
+        raw_facts = []
+    if not isinstance(raw_facts, list):
+        raise ConfigError(
+            f"song_facts must be a list of strings, got {type(raw_facts).__name__} "
+            "(issue #86)"
+        )
+    fact_items = []
+    for i, item in enumerate(raw_facts):
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigError(
+                f"song_facts[{i}] must be a non-empty string, got {item!r} (issue #86)"
+            )
+        fact_items.append(item.strip())
+    values["song_facts"] = tuple(fact_items)
+
+    # Issue #67: an ordinal, never a float. A number here would imply a
+    # resolution no model can act on; the three bands each have a documented
+    # meaning something can actually be done with.
+    raw_literalness = merged.get("lyric_literalness", DEFAULT_LYRIC_LITERALNESS)
+    if raw_literalness is None:
+        raw_literalness = DEFAULT_LYRIC_LITERALNESS
+    if not isinstance(raw_literalness, str):
+        raise ConfigError(
+            f"lyric_literalness must be one of {list(LYRIC_LITERALNESS_BANDS)}, got "
+            f"{raw_literalness!r} -- it is an ordinal band, not a number: a value like "
+            "0.37 implies a precision no model can act on (issue #67)"
+        )
+    literalness = raw_literalness.strip().lower()
+    if literalness not in LYRIC_LITERALNESS_BANDS:
+        raise ConfigError(
+            f"lyric_literalness must be one of {list(LYRIC_LITERALNESS_BANDS)}, got "
+            f"{raw_literalness!r} (issue #67)"
+        )
+    values["lyric_literalness"] = literalness
 
     shot_plan_path = merged.get("shot_plan")
     if shot_plan_path:

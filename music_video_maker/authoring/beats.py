@@ -45,7 +45,11 @@ from typing import Any
 from music_video_maker.authoring.chunks import skeleton_table_text
 from music_video_maker.authoring.driver import MODEL_OPUS, DriverResult, ModelDriver
 from music_video_maker.authoring.hashing import sha256_file, sha256_text
-from music_video_maker.authoring.prompts import SHOT_WRITING_GUIDE_DOC, beats_system_prompt
+from music_video_maker.authoring.prompts import (
+    SHOT_WRITING_GUIDE_DOC,
+    beats_system_prompt,
+    song_facts_block,
+)
 from music_video_maker.config import RunConfig
 from music_video_maker.contracts import AudioChunk
 from music_video_maker.shot_plan import ShotLength
@@ -105,6 +109,17 @@ BEATS_SCHEMA: dict[str, Any] = {
                     # voiced/instrumental status in `_parse_entries`, never
                     # just "is this a string" the way this schema hint is.
                     "subject": {"type": "string", "minLength": 1},
+                    # Issue #83: what the world LOOKS LIKE at this beat --
+                    # weather, light, the aftermath of an event -- the third
+                    # continuity axis, separate from `location` (#78). NOT
+                    # added to `required` above, deliberately: when the
+                    # concept supplies no `conditions` vocabulary the prompt
+                    # never lists one (see `_concept_block`), so demanding a
+                    # value here would ask for something nothing explained.
+                    # The real gate is `_parse_entries`, conditionally on
+                    # whether a vocabulary was supplied -- this hint only
+                    # covers "is this a string" for a model that does set it.
+                    "conditions": {"type": "string", "minLength": 1},
                 },
             },
         }
@@ -159,6 +174,23 @@ class Beat:
     actual gate is :data:`BEATS_SCHEMA` plus :func:`_parse_entries`, which
     require a real, non-empty ``act`` on every entry a *fresh* model reply
     produces -- the dataclass default only covers reading old data back in."""
+    conditions: str = ""
+    """What the world LOOKS LIKE at this beat (issue #83) -- weather, light,
+    and the persistent aftermath of an event the video has already shown,
+    e.g. ``"heavy falling snow"`` or ``"smoke and settling debris"``. The
+    third continuity axis, separate from ``location`` (issue #78, where the
+    active cast member is) and ``setting`` (what world this is): a character
+    legitimately moves back and forth between places, and the world is not
+    supposed to move back and forth between states, which is why this is a
+    second field rather than folded into ``location``.
+
+    Defaults to ``""``, the same register as ``location``'s and ``act``'s own
+    dataclass defaults: ``""`` means a pre-#83 persisted beat sheet, NEVER a
+    fabricated world state. Unlike ``location``/``act``, this field is not
+    unconditionally required -- when the concept supplies no ``conditions``
+    vocabulary, the field is optional free text (see :func:`_parse_entries`),
+    so ``""`` is also the honest value for "the model was not asked to name
+    one and did not"."""
     subject: str | None = None
     """Whose shot an INSTRUMENTAL beat is (issue #82) -- the field that
     replaces the render's ``default_lead_vocalist`` fallback (composed as
@@ -198,6 +230,7 @@ class Beat:
             "beat_group": self.beat_group,
             "location": self.location,
             "act": self.act,
+            "conditions": self.conditions,
             "subject": self.subject,
             "focus": self.focus,
             "length_seconds": self.length_seconds,
@@ -221,6 +254,10 @@ class Beat:
             # Pre-#84 persisted beat sheets have no `act` key at all -- same
             # "not authored" default as `location` above.
             act=str(payload.get("act") or ""),
+            # Pre-#83 persisted beat sheets have no `conditions` key at all --
+            # same "not authored" default as `location`/`act` above, never a
+            # fabricated world state.
+            conditions=str(payload.get("conditions") or ""),
             # Pre-#82 persisted beat sheets have no `subject` key at all;
             # `None` -- not `""` -- is the correct "not stated" value here,
             # see the field's own docstring.
@@ -262,6 +299,7 @@ def _parse_entries(
     locations: Sequence[str] = (),
     acts: Sequence[str] = (),
     cast_names: Sequence[str] = (),
+    conditions: Sequence[str] = (),
 ) -> tuple[Beat, ...]:
     """Shape-check each entry and pin it to a real chunk. Appends to
     ``problems`` rather than raising, so one round reports everything.
@@ -282,9 +320,18 @@ def _parse_entries(
     ``cast_names`` is issue #82's known-cast set for ``subject``, exactly
     the same "empty means no vocabulary supplied" degradation -- a caller
     that has not threaded the cast through (most tests) must not be blocked
-    from parsing at all."""
+    from parsing at all.
+
+    ``conditions`` is issue #83's closed vocabulary for the beat's
+    ``conditions`` -- but where ``location``/``act`` are unconditionally
+    REQUIRED and only their *membership* degrades on an empty vocabulary,
+    ``conditions`` degrades further: an empty vocabulary makes the field
+    itself optional, and any string the model sets is kept as free text
+    (stripped, defaulting to ``""``) rather than checked against a set. A
+    non-empty vocabulary makes it required, exactly like ``location``."""
     canonical = _canonical_vocabulary(locations)
     canonical_acts = _canonical_vocabulary(acts)
+    canonical_conditions = _canonical_vocabulary(conditions)
     known_cast = {n.strip() for n in cast_names if n and n.strip()}
     if not isinstance(data, dict):
         raise BeatsValidationError(
@@ -398,6 +445,41 @@ def _parse_entries(
         else:
             act = act.strip()
 
+        conditions_raw = entry.get("conditions")
+        if conditions_raw is not None and not isinstance(conditions_raw, str):
+            problems.append(
+                f"chunk_id={chunk_id} conditions={conditions_raw!r} must be a string, or "
+                "omitted entirely"
+            )
+            continue
+        if canonical_conditions:
+            # A vocabulary was supplied (issue #83): required, exactly like
+            # `location` -- the model was shown an approved list, so a
+            # missing/blank/out-of-vocabulary value is a problem sent back.
+            if not isinstance(conditions_raw, str) or not conditions_raw.strip():
+                problems.append(
+                    f"chunk_id={chunk_id} conditions must be a non-empty string naming one "
+                    f"of this song's approved conditions {sorted(canonical_conditions.values())}"
+                )
+                continue
+            resolved_conditions = canonical_conditions.get(conditions_raw.strip().lower())
+            if resolved_conditions is None:
+                problems.append(
+                    f"chunk_id={chunk_id} conditions={conditions_raw!r} is not one of this "
+                    f"song's approved conditions {sorted(canonical_conditions.values())}. "
+                    "Every beat's `conditions` has to be exactly one of the concept's list -- "
+                    "pick the closest match, or say in your reply why a new one is needed so "
+                    "the concept can be revised"
+                )
+                continue
+            conditions_value = resolved_conditions
+        else:
+            # No vocabulary supplied (a pre-#83 concept, or a caller not
+            # using the field): `conditions` is fully optional free text,
+            # never checked against a set. A missing key and a blank string
+            # both degrade to the same "" default.
+            conditions_value = (conditions_raw or "").strip()
+
         chunk = by_id[chunk_id]
 
         subject = entry.get("subject")
@@ -434,6 +516,7 @@ def _parse_entries(
                 beat_group=group,
                 location=location,
                 act=act,
+                conditions=conditions_value,
                 subject=subject,
                 focus=focus,
                 length_seconds=length,
@@ -605,17 +688,21 @@ def validate_beats(
     locations: Sequence[str] = (),
     acts: Sequence[str] = (),
     cast_names: Sequence[str] = (),
+    conditions: Sequence[str] = (),
 ) -> tuple[Beat, ...]:
     """Parse and check a model reply, or raise with everything that is wrong.
 
     ``locations`` is the concept's closed vocabulary for ``location`` (issue
     #78); ``acts`` is the concept's closed, ordered vocabulary for ``act``
     (issue #84); ``cast_names`` is the known cast for ``subject`` (issue
-    #82). All three empty means no vocabulary was supplied and anything
-    structurally valid is accepted. See :func:`_parse_entries` and
+    #82); ``conditions`` is the concept's closed vocabulary for
+    ``conditions`` (issue #83) -- empty means no vocabulary was supplied, in
+    which case `location`/`act` still require a real value (only membership
+    is unchecked) while `conditions` becomes optional free text (see
+    :func:`_parse_entries`). See :func:`_parse_entries` and
     :func:`check_act_structure`."""
     problems: list[str] = []
-    beats = _parse_entries(data, chunks, problems, locations, acts, cast_names)
+    beats = _parse_entries(data, chunks, problems, locations, acts, cast_names, conditions)
     check_beat_structure(beats, chunks, problems)
     check_act_structure(beats, acts, problems)
     if problems:
@@ -640,11 +727,17 @@ def beats_input_hashes(
     than silently leaving a beat sheet that descends from a paragraph nobody
     approved -- reported, never auto-healed.
     """
-    return {
+    hashes = {
         "skeleton": sha256_text(skeleton_table_text(chunks)),
         "concept": sha256_text(json.dumps(dict(concept), sort_keys=True)),
         "shot_writing_guide": sha256_file(SHOT_WRITING_GUIDE_DOC),
     }
+    if config.song_facts:
+        # Issue #86: present only when there are facts -- see
+        # concept.concept_input_hashes for why an unconditional key would
+        # falsely stale every pre-#86 run.
+        hashes["song_facts"] = sha256_text(json.dumps(list(config.song_facts)))
+    return hashes
 
 
 def _reading_block(reading: Mapping[str, Any]) -> list[str]:
@@ -709,6 +802,13 @@ def _concept_block(concept: Mapping[str, Any]) -> str:
                 if isinstance(a, Mapping)
             )
         )
+    conditions = concept.get("conditions") or []
+    if conditions:
+        parts.append(
+            "Approved conditions -- every beat's `conditions` MUST be exactly one of these "
+            "(issue #83; a pre-#83 concept has none, in which case leave `conditions` out): "
+            + "; ".join(str(c) for c in conditions)
+        )
     reading = concept.get("reading")
     if isinstance(reading, Mapping) and reading:
         parts.append("")
@@ -729,7 +829,13 @@ def build_beats_prompt(
     instrumental = sum(c.duration for c in chunks if c.is_instrumental)
     cast_lines = "\n".join(f"- {name}: {member.role}" for name, member in config.cast.items())
 
-    parts = [
+    parts: list[str] = []
+    facts = song_facts_block(config.song_facts)
+    if facts:
+        # Issue #86: composed FIRST, same position as
+        # concept.build_concept_prompt -- see that function's comment.
+        parts += [*facts, ""]
+    parts += [
         "## The approved concept (every beat below descends from this)",
         _concept_block(concept),
         "",
@@ -779,7 +885,10 @@ def generate_beats(
     own ``length_seconds`` left a chunk with no direction -- without either
     module having to know the other's retry policy.
     """
-    system = beats_system_prompt()
+    # Issue #67: the directorial literalness choice reaches the model through
+    # the system prompt, straight from config -- same treatment
+    # `concept.generate_concept` gives it.
+    system = beats_system_prompt(literalness=config.lyric_literalness)
     prompt = build_beats_prompt(config, chunks, concept, notes=notes)
     if extra_instructions and extra_instructions.strip():
         prompt = f"{prompt}\n\n{extra_instructions.strip()}"
@@ -806,6 +915,11 @@ def generate_beats(
     # already in scope here, unlike `locations`/`acts` which have to come
     # from the concept because nothing else carries them.
     cast_names = tuple(config.cast)
+    # Issue #83: the closed vocabulary for `conditions`, straight from the
+    # approved concept -- the same "empty means no vocabulary supplied"
+    # degradation `locations` gets for a pre-#78 concept, here making the
+    # field optional rather than merely unchecked (see `_parse_entries`).
+    conditions_vocab = tuple(str(c) for c in (concept.get("conditions") or ()))
 
     last_error: BeatsValidationError | None = None
     for attempt in range(1, max_validation_attempts + 1):
@@ -813,7 +927,9 @@ def generate_beats(
             system=system, prompt=prompt, model=MODEL_OPUS, schema=BEATS_SCHEMA
         )
         try:
-            beats = validate_beats(result.data, chunks, locations, acts, cast_names)
+            beats = validate_beats(
+                result.data, chunks, locations, acts, cast_names, conditions_vocab
+            )
         except BeatsValidationError as exc:
             last_error = exc
             logger.warning(

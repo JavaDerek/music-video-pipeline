@@ -44,7 +44,7 @@ def _chunks(spans: list[tuple[float, float]], *, instrumental_from: int | None =
 def _beat(
     chunk_id, start, end, *,
     role="transition", group=1, focus="subject", length=None, location="the room",
-    act="the story", subject=None,
+    act="the story", subject=None, conditions="",
 ):
     return Beat(
         chunk_id=chunk_id,
@@ -58,6 +58,7 @@ def _beat(
         focus=focus,
         length_seconds=length,
         subject=subject,
+        conditions=conditions,
     )
 
 
@@ -279,6 +280,66 @@ def test_a_single_member_chunk_keeps_its_own_act():
     result = reanchor_beats(beats, v0)
 
     assert [b.act for b in result.beats] == ["situation", "resolution"]
+
+
+# --------------------------------------------------------------------------- #
+# `conditions` -- issue #83 -- the same "first member wins, warn on
+# disagreement" treatment `location`/`act` already get. A vanished conditions
+# boundary silently attaches one world state's beat to another's, which is
+# exactly the shape of bug #83 itself describes.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_merge_keeps_the_first_members_conditions():
+    v1 = _chunks([(0.0, 12.0)])
+    beats = (
+        _beat(1, 0.0, 6.0, conditions="heavy falling snow"),
+        _beat(2, 6.0, 12.0, conditions="clear pre-dawn light"),
+    )
+
+    result = reanchor_beats(beats, v1)
+
+    assert result.beats[0].conditions == "heavy falling snow"
+
+
+def test_a_merge_warns_when_it_joins_two_different_conditions(caplog):
+    v1 = _chunks([(0.0, 12.0)])
+    beats = (
+        _beat(1, 0.0, 6.0, conditions="heavy falling snow"),
+        _beat(2, 6.0, 12.0, conditions="clear pre-dawn light"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        reanchor_beats(beats, v1)
+
+    assert "conditions" in caplog.text.lower()
+    assert "heavy falling snow" in caplog.text
+    assert "clear pre-dawn light" in caplog.text
+
+
+def test_a_merge_with_matching_conditions_does_not_warn(caplog):
+    v1 = _chunks([(0.0, 12.0)])
+    beats = (
+        _beat(1, 0.0, 6.0, conditions="heavy falling snow"),
+        _beat(2, 6.0, 12.0, conditions="heavy falling snow"),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        reanchor_beats(beats, v1)
+
+    assert "different condition" not in caplog.text.lower()
+
+
+def test_a_single_member_chunk_keeps_its_own_conditions():
+    v0 = _chunks(_uniform(2))
+    beats = (
+        _beat(1, 0.0, 6.0, conditions="heavy falling snow"),
+        _beat(2, 6.0, 12.0, conditions="clear pre-dawn light"),
+    )
+
+    result = reanchor_beats(beats, v0)
+
+    assert [b.conditions for b in result.beats] == ["heavy falling snow", "clear pre-dawn light"]
 
 
 # --------------------------------------------------------------------------- #

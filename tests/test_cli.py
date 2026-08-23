@@ -1326,6 +1326,39 @@ def test_run_pipeline_wires_the_present_location_mismatch_lint(tmp_path: Path, m
     assert len(chunks_arg) == 3
 
 
+def test_run_pipeline_passes_lyric_literalness_to_the_shot_vs_lyric_lint(
+    tmp_path: Path, monkeypatch
+):
+    """Issue #67: the config's `lyric_literalness` has to actually reach
+    `lint_shots_against_lyrics`, not just exist as a field nobody reads --
+    the same wiring-must-be-proven discipline as the #78/#82 lints above.
+    The render never refuses on this either way; only which log level the
+    lint uses changes."""
+    rig = Rig(tmp_path)
+    plan_path = tmp_path / "shot_plan.toml"
+    plan_path.write_text(
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks alone."\n'
+    )
+    rig.config = replace(
+        rig.config, shot_plan=plan_path, lyric_literalness="literal"
+    )
+
+    calls = []
+    real_lint = cli.lint_shots_against_lyrics
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs)
+        return real_lint(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "lint_shots_against_lyrics", spy)
+    sequences = [build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)]
+
+    rig.run(sequences)
+
+    assert len(calls) == 1
+    assert calls[0].get("literalness") == "literal"
+
+
 # --------------------------------------------------------------------------- #
 # `subject`: whose shot this is on an instrumental chunk (issue #82)
 # --------------------------------------------------------------------------- #
@@ -1451,6 +1484,45 @@ def test_run_pipeline_passes_the_resolved_location_into_expand_prompt(
     # Every other chunk (nothing authored for it) must resolve to None, not
     # inherit chunk 0's location.
     assert all(location is None for cid, location in calls.items() if cid != 0)
+    assert len(calls) == 3
+
+
+def test_run_pipeline_passes_the_resolved_conditions_into_expand_prompt(
+    tmp_path: Path, monkeypatch
+):
+    """`resolve_conditions(plan, chunk)` must reach `expand_prompt`'s
+    `conditions=` kwarg (issue #83), mirroring the `location` spy test just
+    above -- and only for the chunk the plan tagged; every untagged chunk
+    must resolve to `None`."""
+    rig = Rig(
+        tmp_path,
+        segment_specs=[("walking through the empty halls tonight", 10.0, 16.0)],
+        instrumental_coverage=True,
+    )
+    plan_path = tmp_path / "shot_plan.toml"
+    plan_path.write_text(
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\n'
+        'shot = "Ash settles over the split mill wheel."\n'
+        'conditions = "snow, embers still rising"\n'
+    )
+    rig.config = replace(rig.config, shot_plan=plan_path)
+
+    calls: dict[int, object] = {}
+    real_expand = cli.expand_prompt
+
+    def spy(config, chunk, **kwargs):
+        calls[chunk.chunk_id] = kwargs.get("conditions")
+        return real_expand(config, chunk, **kwargs)
+
+    monkeypatch.setattr(cli, "expand_prompt", spy)
+    sequences = [build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)]
+
+    rig.run(sequences)
+
+    assert calls[0] == "snow, embers still rising"
+    # Every other chunk (nothing authored for it) must resolve to None, not
+    # inherit chunk 0's conditions.
+    assert all(conditions is None for cid, conditions in calls.items() if cid != 0)
     assert len(calls) == 3
 
 

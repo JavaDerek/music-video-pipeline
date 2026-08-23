@@ -373,6 +373,23 @@ background drummer who's never `default_lead_vocalist` and never a chunk's
 active character; he's just an entry the pipeline can inject into a shot's
 prompt if a lyric line ever tags him.
 
+**Three axes, not one.** `setting` fixes *what world this is* and is composed
+unchanged into every prompt, so keep out of it anything that changes over the
+song's own arc. What changes lives per chunk, in the shot plan, on two further
+axes the authoring layer fills in: `location` (issue #78) — where the camera
+stands inside that world, which substitutes for `setting` in the same
+"Location continuity" sentence when it is set — and `conditions` (issue #83) —
+what the world *looks like right now*: weather, light, season, and the
+persistent aftermath of events the video has already shown. Neither is a
+`setting` you can write once. On a real render three consecutive chunks,
+fifteen seconds of screen time, gained snow, lost the debris of an explosion
+that had just happened, and lost the snow again, because nothing had a field
+for it. `conditions` composes as its own short sentence rather than being
+folded into the location one, because a condition holds whether or not the
+place is identifiable, and the authoring layer checks two things about it
+mechanically: a state that flips for one chunk and comes straight back, and a
+state that regresses after the `consequence` beat that ended it.
+
 #### Chunk duration window
 
 MiniMax H3's `length` input is a **frame count**, not a duration, quantized
@@ -1245,7 +1262,8 @@ mvm-author --config run.toml photography --candidates 3   # three looks, side by
 mvm-author --config run.toml photography --pick 2         # freeze one, no model call
 mvm-author --config run.toml prose               # the shot lines -> .authoring/prose.json
 mvm-author --config run.toml prose --groups 3-5 --notes "stop putting her in doorways"
-mvm-author --config run.toml write               # compose, lint, revise -> shot_plan.toml
+mvm-author --config run.toml write               # compose, lint, revise errors -> shot_plan.toml
+mvm-author --config run.toml write --revise-warnings   # also spend a call on warning-tier lints
 mvm-author --config run.toml all                 # every stage, stopping for approval
 mvm-author --config run.toml status              # what's been generated, and whether it's stale
 ```
@@ -1254,6 +1272,77 @@ Session state — `.authoring/session.json`, `concept.json`, `beats.json`,
 `photography.json`, `prose.json`, the raw model replies — lives beside the run config in
 `~/mvm-runs/<song>/`, exactly like `output/` and `shot_plan.toml`, never in
 the repo.
+
+#### Established facts about the song (`song_facts`)
+
+`--notes` steers one stage's single call and is then gone: not recorded in
+`.authoring/`, not carried to the next stage, not in any input hash. That is
+the right shape for a one-off objection ("less handheld, hold the wides"),
+but wrong for a fact the operator has actually established about the song —
+"the narrator is unreliable", "the mill was destroyed and the run's later
+chunks are its aftermath" — which would otherwise have to be retyped,
+correctly, on every future invocation of every stage it matters to.
+
+`song_facts` (in the run config, not on the command line, so it is committed
+and diffable) is a short list of declarative statements every stage sees:
+
+```toml
+song_facts = [
+  "the island is vaporised, not eroded",
+  "the narrator is unreliable",
+]
+```
+
+- **Composed first**, ahead of the lyric text (`concept`) or the approved
+  concept and window (`beats`/`photography`/`prose`) — the frame each stage
+  reads everything else through, not a constraint applied after the fact.
+- **Hashed into every stage's inputs**, but only when `song_facts` is
+  non-empty — editing a fact reports the descendant stages `STALE` by the
+  same comparison `status` already uses for an edited lyrics file. A config
+  that never sets it hashes exactly as it did before this existed.
+- **Written into `shot_plan.toml`** as a header comment (never a TOML key),
+  so a human reviewing the plan can see what it was authored under.
+- **Shown by `status`** beside `reading.subject` — the model's own answer to
+  "what is this song about" (see below) next to the operator's.
+
+Deliberately **not** accompanied by a check that the plan "honours" a fact:
+that is not mechanically decidable, and pretending otherwise is the kind of
+lint this project has already had to retire twice. The value here is
+durability and visibility, not enforcement.
+
+#### How literally the video reads its lyrics (`lyric_literalness`)
+
+How closely a video illustrates its words is a directorial choice with a huge
+range, and until issue #67 this pipeline had one fixed opinion about it,
+spread across four prompt preambles and two lints with no way to say "not
+this time". It is now a run-config setting the authoring layer reads:
+
+```toml
+lyric_literalness = "thematic"   # "free" | "thematic" | "literal"
+```
+
+- **`free`** — the song supplies mood, tempo and title; the video is its own
+  idea and may share nothing else with the words. The shot-vs-lyric check is
+  silenced outright: at this end of the range, a lyric naming an object the
+  plan stages elsewhere is the brief, not a defect.
+- **`thematic`** — the default, and exactly what this pipeline did before the
+  setting existed. The video tells a story the song is about; specific images
+  surface where they land well.
+- **`literal`** — every nameable object and action in a line is on screen in
+  the chunk that sings it, and the shot-vs-lyric check is promoted to the
+  error tier, so `write` revises the offending chunks rather than annotating
+  them.
+
+An ordinal, not a number: `0.37` would imply a resolution no model can act
+on. The band is injected into the concept, beats and prose preambles, and
+recorded in the written plan's `[provenance]` so a shot plan can prove which
+brief it was written to.
+
+**The render path never reads this, deliberately.** Every prompt carries the
+literal lyric text, and it is tempting to read that as the literalness knob
+and turn it down. It is not — it is the lip-sync conditioning, and those
+words are what H3 mouths. The dial lives entirely in the authoring layer and
+the lints.
 
 #### What the beats stage is for
 
@@ -1309,11 +1398,23 @@ symmetric:
 - **Errors** (a blank line, a malformed entry, drift) get a *targeted*
   revision of just the offending chunks, bounded at two rounds. Then it
   aborts and writes nothing.
-- **Warnings** get exactly one round, and whatever survives is written into
-  the file as a `# lint:` comment above its entry. They are not ground to
-  zero on purpose: every one of these lints is documented as a heuristic
-  firing on prose a human wrote deliberately, and a loop that retried until
-  they went quiet would happily rewrite a correct shot to please one.
+- **Warnings** get, at most, exactly one round, and it is **off by default**
+  (`--revise-warnings` to opt in). Measured on "Deathless"
+  `shot_plan_v6.toml`: that round rewrote 37 of 80 shot lines away from what
+  the prose stage wrote, and running `write` a second time on the same,
+  unchanged prose changed 41 lines relative to the first run — it is a model
+  call, so its own output is not stable between runs. Warnings are
+  documented as advisory ("a false positive must never block a run"), so
+  spending a model call rewriting approved prose to satisfy one is a
+  *stronger* action than blocking, not a weaker one; ground to zero it never
+  is, on purpose, because a loop that retried until they went quiet would
+  happily rewrite a correct shot to please a heuristic. With the default,
+  every warning the check finds is written into the file as a `# lint:`
+  comment above its entry and nothing is rewritten to silence it. Whatever a
+  revision round *does* change — either tier — is marked with its own
+  `# revised` comment quoting exactly what the prose stage wrote, so the diff
+  is visible in the file itself rather than something you have to reconstruct
+  by loading `.authoring/prose.json` next to it.
 
 `chunk_id` and `start` are copied from the chunks, never from anything a
 model said, so a generated plan loaded back against the run it was generated
@@ -1459,6 +1560,12 @@ terms of:
   the `shot` lines themselves so cause and effect read as connected: the
   three-beat rule, one beat per shot, naming the contact. Written from what
   the first full render got wrong.
+- [`docs/idiom-corpus.md`](docs/idiom-corpus.md) — the register of figures of
+  speech that named a physical object and got it rendered, the controls that
+  did *not* misfire, and why there is no keyword lint for it yet.
+- [`docs/deathless-render-corpus.md`](docs/deathless-render-corpus.md) — every
+  score behind the framing, luminance and plan-text lints, so the next
+  revision of one starts from data rather than a fresh guess.
 - [`comfyui-setup-summary.md`](comfyui-setup-summary.md) — the raw,
   ground-truth snapshot of the doris ComfyUI install this project targets.
 - [`docs/h3-node-schema.md`](docs/h3-node-schema.md) — the MiniMax H3 node
