@@ -95,6 +95,25 @@ without making. ``_log_leading_vocal_offset`` then reports whatever offset
 survives, unconditionally, so a leftover offset is visible before GPU time
 even where the refinement had no room to act.
 
+A cross-cutting fix, not a seventh pass, because it moves no boundary (issue
+#92): a chunk can merge segments from two singers, and the pipeline picks a
+dominant one to attribute the chunk to but used to hand them the *whole*
+span's text -- including the other singer's words. Measured on "Deathless",
+every one of the three affected chunks sits at a character-change gap of
+0.000-1.510s, well inside H3's 124-frame trained floor (5.167s), so no legal
+chunk boundary can separate the two singers there -- see
+``_merge_for_minimum``'s docstring for the rejected "don't merge across
+characters" alternative. What *can* change without moving anything is what
+the chunk is prompted with: ``_prompted_members`` narrows a chunk's text and
+its issue-#79 onset to whichever character ``_dominant_character_member``
+finds contributes the most voiced duration *inside the chunk* (not the whole
+segment, which may extend well outside it -- the old measure). Used at every
+site that decides what a chunk is prompted with, so "what is this chunk
+prompted with" has one answer everywhere, the same reasoning issue #79
+factored ``_words_attributed_to`` out for. ``source_segment_indices`` is
+deliberately left un-narrowed: it records what the *audio* contains, and the
+audio genuinely contains every singer merged into the chunk.
+
 Timeline integrity is non-negotiable: every chunk's ``start``/``end`` stays
 anchored to the original ``AlignedSegment`` timeline as closely as the frame
 grid allows, ``source_segment_indices`` records exactly which original
@@ -253,6 +272,23 @@ def _effective_bounds(hardware: HardwareProfile) -> tuple[float, float, FrameGri
 def _merge_for_minimum(
     segments: tuple[AlignedSegment, ...], track_duration: float, min_chunk_seconds: float
 ) -> list[_Group]:
+    """Pass 1 (see the module docstring): merge/pad adjacent segments up to
+    ``min_chunk_seconds``, freely across characters.
+
+    Issue #92 proposed refusing to merge across a character change instead.
+    Measured on "Deathless" and found impossible, not merely unimplemented:
+    the three chunks that end up billed to one singer while carrying
+    another's words (ids 35, 58, 73) come from character-change gaps of
+    0.000s, 1.510s and 0.000s -- pass-1 groups ``[23,24]``, ``[38,39]``,
+    ``[52,53]``. H3's trained floor is 124 frames = 5.167s, so *any* legal
+    chunk covering one side of a change that close also covers the other; a
+    refusal here would not even survive to the render, because
+    ``_cover_instrumentals`` re-derives every chunk's members from span
+    overlap afterward regardless of how this pass grouped them. The fix for
+    what a merge like this produces lives downstream, in what the chunk is
+    *prompted with* (``_prompted_members``, issue #92) -- not here, where
+    there is no alternative timeline to fall back to.
+    """
     groups: list[_Group] = []
     n = len(segments)
     i = 0
@@ -1302,6 +1338,111 @@ def _first_prompted_word_onset(
     return best
 
 
+def _voiced_seconds_by_character(
+    members: tuple[AlignedSegment, ...], start: float, end: float
+) -> dict[str | None, float]:
+    """In-chunk voiced seconds per character, summed over every member that
+    carries it -- the same clipped-overlap measure :func:`_voiced_seconds_within`
+    uses for the pooled total, just split by :attr:`AlignedSegment.character`
+    (issue #92)."""
+    totals: dict[str | None, float] = {}
+    for member in members:
+        overlap = max(0.0, min(member.end, end) - max(member.start, start))
+        totals[member.character] = totals.get(member.character, 0.0) + overlap
+    return totals
+
+
+def _dominant_character_member(
+    members: tuple[AlignedSegment, ...], start: float, end: float
+) -> AlignedSegment:
+    """The member whose CHARACTER contributes the most voiced duration
+    actually inside ``[start, end)`` (issue #92).
+
+    Replaces the old rule, which compared :attr:`AlignedSegment.duration` --
+    the whole segment's length, most of which can lie outside the chunk that
+    is actually rendered. Measured on "Deathless": both rules pick the same
+    winner on all three of its cross-character chunks, so this changes no
+    attribution there -- it changes what the log *reports*. Chunk 35's old
+    line credited Jan with "9.030s of the chunk's 10.590s" (his segment's
+    whole duration, most of it outside the chunk); inside the chunk it is
+    4.017s of the chunk's 5.577s total. The chunk is what gets rendered;
+    measure the chunk.
+
+    Strict ``>`` means a later character must *exceed* the current leader's
+    in-chunk total to take over, so an exact tie keeps the earliest
+    character -- unchanged from issue #40's behaviour. Returns the FIRST
+    member carrying the winning character, matching how the caller derives
+    ``AudioChunk.characters`` from a single representative member.
+    """
+    totals = _voiced_seconds_by_character(members, start, end)
+    dominant_character = members[0].character
+    best = totals.get(dominant_character, 0.0)
+    seen = {dominant_character}
+    for member in members[1:]:
+        character = member.character
+        if character in seen:
+            continue
+        seen.add(character)
+        total = totals.get(character, 0.0)
+        if total > best + _EPS:
+            best = total
+            dominant_character = character
+    for member in members:
+        if member.character == dominant_character:
+            return member
+    return members[0]  # unreachable: dominant_character always comes from members
+
+
+def _prompted_members(
+    members: tuple[AlignedSegment, ...], start: float, end: float
+) -> tuple[AlignedSegment, ...]:
+    """The members this chunk is actually prompted with (issue #92).
+
+    Narrows ``members`` down to whichever character
+    :func:`_dominant_character_member` picks, so a chunk that merges two
+    singers' segments is prompted with only the one it is attributed to --
+    never both, which is the disagreement between the attribution rule and
+    the text rule issue #92 reports (naming both risks issue #82's morphing
+    defect; see the module docstring).
+
+    Used at every site that decides what a chunk is prompted with
+    (:func:`slice_audio`'s ``text``/``characters``,
+    :func:`_log_leading_vocal_offset`, :func:`_prefer_vocal_onset`), so those
+    three can never disagree -- the same reasoning issue #79 factored
+    :func:`_words_attributed_to` out for.
+
+    Deliberately NOT used for :func:`_voiced_seconds_within`,
+    :func:`_is_instrumental_span`, or the ``_MIN_VOICED_FRACTION`` demotion:
+    those ask how much voice is in the *audio*, which genuinely contains
+    every singer merged into the chunk, not just the one it is prompted
+    with.
+
+    Guarded against emptying the prompt: narrowing to the dominant
+    character's own members can still leave :func:`_text_within` with
+    nothing, when that character contributes voiced overlap but no word
+    whose midpoint lands in the window. When that happens this falls back to
+    the full ``members`` tuple and logs a warning, rather than silently
+    prompting the chunk as instrumental.
+    """
+    if not members:
+        return members
+    dominant = _dominant_character_member(members, start, end)
+    narrowed = tuple(m for m in members if m.character == dominant.character)
+    if not _text_within(narrowed, start, end):
+        logger.warning(
+            "Chunk span %.3f-%.3fs: narrowing its prompt to the dominant character %r left "
+            "no prompted words (it contributes voiced overlap but no word whose midpoint "
+            "lands in this window); falling back to the full %d-member text rather than "
+            "silently emptying the prompt (issue #92).",
+            start,
+            end,
+            dominant.character,
+            len(members),
+        )
+        return members
+    return narrowed
+
+
 def _voiced_seconds_within(
     segments: tuple[AlignedSegment, ...], start: float, end: float
 ) -> float:
@@ -1312,8 +1453,80 @@ def _voiced_seconds_within(
     )
 
 
+def _log_untenable_segments(
+    segments: tuple[AlignedSegment, ...], eff_max: float, grid: FrameGrid
+) -> None:
+    """Name, once per run, every aligned segment too long for *this run's*
+    ceiling to hold whole (issue #70, reopened).
+
+    A sung phrase longer than the effective maximum chunk duration cannot fit
+    in any chunk, so it is cut mid-utterance on every render no matter where
+    the boundaries fall. That is a different class of defect from a cut that
+    could in principle be moved, and the two have different remedies -- which
+    is why the message distinguishes them:
+
+    * **Longer than ``eff_max`` but inside H3's trained range.** The remedy is
+      a config line. Measured on "Deathless", whose ``max_chunk_seconds`` is
+      **8.0** against a trained ceiling of **15.083s**: segments 24 (9.030s)
+      and 29 (8.020s) are exactly this case, and they are the phrases cut by
+      two of the three chunks issue #70's reopen was built on. Raising the
+      ceiling to 12.0s stops both from being cut at all, and takes the whole
+      song's mid-phrase cuts from 24 to 18 and its cuts deeper than 2.5s from
+      6 to 3.
+    * **Longer than the trained maximum itself.** No setting helps; the lever
+      is a model with a longer trained context, and saying "raise
+      ``max_chunk_seconds``" there would be advice that cannot be taken.
+
+    Note what the first case implies and how easily it is misread: 8.0s looks
+    like a hardware limit in a run config and is not one. Check a segment's
+    duration against ``eff_max``, never against a remembered number.
+    """
+    trained_max_s = grid.frames_to_seconds(grid.trained_max_frames)
+    for segment in segments:
+        if segment.duration <= eff_max + _EPS:
+            continue
+        if segment.duration <= trained_max_s + _EPS:
+            needed_frames = grid.quantize_up(
+                math.ceil(grid.seconds_to_frames(segment.duration) - _EPS)
+            )
+            remedy = (
+                f"it does fit inside H3's trained range (up to {trained_max_s:.3f}s), so "
+                f"raising max_chunk_seconds to at least "
+                f"{grid.frames_to_seconds(needed_frames):.3f}s ({needed_frames} frames) "
+                "would let one chunk hold it -- but nothing longer than "
+                f"{MEASURED_MAX_FRAMES} frames has ever been rendered on this card, so "
+                "prove the VRAM on a short slice first"
+            )
+        else:
+            remedy = (
+                f"it is longer than H3's own trained maximum of {trained_max_s:.3f}s "
+                f"({grid.trained_max_frames} frames), so no max_chunk_seconds setting can "
+                "hold it -- the only lever is a model with a longer trained context"
+            )
+        logger.warning(
+            "Aligned segment index=%d (%r, %.3f-%.3fs, %.3fs) is longer than this run's "
+            "effective maximum chunk duration of %.3fs and so cannot be held whole by any "
+            "chunk: it will be cut mid-utterance on every render regardless of where the "
+            "boundaries fall, and the two halves render as independent shots. %s "
+            "(issue #70).",
+            segment.index,
+            segment.text,
+            segment.start,
+            segment.end,
+            segment.duration,
+            eff_max,
+            remedy,
+        )
+
+
 def _log_final_boundary_segment_cuts(
-    covered: Sequence[_Piece], segments: tuple[AlignedSegment, ...]
+    covered: Sequence[_Piece],
+    segments: tuple[AlignedSegment, ...],
+    *,
+    grid: FrameGrid,
+    min_frames: int,
+    max_frames: int,
+    filler_max_frames: int,
 ) -> None:
     """Issue #70, second mechanism: even where pass 2's segment-edge
     preference had nothing to snap to -- or nothing to say at all, since
@@ -1351,18 +1564,90 @@ def _log_final_boundary_segment_cuts(
     final position a render will use -- unlike pass 2's own warning, whose
     cited timestamp this pass can, and on real material typically does,
     move past.
+
+    Issue #70's 2026-08-23 reopen asked for a *depth-threshold preference* on
+    top of this: prefer a segment edge only when the cut would otherwise land
+    near the middle of a phrase. It was built as a prototype -- the mirror of
+    :func:`_prefer_vocal_onset`, a compensated grid-step transfer moving a
+    boundary *earlier* to the phrase start -- and scored against the real
+    80-chunk "Deathless" timeline, where it **fired 0 times at every threshold
+    tried** (1.0s, 2.0s, 2.5s, 3.0s). Clearing a phrase head is
+    all-or-nothing -- land short of the segment's own start and the cut is
+    still mid-utterance, just somewhere else, which is precisely the mistake
+    the first #70 snap made -- so the move costs 4-6 grid steps of 0.708s,
+    while the chunk that has to pay sits at the 124-frame floor in 20 of the
+    24 cases and is never more than one step above it in the 6 that matter.
+    Depth also failed to separate the labels it was drawn from: the nearest
+    unreported chunk (21, 2.517s into its phrase) and the nearest reported one
+    (39, 2.578s) are 0.061s apart, and chunk 19 at 48.6% is *nearer the
+    middle* than either complaint and was never mentioned in two independent
+    viewings.
+
+    So what this reports is the number that decided it. Per surviving cut:
+    depth in **seconds** as well as percent (a percentage cannot be compared
+    across phrases -- 45% of a 9s phrase and 45% of a 1.5s one are 4.0s and
+    0.7s of already-sung audio, and only the seconds are what a boundary move
+    has to pay for), **which chunk starts there** (every chunk a viewer called
+    defective for this mechanism is named by its own *start* boundary, never
+    its end), and the **transfer budget** in both directions -- what moving it
+    to each phrase edge would cost in grid steps against what the neighbouring
+    chunk actually has. See :func:`_log_untenable_segments` for the lever that
+    *does* move these numbers on real material, and it is the run's own
+    ``max_chunk_seconds``, not a preference.
     """
-    for earlier in covered[:-1]:
+    step = grid.step_frames
+    step_seconds = grid.frames_to_seconds(step)
+    boundary_count = max(0, len(covered) - 1)
+    cut_count = 0
+    deepest: tuple[int, float, float, AlignedSegment] | None = None
+
+    for idx, earlier in enumerate(covered[:-1]):
+        later = covered[idx + 1]
         boundary = earlier.end
         landed = _segment_containing(boundary, segments)
         if landed is None:
             continue
+        cut_count += 1
         pct = _percent_through(boundary, landed)
+        depth = boundary - landed.start
+        remaining = landed.end - boundary
+        if deepest is None or depth > deepest[1]:
+            deepest = (idx + 1, depth, pct, landed)
+
+        # What a move would cost, and what is actually available to spend.
+        # Moving the boundary EARLIER to the phrase start shrinks the
+        # preceding chunk and grows this one; moving it LATER to the phrase
+        # end does the reverse. A filler chunk's ceiling is its own, not a
+        # lyric chunk's -- the same distinction _prefer_vocal_onset draws.
+        earlier_frames = earlier.frame_count or 0
+        later_frames = later.frame_count or 0
+        ceiling_earlier = filler_max_frames if not earlier.members else max_frames
+        ceiling_later = filler_max_frames if not later.members else max_frames
+        back_cost = math.ceil((depth - _EPS) / step_seconds)
+        back_budget = max(
+            0,
+            min(
+                (earlier_frames - min_frames) // step,
+                (ceiling_later - later_frames) // step,
+            ),
+        )
+        forward_cost = math.ceil((remaining - _EPS) / step_seconds)
+        forward_budget = max(
+            0,
+            min(
+                (ceiling_earlier - earlier_frames) // step,
+                (later_frames - min_frames) // step,
+            ),
+        )
+
         logger.warning(
             "Final chunk boundary at %.3fs (after instrumental-coverage retiling) lands "
-            "%.1f%% through segment index=%d (%r, %.3f-%.3fs) -- cutting a sung phrase "
-            "mid-utterance; the two halves will render as independent shots with no error "
-            "anywhere else. This position was not visible to pass 2's own segment-edge "
+            "%.1f%% through segment index=%d (%r, %.3f-%.3fs) -- %.3fs into a %.3fs phrase, "
+            "and chunk %d starts here. Cutting a sung phrase mid-utterance; the two halves "
+            "will render as independent shots with no error anywhere else. Moving it back "
+            "to the phrase start costs %d grid step(s), budget %d; forward to the phrase "
+            "end costs %d, budget %d -- a move is only possible where the cost is within "
+            "the budget. This position was not visible to pass 2's own segment-edge "
             "preference, which only ever sees pre-retiling boundaries (issue #70).",
             boundary,
             pct,
@@ -1370,7 +1655,33 @@ def _log_final_boundary_segment_cuts(
             landed.text,
             landed.start,
             landed.end,
+            depth,
+            landed.duration,
+            idx + 1,
+            back_cost,
+            back_budget,
+            forward_cost,
+            forward_budget,
         )
+
+    if deepest is None:
+        logger.info(
+            "Mid-phrase boundary cuts: none -- no boundary lands inside an aligned segment "
+            "across %d boundary/boundaries (issue #70).",
+            boundary_count,
+        )
+        return
+    deep_idx, deep_depth, deep_pct, deep_segment = deepest
+    logger.info(
+        "Mid-phrase boundary cuts: %d of %d boundaries land inside an aligned segment; "
+        "deepest is chunk %d at %.3fs (%.1f%%) into segment index=%d (issue #70).",
+        cut_count,
+        boundary_count,
+        deep_idx,
+        deep_depth,
+        deep_pct,
+        deep_segment.index,
+    )
 
 
 LEADING_VOCAL_OFFSET_WARN_SECONDS = 1.0
@@ -1382,16 +1693,40 @@ H3 starts the mouth at frame 0 of a chunk regardless of where in that chunk
 the voice actually starts, so this many seconds of a chunk's start is always
 out of phase with what is prompted.
 
-Measured on the real 80-chunk "Deathless" timeline (41 voiced chunks, before
-:func:`_prefer_vocal_onset` gets a chance to reduce any of them): offset >
-0.5s on 15 chunks, > 1.0s on 6 (chunk ids 20, 27, 37, 38, 41, 74), > 2.0s on
-2 (chunk 20 at 4.07s, chunk 38 at 3.30s). The issue that reported this by ear
-named exactly two chunks -- 38 (3.30s) and 41 (1.61s) -- and both clear 1.0s
-comfortably, while none of the other 13 chunks sitting between 0.5s and
-1.0s were ever reported as audible. That is exactly the line the issue's own
-proposal drew ("an offset above ~1s is probably always a defect"), and the
-corpus does not support tightening it to 0.5s -- the wider net would catch
-nothing the measurement can confirm is actually a problem.
+The threshold's original justification ("none of the other 13 chunks sitting
+between 0.5s and 1.0s were ever reported as audible") was **falsified** by a
+later viewing and is retired; keep reading for the re-derivation that
+replaces it. The constant itself is unchanged at 1.0s -- it is the reasoning
+that needed fixing, not the number.
+
+On a later, fully-rendered "Deathless" (v12), a viewer who described
+*symptoms* rather than timestamps named two chunks with "no vocals at the
+start but his mouth is moving, then perfectly in sync when the singing
+starts": chunks 38 (+2.588s) and 41 (+1.607s) -- **ranks 2 and 3 of 41**
+voiced chunks by leading offset. The two chunks they called perfect are 40
+(+0.098s) and 43 (+0.013s), ranks 26 and 29, and they volunteered the
+mechanism unprompted: "starts with singing -- perfect." This is a
+**replication**: an earlier viewing of a *different* render had already named
+the same two chunks (38 and 41) for the same symptom, by ear, before this
+metric existed.
+
+The counter-example is real and is **not** explained away: chunk 20 has the
+largest offset in the song (+2.650s) and has never been reported, on any
+render. A run-local scan once scored it 0.0% face presence, which looked like
+the explanation and was wrong for a reason worth keeping: that CSV was a scan
+of a week-older render wearing the current render's filename (issue #93; see
+:mod:`music_video_maker.facescan`, which now stamps provenance). On the
+render actually viewed the face is large, central and fully lit, and the
+detector finds it in 11 of 12 sampled frames. The extreme upward head angle
+may make lip motion hard to read, but that is a guess, not a measurement.
+Any threshold derived from this data has to live with chunk 20 not fitting
+it.
+
+Post-refinement distribution on the 41 voiced chunks of "Deathless": 29
+positive, 12 negative, 0 exactly zero; positive > 0.5s on 11, > 1.0s on 4
+(chunks 20, 38, 41, 74), > 2.0s on 2 (20 at +2.650s, 38 at +2.588s); worst
+negative -0.707s. See :func:`_log_leading_vocal_offset` for why only the
+positive side is warned on.
 """
 
 
@@ -1408,69 +1743,102 @@ def _log_leading_vocal_offset(
     :func:`_log_final_boundary_segment_cuts`), after
     :func:`_prefer_vocal_onset` has already moved whatever boundaries it
     could -- this reports whatever offset survives that pass, not the
-    pre-refinement position. Uses :func:`_first_prompted_word_onset`, which
-    shares its word-midpoint attribution rule with :func:`_text_within`, so
-    this can never name an offset against a lyric the chunk is not actually
-    prompted with.
+    pre-refinement position. Uses :func:`_first_prompted_word_onset` against
+    :func:`_prompted_members` (issue #92) rather than ``piece.members``
+    directly, so on a chunk that merges two singers this reports the
+    ATTRIBUTED singer's offset, not whichever member's word happens to start
+    earliest -- the same narrowing :func:`slice_audio` uses for the chunk's
+    own ``text``, so the two can never disagree about what is actually
+    prompted.
 
     A chunk with no prompted words at all -- ``piece.members`` empty, which
     is also true of a chunk demoted below :data:`_MIN_VOICED_FRACTION` and
     prompted as instrumental -- has no leading vocal offset to report and is
     skipped.
+
+    Issue #79 follow-up: both signs are counted and reported in the INFO
+    summary. A negative offset -- the first prompted word began BEFORE the
+    chunk did -- is the mirror defect: the mouth opens on a word whose audio
+    has already partly gone by, so it runs *late* rather than early. The
+    WARNING stays positive-side only: measured on "Deathless", 12 of 41
+    voiced chunks are negative, the worst is -0.707s and none reaches -1.0s,
+    so a negative-side warning at any threshold comparable to
+    :data:`LEADING_VOCAL_OFFSET_WARN_SECONDS` would never fire on the only
+    corpus there is to calibrate it against.
     """
     voiced_count = 0
+    positive_count = 0
+    negative_count = 0
+    zero_count = 0
     over_count = 0
-    worst: tuple[int, float, _Piece] | None = None
+    worst_positive: tuple[int, float, _Piece] | None = None
+    worst_negative: tuple[int, float, _Piece] | None = None
 
     for idx, piece in enumerate(covered):
         if not piece.members:
             continue
-        onset = _first_prompted_word_onset(piece.members, piece.start, piece.end)
+        prompted = _prompted_members(piece.members, piece.start, piece.end)
+        onset = _first_prompted_word_onset(prompted, piece.start, piece.end)
         if onset is None:
             continue
         voiced_count += 1
         offset = onset - piece.start
-        if offset <= _EPS:
-            continue
-        if worst is None or offset > worst[1]:
-            worst = (idx, offset, piece)
-        if offset > LEADING_VOCAL_OFFSET_WARN_SECONDS:
-            over_count += 1
-            text = _text_within(piece.members, piece.start, piece.end)
-            logger.warning(
-                "Chunk %d (%.3f-%.3fs) is prompted to sing starting %.3fs into its own span "
-                "(first word onset %.3fs) -- H3 starts the mouth at frame 0 regardless, so "
-                "the chunk is out of phase for its first %.3fs: %r (issue #79).",
-                idx,
-                piece.start,
-                piece.end,
-                offset,
-                onset,
-                offset,
-                text,
-            )
+
+        if offset > _EPS:
+            positive_count += 1
+            if worst_positive is None or offset > worst_positive[1]:
+                worst_positive = (idx, offset, piece)
+            if offset > LEADING_VOCAL_OFFSET_WARN_SECONDS:
+                over_count += 1
+                text = _text_within(prompted, piece.start, piece.end)
+                logger.warning(
+                    "Chunk %d (%.3f-%.3fs) is prompted to sing starting %.3fs into its own "
+                    "span (first word onset %.3fs) -- H3 starts the mouth at frame 0 "
+                    "regardless, so the chunk is out of phase for its first %.3fs: %r "
+                    "(issue #79).",
+                    idx,
+                    piece.start,
+                    piece.end,
+                    offset,
+                    onset,
+                    offset,
+                    text,
+                )
+        elif offset < -_EPS:
+            negative_count += 1
+            if worst_negative is None or offset < worst_negative[1]:
+                worst_negative = (idx, offset, piece)
+        else:
+            zero_count += 1
 
     if not voiced_count:
         return
-    if worst is None:
+    if worst_positive is None and worst_negative is None:
         logger.info(
             "Leading vocal offset: %d voiced chunk(s), all start at their own first prompted "
             "word.",
             voiced_count,
         )
         return
-    worst_idx, worst_offset, worst_piece = worst
-    logger.info(
-        "Leading vocal offset: %d voiced chunk(s), %d over the %.2fs warning threshold; "
-        "worst is chunk %d at %.3fs (%.3f-%.3fs).",
-        voiced_count,
-        over_count,
-        LEADING_VOCAL_OFFSET_WARN_SECONDS,
-        worst_idx,
-        worst_offset,
-        worst_piece.start,
-        worst_piece.end,
+
+    summary = (
+        f"Leading vocal offset: {voiced_count} voiced chunk(s) ({positive_count} positive, "
+        f"{negative_count} negative, {zero_count} exactly zero), {over_count} over the "
+        f"{LEADING_VOCAL_OFFSET_WARN_SECONDS:.2f}s warning threshold"
     )
+    if worst_positive is not None:
+        idx, offset, piece = worst_positive
+        summary += (
+            f"; worst positive is chunk {idx} at +{offset:.3f}s "
+            f"({piece.start:.3f}-{piece.end:.3f}s)"
+        )
+    if worst_negative is not None:
+        idx, offset, piece = worst_negative
+        summary += (
+            f"; worst negative is chunk {idx} at {offset:.3f}s "
+            f"({piece.start:.3f}-{piece.end:.3f}s)"
+        )
+    logger.info("%s.", summary)
 
 
 def _is_instrumental_span(
@@ -1548,6 +1916,29 @@ def _prefer_vocal_onset(
     boundary only ever approaches the vocal onset and never passes it --
     clipping the start of the very phrase this exists to protect would just
     relocate issue #79's defect rather than fix it.
+
+    Issue #79 follow-up: every DECLINED candidate whose offset exceeds
+    :data:`LEADING_VOCAL_OFFSET_WARN_SECONDS` is logged at INFO, naming the
+    blocking constraint, so an unfixed defect says why it is unfixed rather
+    than going silent (threshold-gated so it does not spam a line for every
+    one of ~29 chunks whose offset was never going to be reported anyway).
+
+    Measured on "Deathless": all four surviving offsets over 1.0s are
+    blocked by the *same* constraint -- the chunk itself sits at H3's
+    124-frame trained floor and has no grid step to give back::
+
+        chunk 20: +2.650s  frames prev=158 own=124 next=124   prev can grow 2, own can shrink 0
+        chunk 38: +2.588s  frames prev=192 own=124 next=158   prev can grow 0, own can shrink 0
+        chunk 41: +1.607s  frames prev=175 own=124 next=124   prev can grow 1, own can shrink 0
+        chunk 74: +1.067s  frames prev=141 own=124 next=158   prev can grow 3, own can shrink 0
+
+    An alternative was considered and rejected: a *slide* (grow the
+    predecessor by ``k``, move the whole chunk later by ``k`` while keeping
+    its own duration, shrink the successor by ``k``) would rescue exactly
+    one of the four -- chunk 74, +1.067s -> +0.359s -- and none of the other
+    three, because their successors are also at the floor. Not built: it
+    moves two boundaries instead of one and changes the tail text of two
+    chunks, for one chunk's gain on the only song with labels.
     """
     if len(boundaries) < 2:
         return boundaries
@@ -1559,9 +1950,6 @@ def _prefer_vocal_onset(
     step_seconds = grid.frames_to_seconds(step)
 
     for i in range(1, len(frames)):
-        if (i - 1) in pinned_indices or i in pinned_indices:
-            continue
-
         start_i = starts[i]
         end_i = start_i + grid.frames_to_seconds(frames[i])
         members_i = _segments_overlapping(segments, start_i, end_i)
@@ -1571,11 +1959,25 @@ def _prefer_vocal_onset(
         if voiced_i < _MIN_VOICED_FRACTION * (end_i - start_i):
             continue  # will be prompted as instrumental -- no offset applies
 
-        onset = _first_prompted_word_onset(members_i, start_i, end_i)
+        prompted_i = _prompted_members(members_i, start_i, end_i)  # issue #92
+        onset = _first_prompted_word_onset(prompted_i, start_i, end_i)
         if onset is None:
             continue
         offset = onset - start_i
         if offset <= _EPS:
+            continue
+
+        loggable = offset > LEADING_VOCAL_OFFSET_WARN_SECONDS
+
+        if (i - 1) in pinned_indices or i in pinned_indices:
+            if loggable:
+                logger.info(
+                    "Leading vocal offset: chunk %d's %.3fs offset was not reduced -- "
+                    "boundary %d is pinned by an honoured shot-length request (issue #79).",
+                    i,
+                    offset,
+                    i,
+                )
             continue
 
         start_prev = starts[i - 1]
@@ -1590,6 +1992,26 @@ def _prefer_vocal_onset(
         max_k_i = (frames[i] - min_frames) // step
         max_k = min(max_k_offset, max_k_prev, max_k_i)
         if max_k < 1:
+            if loggable:
+                reasons = []
+                if max_k_prev < 1:
+                    reasons.append(
+                        f"the preceding chunk is already at its {ceiling_prev}-frame ceiling"
+                    )
+                if max_k_i < 1:
+                    reasons.append(
+                        f"this chunk is already at the {min_frames}-frame trained floor and "
+                        "cannot shrink"
+                    )
+                if not reasons:
+                    reasons.append("the offset is smaller than one grid step")
+                logger.info(
+                    "Leading vocal offset: chunk %d's %.3fs offset was not reduced -- %s "
+                    "(issue #79).",
+                    i,
+                    offset,
+                    " and ".join(reasons),
+                )
             continue
 
         accepted_k = None
@@ -1600,6 +2022,15 @@ def _prefer_vocal_onset(
             accepted_k = k
             break
         if accepted_k is None:
+            if loggable:
+                logger.info(
+                    "Leading vocal offset: chunk %d's %.3fs offset was not reduced -- every "
+                    "candidate boundary step (1-%d grid step(s)) lands inside an aligned "
+                    "segment (issue #79).",
+                    i,
+                    offset,
+                    max_k,
+                )
             continue
 
         k = accepted_k
@@ -1736,7 +2167,14 @@ def _cover_instrumentals(
             )
         )
 
-    _log_final_boundary_segment_cuts(covered, segments)
+    _log_final_boundary_segment_cuts(
+        covered,
+        segments,
+        grid=grid,
+        min_frames=min_frames,
+        max_frames=max_frames,
+        filler_max_frames=filler_max_frames,
+    )
     _log_leading_vocal_offset(covered, segments)
 
     voiced = sum(1 for p in covered if p.members)
@@ -1827,6 +2265,12 @@ def slice_audio(
     eff_min, eff_max, grid = _effective_bounds(hardware)
 
     segments = tuple(sorted(alignment.segments, key=lambda s: s.start))
+
+    # Issue #70: a phrase longer than this run's ceiling is cut mid-utterance
+    # by every render there is, so it is worth naming before any of them --
+    # and separately from the boundaries below, which are placement choices
+    # rather than arithmetic. Runs whether or not instrumental coverage is on.
+    _log_untenable_segments(segments, eff_max, grid)
 
     groups = _merge_for_minimum(segments, alignment.track_duration, eff_min)
     raw_pieces = _split_for_maximum(groups, eff_min, eff_max, grid)
@@ -1936,7 +2380,12 @@ def slice_audio(
                 duration=shortfall_ms, frame_rate=master.frame_rate
             ).set_channels(master.channels).set_sample_width(master.sample_width)
 
-        text = _text_within(piece.members, piece.start, piece.end)
+        # Issue #92: narrow to whichever character _dominant_character_member
+        # picks BEFORE deriving text, so a chunk merging two singers is
+        # prompted with only the one it is attributed to -- never both (see
+        # _prompted_members's docstring for the empty-narrowing fallback).
+        prompted = _prompted_members(piece.members, piece.start, piece.end)
+        text = _text_within(prompted, piece.start, piece.end)
         is_instrumental = not piece.members or not text
 
         # Issue #73 follow-up, measured on the v8 "Deathless" render (F26).
@@ -1986,36 +2435,66 @@ def slice_audio(
             prev_end = piece.end
             continue
 
+        # Issue #40's dominant-voice rule, now measured by in-chunk voiced
+        # overlap rather than whole-segment duration (issue #92) -- see
+        # _dominant_character_member's docstring for why the two agree on
+        # every real "Deathless" case but the old one over-reports how much
+        # of the *chunk* a singer actually holds.
         distinct = {m.character for m in piece.members}
+        dominant = _dominant_character_member(piece.members, piece.start, piece.end)
         if len(distinct) > 1:
-            # Attribute to whichever member contributed the most voiced
-            # duration, not whichever comes first (issue #40). A merge can now
-            # be a genuine mid-chunk handover between singers (issue #33 made
-            # per-line attribution real), and picking by position silently
-            # gave one singer's face to audio that was mostly the other's --
-            # confirmed by ear on "The Lucky Ones" chunk 26. Voiced duration
-            # (``AlignedSegment.duration``, already computed by Stage 1) is
-            # the measure, not word count: a held note with few words can
-            # still dominate a chunk's screen time, which is what perception
-            # tracks. Strict ``>`` means a later member must *exceed* the
-            # current leader to take over, so an exact tie keeps the first
-            # member -- today's behaviour, unchanged.
-            dominant = piece.members[0]
-            for member in piece.members[1:]:
-                if member.duration > dominant.duration + _EPS:
-                    dominant = member
-            total_voiced = sum(m.duration for m in piece.members)
-            logger.warning(
-                "Chunk %d merges segments with differing characters %s; attributing to "
-                "%r, which contributes %.3fs of the chunk's %.3fs total voiced duration.",
-                idx,
-                sorted(c for c in distinct if c is not None),
-                dominant.character,
-                dominant.duration,
-                total_voiced,
+            # Issue #92: this used to name only the winner and the
+            # WHOLE-SEGMENT voiced-duration numbers that (issue #40) decided
+            # it -- true about the attribution, silent about the actual
+            # defect, which is that the chunk is then prompted with the
+            # FULL span's text, including the other singer's words. This
+            # version names, per character, how much of THIS CHUNK (not the
+            # whole segment) it is audible for; who it is attributed to; the
+            # text that IS prompted (already narrowed to `prompted` above);
+            # the words that are audible in the stem but deliberately
+            # dropped from the prompt; and the resulting leading vocal
+            # offset for the attributed singer -- because H3 starts the
+            # mouth at frame 0 regardless, so the dropped singer's seconds
+            # at the head of the chunk are exactly what a viewer hears as
+            # the attributed singer running late (issue #92, #79). One
+            # WARNING per chunk, not per character.
+            totals = _voiced_seconds_by_character(piece.members, piece.start, piece.end)
+            total_voiced_in_chunk = sum(totals.values()) or _EPS
+            breakdown = ", ".join(
+                f"{character!r} {seconds:.3f}s ({100.0 * seconds / total_voiced_in_chunk:.0f}%)"
+                for character, seconds in sorted(totals.items(), key=lambda kv: -kv[1])
             )
-        else:
-            dominant = piece.members[0]
+            dropped_members = tuple(
+                m for m in piece.members if m.character != dominant.character
+            )
+            dropped_text = _text_within(dropped_members, piece.start, piece.end)
+            dominant_onset = _first_prompted_word_onset(prompted, piece.start, piece.end)
+            dominant_offset_text = (
+                f" {dominant_onset - piece.start:.3f}s" if dominant_onset is not None else ""
+            )
+            logger.warning(
+                "Chunk %d (%.3f-%.3fs) merges segments with differing characters %s -- "
+                "in-chunk voiced time: %s. Attributing to %r, which contributes %.3fs of "
+                "the chunk's %.3fs total in-chunk voiced duration. Prompted with %r; %r is "
+                "audible in this chunk's stem but deliberately dropped from the prompt "
+                "because it belongs to the other singer, not %r -- naming both risks #82's "
+                "morphing defect. H3 starts the mouth at frame 0 regardless of where in the "
+                "chunk the voice actually starts, so the dropped singer's time at the head "
+                "of the chunk is what a viewer hears as %r running%s late (issue #92, #79).",
+                idx,
+                piece.start,
+                piece.end,
+                sorted(c for c in distinct if c is not None),
+                breakdown,
+                dominant.character,
+                totals.get(dominant.character, 0.0),
+                total_voiced_in_chunk,
+                text,
+                dropped_text,
+                dominant.character,
+                dominant.character,
+                dominant_offset_text,
+            )
         # Deliberately the dominant member's cast, not the union: who is
         # audible across a merge is a real question (issue #33 widened the
         # field so it *can* be answered), but answering it by union here
@@ -2032,6 +2511,10 @@ def slice_audio(
                 end=piece.end,
                 text=text,
                 characters=characters,
+                # Deliberately NOT narrowed to `prompted` (issue #92): this
+                # records the provenance of the AUDIO, which genuinely
+                # contains every singer merged into the chunk, not just the
+                # one `text` above is narrowed to.
                 source_segment_indices=tuple(m.index for m in piece.members),
                 is_split_continuation=piece.is_split_continuation,
                 frame_count=piece.frame_count,

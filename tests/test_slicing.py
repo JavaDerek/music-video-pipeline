@@ -1210,6 +1210,132 @@ def test_merged_chunk_with_same_character_behaves_as_before(tmp_path, caplog):
 
 
 # --------------------------------------------------------------------------- #
+# Issue #92: a merged chunk is prompted with ONLY the dominant character's
+# words, never the full span's text -- the attribution rule and the text
+# rule used to disagree, and that disagreement is the defect (7:57 "singing
+# the right words, but a couple seconds behind the music" on "Deathless").
+# --------------------------------------------------------------------------- #
+
+
+def test_merged_chunk_is_prompted_with_only_the_dominant_characters_words(tmp_path):
+    """The core #92 fix: Dianne wins the merge (her segment is longer), and
+    the chunk's ``text`` must be exactly her words -- not Marcus's "his
+    line" prepended to it, which is what the pre-#92 code produced."""
+    segments = (
+        make_aligned_segment(0, "his line", 0.0, 2.0, "Marcus"),
+        make_aligned_segment(1, "her line", 2.1, 5.0, "Dianne"),
+    )
+    alignment = AlignmentResult(segments=segments, track_duration=10.0)
+    master = write_silent_wav(tmp_path / "master.wav", alignment.track_duration)
+
+    chunks = slice_audio(master, alignment, DEFAULT_HARDWARE, tmp_path / "chunks")
+
+    assert len(chunks) == 1
+    assert chunks[0].character == "Dianne"
+    assert chunks[0].characters == ("Dianne",)
+    assert chunks[0].text == "her line"
+
+
+def test_single_character_chunk_text_is_untouched_by_the_92_narrowing(tmp_path):
+    """The regression guard that matters most: a chunk with only one
+    character in it must be byte-identical to before -- narrowing to "the
+    dominant character's members" is a no-op when there is only one."""
+    segments = (make_aligned_segment(0, "one two three four five", 0.0, 6.0, "Dianne"),)
+    alignment = AlignmentResult(segments=segments, track_duration=10.0)
+    master = write_silent_wav(tmp_path / "master.wav", alignment.track_duration)
+
+    chunks = slice_audio(master, alignment, DEFAULT_HARDWARE, tmp_path / "chunks")
+
+    assert len(chunks) == 1
+    assert chunks[0].text == "one two three four five"
+
+
+def test_dominant_character_member_uses_in_chunk_overlap_not_whole_segment_duration():
+    """Issue #92's replacement rule, isolated: Marcus's segment is long
+    (8.0s) but only barely clips the chunk's tail (0.5s inside [0.0, 5.0)));
+    Dianne's segment is short (3.0s) but wholly inside the chunk. The OLD
+    whole-segment-duration rule would pick Marcus (8.0s > 3.0s); the in-chunk
+    -overlap rule must pick Dianne (3.0s > 0.5s) -- the two rules disagree,
+    and the chunk is what gets rendered."""
+    marcus = make_aligned_segment(0, "his long song continues on and on", 4.5, 12.5, "Marcus")
+    dianne = make_aligned_segment(1, "her short line", 0.0, 3.0, "Dianne")
+
+    dominant = slicing_module._dominant_character_member((marcus, dianne), 0.0, 5.0)
+
+    assert dominant.character == "Dianne"
+
+
+def test_dominant_character_member_tie_keeps_earliest_character():
+    """Ties keep today's first-wins behaviour (issue #40's explicit
+    carve-out, preserved by #92's replacement measure)."""
+    marcus = make_aligned_segment(0, "his line here", 0.0, 2.5, "Marcus")
+    dianne = make_aligned_segment(1, "her line here", 2.5, 5.0, "Dianne")
+
+    dominant = slicing_module._dominant_character_member((marcus, dianne), 0.0, 5.0)
+
+    assert dominant.character == "Marcus"
+
+
+def test_prompted_members_falls_back_to_full_text_when_narrowing_empties_it(caplog):
+    """Guard case: Dianne is the dominant character by in-chunk voiced
+    overlap (2.0s vs Marcus's 1.0s), but her only word's midpoint (1.0s)
+    falls BEFORE the window starts (2.0s), so narrowing to just her member
+    would leave nothing prompted at all. Falls back to the full tuple and
+    logs a warning rather than silently emptying the prompt."""
+    dianne = _word_seg(0, "her", 0.0, 4.0, 0.0, 2.0, character="Dianne")
+    marcus = _word_seg(1, "his", 4.0, 5.0, 4.0, 5.0, character="Marcus")
+
+    with caplog.at_level(logging.WARNING):
+        narrowed = slicing_module._prompted_members((dianne, marcus), 2.0, 5.0)
+
+    assert narrowed == (dianne, marcus)
+    assert "falling back to the full" in caplog.text
+    assert "'Dianne'" in caplog.text
+
+
+def test_merged_chunk_warning_names_the_dropped_words(tmp_path, caplog):
+    """The rewritten WARNING (issue #92) must name the words that ARE
+    audible in the stem but deliberately absent from the prompt -- not just
+    the bare fact that characters differed."""
+    segments = (
+        make_aligned_segment(0, "his line", 0.0, 2.0, "Marcus"),
+        make_aligned_segment(1, "her line", 2.1, 5.0, "Dianne"),
+    )
+    alignment = AlignmentResult(segments=segments, track_duration=10.0)
+    master = write_silent_wav(tmp_path / "master.wav", alignment.track_duration)
+
+    with caplog.at_level(logging.WARNING):
+        chunks = slice_audio(master, alignment, DEFAULT_HARDWARE, tmp_path / "chunks")
+
+    assert chunks[0].character == "Dianne"
+    assert "'his line'" in caplog.text  # dropped from the prompt, but named
+    assert "'her line'" in caplog.text  # what IS prompted
+    assert "issue #92" in caplog.text
+
+
+def test_log_leading_vocal_offset_reports_the_dominant_characters_onset(caplog):
+    """Issue #92: on a merged chunk, the leading-vocal-offset report must
+    name the ATTRIBUTED singer's own onset -- not whichever member's word
+    happens to start earliest. Marcus's word starts at the chunk's own
+    start (0.0s offset if it were reported), but he contributes only 1.0s of
+    in-chunk voice; Dianne is dominant (4.0s) and her word starts 3.0s into
+    the chunk. Pre-#92, the pooled onset across both members would have
+    reported 0.000s (Marcus's) and stayed silent."""
+    marcus = _word_seg(0, "word", 0.0, 1.0, 0.0, 1.0, character="Marcus")
+    dianne = _word_seg(1, "word", 1.0, 5.0, 3.0, 3.5, character="Dianne")
+    piece = slicing_module._Piece(
+        members=(marcus, dianne), start=0.0, end=5.0, is_split_continuation=False,
+        frame_count=120,
+    )
+
+    with caplog.at_level(logging.INFO):
+        slicing_module._log_leading_vocal_offset([piece], (marcus, dianne))
+
+    assert "starting 3.000s into its own span" in caplog.text
+    assert "starting 0.000s into its own span" not in caplog.text
+
+
+# --------------------------------------------------------------------------- #
 # Instrumental coverage (contiguous timeline tiling)
 #
 # Without this, slice_audio emits chunks only for *voiced* spans. On a real
@@ -1668,7 +1794,8 @@ def test_leading_vocal_offset_silent_below_threshold_but_counted(caplog):
         slicing_module._log_leading_vocal_offset([piece], (seg,))
 
     assert "is prompted to sing starting" not in caplog.text
-    assert "1 voiced chunk(s), 0 over the 1.00s warning threshold" in caplog.text
+    assert "1 voiced chunk(s) (1 positive, 0 negative, 0 exactly zero), 0 over the 1.00s " \
+        "warning threshold" in caplog.text
 
 
 def test_leading_vocal_offset_skips_chunks_with_no_prompted_words(caplog):
@@ -1708,8 +1835,54 @@ def test_leading_vocal_offset_summary_names_the_worst_chunk(caplog):
     with caplog.at_level(logging.INFO):
         slicing_module._log_leading_vocal_offset([piece1, piece2], (seg1, seg2))
 
-    assert "2 voiced chunk(s), 2 over the 1.00s warning threshold" in caplog.text
-    assert "worst is chunk 0 at 1.500s" in caplog.text
+    assert "2 voiced chunk(s) (2 positive, 0 negative, 0 exactly zero), 2 over the 1.00s " \
+        "warning threshold" in caplog.text
+    assert "worst positive is chunk 0 at +1.500s" in caplog.text
+    # Only a positive worst exists here -- the summary must not invent one.
+    assert "worst negative" not in caplog.text
+
+
+def test_leading_vocal_offset_summary_names_both_worst_signs(caplog):
+    """Issue #79 follow-up: the INFO summary reports both signs, not just
+    the (warned-on) positive one, when both are present."""
+    seg_pos = _word_seg(0, "late", 6.5, 9.5, 6.5, 9.5)  # offset +1.5s
+    piece_pos = slicing_module._Piece(
+        members=(seg_pos,), start=5.0, end=11.0, is_split_continuation=False, frame_count=144
+    )
+    # The word's own start (10.5) is BEFORE the chunk's start (11.0) -- a
+    # negative offset: the mouth opens on a word whose audio has already
+    # partly gone by.
+    seg_neg = _word_seg(1, "early", 10.5, 14.0, 10.5, 14.0)
+    piece_neg = slicing_module._Piece(
+        members=(seg_neg,), start=11.0, end=17.0, is_split_continuation=False, frame_count=144
+    )
+
+    with caplog.at_level(logging.INFO):
+        slicing_module._log_leading_vocal_offset([piece_pos, piece_neg], (seg_pos, seg_neg))
+
+    assert "2 voiced chunk(s) (1 positive, 1 negative, 0 exactly zero)" in caplog.text
+    assert "worst positive is chunk 0 at +1.500s" in caplog.text
+    assert "worst negative is chunk 1 at -0.500s" in caplog.text
+
+
+def test_leading_vocal_offset_never_warns_on_negative_offset(caplog):
+    """However large a negative offset is, it must never trigger the
+    per-chunk WARNING -- only the positive side is warned on. Measured: the
+    worst negative offset on "Deathless" is -0.707s and none reaches -1.0s,
+    so a negative-side warning at any threshold comparable to
+    LEADING_VOCAL_OFFSET_WARN_SECONDS would never fire on the only corpus
+    there is to calibrate it against."""
+    # Word spans 3.0-9.0 (midpoint 6.0, inside the chunk's [5.0, 11.0) span)
+    # but STARTS at 3.0 -- 2.0s before the chunk itself starts.
+    seg = _word_seg(0, "long word", 3.0, 9.0, 3.0, 9.0)
+    piece = slicing_module._Piece(
+        members=(seg,), start=5.0, end=11.0, is_split_continuation=False, frame_count=144
+    )
+
+    with caplog.at_level(logging.WARNING):
+        slicing_module._log_leading_vocal_offset([piece], (seg,))
+
+    assert caplog.text == ""
 
 
 # --- _prefer_vocal_onset: the boundary refinement --- #
@@ -1730,35 +1903,45 @@ def test_prefer_vocal_onset_moves_boundary_toward_the_onset():
     assert result[1][0] == pytest.approx(7.291666667, abs=1e-6)
 
 
-def test_prefer_vocal_onset_refuses_when_predecessor_has_no_headroom():
+def test_prefer_vocal_onset_refuses_when_predecessor_has_no_headroom(caplog):
     """The preceding chunk is already at its own ceiling (192 frames, the
     8.0s max) -- there are no frames left to give it, so the pair is
     refused entirely and nothing changes."""
     seg = _word_seg(0, "word", 9.5, 12.5, 9.5, 12.5)
     boundaries = [(0.0, 192, False), (8.0, 158, False)]
 
-    result = slicing_module._prefer_vocal_onset(
-        boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
-    )
+    with caplog.at_level(logging.INFO):
+        result = slicing_module._prefer_vocal_onset(
+            boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
+        )
 
     assert result == boundaries
+    # Issue #79 follow-up: the 1.5s offset clears the warning threshold, so
+    # the decline is logged naming the blocking constraint.
+    assert "chunk 1's 1.500s offset was not reduced" in caplog.text
+    assert "the preceding chunk is already at its 192-frame ceiling" in caplog.text
 
 
-def test_prefer_vocal_onset_refuses_when_chunk_is_already_at_the_floor():
+def test_prefer_vocal_onset_refuses_when_chunk_is_already_at_the_floor(caplog):
     """The chunk with the offset is already at the 124-frame trained floor
     -- it cannot give up any frames without going below the minimum, so the
     pair is refused."""
     seg = _word_seg(0, "word", 7.375, 10.5, 7.375, 10.5)
     boundaries = [(0.0, 141, False), (141 / 24, 124, False)]
 
-    result = slicing_module._prefer_vocal_onset(
-        boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
-    )
+    with caplog.at_level(logging.INFO):
+        result = slicing_module._prefer_vocal_onset(
+            boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
+        )
 
     assert result == boundaries
+    assert "chunk 1's 1.500s offset was not reduced" in caplog.text
+    assert "this chunk is already at the 124-frame trained floor and cannot shrink" in (
+        caplog.text
+    )
 
 
-def test_prefer_vocal_onset_refuses_when_either_side_is_pinned():
+def test_prefer_vocal_onset_refuses_when_either_side_is_pinned(caplog):
     """An honoured ShotLength request's own chunk must never be silently
     nudged -- pinning either the predecessor's or the chunk's own index
     refuses the pair."""
@@ -1766,10 +1949,14 @@ def test_prefer_vocal_onset_refuses_when_either_side_is_pinned():
     boundaries = [(0.0, 141, False), (141 / 24, 158, False)]
 
     for pinned in (frozenset({0}), frozenset({1})):
-        result = slicing_module._prefer_vocal_onset(
-            boundaries, (seg,), pinned, _MIN79, _MAX79, _MAX79, GRID
-        )
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            result = slicing_module._prefer_vocal_onset(
+                boundaries, (seg,), pinned, _MIN79, _MAX79, _MAX79, GRID
+            )
         assert result == boundaries
+        assert "chunk 1's 1.500s offset was not reduced" in caplog.text
+        assert "boundary 1 is pinned by an honoured shot-length request" in caplog.text
 
 
 def test_prefer_vocal_onset_uses_the_filler_ceiling_for_an_instrumental_predecessor():
@@ -1804,7 +1991,7 @@ def test_prefer_vocal_onset_refuses_the_largest_k_and_accepts_a_smaller_clean_on
     assert result[1] == (pytest.approx(141 / 24 + _STEP79_S, abs=1e-6), 141, False)
 
 
-def test_prefer_vocal_onset_refuses_entirely_when_every_candidate_lands_inside_a_segment():
+def test_prefer_vocal_onset_refuses_entirely_when_every_candidate_lands_inside_a_segment(caplog):
     """Same shape as the search-downward case, but the segment's span (6.0-
     11.0) is wide enough to cover every candidate boundary the offset and
     capacity would otherwise permit -- trading the leading-offset defect for
@@ -1812,11 +1999,33 @@ def test_prefer_vocal_onset_refuses_entirely_when_every_candidate_lands_inside_a
     seg = _word_seg(0, "word", 6.0, 11.0, 7.375, 11.0)
     boundaries = [(0.0, 141, False), (141 / 24, 158, False)]
 
-    result = slicing_module._prefer_vocal_onset(
-        boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
-    )
+    with caplog.at_level(logging.INFO):
+        result = slicing_module._prefer_vocal_onset(
+            boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
+        )
 
     assert result == boundaries
+    assert "chunk 1's 1.500s offset was not reduced" in caplog.text
+    assert "every candidate boundary step" in caplog.text
+    assert "lands inside an aligned segment" in caplog.text
+
+
+def test_prefer_vocal_onset_declined_below_threshold_is_not_logged(caplog):
+    """Below the warning threshold, a declined move is silent -- logging one
+    line per candidate under 1.0s would spam a line for every one of the
+    ~29 chunks whose offset was never going to be reported anyway."""
+    # Same "already at the floor" shape as the dedicated test above, but the
+    # offset itself is only 0.5s -- below LEADING_VOCAL_OFFSET_WARN_SECONDS.
+    seg = _word_seg(0, "word", 6.375, 10.0, 6.375, 10.0)
+    boundaries = [(0.0, 141, False), (141 / 24, 124, False)]
+
+    with caplog.at_level(logging.INFO):
+        result = slicing_module._prefer_vocal_onset(
+            boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
+        )
+
+    assert result == boundaries
+    assert caplog.text == ""
 
 
 def test_prefer_vocal_onset_never_moves_more_than_the_offset_even_with_room_to_spare():
@@ -1977,7 +2186,7 @@ def test_cover_instrumentals_reduces_a_fixable_offset(caplog):
     assert covered[1].frame_count == 124
     assert covered[1].start == pytest.approx(7.291666667, abs=1e-6)
     assert "is prompted to sing starting" not in caplog.text
-    assert "worst is chunk 1 at 0.875s" in caplog.text
+    assert "worst positive is chunk 1 at +0.875s" in caplog.text
 
 
 def test_cover_instrumentals_does_not_move_a_boundary_pinned_by_a_shot_length():
@@ -2123,3 +2332,228 @@ def test_instrumental_audio_gain_preserves_the_timeline_exactly(tmp_path):
         assert _wav_duration_seconds(a.audio_file) == pytest.approx(
             _wav_duration_seconds(b.audio_file), abs=1e-6
         )
+
+
+# --------------------------------------------------------------------------- #
+# Issue #70 (reopened 2026-08-23), the instrument rather than the preference.
+#
+# The reopen asked for a depth-threshold preference: prefer a segment edge only
+# when a cut would otherwise land near the middle of a phrase. It was built as
+# a prototype -- the mirror of `_prefer_vocal_onset`, a compensated grid-step
+# transfer moving a boundary *earlier* to the phrase start -- and scored against
+# the real 80-chunk "Deathless" timeline, where it **fired 0 times at every
+# threshold tried** (1.0s, 2.0s, 2.5s, 3.0s). Clearing a phrase head is
+# all-or-nothing -- land short of the segment's start and the cut is still
+# mid-utterance, just somewhere else, which is exactly the mistake the first
+# #70 snap made -- so it costs 4-6 grid steps of 0.708s, and the chunk that has
+# to pay sits at the 124-frame floor in 20 of the 24 cases.
+#
+# What DOES move the number is the run's own `max_chunk_seconds`. On "Deathless"
+# that is set to 8.0s, well under H3's trained ceiling of 15.083s, and raising
+# it to 12.0s takes mid-phrase cuts 24 -> 18, cuts deeper than 2.5s 6 -> 3, and
+# leading offsets over 1s 4 -> 2, while stopping the two phrases longer than
+# 8.0s (9.030s and 8.020s) from being cut at all. So the lever is the ceiling,
+# not a preference -- and the instrument below is what makes that visible in one
+# `--prepare`: every surviving cut names its depth in SECONDS as well as
+# percent, which chunk starts there, and the transfer budget in both directions;
+# and separately, once per run, every phrase too long for THIS RUN's ceiling to
+# hold whole, distinguishing the case a bigger `max_chunk_seconds` would fix
+# from the case nothing can.
+# --------------------------------------------------------------------------- #
+
+
+def _cut_boundary_pieces() -> tuple[list, tuple]:
+    """Two pieces whose shared boundary lands well inside the second segment.
+
+    piece0 is 175 frames (7.292s) so it has slack to give; piece1 is 141
+    frames and has room to grow. The 1.0s gap is below the trained floor, so
+    `_cover_instrumentals` absorbs it and piece1 lands 1.0s early -- inside
+    seg1 -- exactly as `test_retiling_residue_landing_inside_a_segment_is_logged`
+    sets up.
+    """
+    seg0 = make_aligned_segment(0, "first line here", 0.0, 7.0, "Dianne")
+    seg1 = make_aligned_segment(1, "second line here", 8.5, 14.0, "Dianne")
+    piece0_end = 175 / 24
+    piece1_true_start = piece0_end + 1.0
+    piece0 = slicing_module._Piece(
+        members=(seg0,), start=0.0, end=piece0_end, is_split_continuation=False, frame_count=175
+    )
+    piece1 = slicing_module._Piece(
+        members=(seg1,),
+        start=piece1_true_start,
+        end=piece1_true_start + 141 / 24,
+        is_split_continuation=False,
+        frame_count=141,
+    )
+    return [piece0, piece1], (seg0, seg1)
+
+
+def test_final_boundary_cut_reports_depth_in_seconds_and_the_chunk_that_starts_there(caplog):
+    """A percentage cannot be compared across phrases -- 45% of a 9s phrase and
+    45% of a 1.5s one are 4.0s and 0.7s of already-sung audio, and only the
+    seconds are the quantity a boundary move has to pay for. The warning also
+    has to name the chunk that STARTS at the boundary, because that is the
+    chunk a viewer report attaches to (measured on "Deathless": every chunk a
+    viewer called defective for this mechanism is named by its own start
+    boundary, never its end)."""
+    pieces, segments = _cut_boundary_pieces()
+
+    with caplog.at_level(logging.WARNING):
+        slicing_module._cover_instrumentals(
+            pieces,
+            segments,
+            track_duration=20.0,
+            eff_min=DEFAULT_HARDWARE.min_chunk_seconds,
+            eff_max=DEFAULT_HARDWARE.max_chunk_seconds,
+            grid=GRID,
+        )
+
+    assert "Final chunk boundary" in caplog.text
+    assert "lands 84.8% through segment index=1" in caplog.text
+    # The new parts: depth in seconds, and whose start this is.
+    assert "4.667s into" in caplog.text
+    assert "chunk 2 starts here" in caplog.text
+
+
+def test_final_boundary_cut_reports_the_transfer_budget_in_both_directions(caplog):
+    """The number that decided issue #70. A preference can only move this
+    boundary by transferring whole grid steps between the two chunks either
+    side of it, so what matters is how many steps the move costs against how
+    many the neighbour actually has. Reporting it turns "this cut survived"
+    into "this cut survived because the budget was N and the price was M",
+    which is diagnosable in one `--prepare` instead of an afternoon."""
+    pieces, segments = _cut_boundary_pieces()
+
+    with caplog.at_level(logging.WARNING):
+        slicing_module._cover_instrumentals(
+            pieces,
+            segments,
+            track_duration=20.0,
+            eff_min=DEFAULT_HARDWARE.min_chunk_seconds,
+            eff_max=DEFAULT_HARDWARE.max_chunk_seconds,
+            grid=GRID,
+        )
+
+    assert "grid step(s)" in caplog.text
+    assert "phrase start" in caplog.text
+    assert "phrase end" in caplog.text
+    assert "budget" in caplog.text
+
+
+def test_final_boundary_cut_summary_counts_the_cuts_and_names_the_deepest(caplog):
+    pieces, segments = _cut_boundary_pieces()
+
+    with caplog.at_level(logging.INFO):
+        slicing_module._cover_instrumentals(
+            pieces,
+            segments,
+            track_duration=20.0,
+            eff_min=DEFAULT_HARDWARE.min_chunk_seconds,
+            eff_max=DEFAULT_HARDWARE.max_chunk_seconds,
+            grid=GRID,
+        )
+
+    assert "Mid-phrase boundary cuts: 1 of" in caplog.text
+    assert "deepest is chunk 2" in caplog.text
+
+
+def test_no_mid_phrase_cut_summary_when_every_boundary_is_clean(caplog):
+    """The control from `test_no_final_boundary_warning_when_retiling_introduces
+    _no_drift`: a zero-residue gap leaves every boundary outside every segment,
+    so the summary says so rather than going silent (a silent instrument and a
+    broken one look identical)."""
+    seg0 = make_aligned_segment(0, "first line here", 0.0, 7.0, "Dianne")
+    seg1 = make_aligned_segment(1, "second line here", 12.6, 18.2, "Dianne")
+    piece0_end = 175 / 24
+    piece1_start = piece0_end + 124 / 24
+    piece0 = slicing_module._Piece(
+        members=(seg0,), start=0.0, end=piece0_end, is_split_continuation=False, frame_count=175
+    )
+    piece1 = slicing_module._Piece(
+        members=(seg1,),
+        start=piece1_start,
+        end=piece1_start + 141 / 24,
+        is_split_continuation=False,
+        frame_count=141,
+    )
+
+    with caplog.at_level(logging.INFO):
+        slicing_module._cover_instrumentals(
+            [piece0, piece1],
+            (seg0, seg1),
+            track_duration=20.0,
+            eff_min=DEFAULT_HARDWARE.min_chunk_seconds,
+            eff_max=DEFAULT_HARDWARE.max_chunk_seconds,
+            grid=GRID,
+        )
+
+    assert "Final chunk boundary" not in caplog.text
+    assert "no boundary lands inside an aligned segment" in caplog.text
+
+
+def test_a_phrase_longer_than_this_run_s_ceiling_names_the_config_that_would_fix_it(
+    tmp_path, caplog
+):
+    """A phrase longer than the run's effective maximum chunk duration cannot be
+    held whole by any chunk, so it is cut mid-utterance on every render no matter
+    where the boundaries fall. That is a different class of defect from a cut
+    that could in principle be moved, and when the phrase still fits inside H3's
+    trained range the remedy is a config line, not code.
+
+    Measured on "Deathless", whose ``max_chunk_seconds`` is 8.0 against a trained
+    ceiling of 15.083s: segments 24 (9.030s) and 29 (8.020s) are exactly this
+    case, and they are the phrases cut by two of the three chunks issue #70's
+    reopen was built on. Raising the ceiling to 12.0s stops both from being cut.
+    """
+    profile = HardwareProfile(
+        name="ceiling-8s", vram_gb=24.0, min_chunk_seconds=5.166666666666667,
+        max_chunk_seconds=8.0,
+    )
+    long_segment = make_aligned_segment(0, "a phrase too long to hold", 1.0, 10.5, "Dianne")
+    short_segment = make_aligned_segment(1, "a short one", 14.0, 20.0, "Dianne")
+    audio = write_silent_wav(tmp_path / "master.wav", seconds=40.0)
+    alignment = AlignmentResult(segments=(long_segment, short_segment), track_duration=40.0)
+
+    with caplog.at_level(logging.WARNING):
+        slice_audio(audio, alignment, profile, tmp_path / "chunks")
+
+    assert caplog.text.count("cannot be held whole by any chunk") == 1
+    assert "segment index=0" in caplog.text
+    assert "cut mid-utterance on every render" in caplog.text
+    # The actionable half: it fits inside the trained range, so name the lever.
+    assert "max_chunk_seconds" in caplog.text
+
+
+def test_a_phrase_longer_than_the_trained_ceiling_says_no_setting_can_hold_it(
+    tmp_path, caplog
+):
+    """The other branch: past H3's own trained maximum there is no config that
+    helps, and saying "raise max_chunk_seconds" would be advice that cannot be
+    taken. The lever there is a model with a longer trained context."""
+    trained_max_s = GRID.frames_to_seconds(GRID.trained_max_frames)
+    long_segment = make_aligned_segment(
+        0, "a phrase longer than anything", 1.0, 1.0 + trained_max_s + 1.5, "Dianne"
+    )
+    short_segment = make_aligned_segment(
+        1, "a short one", trained_max_s + 5.0, trained_max_s + 11.0, "Dianne"
+    )
+    audio = write_silent_wav(tmp_path / "master.wav", seconds=40.0)
+    alignment = AlignmentResult(segments=(long_segment, short_segment), track_duration=40.0)
+
+    with caplog.at_level(logging.WARNING):
+        slice_audio(audio, alignment, DEFAULT_HARDWARE, tmp_path / "chunks")
+
+    assert caplog.text.count("cannot be held whole by any chunk") == 1
+    assert "no max_chunk_seconds setting can hold it" in caplog.text
+
+
+def test_no_untenable_phrase_warning_when_every_phrase_fits(tmp_path, caplog):
+    seg0 = make_aligned_segment(0, "a phrase that fits", 1.0, 7.0, "Dianne")
+    seg1 = make_aligned_segment(1, "another that fits", 12.0, 18.0, "Dianne")
+    audio = write_silent_wav(tmp_path / "master.wav", seconds=30.0)
+    alignment = AlignmentResult(segments=(seg0, seg1), track_duration=30.0)
+
+    with caplog.at_level(logging.WARNING):
+        slice_audio(audio, alignment, DEFAULT_HARDWARE, tmp_path / "chunks")
+
+    assert "cannot be held whole by any chunk" not in caplog.text
