@@ -111,6 +111,40 @@ timing + text heuristics that are necessarily imperfect:
   documented failure; there is no fixture in this project requiring the
   trailing edge to be false-positive-free, so this trade was made
   deliberately.
+
+Voice-in-unplaced-gap check (issue #80)
+----------------------------------------
+Issue #71 asks, of every *placed* segment, "is there a voice where you put
+this lyric". Issue #80 is its mirror: "is there a voice where you placed
+NOTHING". A span the aligner skipped is invisible to every check in this
+module, including #71's, because none of them examine anything but placed
+segments -- an omission leaves no record for a check to attach to. This is
+what let a viewer catch "he is back on non-snowy tower, with singing
+playing, but he isn't singing" at 4:55 of a real render when nothing in the
+quality report had.
+
+The check (a no-op unless ``audio_path`` is given, same exception as #71's):
+reuse the same decoded-once master and the same per-segment consonant-band
+shares #71 already computes; enumerate the spans no placed segment covers
+(including the trailing span after the last segment -- deliberately, since a
+silent tail is the trap this check must resist firing on, not a case to
+special-case away); tile each qualifying gap into equal windows; gate out
+any window whose full-band level sits far below the placed segments' own
+typical level (GAP_LEVEL_DROP_DB), because a share ratio computed from two
+near-silent measurements is meaningless in either direction; and compare the
+loudest surviving window's share against the same median baseline #71 uses.
+
+**Honesty requirement, non-negotiable:** #71's LOW-ratio flag is unambiguous
+-- a tonal fadeout genuinely has no energy above the consonant band. This
+check's HIGH-ratio flag is not: cymbals, hi-hat and a bright lead guitar all
+live above 3.4kHz too, so a high ratio is a candidate worth a human ear, not
+proof of a voice. It is a WARNING for exactly this reason, never CRITICAL,
+and ``--strict-alignment`` never refuses on it alone. See
+GAP_VOCAL_ENERGY_RATIO_THRESHOLD's docstring for the calibration (3 of 13
+real gaps fire, one adjudicated true positive ranked first, two recorded as
+unadjudicated rather than false positives) and for why this is also the
+check that tells an operator their ``alignment_model_size`` is too small for
+the song (issue #80's own point, and #42's).
 """
 
 from __future__ import annotations
@@ -280,6 +314,119 @@ rejected as too conservative given that cost asymmetry -- it would have
 missed this issue's own tighter 1.9%-ratio measurement of the documented
 failure had the wider chunk-level span (5.7%) not been the one evaluated."""
 
+# Issue #80 -- #71's mirror. #71 asks "is there a voice where you PLACED this
+# lyric"; these four constants ask "is there a voice where you placed
+# NOTHING". An omitted placement leaves no record for any existing check to
+# examine, so a span the aligner skipped entirely was invisible to every
+# check above, including #71's -- see the "Voice-in-unplaced-gap check"
+# section further down for the algorithm and the honesty requirement this
+# check carries (a HIGH consonant-band ratio is not proof of a voice the way
+# #71's LOW ratio is proof of its absence).
+
+GAP_MIN_DURATION_S = 4.0
+"""How large an unplaced span between (or after) aligned segments has to be
+before it is worth measuring at all. Below this, a gap is ordinary word-to-
+word or line-to-line breathing space, not a candidate for "the aligner
+skipped real singing here." Set equal to GAP_WINDOW_S so the shortest
+qualifying gap still produces exactly one full window rather than a
+fractional one."""
+
+GAP_WINDOW_S = 4.0
+"""Width of the equal-sized tiles a qualifying gap is cut into before
+measuring. Matches #71's own placed-segment spans in order of magnitude (its
+calibration segments run 1.28s-7.29s) -- narrow enough that a single sung
+phrase inside a long instrumental break isn't diluted by averaging across
+silence on either side of it (see GAP_VOCAL_ENERGY_RATIO_THRESHOLD's
+docstring for the measured cost of skipping this step: whole-gap averaging
+was tried and rejected)."""
+
+GAP_LEVEL_DROP_DB = 15.0
+"""How far below the placed-segment median full-band level (``median_level_db``,
+computed the same pass as the baseline share -- see the "Voice-in-unplaced-gap
+check" section) a window's own full-band RMS can fall before it is gated out
+of consideration, regardless of its consonant-band share.
+
+This is the trap issue #80 names explicitly: consonant-band share is a power
+*ratio*, and a ratio of near-nothing to near-nothing is meaningless -- pure
+digital-silence-adjacent noise can score a higher share than a real vocal
+because both bands are dominated by noise floor rather than signal. #71 never
+needed this gate because it only ever flags a LOW ratio, and a quiet-but-real
+window and a truly silent one both read as "low" -- the failure mode is
+symmetric only in the high direction.
+
+Deathless calibration (2026-08-22, 49 qualifying placed segments): median
+full-band RMS -15.74dB, full range -22.31...-14.38dB, so the gate floor lands
+at -30.74dB on this track. The real trailing tail, 501.63-512.08s, measures
+-67.8dB and every one of its windows is gated out by this floor -- confirming
+the gate does its job on the exact case the issue's own proposal called out
+(the post-fadeout window that scored 0.0452, higher than several real
+vocals, entirely on noise)."""
+
+GAP_VOCAL_ENERGY_RATIO_THRESHOLD = 2.0
+"""How far a gap's peak surviving window's consonant-band share has to sit
+*above* the placed-segment median (``baseline_share``) before the gap is
+flagged as plausibly containing an unplaced voice. This is #71's ratio
+mirrored to the other side of 1.0: #71 flags small; this flags large.
+
+Calibrated 2026-08-22 against the real "Deathless" master, 13 gaps
+>=GAP_MIN_DURATION_S, peak-window ratios: 1.63, 1.49, 2.75, 1.02, 1.72, 3.51,
+2.48, 0.40, 0.90, 1.01, 1.00, 1.21, and the trailing tail (every window
+gated out by GAP_LEVEL_DROP_DB before a ratio is even considered).
+
+The one known true positive is 288.65-297.41s -- the viewer's own "4:55 he is
+back on non-snowy tower, with singing playing, but he isn't singing" -- and
+it is the highest ratio on the track, 3.51, peak window 293.03-297.41s (share
+0.0616, level -16.11dB). The other two firings at this threshold,
+131.03-137.15s (2.75) and 320.97-378.47s (2.48), are recorded as
+*unadjudicated*, not as false positives: the lyric at 131s reads "...for an
+endless night" with an ellipsis exactly there (a held/paused vocal is
+plausible), and 320.97-378.47s is a 57.5s instrumental break where a real
+lead instrument living above 3.4kHz is at least as likely an explanation as a
+voice -- this check cannot tell the two apart, and says so in its own
+finding message.
+
+Rejected candidates, in the direction cheap-mistake-favoring (CLAUDE.md: "A
+guard's threshold belongs near the evidence, on the side whose mistake is
+cheap"):
+  - 3.0 -- fires on exactly the one labelled positive and nothing else, but
+    sits 0.07 below it: zero margin. A threshold tuned to fire on exactly one
+    example, with no room to spare, misses any track whose missed vocal is
+    marginally quieter than this one. The mistake this threshold guards
+    against (a false positive) costs one log line; the mistake it invites (a
+    passage rendered mute over real singing) costs hours of GPU and a viewer
+    finding it. The cheap mistake is the one to risk.
+  - 2.5 -- 0.57 below the positive; excludes 320.97-378.47 only because that
+    gap is long enough to dilute a short vocal across many windows, which is
+    exactly the dilution GAP_WINDOW_S's tiling exists to defeat -- a
+    threshold that relies on dilution to stay quiet is fragile in the wrong
+    direction.
+  - 1.5 -- pulls in the two longest instrumental breaks on the track (1.72
+    and 1.70): it starts firing on the song's ordinary structure rather than
+    on a defect.
+  - an absolute consonant-band-share threshold with no ratio -- rejected for
+    the same reason #71 rejected one: it needs recalibrating per mix, and the
+    self-calibrating median is already in hand.
+  - whole-gap averaging without windowing -- measured and rejected: it scores
+    the true positive at 2.50 (still over 2.0, so it would technically still
+    catch it) but the 57.5s break at only 1.09, i.e. it dilutes a short real
+    signal spread across a long gap into invisibility -- the general defect
+    GAP_WINDOW_S's tiling exists to avoid, not just this track's specific
+    numbers.
+
+2.0 sits below the true positive (3.51) with real margin (a low-side move to
+2.5 still catches it) while staying above the song's ordinary instrumental
+structure (1.72, the highest non-firing ratio measured). Honesty requirement,
+restated because it is non-negotiable: a HIGH consonant-band ratio is *not*
+specific to a voice the way a LOW one is specific to its absence -- cymbals,
+hi-hat and a bright lead guitar all live above 3.4kHz. This fires on 3 of 13
+gaps on the calibration track, with exactly one adjudicated true positive
+ranked first; its job is to rank candidates and name a window for a human to
+listen to, never to assert a voice is there. It is a WARNING for exactly this
+reason and --strict-alignment never refuses on it. A track that fires here
+often is also the signal that alignment_model_size is too small for the song
+(issue #80's own point, and #42's) -- today that is otherwise only
+discoverable by ear."""
+
 # --------------------------------------------------------------------------- #
 # Finding codes.
 # --------------------------------------------------------------------------- #
@@ -297,6 +444,7 @@ FINDING_CONFIDENCE_COLLAPSE = "track_confidence_collapse"
 FINDING_COUNTERPOINT_RATE = "counterpoint_delivery_rate"
 FINDING_COUNTERPOINT_SPAN = "counterpoint_degenerate_span"
 FINDING_NO_VOCAL_ENERGY = "no_vocal_energy_in_placed_segment"
+FINDING_VOICE_IN_UNPLACED_GAP = "voice_in_unplaced_gap"
 
 
 class Severity(IntEnum):
@@ -407,6 +555,10 @@ def evaluate_alignment_quality(
     vocal_energy_ratio_threshold: float = VOCAL_ENERGY_RATIO_THRESHOLD,
     vocal_energy_min_duration_s: float = MIN_SEGMENT_DURATION_FOR_VOCAL_ENERGY_S,
     vocal_energy_min_baseline_segments: int = VOCAL_ENERGY_BASELINE_MIN_SEGMENTS,
+    gap_min_duration_s: float = GAP_MIN_DURATION_S,
+    gap_window_s: float = GAP_WINDOW_S,
+    gap_level_drop_db: float = GAP_LEVEL_DROP_DB,
+    gap_vocal_energy_ratio_threshold: float = GAP_VOCAL_ENERGY_RATIO_THRESHOLD,
     ffmpeg_runner: FfmpegRunner | None = None,
 ) -> AlignmentQualityReport:
     """Pure function *by default*: no audio, no model, no I/O. Runs every
@@ -415,12 +567,13 @@ def evaluate_alignment_quality(
     "Per-word confidence" section) and returns a structured
     :class:`AlignmentQualityReport`.
 
-    The one exception is the vocal-energy check (issue #71): it is a no-op
-    (and touches no audio, no ffmpeg, nothing) unless ``audio_path`` is
-    given, which is why that parameter defaults to ``None`` -- every
-    existing caller that never passes it keeps the pure-function contract
-    exactly as before. See the module docstring's "Vocal-energy check"
-    section for what it does and why it needs to be the one exception.
+    The one exception is the vocal-energy check and its mirror (issues #71
+    and #80): both are a no-op (and touch no audio, no ffmpeg, nothing)
+    unless ``audio_path`` is given, which is why that parameter defaults to
+    ``None`` -- every existing caller that never passes it keeps the
+    pure-function contract exactly as before. See the module docstring's
+    "Vocal-energy check" and "Voice-in-unplaced-gap check" sections for what
+    each does and why they need to be the exception.
 
     Checks:
       - zero-length / near-zero-length segments
@@ -434,6 +587,9 @@ def evaluate_alignment_quality(
         on their own terms, see the module docstring
       - no vocal energy where a segment was placed, if ``audio_path`` is
         supplied (issue #71) -- see the module docstring
+      - a voice-like span in a gap where nothing was placed, if
+        ``audio_path`` is supplied (issue #80) -- see the module docstring's
+        "Voice-in-unplaced-gap check" section
     """
     segments = result.segments
     # Duck-typed rather than imported: this module must not depend on the
@@ -475,10 +631,15 @@ def evaluate_alignment_quality(
         _check_vocal_energy(
             segments,
             audio_path,
+            track_duration=result.track_duration,
             consonant_band_hz=consonant_band_hz,
             ratio_threshold=vocal_energy_ratio_threshold,
             min_duration_s=vocal_energy_min_duration_s,
             min_baseline_segments=vocal_energy_min_baseline_segments,
+            gap_min_duration_s=gap_min_duration_s,
+            gap_window_s=gap_window_s,
+            gap_level_drop_db=gap_level_drop_db,
+            gap_ratio_threshold=gap_vocal_energy_ratio_threshold,
             runner=ffmpeg_runner,
         )
     )
@@ -845,6 +1006,12 @@ def _check_track_confidence(
 # -- see that function's docstring. Every failure mode degrades to "skip
 # this check" with a logged reason, never a crash: a quality check must
 # never be the thing that takes an alignment run down (global standard).
+#
+# Its mirror, issue #80 (see the module docstring's "Voice-in-unplaced-gap
+# check" section and GAP_VOCAL_ENERGY_RATIO_THRESHOLD's docstring), lives in
+# `_enumerate_unplaced_gaps` / `_check_unplaced_gaps` just below and is
+# invoked from inside `_check_vocal_energy` -- same decode, same
+# per-segment shares, no second entry point.
 # --------------------------------------------------------------------------- #
 
 FfmpegRunner = Callable[[Sequence[str]], "subprocess.CompletedProcess"]
@@ -927,18 +1094,26 @@ def _rms_level_db(
     return float(match.group(1))
 
 
-def _consonant_band_share(
+def _measure_window(
     audio_path: Path,
     start: float,
     end: float,
     *,
     consonant_band_hz: float,
     runner: FfmpegRunner,
-) -> float | None:
-    """This window's share of total spectral energy sitting above
-    ``consonant_band_hz``, as a power ratio (``10 ** ((hf_db - total_db) /
-    10)``). ``None`` if either the total or the highpassed measurement
-    failed."""
+) -> tuple[float, float] | None:
+    """Returns ``(total_db, consonant_band_share)`` for one window in exactly
+    two ffmpeg ``astats`` calls: a full-band RMS level in dB, and this
+    window's share of total spectral energy sitting above
+    ``consonant_band_hz`` as a power ratio (``10 ** ((hf_db - total_db) /
+    10)``). ``None`` if either measurement failed.
+
+    Both #71's placed-segment check and #80's unplaced-gap check need the
+    share; #80 also needs the full-band level for its own gate
+    (GAP_LEVEL_DROP_DB) -- and that level is already computed as part of
+    getting the share (it's the same ``total_db`` the ratio divides by), so
+    returning it here instead of discarding it costs nothing extra: still
+    two ffmpeg calls per window, not three or four."""
     duration = end - start
     if duration <= 0:
         return None
@@ -950,23 +1125,148 @@ def _consonant_band_share(
     )
     if hf_db is None:
         return None
-    return 10 ** ((hf_db - total_db) / 10)
+    return total_db, 10 ** ((hf_db - total_db) / 10)
+
+
+def _enumerate_unplaced_gaps(
+    segments: tuple[AlignedSegment, ...],
+    track_duration: float,
+    gap_min_duration_s: float,
+) -> list[tuple[float, float]]:
+    """Spans of the track no placed segment covers, sorted and de-
+    overlapped -- ``prev = max(prev, segment.end)`` so segments that overlap
+    (which happens; see FINDING_OVERLAP) don't produce a spurious negative-
+    length "gap". Only spans ``>= gap_min_duration_s`` are returned.
+
+    The trailing span after the last segment is enumerated exactly like any
+    other gap -- deliberately not special-cased away the way
+    ``_check_isolated_segments`` treats the *first* segment. A silent tail
+    after the music ends is the trap issue #80 documents (broadband noise
+    scoring a higher consonant-band ratio than a real vocal): it must be
+    measured and rejected by the level gate (GAP_LEVEL_DROP_DB), not
+    excluded from consideration before that gate gets a chance to work."""
+    gaps: list[tuple[float, float]] = []
+    prev = 0.0
+    for segment in sorted(segments, key=lambda s: s.start):
+        if segment.start - prev >= gap_min_duration_s:
+            gaps.append((prev, segment.start))
+        prev = max(prev, segment.end)
+    if track_duration - prev >= gap_min_duration_s:
+        gaps.append((prev, track_duration))
+    return gaps
+
+
+def _check_unplaced_gaps(
+    segments: tuple[AlignedSegment, ...],
+    audio_path: Path,
+    *,
+    track_duration: float,
+    shares: dict[int, float],
+    levels: dict[int, float],
+    consonant_band_hz: float,
+    runner: FfmpegRunner,
+    min_baseline_segments: int,
+    gap_min_duration_s: float,
+    gap_window_s: float,
+    gap_level_drop_db: float,
+    gap_ratio_threshold: float,
+) -> list[Finding]:
+    """Issue #80: the mirror of the per-segment check above -- "is there a
+    voice where nothing was placed", instead of "is there a voice where
+    something was". See the module docstring's "Voice-in-unplaced-gap check"
+    section and GAP_VOCAL_ENERGY_RATIO_THRESHOLD's docstring for the
+    calibration and the honesty requirement this check carries: a HIGH
+    consonant-band ratio is a candidate worth a human ear, never proof of a
+    voice, so this is WARNING-only regardless of how high the ratio is.
+
+    ``shares``/``levels`` are the *placed*-segment measurements the caller
+    (``_check_vocal_energy``) already computed for its own check -- reused
+    here as the self-calibrated baseline rather than decoding or measuring
+    those spans again.
+    """
+    if len(shares) < min_baseline_segments:
+        return []  # not enough of a baseline on this track to calibrate against
+    baseline_share = statistics.median(shares.values())
+    if baseline_share <= 0:
+        return []
+    median_level_db = statistics.median(levels.values())
+    level_floor_db = median_level_db - gap_level_drop_db
+
+    findings: list[Finding] = []
+    gaps = _enumerate_unplaced_gaps(segments, track_duration, gap_min_duration_s)
+    for gap_start, gap_end in gaps:
+        gap_len = gap_end - gap_start
+        window_count = max(1, int(gap_len // gap_window_s))
+        window_len = gap_len / window_count
+
+        peak_share: float | None = None
+        peak_start = peak_end = peak_db = 0.0
+        for i in range(window_count):
+            win_start = gap_start + i * window_len
+            win_end = gap_start + (i + 1) * window_len
+            measurement = _measure_window(
+                audio_path, win_start, win_end, consonant_band_hz=consonant_band_hz, runner=runner
+            )
+            if measurement is None:
+                continue  # this window's own measurement failed -- already logged
+            win_db, win_share = measurement
+            if win_db < level_floor_db:
+                continue  # gated out: too quiet for a share ratio to mean anything (#80)
+            if peak_share is None or win_share > peak_share:
+                peak_share, peak_start, peak_end, peak_db = win_share, win_start, win_end, win_db
+
+        if peak_share is None:
+            continue  # every window unmeasurable or gated out by level -- no finding
+        ratio = peak_share / baseline_share
+        if ratio < gap_ratio_threshold:
+            continue
+
+        findings.append(
+            Finding(
+                segment_index=None,
+                start=gap_start,
+                end=gap_end,
+                severity=Severity.WARNING,
+                code=FINDING_VOICE_IN_UNPLACED_GAP,
+                message=(
+                    f"unplaced gap {gap_start:.3f}s -> {gap_end:.3f}s ({gap_len:.1f}s, no "
+                    "aligned segment covers it) has a window that looks like a voice: "
+                    f"{peak_start:.3f}s -> {peak_end:.3f}s scores consonant-band share "
+                    f"{peak_share:.4f} at {peak_db:.1f}dB, against this track's own "
+                    f"placed-segment median of {baseline_share:.4f} ({ratio:.2f}x baseline, "
+                    f"threshold {gap_ratio_threshold:.2f}x). Listen to that window by hand -- "
+                    "a high consonant-band ratio is not proof of a voice the way a low one is "
+                    "proof of its absence (cymbals, hi-hat and a bright lead guitar live in "
+                    "the same band), only a candidate worth a human ear. If this fires often "
+                    "on a track, alignment_model_size is probably too small for this song "
+                    "(issue #80)"
+                ),
+            )
+        )
+    return findings
 
 
 def _check_vocal_energy(
     segments: tuple[AlignedSegment, ...],
     audio_path: str | Path | None,
     *,
+    track_duration: float,
     consonant_band_hz: float,
     ratio_threshold: float,
     min_duration_s: float,
     min_baseline_segments: int,
+    gap_min_duration_s: float,
+    gap_window_s: float,
+    gap_level_drop_db: float,
+    gap_ratio_threshold: float,
     runner: FfmpegRunner | None,
 ) -> list[Finding]:
     """See the section docstring above. No-op (no I/O at all) when
     ``audio_path`` is ``None`` -- this is what keeps
     ``evaluate_alignment_quality`` a pure function for every caller that
-    doesn't pass one."""
+    doesn't pass one. Runs both #71's placed-segment check and #80's
+    unplaced-gap mirror, sharing one decode and one set of per-segment
+    measurements between them."""
     if audio_path is None or not segments:
         return []
 
@@ -1026,18 +1326,19 @@ def _check_vocal_energy(
             return []
 
         shares: dict[int, float] = {}
+        levels: dict[int, float] = {}
         for segment in segments:
             if segment.end - segment.start < min_duration_s:
                 continue  # too short for a trustworthy spectral estimate either way
-            share = _consonant_band_share(
+            measurement = _measure_window(
                 tmp_path,
                 segment.start,
                 segment.end,
                 consonant_band_hz=consonant_band_hz,
                 runner=active_runner,
             )
-            if share is not None:
-                shares[segment.index] = share
+            if measurement is not None:
+                levels[segment.index], shares[segment.index] = measurement
 
         findings: list[Finding] = []
         for segment in segments:
@@ -1075,6 +1376,23 @@ def _check_vocal_energy(
                         ),
                     )
                 )
+
+        findings.extend(
+            _check_unplaced_gaps(
+                segments,
+                tmp_path,
+                track_duration=track_duration,
+                shares=shares,
+                levels=levels,
+                consonant_band_hz=consonant_band_hz,
+                runner=active_runner,
+                min_baseline_segments=min_baseline_segments,
+                gap_min_duration_s=gap_min_duration_s,
+                gap_window_s=gap_window_s,
+                gap_level_drop_db=gap_level_drop_db,
+                gap_ratio_threshold=gap_ratio_threshold,
+            )
+        )
         return findings
     except Exception:
         logger.exception(

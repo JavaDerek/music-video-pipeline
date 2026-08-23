@@ -11,6 +11,7 @@ on "The Lucky Ones" (2026-08-08 alignment run).
 
 import math
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -20,6 +21,7 @@ from music_video_maker.alignment_quality import (
     FINDING_OUT_OF_ORDER,
     FINDING_OVERLAP,
     FINDING_SPLIT_LINE,
+    FINDING_VOICE_IN_UNPLACED_GAP,
     FINDING_WPS_HIGH,
     FINDING_WPS_LOW,
     FINDING_ZERO_LENGTH,
@@ -589,7 +591,17 @@ class _FakeVocalEnergyRunner:
     test's segments) to its intended HF share. The whole-file decode call
     (no ``-ss`` in argv) reports success unless ``decode_ok`` is False.
     ``fail_starts`` makes specific per-window ``astats`` calls fail (exit 1)
-    to test that one bad window doesn't take down the others."""
+    to test that one bad window doesn't take down the others.
+
+    Issue #80's gap check tiles windows inside the (large, by construction)
+    gaps between these tests' tiny synthetic segments, at ``-ss`` starts no
+    pre-#80 test ever anticipated. Falling back to ``DEFAULT_SHARE`` for any
+    unlisted start (rather than a bare ``self.profile[start]`` that would
+    raise ``KeyError``) keeps every test written before #80 existed passing
+    unchanged: the default is far enough below any of these fixtures'
+    baselines that it never trips GAP_VOCAL_ENERGY_RATIO_THRESHOLD."""
+
+    DEFAULT_SHARE = 0.001
 
     def __init__(self, profile, *, decode_ok=True, fail_starts=frozenset()):
         self.profile = profile
@@ -610,7 +622,14 @@ class _FakeVocalEnergyRunner:
             )
         af = args[args.index("-af") + 1]
         highpass = "highpass" in af
-        total_db, hf_db = _share_to_db_pair(self.profile[start])
+        entry = self.profile.get(start, self.DEFAULT_SHARE)
+        # An entry may be a bare share (uses the -15.0dB default full-band
+        # level) or a (share, total_db) pair -- the latter is how issue #80's
+        # "silent tail" trap is expressed: a high share at a level nowhere
+        # near the placed-segment baseline, which GAP_LEVEL_DROP_DB exists to
+        # gate out regardless of how high the share looks.
+        share, total_db = entry if isinstance(entry, tuple) else (entry, -15.0)
+        total_db, hf_db = _share_to_db_pair(share, total_db)
         db = hf_db if highpass else total_db
         stderr = f"[Parsed_astats_0] Overall\n[Parsed_astats_0] RMS level dB: {db:.4f}\n".encode()
         return subprocess.CompletedProcess(args, returncode=0, stdout=b"", stderr=stderr)
@@ -1013,3 +1032,249 @@ def test_vocal_energy_integration_real_ffmpeg(tmp_path):
 
     hits = {f.segment_index for f in report.findings if f.code == FINDING_NO_VOCAL_ENERGY}
     assert hits == {3}
+
+
+# --------------------------------------------------------------------------- #
+# Voice-in-unplaced-gap check (issue #80): #71's mirror. "Is there a voice
+# where you placed NOTHING", instead of "is there a voice where you placed
+# this lyric". Same fake-runner convention as the section above; every gap
+# in these fixtures is deliberately sized as a whole multiple of
+# GAP_WINDOW_S (4.0s) so window boundaries land on exact floats and the
+# fake runner's dict lookups need no floating-point tolerance.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_high_share_window_inside_a_gap_at_a_healthy_level_is_flagged_warning(tmp_path):
+    # Three contiguous baseline segments (0-18s, share ~0.02), an 8s gap
+    # (18-26s, two 4s windows), then a closing segment so the gap under test
+    # isn't the trailing tail. The second window (22-26s) sounds like a
+    # voice; the first (18-22s) is left at the fake's quiet default.
+    segments = (
+        make_aligned_segment(0, "real one", 0.0, 6.0, "Dianne"),
+        make_aligned_segment(1, "real two", 6.0, 12.0, "Dianne"),
+        make_aligned_segment(2, "real three", 12.0, 18.0, "Dianne"),
+        make_aligned_segment(3, "real four", 26.0, 32.0, "Dianne"),
+    )
+    result = AlignmentResult(segments=segments, track_duration=32.0)
+    profile = {0.0: 0.02, 6.0: 0.021, 12.0: 0.019, 26.0: 0.02, 22.0: 0.08}
+    runner = _FakeVocalEnergyRunner(profile)
+
+    report = evaluate_alignment_quality(
+        result, audio_path=_write_stub_audio(tmp_path), ffmpeg_runner=runner
+    )
+
+    hits = [f for f in report.findings if f.code == FINDING_VOICE_IN_UNPLACED_GAP]
+    assert len(hits) == 1
+    assert hits[0].severity is Severity.WARNING
+    assert hits[0].segment_index is None
+    assert hits[0].start == pytest.approx(18.0)
+    assert hits[0].end == pytest.approx(26.0)
+    assert "22.000" in hits[0].message or "22.0" in hits[0].message
+
+
+def test_high_share_gated_out_by_silent_level_produces_no_finding_the_silent_tail_trap(tmp_path):
+    # Same layout as above, but the high-share window is also very quiet
+    # (-67.8dB, the real trailing-tail level this issue's calibration
+    # measured) -- well below the placed-segment level floor. A share ratio
+    # computed from two near-nothing measurements is meaningless, so this
+    # window must be gated out rather than flagged, regardless of how high
+    # its share looks.
+    segments = (
+        make_aligned_segment(0, "real one", 0.0, 6.0, "Dianne"),
+        make_aligned_segment(1, "real two", 6.0, 12.0, "Dianne"),
+        make_aligned_segment(2, "real three", 12.0, 18.0, "Dianne"),
+        make_aligned_segment(3, "real four", 26.0, 32.0, "Dianne"),
+    )
+    result = AlignmentResult(segments=segments, track_duration=32.0)
+    profile = {
+        0.0: 0.02,
+        6.0: 0.021,
+        12.0: 0.019,
+        26.0: 0.02,
+        22.0: (0.08, -67.8),  # high share, but effectively silent
+    }
+    runner = _FakeVocalEnergyRunner(profile)
+
+    report = evaluate_alignment_quality(
+        result, audio_path=_write_stub_audio(tmp_path), ffmpeg_runner=runner
+    )
+
+    assert not [f for f in report.findings if f.code == FINDING_VOICE_IN_UNPLACED_GAP]
+
+
+def test_a_gap_shorter_than_the_minimum_duration_is_never_measured(tmp_path):
+    # 18.0 -> 20.0 is only 2.0s, below GAP_MIN_DURATION_S (4.0s): it must not
+    # even be enumerated, let alone measured.
+    segments = (
+        make_aligned_segment(0, "real one", 0.0, 6.0, "Dianne"),
+        make_aligned_segment(1, "real two", 6.0, 12.0, "Dianne"),
+        make_aligned_segment(2, "real three", 12.0, 18.0, "Dianne"),
+        make_aligned_segment(3, "real four", 20.0, 26.0, "Dianne"),
+    )
+    result = AlignmentResult(segments=segments, track_duration=26.0)
+    profile = {0.0: 0.02, 6.0: 0.021, 12.0: 0.019, 20.0: 0.02}
+    runner = _FakeVocalEnergyRunner(profile)
+
+    report = evaluate_alignment_quality(
+        result, audio_path=_write_stub_audio(tmp_path), ffmpeg_runner=runner
+    )
+
+    assert not [f for f in report.findings if f.code == FINDING_VOICE_IN_UNPLACED_GAP]
+    ss_starts = {float(c[c.index("-ss") + 1]) for c in runner.calls if "-ss" in c}
+    assert 18.0 not in ss_starts  # the short gap was never even measured
+
+
+def test_fewer_than_the_baseline_minimum_placed_segments_skips_the_gap_check_entirely(tmp_path):
+    # Only two placed segments exist on this track -- below
+    # VOCAL_ENERGY_BASELINE_MIN_SEGMENTS -- even though the gap between them
+    # is large and a window in it would score high if it were ever measured.
+    segments = (
+        make_aligned_segment(0, "real one", 0.0, 6.0, "Dianne"),
+        make_aligned_segment(1, "real two", 20.0, 26.0, "Dianne"),
+    )
+    result = AlignmentResult(segments=segments, track_duration=26.0)
+    profile = {0.0: 0.02, 20.0: 0.021, 10.0: 0.09}  # 10.0 would trip it if ever measured
+    runner = _FakeVocalEnergyRunner(profile)
+
+    report = evaluate_alignment_quality(
+        result, audio_path=_write_stub_audio(tmp_path), ffmpeg_runner=runner
+    )
+
+    assert not [f for f in report.findings if f.code == FINDING_VOICE_IN_UNPLACED_GAP]
+    ss_starts = {float(c[c.index("-ss") + 1]) for c in runner.calls if "-ss" in c}
+    assert ss_starts == {0.0, 20.0}  # only the two segments -- the gap was never touched
+
+
+def test_a_long_gap_with_several_high_windows_yields_exactly_one_finding(tmp_path):
+    # 18.0 -> 34.0 is 16s, tiled into four 4s windows (18, 22, 26, 30). Three
+    # of the four score high; this must still produce exactly one finding
+    # for the gap, not one per window.
+    segments = (
+        make_aligned_segment(0, "real one", 0.0, 6.0, "Dianne"),
+        make_aligned_segment(1, "real two", 6.0, 12.0, "Dianne"),
+        make_aligned_segment(2, "real three", 12.0, 18.0, "Dianne"),
+        make_aligned_segment(3, "real four", 34.0, 40.0, "Dianne"),
+    )
+    result = AlignmentResult(segments=segments, track_duration=40.0)
+    profile = {
+        0.0: 0.02,
+        6.0: 0.021,
+        12.0: 0.019,
+        34.0: 0.02,
+        22.0: 0.09,
+        26.0: 0.07,
+        30.0: 0.08,
+    }
+    runner = _FakeVocalEnergyRunner(profile)
+
+    report = evaluate_alignment_quality(
+        result, audio_path=_write_stub_audio(tmp_path), ffmpeg_runner=runner
+    )
+
+    hits = [f for f in report.findings if f.code == FINDING_VOICE_IN_UNPLACED_GAP]
+    assert len(hits) == 1
+    assert hits[0].start == pytest.approx(18.0)
+    assert hits[0].end == pytest.approx(34.0)
+    # the peak window (22-26s, share 0.09) is the one named in the message
+    assert "22.000" in hits[0].message or "22.0" in hits[0].message
+
+
+def test_the_trailing_span_after_the_last_segment_is_measured_and_can_fire(tmp_path):
+    # Three contiguous baseline segments end at 18.0s; the track runs to
+    # 26.0s, an 8s trailing tail with no segment after it at all. This is
+    # exactly the span #79/#71's isolated_segment check would never look at
+    # past the last segment -- it must still be tiled and measured here.
+    segments = (
+        make_aligned_segment(0, "real one", 0.0, 6.0, "Dianne"),
+        make_aligned_segment(1, "real two", 6.0, 12.0, "Dianne"),
+        make_aligned_segment(2, "real three", 12.0, 18.0, "Dianne"),
+    )
+    result = AlignmentResult(segments=segments, track_duration=26.0)
+    profile = {0.0: 0.02, 6.0: 0.021, 12.0: 0.019, 22.0: 0.09}
+    runner = _FakeVocalEnergyRunner(profile)
+
+    report = evaluate_alignment_quality(
+        result, audio_path=_write_stub_audio(tmp_path), ffmpeg_runner=runner
+    )
+
+    hits = [f for f in report.findings if f.code == FINDING_VOICE_IN_UNPLACED_GAP]
+    assert len(hits) == 1
+    assert hits[0].start == pytest.approx(18.0)
+    assert hits[0].end == pytest.approx(26.0)
+    ss_starts = {float(c[c.index("-ss") + 1]) for c in runner.calls if "-ss" in c}
+    assert 18.0 in ss_starts and 22.0 in ss_starts  # the trailing tail WAS measured
+
+
+def test_gap_check_audio_path_none_is_a_pure_noop_and_never_touches_ffmpeg():
+    # Regression: an existing pure call must stay unchanged by #80 -- no I/O
+    # at all when audio_path is None, same guarantee #71 already gave.
+    def _boom(args):
+        raise AssertionError("ffmpeg must not be invoked when audio_path is None")
+
+    result = make_alignment_result_normal_song()
+
+    report = evaluate_alignment_quality(result, audio_path=None, ffmpeg_runner=_boom)
+
+    assert not [f for f in report.findings if f.code == FINDING_VOICE_IN_UNPLACED_GAP]
+
+
+# --------------------------------------------------------------------------- #
+# Real "Deathless" master, real ffmpeg -- skipped when the master (deliberately
+# never committed to this repo) is absent from the machine running the tests.
+# --------------------------------------------------------------------------- #
+
+_DEATHLESS_MASTER = Path.home() / "mvm-runs" / "deathless" / "audio" / "master.wav"
+
+
+@pytest.mark.skipif(
+    not _DEATHLESS_MASTER.exists(),
+    reason="real 'Deathless' master audio is not present on this machine (deliberately not "
+    "committed to the repo -- see CLAUDE.md's 'Everything committed here is intended to "
+    "become public')",
+)
+def test_real_deathless_gap_check_flags_the_495s_silent_tower_and_not_the_fadeout_tail():
+    """Locks in issue #80's own real measurement: the aligner never placed a
+    lyric across 288.65s-297.41s, and the viewer who watched the render said
+    "4:55 he is back on non-snowy tower, with singing playing, but he isn't
+    singing" -- 295.0s falls inside that exact gap. Segment spans are the
+    ones bracketing the interesting region (issue #80's own list); this does
+    NOT run whisper -- alignment in a test is not allowed.
+
+    The two assertions this test exists for: the gap containing 295.0s
+    fires, and the trailing tail after the last placed segment (501.630s ->
+    the track's own 512.080s end) does not -- that tail is the silent-tail
+    trap GAP_LEVEL_DROP_DB exists to gate out.
+    """
+    spans = [
+        (281.570, 286.870),
+        (287.010, 288.650),
+        (297.410, 300.670),
+        (301.260, 307.110),
+        (307.110, 312.090),
+        (314.390, 320.970),
+        (473.990, 475.490),
+        (475.490, 477.050),
+        (481.150, 483.930),
+        (485.580, 486.550),
+        (498.730, 501.630),
+    ]
+    segments = tuple(
+        make_aligned_segment(i, f"lyric segment {i}", start, end, "Dianne")
+        for i, (start, end) in enumerate(spans)
+    )
+    result = AlignmentResult(segments=segments, track_duration=512.080)
+
+    report = evaluate_alignment_quality(result, audio_path=_DEATHLESS_MASTER)  # real ffmpeg
+
+    gap_hits = [f for f in report.findings if f.code == FINDING_VOICE_IN_UNPLACED_GAP]
+
+    contains_295 = [f for f in gap_hits if f.start <= 295.0 <= f.end]
+    assert contains_295, f"expected a gap finding containing 295.0s; got {gap_hits}"
+    assert contains_295[0].severity is Severity.WARNING
+    assert contains_295[0].start == pytest.approx(288.650, abs=0.01)
+    assert contains_295[0].end == pytest.approx(297.410, abs=0.01)
+
+    trailing_tail_start = 501.630
+    assert not any(f.start >= trailing_tail_start - 0.01 for f in gap_hits), (
+        f"the trailing tail after the last placed segment must not fire; got {gap_hits}"
+    )
