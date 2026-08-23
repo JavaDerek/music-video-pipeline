@@ -748,6 +748,41 @@ reference photo to condition every shot on, so the field is really "whose
 face anchors any chunk nobody tagged" rather than "who sings" — the two only
 look identical when every song has a visible singer.
 
+Do not read the above as "lyrics are optional." An **empty** `lyrics_file`
+is a deliberate, supported way to render no visible singing; having **no**
+`lyrics_file` at all is not supported — see the FAQ entry immediately below.
+
+#### Can I skip the lyrics file entirely?
+
+No. `lyrics_file` is a required `RunConfig` field; there is no path that
+lets you hand this pipeline audio alone and get lyrics for free.
+
+Why: Stage 1 is forced alignment, never transcription — `alignment.py` calls
+stable-ts's `model.align()`, which fits timestamps to text you already
+supplied, and never `model.transcribe()`, which would guess the text from
+the audio. That's deliberate, not an unimplemented convenience: ASR run on
+sung vocals buried in a full mix hallucinates words that were never sung —
+a known failure mode of transcription on music, not a quality gap the next
+model release closes. And a hallucinated lyric doesn't fail quietly in a way
+you'd notice on the page — every chunk boundary in the whole video is
+computed from where each word starts and ends, so one wrong word silently
+desyncs every chunk boundary drawn from it downstream, with no error
+anywhere. "Lyrics are immutable truth" is one of this project's
+[non-negotiable invariants](#non-negotiable-invariants) for exactly this
+reason.
+
+What would have to change for the answer to be yes: not "a better ASR
+model" — hallucination on sung audio is a property of ASR-on-music, not a
+gap current models will close. The one path that doesn't reopen the bug the
+invariant exists to prevent is a supervised workflow — an ASR-generated
+draft plus a *mandatory* human correction pass before Stage 1 ever runs.
+That's a real workflow, but notice what it actually does: it **adds** an
+authoring step rather than removing the lyrics-file requirement — it just
+changes who writes `lyrics_file` and what the process that produces it is
+called. Accepting unverified ASR output directly into Stage 1 instead would
+remove the one property ("this text is ground truth") that makes alignment
+trustworthy at all, to save supplying one input file. See issue #57.
+
 ### Running a render
 
 ```bash
