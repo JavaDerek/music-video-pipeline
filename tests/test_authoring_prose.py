@@ -23,6 +23,7 @@ from music_video_maker import contracts
 from music_video_maker.authoring.beats import Beat
 from music_video_maker.authoring.driver import MODEL_SONNET, DriverError, ScriptedDriver
 from music_video_maker.authoring.prose import (
+    ProseIssue,
     ProseValidationError,
     beat_windows,
     build_prose_prompt,
@@ -403,6 +404,19 @@ def test_generate_prose_calls_the_model_once_per_beat_group(tmp_path):
     assert driver.calls[0]["model"] == MODEL_SONNET
 
 
+def test_generate_prose_threads_lyric_literalness_into_the_system_prompt(tmp_path):
+    """Issue #67: the directorial choice has to reach the model, not just
+    live in config."""
+    from music_video_maker.authoring.prompts import LITERALNESS_BLOCKS
+
+    config = replace(_config(tmp_path), lyric_literalness="thematic")
+    driver = ScriptedDriver([_shots((1, GOOD))])
+
+    generate_prose(config, CONCEPT, (_beat(1),), _chunks([""]), driver)
+
+    assert LITERALNESS_BLOCKS["thematic"] in driver.calls[0]["system"]
+
+
 def test_a_prohibited_line_feeds_its_own_error_back_into_the_next_prompt(tmp_path):
     beats = (_beat(1),)
     chunks = _chunks([""])
@@ -515,6 +529,26 @@ def test_a_revision_shows_the_model_its_own_line_and_the_objection(tmp_path):
     prompt = driver.calls[0]["prompt"]
     assert "the line under objection" in prompt
     assert "names a landmark outside the setting" in prompt
+
+
+def test_a_revision_threads_lyric_literalness_into_the_system_prompt(tmp_path):
+    from music_video_maker.authoring.prompts import LITERALNESS_BLOCKS
+    from music_video_maker.authoring.prose import revise_prose
+
+    config = replace(_config(tmp_path), lyric_literalness="literal")
+    driver = ScriptedDriver([_shots((1, GOOD))])
+
+    revise_prose(
+        config,
+        CONCEPT,
+        (_beat(1),),
+        _chunks([""]),
+        driver,
+        shots={1: "the line under objection"},
+        objections={1: ["too bleak"]},
+    )
+
+    assert LITERALNESS_BLOCKS["literal"] in driver.calls[0]["system"]
 
 
 def test_a_revision_skips_groups_nothing_was_objected_to(tmp_path):
@@ -972,3 +1006,26 @@ def test_input_hashes_include_song_facts_when_set_and_change_with_it(tmp_path):
 
     assert "song_facts" in before
     assert before["song_facts"] != after["song_facts"]
+
+
+# --------------------------------------------------------------------------- #
+# ProseIssue.revisable -- some findings name a defect prose cannot fix (a
+# world-state continuity error belongs to the beat sheet, per `mvm-author
+# beats --notes`), and #87 is the standing evidence that a revision round
+# will happily rewrite approved prose to satisfy anything it is handed. This
+# field is the switch; nothing in this module sets it False yet.
+# --------------------------------------------------------------------------- #
+
+
+def test_prose_issue_revisable_defaults_to_true():
+    issue = ProseIssue(chunk_id=1, severity="warning", message="a camera phrase in the line")
+
+    assert issue.revisable is True
+
+
+def test_a_prose_issue_can_be_marked_not_revisable():
+    issue = ProseIssue(
+        chunk_id=1, severity="warning", message="a world-state continuity error", revisable=False
+    )
+
+    assert issue.revisable is False

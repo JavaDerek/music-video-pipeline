@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import pytest
 
+from music_video_maker.authoring.beats import Beat
 from music_video_maker.authoring.conditions import (
     FLIP_FLOP,
     REGRESSION,
     ConditionFinding,
     ConditionSpan,
     check_conditions,
+    conditions_from_beats,
 )
 
 
@@ -231,3 +233,81 @@ def test_findings_carry_the_offending_spans_own_story_time():
         )
     )
     assert findings[0].at_t == pytest.approx(288.0)
+
+
+# --------------------------------------------------------------------------- #
+# conditions_from_beats -- the one place that knows a chunk id is what goes
+# in ConditionSpan.ref. check_conditions itself stays opaque to the caller's
+# units (the same contract worldstate.LocatedSpan documents); this is the
+# adapter between a beat sheet and that opaque interface.
+# --------------------------------------------------------------------------- #
+
+
+def _beat(chunk_id, start, end, *, role="transition", conditions=""):
+    return Beat(
+        chunk_id=chunk_id,
+        start=start,
+        end=end,
+        beat=f"beat {chunk_id}",
+        beat_role=role,
+        beat_group=1,
+        location="the room",
+        conditions=conditions,
+    )
+
+
+def test_conditions_from_beats_maps_chunk_id_start_and_conditions():
+    beats = (
+        _beat(44, 282.58, 288.0, conditions="smoke and settling debris"),
+        _beat(45, 288.0, 293.5, conditions="heavy falling snow"),
+    )
+
+    spans = conditions_from_beats(beats)
+
+    assert spans == (
+        ConditionSpan(ref=44, at_t=282.58, conditions="smoke and settling debris"),
+        ConditionSpan(ref=45, at_t=288.0, conditions="heavy falling snow"),
+    )
+
+
+def test_conditions_from_beats_marks_only_consequence_beats():
+    beats = (
+        _beat(1, 0.0, 6.0, role="plant", conditions="green valley"),
+        _beat(2, 6.0, 12.0, role="consequence", conditions="burnt ground"),
+        _beat(3, 12.0, 18.0, role="transition", conditions="burnt ground"),
+    )
+
+    spans = conditions_from_beats(beats)
+
+    assert [s.is_consequence for s in spans] == [False, True, False]
+
+
+def test_conditions_from_beats_sorts_by_start_time_not_input_order():
+    beats = (
+        _beat(2, 6.0, 12.0, conditions="snow"),
+        _beat(1, 0.0, 6.0, conditions="clear"),
+    )
+
+    spans = conditions_from_beats(beats)
+
+    assert [s.ref for s in spans] == [1, 2]
+    assert [s.at_t for s in spans] == [0.0, 6.0]
+
+
+def test_conditions_from_beats_of_an_empty_sheet_is_empty():
+    assert conditions_from_beats(()) == ()
+
+
+def test_conditions_from_beats_feeds_check_conditions_end_to_end():
+    """The viewer's own reported case (issue #83), built through the real
+    adapter rather than hand-built ConditionSpan objects."""
+    beats = (
+        _beat(44, 282.6, 288.0, conditions="smoke and settling debris"),
+        _beat(45, 288.0, 293.5, conditions="heavy falling snow"),
+        _beat(46, 293.5, 299.0, conditions="smoke and settling debris"),
+    )
+
+    findings = check_conditions(conditions_from_beats(beats))
+
+    assert [f.kind for f in findings] == [FLIP_FLOP]
+    assert findings[0].ref == 45

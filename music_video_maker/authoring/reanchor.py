@@ -135,6 +135,11 @@ def reanchor_beats(
       silently misreport which of the concept's acts the merged chunk
       belongs to for :func:`.beats.check_act_structure`'s coverage/order/
       contiguity checks.
+    * **conditions** (issue #83) -- the first member's, the same "first
+      member wins" rule as ``location``/``act``, and warned about the same
+      way when members disagree. A vanished conditions boundary silently
+      attaches one world state's beat to another's -- precisely the shape of
+      bug #83's own report, one long take away from happening again.
     * **subject** (issue #82) -- the first member that SET one (mirroring
       ``length_seconds``'s own rule, not ``location``'s: most beats leave
       ``subject`` unset, so "the literal first member's" would silently drop
@@ -267,6 +272,19 @@ def _merge(members: Sequence[Beat], chunk: AudioChunk) -> Beat:
             first.act,
         )
 
+    conditions = {member.conditions for member in members}
+    if len(conditions) > 1:
+        logger.warning(
+            "Chunk %d merges beats naming %d different conditions (%s); keeping %r "
+            "(issue #83). A vanished conditions boundary silently attaches one world state's "
+            "beat to another's -- if this long take really does cross a world-state boundary, "
+            "consider a shorter length_seconds instead so the boundary survives.",
+            chunk.chunk_id,
+            len(conditions),
+            sorted(conditions),
+            first.conditions,
+        )
+
     with_subject = [m for m in members if m.subject is not None]
     if len({m.subject for m in with_subject}) > 1:
         logger.warning(
@@ -298,6 +316,7 @@ def _merge(members: Sequence[Beat], chunk: AudioChunk) -> Beat:
         beat_group=first.beat_group,
         location=first.location,
         act=first.act,
+        conditions=first.conditions,
         subject=with_subject[0].subject if with_subject else None,
         focus=focus,
         length_seconds=with_length[0].length_seconds if with_length else None,

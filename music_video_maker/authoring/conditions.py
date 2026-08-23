@@ -45,6 +45,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from music_video_maker.authoring.beats import Beat
 from music_video_maker.authoring.worldstate import (
     IrreversibleFactViolation,
     WorldState,
@@ -95,6 +96,42 @@ class ConditionSpan:
     at_t: float
     conditions: str
     is_consequence: bool = False
+
+
+def conditions_from_beats(beats: Sequence[Beat]) -> tuple[ConditionSpan, ...]:
+    """The adapter from a beat sheet to :func:`check_conditions`'s opaque
+    span interface -- one :class:`ConditionSpan` per beat, sorted by
+    ``at_t``.
+
+    ``check_conditions`` is deliberately written against ``ConditionSpan``
+    rather than :class:`.beats.Beat` directly, the same contract
+    :class:`~...worldstate.LocatedSpan` documents for
+    :func:`~...worldstate.check_location_tags`: the check never learns the
+    caller's units, so it stays a pure structural test of a sequence of
+    (time, value, is_consequence) triples and cannot drift into guessing
+    meaning from a beat's other fields. This module is the one place that
+    *does* know a chunk id is what belongs in ``ref`` -- ``beats.py`` itself
+    stays ignorant of ``ConditionSpan`` entirely, the same separation
+    ``.beats`` keeps from ``.reanchor``.
+
+    ``is_consequence`` is read straight off ``beat_role`` -- the beat
+    sheet's own classification (issue #83's rule 3c(ii): a state that
+    ARRIVES on a `consequence` beat is that consequence's one-way aftermath),
+    never inferred from ``conditions`` text."""
+    return tuple(
+        sorted(
+            (
+                ConditionSpan(
+                    ref=beat.chunk_id,
+                    at_t=beat.start,
+                    conditions=beat.conditions,
+                    is_consequence=(beat.beat_role == "consequence"),
+                )
+                for beat in beats
+            ),
+            key=lambda span: span.at_t,
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -342,4 +379,5 @@ __all__ = [
     "ConditionFinding",
     "ConditionSpan",
     "check_conditions",
+    "conditions_from_beats",
 ]

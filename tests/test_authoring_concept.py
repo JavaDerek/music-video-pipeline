@@ -73,6 +73,13 @@ VALID_CONCEPT = {
     "locations": ["the boardwalk", "the empty pier", "her front porch"],
     # Issue #84: the video's dramatic shape, ordered.
     "acts": VALID_ACTS,
+    # Issue #83: the third continuity axis -- what the world LOOKS LIKE at a
+    # given moment (weather, light, the aftermath of what already happened),
+    # separate from `locations` (where anyone is) and `setting` (what world
+    # this is). Required and non-empty, unlike `reading.references`: a video
+    # always has some weather and light, so "nobody said" is a gap, not a
+    # valid answer.
+    "conditions": ["clear pre-dawn light", "heavy falling snow", "flat grey daylight"],
 }
 
 
@@ -170,6 +177,54 @@ def test_locations_must_be_a_non_empty_list_of_strings():
     bad4 = {**VALID_CONCEPT, "locations": ["  "]}
     with pytest.raises(ConceptValidationError, match="locations"):
         validate_concept(bad4)
+
+
+# --------------------------------------------------------------------------- #
+# `conditions` -- issue #83's third continuity axis: what the world LOOKS
+# LIKE at a given moment (weather, light, the persistent aftermath of an
+# event), separate from `locations` (issue #78, where anyone is) and
+# `setting` (what world this is). Required and non-empty for the same shape
+# of reason `locations` is -- the beats stage has no vocabulary to assign
+# `conditions` from otherwise -- but *unlike* `reading.references`, where
+# empty is a first-class, correct answer: a video always has some weather
+# and light, and #83's whole defect is a world state nobody named, so
+# leaving this out is never the correct reply the way an empty `references`
+# list is for a song with no mythology in it.
+# --------------------------------------------------------------------------- #
+
+
+def test_conditions_is_required():
+    bad = {k: v for k, v in VALID_CONCEPT.items() if k != "conditions"}
+    with pytest.raises(ConceptValidationError, match="conditions"):
+        validate_concept(bad)
+
+
+def test_conditions_names_issue_83_in_its_message():
+    bad = {**VALID_CONCEPT, "conditions": []}
+    with pytest.raises(ConceptValidationError, match="83"):
+        validate_concept(bad)
+
+
+def test_conditions_must_be_a_non_empty_list_of_strings():
+    bad = {**VALID_CONCEPT, "conditions": []}
+    with pytest.raises(ConceptValidationError, match="conditions"):
+        validate_concept(bad)
+
+    bad2 = {**VALID_CONCEPT, "conditions": "heavy falling snow"}
+    with pytest.raises(ConceptValidationError, match="conditions"):
+        validate_concept(bad2)
+
+    bad3 = {**VALID_CONCEPT, "conditions": [1, 2]}
+    with pytest.raises(ConceptValidationError, match="conditions"):
+        validate_concept(bad3)
+
+    bad4 = {**VALID_CONCEPT, "conditions": ["  "]}
+    with pytest.raises(ConceptValidationError, match="conditions"):
+        validate_concept(bad4)
+
+
+def test_a_valid_concept_with_conditions_passes_silently():
+    validate_concept(VALID_CONCEPT)  # must not raise -- conditions is already set
 
 
 # --------------------------------------------------------------------------- #
@@ -462,6 +517,21 @@ def test_generate_concept_happy_path(tmp_path):
     assert result.data == VALID_CONCEPT
     assert len(driver.calls) == 1
     assert result.input_hashes == concept_input_hashes(config, chunks)
+
+
+def test_generate_concept_threads_lyric_literalness_into_the_system_prompt(tmp_path):
+    """Issue #67: the directorial choice has to reach the model, not just
+    live in config -- `generate_concept` must compose the system prompt with
+    `config.lyric_literalness`, not the module default."""
+    from music_video_maker.authoring.prompts import LITERALNESS_BLOCKS
+
+    config = replace(_config(tmp_path, lyrics_text=""), lyric_literalness="literal")
+    chunks = load_chunk_skeleton(config)
+    driver = ScriptedDriver([VALID_CONCEPT])
+
+    generate_concept(config, chunks, driver)
+
+    assert LITERALNESS_BLOCKS["literal"] in driver.calls[0]["system"]
 
 
 def test_generate_concept_retries_with_the_validators_error_on_a_bad_reply(tmp_path):

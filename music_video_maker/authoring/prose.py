@@ -136,6 +136,22 @@ class ProseIssue:
 
     message: str
 
+    revisable: bool = True
+    """Whether the plan-level warning-revision round (design section 6) is
+    allowed to hand this finding to a prose rewrite at all.
+
+    Some findings name a defect prose CANNOT fix -- a world-state continuity
+    error (issue #83) belongs to the beat sheet, and the remedy is
+    ``mvm-author beats --notes "..."``, never a shot-line rewrite. #87 is the
+    standing evidence for why this matters: a revision round will happily
+    rewrite approved, correct prose to satisfy whatever objection it is
+    handed, so a finding prose cannot act on correctly must never reach it.
+
+    Defaults to ``True`` -- every existing finding in this module names a
+    defect in the shot line itself, which prose genuinely can revise. Nothing
+    in this module sets it ``False``; that is wired up where the revision
+    round itself lives."""
+
 
 @dataclass(frozen=True)
 class ProseResult:
@@ -685,7 +701,11 @@ def generate_prose(
     approved for them.
     """
     camera = dict(camera or {})
-    system = prose_system_prompt()
+    # Issue #67: the directorial literalness choice reaches the model through
+    # the system prompt, straight from config -- both `generate_prose` and
+    # `revise_prose` compose it here, so a targeted revision is held to the
+    # same brief the original generation was.
+    system = prose_system_prompt(literalness=config.lyric_literalness)
     cast_names = tuple(config.cast)
 
     shots: dict[int, str] = {}
@@ -785,7 +805,11 @@ def revise_prose(
     value of the approval that came before it.
     """
     camera = dict(camera or {})
-    system = prose_system_prompt()
+    # Issue #67: the directorial literalness choice reaches the model through
+    # the system prompt, straight from config -- both `generate_prose` and
+    # `revise_prose` compose it here, so a targeted revision is held to the
+    # same brief the original generation was.
+    system = prose_system_prompt(literalness=config.lyric_literalness)
     cast_names = tuple(config.cast)
 
     revised: dict[int, str] = {}

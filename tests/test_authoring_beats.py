@@ -371,6 +371,167 @@ def test_a_concept_with_no_acts_logs_a_warning_but_still_generates(tmp_path, cap
 
 
 # --------------------------------------------------------------------------- #
+# `conditions` -- issue #83's third continuity axis: what the world LOOKS
+# LIKE at this beat (weather, light, the aftermath of an event), separate
+# from `location` (#78, where anyone is). Membership works like `location`
+# and `act`, but the field itself is NOT in BEATS_SCHEMA's `required` list:
+# when the concept supplies no vocabulary the prompt never lists one, so
+# demanding a value would ask for something nothing explained. The real gate
+# is here, conditionally on whether a vocabulary was supplied.
+# --------------------------------------------------------------------------- #
+
+_APPROVED_CONDITIONS = ("clear pre-dawn light", "heavy falling snow", "smoke and drifting ash")
+
+
+def test_a_missing_conditions_with_a_vocabulary_is_rejected():
+    reply = _three_beat_gag()  # no "conditions" key on any entry
+
+    with pytest.raises(BeatsValidationError, match="conditions"):
+        validate_beats(reply, _chunks(), (), (), (), _APPROVED_CONDITIONS)
+
+
+def test_a_blank_conditions_with_a_vocabulary_is_rejected():
+    reply = _reply(
+        _entry(1, role="plant", conditions="   "),
+        _entry(2, role="contact", conditions="heavy falling snow"),
+        _entry(3, role="consequence", focus="action", conditions="heavy falling snow"),
+    )
+
+    with pytest.raises(BeatsValidationError, match="conditions"):
+        validate_beats(reply, _chunks(), (), (), (), _APPROVED_CONDITIONS)
+
+
+def test_a_conditions_outside_the_approved_list_with_a_vocabulary_is_rejected():
+    reply = _reply(
+        _entry(1, role="plant", conditions="a state nobody approved"),
+        _entry(2, role="contact", conditions="heavy falling snow"),
+        _entry(3, role="consequence", focus="action", conditions="heavy falling snow"),
+    )
+
+    with pytest.raises(BeatsValidationError, match="approved conditions"):
+        validate_beats(reply, _chunks(), (), (), (), _APPROVED_CONDITIONS)
+
+
+def test_a_conditions_on_the_approved_list_is_accepted_and_canonicalized():
+    reply = _reply(
+        _entry(1, role="plant", conditions="  Heavy Falling Snow  "),
+        _entry(2, role="contact", conditions="HEAVY FALLING SNOW"),
+        _entry(3, role="consequence", focus="action", conditions="heavy falling snow"),
+    )
+
+    beats = validate_beats(reply, _chunks(), (), (), (), _APPROVED_CONDITIONS)
+
+    assert [b.conditions for b in beats] == ["heavy falling snow"] * 3
+
+
+def test_an_empty_conditions_vocabulary_makes_the_field_optional():
+    """No vocabulary supplied (a pre-#83 concept, or a caller not using the
+    field) -- `conditions` is not required at all, and a beat sheet with none
+    of them set still validates."""
+    beats = validate_beats(_three_beat_gag(), _chunks())
+
+    assert [b.conditions for b in beats] == [""] * 3
+
+
+def test_an_empty_conditions_vocabulary_keeps_free_text_as_written():
+    reply = _reply(
+        _entry(1, role="plant", conditions="  a snowstorm rolling in  "),
+        _entry(2, role="contact"),
+        _entry(3, role="consequence", focus="action"),
+    )
+
+    beats = validate_beats(reply, _chunks())
+
+    assert beats[0].conditions == "a snowstorm rolling in"
+    assert beats[1].conditions == ""
+
+
+def test_a_blank_conditions_with_no_vocabulary_is_not_rejected():
+    """No vocabulary supplied means `conditions` is fully optional, so a
+    blank value degrades to the same "" default a missing key gets -- it is
+    not a validation problem the way a blank `location`/`act` always is."""
+    reply = _reply(
+        _entry(1, role="plant", conditions="   "),
+        _entry(2, role="contact"),
+        _entry(3, role="consequence", focus="action"),
+    )
+
+    beats = validate_beats(reply, _chunks())
+
+    assert beats[0].conditions == ""
+
+
+def test_a_non_string_conditions_is_rejected_even_with_no_vocabulary():
+    reply = _reply(
+        _entry(1, role="plant", conditions=5),
+        _entry(2, role="contact"),
+        _entry(3, role="consequence", focus="action"),
+    )
+
+    with pytest.raises(BeatsValidationError, match="conditions"):
+        validate_beats(reply, _chunks())
+
+
+def test_generate_beats_threads_the_concepts_conditions_into_validation(tmp_path):
+    concept_with_conditions = {**CONCEPT, "conditions": list(_APPROVED_CONDITIONS)}
+    bad = _reply(
+        _entry(1, role="plant", conditions="not approved"),
+        _entry(2, role="contact", conditions="heavy falling snow"),
+        _entry(3, role="consequence", focus="action", conditions="heavy falling snow"),
+    )
+    good = _reply(
+        _entry(1, role="plant", conditions="heavy falling snow"),
+        _entry(2, role="contact", conditions="heavy falling snow"),
+        _entry(3, role="consequence", focus="action", conditions="heavy falling snow"),
+    )
+    driver = ScriptedDriver([bad, good])
+
+    result = generate_beats(_config(tmp_path), _chunks(), concept_with_conditions, driver)
+
+    assert len(driver.calls) == 2
+    assert "approved conditions" in driver.calls[1]["prompt"]
+    assert all(b.conditions == "heavy falling snow" for b in result.beats)
+
+
+def test_the_concepts_conditions_reach_the_prompt(tmp_path):
+    concept_with_conditions = {**CONCEPT, "conditions": list(_APPROVED_CONDITIONS)}
+
+    prompt = build_beats_prompt(_config(tmp_path), _chunks(), concept_with_conditions)
+
+    assert "heavy falling snow" in prompt
+    assert "clear pre-dawn light" in prompt
+
+
+def test_no_conditions_line_in_the_prompt_when_the_concept_has_none(tmp_path):
+    prompt = build_beats_prompt(_config(tmp_path), _chunks(), CONCEPT)
+
+    assert "approved conditions" not in prompt.lower()
+
+
+def test_a_beat_with_conditions_round_trips():
+    reply = _reply(
+        _entry(1, role="plant", conditions="heavy falling snow"),
+        _entry(2, role="contact"),
+        _entry(3, role="consequence", focus="action"),
+    )
+    beats = validate_beats(reply, _chunks())
+
+    assert tuple(Beat.from_dict(b.to_dict()) for b in beats) == beats
+
+
+def test_from_dict_tolerates_a_persisted_beat_sheet_with_no_conditions_key():
+    """A pre-#83 persisted beat sheet has no `conditions` key at all -- `""`
+    is the correct "not authored" default, never a fabricated state."""
+    beats = validate_beats(_three_beat_gag(), _chunks())
+    payload = beats[0].to_dict()
+    del payload["conditions"]
+
+    restored = Beat.from_dict(payload)
+
+    assert restored.conditions == ""
+
+
+# --------------------------------------------------------------------------- #
 # check_act_structure -- issue #84's four mechanical arc checks. Each is
 # independently testable and independently failing, and a sheet violating
 # more than one must report all of them in a single message (one retry round
@@ -706,6 +867,19 @@ def test_generate_beats_returns_a_validated_sheet(tmp_path):
 
     assert [b.chunk_id for b in result.beats] == [1, 2, 3]
     assert driver.calls[0]["model"] == MODEL_OPUS
+
+
+def test_generate_beats_threads_lyric_literalness_into_the_system_prompt(tmp_path):
+    """Issue #67: the directorial choice has to reach the model, not just
+    live in config."""
+    from music_video_maker.authoring.prompts import LITERALNESS_BLOCKS
+
+    config = replace(_config(tmp_path), lyric_literalness="free")
+    driver = ScriptedDriver([_three_beat_gag()])
+
+    generate_beats(config, _chunks(), CONCEPT, driver)
+
+    assert LITERALNESS_BLOCKS["free"] in driver.calls[0]["system"]
 
 
 def test_a_structural_failure_feeds_its_own_error_back_into_the_next_prompt(tmp_path):

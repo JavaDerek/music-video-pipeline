@@ -120,7 +120,10 @@ being config rather than a preamble opinion."""
 CONCEPT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["reading", "logline", "setting", "tone", "motifs", "avoid", "locations", "acts"],
+    "required": [
+        "reading", "logline", "setting", "tone", "motifs", "avoid", "locations", "acts",
+        "conditions",
+    ],
     "properties": {
         "reading": READING_SCHEMA,
         "logline": {"type": "string", "minLength": 1},
@@ -136,6 +139,21 @@ CONCEPT_SCHEMA: dict[str, Any] = {
         "acts": {
             "type": "array",
             "items": ACT_SCHEMA,
+            "minItems": 1,
+        },
+        # Issue #83: the third continuity axis -- what the world LOOKS LIKE
+        # at a given moment (weather, light, the persistent aftermath of an
+        # event), separate from `locations` (where anyone is) and `setting`
+        # (what world this is). Required and non-empty like `locations`, but
+        # for a sharper reason than "the beats stage needs a vocabulary":
+        # unlike `reading.references`, where an empty list is a first-class,
+        # CORRECT answer for a song with no mythology in it, a video always
+        # has SOME weather and light. #83's whole defect was a world state
+        # nobody had named anywhere -- "nobody said" is exactly the gap this
+        # field exists to close, so leaving it out is never the right reply.
+        "conditions": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
             "minItems": 1,
         },
     },
@@ -182,6 +200,20 @@ def validate_concept(data: object) -> None:
             "concept.locations must be a non-empty list of non-empty strings (issue #78: "
             f"the beats stage has no vocabulary to assign `location` from otherwise), got "
             f"{locations!r}"
+        )
+
+    conditions = data["conditions"]
+    if (
+        not isinstance(conditions, list)
+        or not conditions
+        or not all(isinstance(v, str) and v.strip() for v in conditions)
+    ):
+        raise ConceptValidationError(
+            "concept.conditions must be a non-empty list of non-empty strings (issue #83: "
+            "the beats stage has no vocabulary to assign `conditions` from otherwise -- and, "
+            "unlike `reading.references`, an empty list is never the correct reply here, "
+            "because a video always has SOME weather and light), got "
+            f"{conditions!r}"
         )
 
     problems = _validate_reading(data["reading"]) + _validate_acts(data["acts"])
@@ -411,7 +443,10 @@ def generate_concept(
     driver itself propagate -- either way, nothing is returned to write, per
     design section 3: "a half-written session is worse than no session."
     """
-    system = concept_system_prompt()
+    # Issue #67: the directorial literalness choice reaches the model through
+    # the system prompt, straight from config -- never re-derived or defaulted
+    # here a second time.
+    system = concept_system_prompt(literalness=config.lyric_literalness)
     prompt = build_concept_prompt(config, chunks, hints=hints)
 
     last_error: ConceptValidationError | None = None

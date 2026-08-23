@@ -30,6 +30,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
+from music_video_maker.config import DEFAULT_LYRIC_LITERALNESS
+
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DOCS_DIR = REPO_ROOT / "docs"
 
@@ -143,6 +145,7 @@ Reply with a single JSON object, no other text, matching exactly:
   "motifs": ["a short list of recurring visual ideas the shot plan can plant and pay off"],
   "avoid": ["things this concept deliberately does NOT want on screen"],
   "locations": ["a small closed list of DISTINCT places within `setting` the story visits"],
+  "conditions": ["a small closed list of the world STATES the video passes through"],
   "acts": [{"name": "situation", "function": "what this act establishes"},
            {"name": "resolution", "function": "what this act pays off, planted earlier"}]
 }
@@ -157,6 +160,22 @@ gradient like "closer to the summit" or a duplicate of another entry under a \
 different name. Every chunk's `location` in the next stage is assigned from \
 exactly this list, and a place that is not on it cannot be used -- so name \
 everywhere the story actually goes, and nothing it does not.
+
+`conditions` is the third continuity axis and the one nothing has carried \
+until now. `setting` fixes what world this is; `locations` fixes where \
+inside it anyone is; neither says what the world LOOKS LIKE at a given \
+moment -- weather, light, season, and the persistent aftermath of events the \
+video has already shown. On a real render three consecutive chunks, fifteen \
+seconds of screen time, gained snow, lost the debris of an explosion that \
+had just happened, and lost the snow again, and nothing anywhere could \
+notice. Keep this list SMALL (typically 2-5 entries), each entry a short \
+phrase naming a state the WHOLE FRAME is in -- "clear pre-dawn light", \
+"heavy falling snow", "smoke and drifting ash", "the flat grey stillness \
+after the blast" -- and list them in the order the video passes through \
+them where there is one. Every beat in the next stage is assigned exactly \
+one of these and it is composed into that chunk's render prompt, so name \
+only states you actually want on screen. Name at least one even if the \
+world never changes: "nobody said" is exactly the gap this exists to close.
 
 `acts` is the video's dramatic shape -- a small, ORDERED, closed list, each \
 entry a name and what that act is FOR. Nothing prescribes the set: a ballad \
@@ -191,6 +210,7 @@ Reply with a single JSON object, no other text:
 {"beats": [
   {"chunk_id": 12, "beat": "the printer erupts", "beat_role": "consequence",
    "beat_group": 3, "focus": "action", "location": "the office aisle",
+   "conditions": "heavy falling snow",
    "act": "resolution", "length_seconds": 9.0}
 ]}
 
@@ -234,6 +254,23 @@ you if it fails; it is not a request to sound story-shaped, it is a \
 structural property of the beat sheet you write. Use the concept's own \
 `reading.change` to decide where the turn actually falls -- the acts exist \
 to carry that movement, not to be evenly-sized decoration.
+3c. `conditions` MUST be exactly one of the concept's approved `conditions` \
+-- copy the string verbatim. This is what the world LOOKS LIKE at this beat: \
+weather, light, and the aftermath of anything the video has already shown \
+happening. It is a third continuity axis, separate from `location`, because \
+the two fail in opposite directions: a character legitimately moves back and \
+forth between places, and the world legitimately does not move back and \
+forth between states. Two rules follow, and both are checked mechanically. \
+(i) A state that holds, is interrupted for exactly ONE chunk, and comes \
+straight back is a continuity error -- pick one of the two and let it run. \
+(ii) A state that ARRIVES on a `consequence` beat is that consequence's \
+aftermath and is one-way: debris does not un-explode, a burnt valley does \
+not green over, and no later beat may go back to a state from before it. If \
+the world genuinely does recover -- weather clears, snow melts -- that \
+recovery is itself an event: put it on a `consequence` beat of its own, \
+which is what makes it part of the story instead of an inconsistency. A real \
+render lost fifteen seconds to exactly this: buildings explode, the next \
+shot is clean snow with no debris, the shot after that has neither.
 4. Every `consequence` sets `focus` to "action". Everything else uses \
 "subject". This is not stylistic -- "action" is what stops the composed \
 "X is the focus of this shot" clause from competing with the state change. \
@@ -299,22 +336,68 @@ contradicts the concept's own "deliberately NOT on screen" list.\
 """
 
 
-def concept_system_prompt() -> str:
+LITERALNESS_BLOCKS: dict[str, str] = {
+    "free": """\
+HOW LITERALLY THIS VIDEO READS ITS LYRICS: FREE. The song supplies mood, \
+tempo and title, and nothing else you are obliged to use. This video is its \
+own idea and may share no imagery with the words at all. Do not reach for an \
+object because a line names it, and do not treat an unillustrated line as a \
+gap to fill. What you must still honour is the song's own movement -- what \
+changes across it, and its register -- because that is what makes this video \
+belong to THIS song rather than to any song.\
+""",
+    "thematic": """\
+HOW LITERALLY THIS VIDEO READS ITS LYRICS: THEMATIC. The video tells a story \
+the song is about. Specific images the lyrics name surface where they land \
+well and are left alone where they do not; a line whose object never appears \
+on screen is not a defect. This is the middle of the range, and it is a \
+choice rather than a default -- neither an illustration of the words nor an \
+unrelated film with the song playing over it.\
+""",
+    "literal": """\
+HOW LITERALLY THIS VIDEO READS ITS LYRICS: LITERAL. Every nameable object \
+and action in a line is on screen in the chunk that sings it. If a line \
+names a printer, that chunk shows a printer; if it names a mountain, that \
+chunk shows the mountain. An object the lyric names and the shot does not \
+stage is an error in this band, and it is checked: the shot-vs-lyric check \
+runs at error tier here, so a plan that leaves one unstaged is sent back for \
+revision rather than annotated and shipped.\
+""",
+}
+"""Issue #67: how literally this video reads its lyrics, as an ORDERED
+ordinal set of paragraphs rather than a number -- see
+:data:`music_video_maker.config.LYRIC_LITERALNESS_BANDS`. One entry per band,
+composed verbatim into the concept/beats/prose system prompts by
+:func:`literalness_block`; never paraphrased per call site, the same "one
+wording, not a fourth copy" discipline :func:`song_facts_block` follows."""
+
+
+def literalness_block(literalness: str) -> str:
+    """The band paragraph for ``literalness``, falling back to the default
+    band for anything unrecognised -- ``load_config`` is the gate for the
+    vocabulary, and a prompt composer must never be the thing that refuses a
+    run."""
+    return LITERALNESS_BLOCKS.get(literalness, LITERALNESS_BLOCKS[DEFAULT_LYRIC_LITERALNESS])
+
+
+def concept_system_prompt(literalness: str = DEFAULT_LYRIC_LITERALNESS) -> str:
     """The full system prompt for Stage 1 (concept): this stage's own
-    preamble plus ``docs/lyrics-format.md`` -- so the model can tell a
-    character tag (``[Name: Role]``) apart from a sung word rather than
-    reading tags as lyrics."""
+    preamble, issue #67's literalness band, plus ``docs/lyrics-format.md`` --
+    so the model can tell a character tag (``[Name: Role]``) apart from a
+    sung word rather than reading tags as lyrics."""
     lyrics_format = read_doc(LYRICS_FORMAT_DOC)
     return (
         f"{CONCEPT_PREAMBLE}\n\n"
+        "# The brief: how literally this video reads its lyrics\n\n"
+        f"{literalness_block(literalness)}\n\n"
         "# Reference: the lyrics file format this project uses\n\n"
         f"{lyrics_format}"
     )
 
 
-def beats_system_prompt() -> str:
-    """The full system prompt for Stage 2 (beats): this stage's preamble plus
-    ``docs/shot-writing-guide.md``.
+def beats_system_prompt(literalness: str = DEFAULT_LYRIC_LITERALNESS) -> str:
+    """The full system prompt for Stage 2 (beats): this stage's preamble,
+    issue #67's literalness band, plus ``docs/shot-writing-guide.md``.
 
     The guide is the whole reason this stage can be checked at all -- its
     three-beat rule is what ``beat_role``/``beat_group`` encode, and its
@@ -323,6 +406,8 @@ def beats_system_prompt() -> str:
     guide = read_doc(SHOT_WRITING_GUIDE_DOC)
     return (
         f"{BEATS_PREAMBLE}\n\n"
+        "# The brief: how literally this video reads its lyrics\n\n"
+        f"{literalness_block(literalness)}\n\n"
         "# Reference: how shots have to be structured for this model\n\n"
         f"{guide}"
     )
@@ -407,7 +492,14 @@ def photography_system_prompt() -> str:
     guide is about what to put in ``shot``, and feeding it to a stage that
     must NOT write staging would work against the one thing this stage is
     being asked to keep separate (design section 9 names the guide for beats
-    and prose only)."""
+    and prose only).
+
+    Deliberately takes no ``literalness`` argument, unlike
+    :func:`concept_system_prompt`/:func:`beats_system_prompt`/
+    :func:`prose_system_prompt` (issue #67). This stage decides FRAMING --
+    close or wide, tracking or locked off -- never what the words put on
+    screen; the literalness dial governs whether a lyric's object appears at
+    all, which is a question this stage is not asked and must not answer."""
     return PHOTOGRAPHY_PREAMBLE
 
 
@@ -547,13 +639,16 @@ because that is what a plant is for.\
 """
 
 
-def prose_system_prompt() -> str:
-    """The full system prompt for Stage 4 (prose): this stage's preamble plus
-    ``docs/shot-writing-guide.md``, which is the whole point -- the guide is
-    what turns generic shot text into shot text that survives H3."""
+def prose_system_prompt(literalness: str = DEFAULT_LYRIC_LITERALNESS) -> str:
+    """The full system prompt for Stage 4 (prose): this stage's preamble,
+    issue #67's literalness band, plus ``docs/shot-writing-guide.md``, which
+    is the whole point -- the guide is what turns generic shot text into shot
+    text that survives H3."""
     guide = read_doc(SHOT_WRITING_GUIDE_DOC)
     return (
         f"{PROSE_PREAMBLE}\n\n"
+        "# The brief: how literally this video reads its lyrics\n\n"
+        f"{literalness_block(literalness)}\n\n"
         "# The shot-writing guide you are working to\n\n"
         f"{guide}"
     )
@@ -561,6 +656,7 @@ def prose_system_prompt() -> str:
 
 __all__ = [
     "BEATS_PREAMBLE",
+    "LITERALNESS_BLOCKS",
     "PHOTOGRAPHY_PREAMBLE",
     "PROSE_PREAMBLE",
     "CONCEPT_PREAMBLE",
@@ -571,6 +667,7 @@ __all__ = [
     "PromptError",
     "beats_system_prompt",
     "concept_system_prompt",
+    "literalness_block",
     "photography_system_prompt",
     "prose_system_prompt",
     "read_doc",
