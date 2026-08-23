@@ -1,4 +1,4 @@
-# "Deathless" full-render corpus (issues #76, #77)
+# "Deathless" full-render corpus (issues #76, #77, #85, #83)
 
 Measured 2026-08-16, entirely offline against mp4s already on disk in
 `~/mvm-runs/deathless/output/chunks/` -- no GPU, no ComfyUI, no doris. This
@@ -505,6 +505,106 @@ re-deriving it down to a single thin word. Net: 2 fewer warnings overall,
 lost to the foot-level retirement, and 1 known false positive (chunk 7)
 remaining and explicitly flagged rather than silently left in.
 
+## Part 7: plan-TEXT scorings (issues #85, #83) -- no pixels involved
+
+Parts 1-6 measure the *render*. This part measures the *plans*, which is a
+different corpus with a different denominator, and the distinction matters
+when reading a number: a plan-text scoring can tell you how often a shape
+occurs in real authored text, and it cannot tell you what H3 did with it.
+Both scorings below are reproducible in seconds with no GPU and no mp4s, and
+neither reproduces a full shot line.
+
+### 7a: #85's plant-vs-consequence check
+
+**Corpus.** Eight real "Deathless" plans -- `shot_plan_v4.toml`,
+`shot_plan_v5.toml`, `shot_plan_v6.toml.before_g5fix`, `shot_plan_v6.toml`,
+`shot_plan_v8.toml`, `shot_plan_v10.toml`, `shot_plan_v11.toml`,
+`shot_plan_v12.toml`. Beat role and group are read from each plan's own
+`# beat: ... [role, group N, act "..."]` comment, so this needs no
+`.authoring/` state. **140 plant -> consequence pairs** in total (a pair is
+one `plant` and one `consequence` in the same `beat_group`, plant first).
+
+| pattern, anchored on a noun the two lines share | hits / 140 | verdict |
+|---|---|---|
+| `where {noun} (once\|formerly\|used to)? stood/was/rose/...` | **1** | SHIPPED. The one true positive: `shot_plan_v6.toml.before_g5fix`, group 5, plant chunk 59 vs consequence chunk 61, noun `island` |
+| `no {noun} left/remaining/anywhere/...` | 0 | shipped unmeasured -- the issue's own proposal, anchored the same way |
+| `nothing of {noun} remains/is left` | 0 | shipped unmeasured -- same |
+| requiring the word "once" | 1 | EXCLUDED: identical score; the optional form ships because the ambiguous "where the island stood" is the same defect |
+| "once" within ~30 chars of the shared noun, either order | 2 | EXCLUDED: 1 false positive, `"a needle glints once"` (chunk 4, the same group) |
+| unanchored absence nouns (`no trace/sign/silhouette ... left`) | 1 | EXCLUDED: fires on the true positive through the generic alternative, not through the shared noun -- an inert anchor |
+
+**The vocabulary-free hypothesis, tested and dead.** "The plant line repeats
+a phrase from its own consequence line" needs no word list at all and would
+have been the better mechanism -- the same shape as
+`worldstate.check_location_tags`, which needs no vocabulary because correct
+and incorrect authoring have different structures. Longest shared word run
+between a plant and its consequence, over the same 140 pairs:
+
+| plans | longest shared run | pair |
+|---|---|---|
+| `v6.before_g5fix` | **5** | group 5, plant 59 -> consequence 61 (the true positive) |
+| `v6`, `v12` | **5** | group 14, plant 38 -> consequence 45 (correct authoring) |
+| everything else | <= 4 | -- |
+
+Tied at the top, so there is no threshold. Recorded as a failed hypothesis
+rather than left as a to-do.
+
+### 7b: #83's world-state checks, scored on the `location` axis as a surrogate
+
+No song has been authored with `conditions` yet, so there is no corpus of
+real values. Inventing one by reading weather out of finished shot lines
+would be exactly the guessing `authoring/conditions.py` refuses to do. What
+does exist is the only other enumerated per-chunk tag this project has:
+`location`, 80 chunks each on `shot_plan_v6.toml` and `shot_plan_v12.toml`
+(6 and 7 distinct labels, 30 runs each). Running both checks over that axis
+measures **false-positive surface** -- how often the shape occurs in real
+authored tag sequences -- and measures **nothing at all about detection**.
+
+| check, run over the `location` axis | v6 | v12 | verdict |
+|---|---|---|---|
+| flip-flop, interruption of exactly one span | 3 | 3 | SHIPPED |
+| flip-flop, interruption of any length | 6 | 5 | EXCLUDED: twice the surface, and the reported defect is the single-span one |
+| regression: any earlier value after any consequence | 11 | 10 | EXCLUDED |
+| regression: only a value a consequence ENDED | **0** | **0** | SHIPPED |
+
+Read the last two rows together and they are the measured argument for
+`conditions` being a **second axis** rather than a facet of `location`: the
+loose regression form fires 10-11 times on locations and every one is
+correct authoring, because a character is supposed to move back and forth
+between places and the world is not supposed to move back and forth between
+states. Opposite correctness shapes, so two axes. The tightened form -- only
+a state that *arrived on a `consequence` beat* is one-way -- is what takes
+that from 10 false positives to 0, and it is expressed as an irreversible
+fact through `authoring/worldstate.WorldState.set_fact`'s existing choke
+point rather than as a second copy of the rule.
+
+All three single-span flip-flops on the location axis are legitimate *for a
+location* (the cut goes to the watch-post for one shot and comes back),
+which is the same asymmetry stated from the other side.
+
+### 7c: a pixel check that cannot substitute (negative result)
+
+The #83 defect a viewer reported -- snow arriving at 4:48 and gone by 4:55,
+with the debris of a 4:44 explosion missing in between -- looks like
+something a detector could confirm on the mp4s already on disk. It is not.
+A white-and-desaturated pixel fraction (HSV `V > 170`, `S < 45`), 8 evenly
+spaced frames, over `chunks_v12`:
+
+| chunk | mean | per-frame |
+|---|---|---|
+| 43 | 20.28% | 21.5, 21.0, 20.4, 21.7, 19.9, 19.7, 18.9, 19.0 |
+| 44 | 4.35% | 9.5, 5.0, 0.0, 0.0, 0.0, 7.5, 12.7, 0.0 |
+| 45 | 5.36% | 5.5, 5.5, 5.4, 5.3, 5.3, 5.3, 5.3, 5.4 |
+| 46 | 9.56% | 5.9, 12.6, 17.1, 19.9, 18.2, 2.7, 0.0, 0.0 |
+| 47 | 10.97% | 0.2, 5.2, 6.9, 11.1, 12.8, 17.1, 17.6, 17.1 |
+
+Chunk 44 swings from 0.0% to 12.7% *within itself*. These are the chunks
+around the blast, and the blast's own white light is indistinguishable from
+snow to any such measure -- so the between-chunk differences carry no signal
+about weather. The world state has to be authored and checked as a tag; it
+cannot be recovered from the pixels afterwards. Recorded because "we could
+just measure it" is the obvious next suggestion, and it has now been tried.
+
 ## Reproducing this corpus
 
 1. `run_state.json` for the chunk-id -> mp4 -> rendered-span mapping
@@ -518,6 +618,10 @@ remaining and explicitly flagged rather than silently left in.
    (`cv2`) for this document's numbers; `music_video_maker.luminance`'s
    sparser ffmpeg-based probe for the shipped, always-on assembly check --
    cross-checked to agree within ~1 Y at chunk 43.
+5. Part 7 needs none of the above: the plan files alone, with beat role and
+   group read from each plan's own `# beat:` comments, and the noun stemming
+   taken from `shot_plan._content_words`/`_singularish` so it cannot drift
+   from what the lints themselves call "the same word".
 
 No frame, still, clip, lyric line, or full shot line from the render is
 reproduced in this repository; every number above is derived from run-local
