@@ -481,10 +481,18 @@ def test_verdict_is_inconclusive_when_an_inspection_pass_found_a_candidate():
 def test_default_inspection_floor_sits_between_the_rejected_noise_floors_and_the_score_threshold():
     """0.05 and 0.01 were measured on real rendered frames and rejected: at
     0.05 YuNet emits boxes up to 1.07x the whole frame's area (not a face,
-    noise), and at 0.01 it emits 22-112 boxes per frame. 0.15 is the floor
-    low enough to surface a genuine low-confidence candidate (a real
-    0.253-confidence face-shaped box) without flooding on detector noise."""
+    noise), and at 0.01 it emits 22-112 boxes per frame. 0.15 is also
+    rejected, on the other end -- scored over the 27 "Deathless" chunks_v12
+    chunks that read 0.0% at the 0.9 gate, a 0.15 inspection floor calls
+    96.3% of them "inconclusive" (a verdict that fires on nearly everything
+    qualifies nothing) and one of its extra candidates, checked on the real
+    pixels, is the back of her head, not a face. 0.80 is plausible but
+    barely different from 0.70 (48.1% vs. 59.3%) and sits close enough to
+    the 0.9 gate to blur "inconclusive" into "nearly cleared it". 0.70 is
+    where the chunk-level split becomes informative -- see the module
+    docstring's calibration table."""
     assert 0.05 < DEFAULT_INSPECTION_FLOOR < DEFAULT_SCORE_THRESHOLD
+    assert 0.15 < DEFAULT_INSPECTION_FLOOR < 0.80
 
 
 def test_detect_faces_accepts_inspect_floor_as_a_keyword_only_argument():

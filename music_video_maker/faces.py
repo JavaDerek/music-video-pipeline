@@ -171,7 +171,7 @@ being non-frontal in a way a benchmark portrait pair is not, and exactly why
 this constant is measured against this project's own material rather than
 imported from someone else's calibration."""
 
-DEFAULT_INSPECTION_FLOOR = 0.15
+DEFAULT_INSPECTION_FLOOR = 0.70
 """Score floor for a *second*, inspection-only detector call (issue #93) --
 never the primary decision floor, which stays :data:`DEFAULT_SCORE_THRESHOLD`
 (0.9), untouched. This exists to answer a different question than the
@@ -188,20 +188,53 @@ zero from :func:`detect_faces` has never meant "no face"; it has only ever
 meant "nothing cleared ``score_threshold``" -- and that is a distinction a
 plain CSV count could never express.
 
-Measured on real rendered frames at 864x480 (Deathless ``chunks_v12``):
+Calibrated on the 27 chunks of the "Deathless" ``chunks_v12`` render that
+score 0.0% face presence at the 0.9 gate (324 sampled frames, 12/chunk),
+scored per candidate floor for whether *any* sampled frame in the chunk
+turns up a candidate at all:
 
-- At 0.15, the extra candidates a second call turns up are still face-shaped:
-  a 0.253-confidence real-face candidate on chunk 7's t~=0.8s frame, 1-5
-  boxes total per frame across the frames inspected.
-- At **0.05**, rejected: YuNet emits 4-13 boxes per frame, including boxes
-  0.60-1.07x the area of the *entire frame* -- a "face" larger than the frame
-  it was found in is not a face, it is noise.
-- At **0.01**, rejected outright: 22-112 boxes per frame.
+=====  ===========================  ==========================
+floor  chunk-level "inconclusive"   frame-level candidate rate
+=====  ===========================  ==========================
+0.15   26/27  (96.3%)                265/324  (81.8%)
+0.30   24/27  (88.9%)                190/324  (58.6%)
+0.50   22/27  (81.5%)                132/324  (40.7%)
+0.70   16/27  (59.3%)                106/324  (32.7%)
+0.80   13/27  (48.1%)                 99/324  (30.6%)
+=====  ===========================  ==========================
 
-0.15 is the floor low enough to surface a genuine low-confidence candidate
-without flooding the candidate list with detector noise -- a measured gap,
-not a round number someone liked, the same reasoning
-:data:`DEFAULT_MIN_FACE_FRACTION` and :data:`DEFAULT_SCORE_THRESHOLD` use."""
+Excluded candidates, measured and rejected:
+
+- **0.15 -- rejected.** 96.3% of the zero-scoring chunks turn up a
+  candidate at this floor -- a verdict that fires on nearly every zero
+  qualifies nothing. Worse, its extra candidates are not reliably
+  face-shaped: chunk 7 of ``chunks_v12`` turns up a 0.239-confidence box at
+  ~4.0s that is, checked against the actual pixels, the *back of her head*
+  (hair, no face at all). YuNet is correct to score it low; a 0.15 floor
+  would wrongly promote a true absence to "inconclusive".
+- **0.05 and 0.01 -- rejected.** At 0.05, YuNet emits 4-13 boxes per frame,
+  including boxes 0.60-1.07x the area of the *entire frame* -- a "face"
+  larger than the frame it was found in is not a face, it is noise. At
+  0.01, 22-112 boxes per frame.
+- **0.80 -- plausible, not chosen.** 48.1% vs. 0.70's 59.3% is a small move
+  for a full extra step, and 0.80 sits close enough to the 0.9 primary gate
+  that "inconclusive" starts to mean "nearly cleared it" rather than
+  "genuinely uncertain". 0.70 leaves a visible band between the two.
+
+0.70 is where the split becomes informative: 16 of 27 zero-scoring chunks
+turn up a real candidate worth a second look, 11 do not -- both
+``inconclusive`` and ``absent`` become claims worth making, which they are
+not at 0.15 (``absent`` fires on only 1 chunk of 27) or below. The near-miss
+it keeps is a real one, checked on pixels: chunk 76 of the same render
+scores 0.7828 at ~4.0s -- a hat, glasses and full beard plainly in frame,
+missed by the 0.9 gate for exactly the reason #93 was filed, and precisely
+the case ``inconclusive`` exists to surface.
+
+One consequence of gathering at 0.70 rather than lower:
+:attr:`FaceObservation.candidate_scores` holds only near-misses, not the
+full low-confidence tail -- deliberate, since the measured tail below 0.70
+is mostly noise (a back of a head at 0.24; boxes larger than the frame at
+0.05), and keeping it would dilute the field rather than inform it."""
 
 RECOGNITION_MODEL_FILENAME = "face_recognition_sface_2021dec.onnx"
 RECOGNITION_MODEL_SOURCE = "https://github.com/opencv/opencv_zoo/tree/main/models/face_recognition_sface"
