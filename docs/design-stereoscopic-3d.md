@@ -90,11 +90,11 @@ experiment retires.
 **Inputs.** Three chunks from `~/mvm-runs/deathless/output/chunks_v12`, chosen
 to span the difficulty range rather than to look good:
 
-| chunk | why |
-|---|---|
-| 0 | extreme wide, locked off, a silhouette against a flat horizon — almost no depth cues; the hardest case |
-| 54 | a close face; the case where a wrong depth map is most visible |
-| 73 | a summit wide with a near slope and a far valley — a genuine two-plane composition, the case the feature would be for |
+| chunk | camera clause | why |
+|---|---|---|
+| 0 | "extreme wide, locked off, the silhouette small and central against the flat horizon" | almost no depth cues; the hardest case |
+| 20 | "close and slightly low on her upturned face" (looking up at a distant silhouette) | where a wrong depth map is most visible — the cardboard cut-out effect — with a real near/far pair in one frame. Also a frame YuNet scores 0.0% on, so it is worth knowing whether depth sees a face where detection does not |
+| 73 | "medium close on his face and chest, locked off", above "an ash-grey, burnt-over valley lying still and quiet below" | a genuine two-plane composition, and the chunk whose far ground already caused trouble in the #78 location work; the case the feature is for |
 
 **Procedure.**
 1. A throwaway venv — **not** `~/mvm-runs/deathless/.venv`, which the test
@@ -108,7 +108,7 @@ to span the difficulty range rather than to look good:
    Fill disocclusions with a horizontal edge-stretch for this test only.
 5. Anaglyph mux: left eye's red channel + right eye's green and blue.
 6. Watch it. The three questions: does the depth boil frame to frame; do the
-   two planes in chunk 73 separate; does the face in chunk 54 stay solid or
+   two planes in chunk 73 separate; does the face in chunk 20 stay solid or
    turn to cardboard.
 
 **Model candidates.** The licence must be checked before anything is committed
