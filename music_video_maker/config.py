@@ -34,6 +34,7 @@ against the *config file's* directory, not the process cwd)::
     render_width             = 864       # optional; both or neither, multiples of 32
     render_height            = 480       # biggest lever on run time -- see RunConfig
     instrumental_coverage    = true      # render the unvoiced spans too
+    silent_output            = false     # issue #22; no audio stream at all
     i2v_continuity           = false     # issue #12
     i2v_workflow_template    = "workflow_i2v_api.json"          # issue #12
     resume_ignore_prompt_changes = false # issue #34; --ignore-prompt-changes overrides
@@ -514,6 +515,22 @@ class RunConfig:
     this field existed keeps loading and rendering exactly as it always
     has, since nothing here changes a value that config already sets."""
 
+    cinematography_profile_overrides: tuple[str, ...] = ()
+    """Which of :data:`~music_video_maker.profiles.LOOK_FIELDS` the run config
+    set for itself, beating a profile that also set them.
+
+    Its own field because **it cannot be recomputed after the fact.** A
+    resolved :class:`RunConfig` cannot tell "the run config set this" from
+    "the dataclass defaulted it": ``lora_strength`` defaults to ``1.0``, not
+    ``None``, so a reconstruction from the finished object reports it
+    overridden on every run that names a profile at all -- which is how this
+    was found. The distinction only exists while the raw TOML is still
+    visible, i.e. inside :func:`load_config`, so that is where it is written
+    down.
+
+    Empty when there is no profile, and empty when a profile's every field
+    was inherited untouched."""
+
     between_chunk_min_free_vram_gb: float | None = None
     """Issue #23: optional free-VRAM floor re-checked *between* chunks.
 
@@ -588,6 +605,30 @@ class RunConfig:
     render resolution moved is re-rendered regardless -- that is a desync (or,
     for resolution, a concat that Stage 5 cannot copy), not a cosmetic
     difference, and no flag makes it reusable."""
+
+    silent_output: bool = False
+    """Issue #22: assemble a final video with **no audio stream at all**.
+
+    This suspends one of the project's non-negotiable invariants ("the master
+    audio track is the only audio in the final video"), which is why it is a
+    named field with a loud warning rather than a quiet default. It does not
+    touch the other one: the concat pass still passes ``-an``, so H3's own
+    generated audio is discarded exactly as before.
+
+    The case it exists for is a rear-projection backdrop for a live band: the
+    band *is* the audio, and shipping a file with an audio track risks
+    double-audio if someone's playback rig un-mutes it.
+
+    A silent run loses the accidental safety net a muxed run has. Measured on
+    the finished "Deathless" render: the chunk timeline ends at 513.917s
+    against a 512.080s master, because the last tile is padded up to H3's
+    124-frame floor -- and the mux's ``-shortest`` silently trimmed 47
+    rendered frames to hide it. With no audio there is nothing to trim
+    against, so the same pipeline emits a file 1.84s longer than the track it
+    was cut to. Pass ``expected_duration`` to
+    :func:`~music_video_maker.assembly.assemble_final_video` when that
+    difference matters, i.e. whenever something else is playing to the same
+    clock."""
 
     instrumental_coverage: bool = True
     """Render the unvoiced spans too -- intro, outro, and every instrumental
@@ -1276,6 +1317,7 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
             overridden,
         )
     values["cinematography_profile"] = profile
+    values["cinematography_profile_overrides"] = overridden
 
     for key in _SCALAR_FIELDS:
         values[key] = _require(merged, key)
@@ -1295,6 +1337,7 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
     values["min_free_vram_gb"] = _positive_number(merged, "min_free_vram_gb", 16.0)
     values["render_width"], values["render_height"] = _render_dimensions(merged)
     values["instrumental_coverage"] = _flag(merged, "instrumental_coverage", True)
+    values["silent_output"] = _flag(merged, "silent_output", False)
     values["i2v_continuity"] = _flag(merged, "i2v_continuity", False)
     values["resume_ignore_prompt_changes"] = _flag(merged, "resume_ignore_prompt_changes", False)
     values["strict_alignment"] = _flag(merged, "strict_alignment", False)
