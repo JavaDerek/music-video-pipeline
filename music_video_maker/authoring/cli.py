@@ -900,6 +900,9 @@ def _cmd_write(args: argparse.Namespace) -> int:
             "lyrics": sha256_file(config.lyrics_file),
             "skeleton": sha256_text(beats_module.skeleton_table_text(chunks)),
         },
+        # Issue #86: straight from the run config, so a human reviewing the
+        # plan sees what it was authored under.
+        song_facts=tuple(config.song_facts),
     )
 
     driver = ClaudeCliDriver()
@@ -1148,6 +1151,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
     for stage, state, detail in rows:
         print(f"{stage:<14}{state:<12}{detail}")
 
+    _report_song_facts_and_reading(config, concept)
     _report_human_edits(config, run_dir)
     return EXIT_SUCCESS
 
@@ -1164,6 +1168,23 @@ def _prose_timeline(
     except SkeletonError:
         return tuple(fallback)
     return recut if recut is not None else tuple(fallback)
+
+
+def _report_song_facts_and_reading(config: RunConfig, concept: dict | None) -> None:
+    """Issue #86 point 1: the model's answer to "what is this song about"
+    (issue #69's ``reading.subject``) beside the operator's own answer
+    (``song_facts``) -- printed only when there is something to print, so a
+    run with neither a concept yet nor any facts gets no extra output."""
+    lines: list[str] = []
+    if concept is not None:
+        subject = str((concept.get("reading") or {}).get("subject") or "").strip()
+        if subject:
+            lines.append(f"reading.subject: {subject}")
+    if config.song_facts:
+        lines.append("song_facts:")
+        lines += [f"  - {fact}" for fact in config.song_facts]
+    if lines:
+        print("\n" + "\n".join(lines))
 
 
 def _report_human_edits(config: RunConfig, run_dir: Path) -> None:

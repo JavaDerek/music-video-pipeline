@@ -133,6 +133,13 @@ class Provenance:
     hashes: Mapping[str, str] = field(default_factory=dict)
     """``{"concept": ..., "guide": ..., "lyrics": ..., "skeleton": ...}``."""
 
+    song_facts: tuple[str, ...] = ()
+    """Issue #86: the run config's own ``song_facts``, surfaced verbatim as a
+    header comment (never a TOML key -- see :func:`render_plan_toml`) so a
+    human reviewing the plan can see what it was authored under. Defaults to
+    ``()`` so every ``Provenance(...)`` call site that predates this field
+    keeps working, and an unset value emits nothing (byte-identical output)."""
+
 
 # --------------------------------------------------------------------------- #
 # Composition
@@ -193,6 +200,19 @@ def render_plan_toml(
         "# Anchors come from this run's own alignment -- edit the shot lines, not the",
         "# chunk_id/start values. A '# lint:' comment is a warning the real loaders",
         "# raised and nobody silenced; they are advisory, and some are false positives.",
+    ]
+    if provenance.song_facts:
+        # Issue #86: a comment, never a TOML key -- the plan's own loaders
+        # already warn about an unrecognized key under [provenance], and this
+        # is prose for a human, not data anything reads back. Omitted
+        # entirely when there are no facts, so a config that never sets
+        # `song_facts` renders byte-identical to before this existed.
+        lines.append(
+            "# Authored under these established facts about the song (run config "
+            "`song_facts`):"
+        )
+        lines += [f"#   - {_comment(fact)}" for fact in provenance.song_facts]
+    lines += [
         "",
         "[provenance]",
         f'generated_by = {_toml_string(provenance.generated_by)}',

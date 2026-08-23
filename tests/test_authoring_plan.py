@@ -313,6 +313,59 @@ def test_provenance_keys_do_not_trip_the_unknown_key_lint(tmp_path, caplog):
     assert "nothing reads" not in caplog.text
 
 
+# --------------------------------------------------------------------------- #
+# Issue #86: song_facts surfaced as a header comment, so a human reviewing
+# the plan can see what it was authored under.
+# --------------------------------------------------------------------------- #
+
+
+def test_provenance_song_facts_defaults_to_empty():
+    """Every `Provenance(...)` call site that predates issue #86 -- and
+    `PROVENANCE` above is one -- must keep working unchanged."""
+    assert PROVENANCE.song_facts == ()
+
+
+def test_no_song_facts_header_when_the_provenance_has_none():
+    text = render_plan_toml(_chunks(["x"]), (_beat(1),), LINES, provenance=PROVENANCE)
+    assert "Authored under these established facts" not in text
+
+
+def test_a_song_facts_header_is_written_when_the_provenance_has_them():
+    provenance = replace(
+        PROVENANCE,
+        song_facts=("the island is vaporised, not eroded", "the narrator is unreliable"),
+    )
+    text = render_plan_toml(_chunks(["x"]), (_beat(1),), LINES, provenance=provenance)
+
+    lines = text.splitlines()
+    header_index = lines.index(
+        "# Authored under these established facts about the song (run config `song_facts`):"
+    )
+    assert lines[header_index + 1] == "#   - the island is vaporised, not eroded"
+    assert lines[header_index + 2] == "#   - the narrator is unreliable"
+    # Immediately after the existing four header comment lines, before the
+    # blank line preceding [provenance].
+    assert lines[header_index - 1].startswith("# raised and nobody silenced")
+    assert lines[header_index + 3] == ""
+    assert lines[header_index + 4] == "[provenance]"
+
+
+def test_a_song_facts_bullet_collapses_whitespace_like_every_other_comment():
+    provenance = replace(PROVENANCE, song_facts=("a fact\nwith  a   line break",))
+    text = render_plan_toml(_chunks(["x"]), (_beat(1),), LINES, provenance=provenance)
+
+    assert "#   - a fact with a line break" in text.splitlines()
+
+
+def test_song_facts_header_does_not_break_the_real_loader(tmp_path):
+    provenance = replace(PROVENANCE, song_facts=("a settled fact",))
+    path = tmp_path / "shot_plan.toml"
+    path.write_text(render_plan_toml(_chunks(["x"]), (_beat(1),), LINES, provenance=provenance))
+
+    plan = load_shot_plan(path)  # must not raise
+    assert set(plan) == {1}
+
+
 def test_lint_comments_land_above_their_entry(tmp_path):
     chunks = _chunks(["x", "y"])
     text = render_plan_toml(

@@ -9,6 +9,7 @@ or silently accept a malformed reply.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -25,7 +26,8 @@ from music_video_maker.authoring.concept import (
     validate_concept,
 )
 from music_video_maker.authoring.driver import DriverError, ScriptedDriver
-from music_video_maker.authoring.prompts import LYRICS_FORMAT_DOC
+from music_video_maker.authoring.prompts import LYRICS_FORMAT_DOC, song_facts_block
+from music_video_maker.authoring.session import StageRecord, stage_staleness
 from music_video_maker.config import RunConfig
 from tests.harness.factories import make_cast_dict, make_raw_stablets_result, write_silent_wav
 
@@ -580,3 +582,149 @@ def test_the_concept_preamble_explains_the_acts_payoff_requirement():
     lowered = CONCEPT_PREAMBLE.lower()
     assert "acts" in lowered
     assert "pay off" in lowered or "payoff" in lowered
+
+
+# --------------------------------------------------------------------------- #
+# Issue #86: song_facts -- an operator's established fact about the song,
+# composed once in prompts.song_facts_block and shared by all four stages.
+# This file owns the direct unit tests for the shared composer (concept is
+# stage 1, the simplest fixture); beats/photography/prose each carry their
+# own smaller integration tests proving the same block lands at the top of
+# *their* prompt and is hashed the same way -- see prompts.song_facts_block's
+# own docstring for why one function, not four copies.
+# --------------------------------------------------------------------------- #
+
+
+def test_song_facts_block_is_empty_for_no_facts():
+    assert song_facts_block(()) == []
+
+
+def test_song_facts_block_is_empty_when_every_fact_is_blank():
+    """Defensive: `RunConfig` already refuses a blank `song_facts` entry at
+    load time (issue #86's config validation), but the composer does not
+    trust that and re-checks, the same posture every other composer in this
+    module takes toward its inputs."""
+    assert song_facts_block(("   ", "")) == []
+
+
+def test_song_facts_block_composes_the_settled_header_and_bullets():
+    block = song_facts_block(
+        ("the island is vaporised, not eroded", "the narrator is unreliable")
+    )
+    assert block == [
+        "## Established facts about this song (from the person running this)",
+        "These are settled. Treat them as true, do not contradict them, and do not",
+        "re-litigate them in your reply.",
+        "- the island is vaporised, not eroded",
+        "- the narrator is unreliable",
+    ]
+
+
+def test_prompt_has_no_established_facts_section_when_config_has_none(tmp_path):
+    """Byte-identical to before #86 whenever `song_facts` is unset -- the
+    default for every config committed before this field existed."""
+    config = _config(tmp_path, lyrics_text="")
+    chunks = load_chunk_skeleton(config)
+
+    prompt = build_concept_prompt(config, chunks)
+
+    assert "Established facts about this song" not in prompt
+
+
+def test_prompt_puts_song_facts_first_when_the_config_has_them(tmp_path):
+    config = replace(
+        _config(tmp_path, lyrics_text=""),
+        song_facts=("the island is vaporised, not eroded",),
+    )
+    chunks = load_chunk_skeleton(config)
+
+    prompt = build_concept_prompt(config, chunks)
+
+    assert prompt.startswith("## Established facts about this song")
+    assert "the island is vaporised, not eroded" in prompt
+    facts_index = prompt.index("Established facts")
+    lyric_index = prompt.index("## Lyric text")
+    assert facts_index < lyric_index
+
+
+# --------------------------------------------------------------------------- #
+# concept_input_hashes: song_facts hashed only when present (issue #86)
+# --------------------------------------------------------------------------- #
+
+
+def test_input_hashes_have_no_song_facts_key_when_the_config_has_none(tmp_path):
+    """`session.stage_staleness` compares hash dicts with `==` -- an
+    unconditional `song_facts` key would report every pre-#86 run stale the
+    moment this landed, with nothing having actually changed."""
+    config = _config(tmp_path, lyrics_text="")
+    chunks = load_chunk_skeleton(config)
+
+    hashes = concept_input_hashes(config, chunks)
+
+    assert "song_facts" not in hashes
+    assert set(hashes) == {"lyrics", "skeleton", "lyrics_format_doc"}
+
+
+def test_input_hashes_include_song_facts_when_set_and_change_with_it(tmp_path):
+    config = replace(_config(tmp_path, lyrics_text=""), song_facts=("fact one",))
+    chunks = load_chunk_skeleton(config)
+
+    before = concept_input_hashes(config, chunks)
+    assert "song_facts" in before
+
+    changed = replace(config, song_facts=("fact one (edited)",))
+    after = concept_input_hashes(changed, chunks)
+
+    assert before["song_facts"] != after["song_facts"]
+    assert before["lyrics"] == after["lyrics"]  # nothing else moved
+
+
+def test_editing_a_song_fact_stales_the_stage_and_names_it(tmp_path):
+    """The cascade this whole issue exists for: a run's facts are hashed, an
+    operator edits one, and `stage_staleness` -- the same comparison that
+    already catches an edited lyrics file -- reports it, naming the input
+    that changed."""
+    config = replace(
+        _config(tmp_path, lyrics_text=""),
+        song_facts=("the island is vaporised, not eroded",),
+    )
+    chunks = load_chunk_skeleton(config)
+    recorded_hashes = concept_input_hashes(config, chunks)
+    record = StageRecord(
+        stage="concept",
+        model="claude-fable-5",
+        completed_at="2026-08-23",
+        cost_usd=0.1,
+        input_hashes=recorded_hashes,
+    )
+
+    unchanged = stage_staleness(record, concept_input_hashes(config, chunks))
+    assert unchanged.stale is False
+
+    edited_config = replace(config, song_facts=("the island erodes over centuries",))
+    check = stage_staleness(record, concept_input_hashes(edited_config, chunks))
+
+    assert check.stale is True
+    assert "song_facts" in check.reason
+
+
+def test_a_run_with_no_facts_hashes_exactly_as_before_the_field_existed(tmp_path):
+    """The other half of the cascade: a config that never sets `song_facts`
+    (every config committed before issue #86) must hash identically to
+    before the field existed -- no new key, no new staleness."""
+    config = _config(tmp_path, lyrics_text="")
+    chunks = load_chunk_skeleton(config)
+
+    hashes = concept_input_hashes(config, chunks)
+    record = StageRecord(
+        stage="concept",
+        model="claude-fable-5",
+        completed_at="2026-08-23",
+        cost_usd=0.1,
+        input_hashes={"lyrics": hashes["lyrics"], "skeleton": hashes["skeleton"],
+                      "lyrics_format_doc": hashes["lyrics_format_doc"]},
+    )
+
+    check = stage_staleness(record, concept_input_hashes(config, chunks))
+
+    assert check.stale is False

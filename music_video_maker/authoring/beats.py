@@ -45,7 +45,11 @@ from typing import Any
 from music_video_maker.authoring.chunks import skeleton_table_text
 from music_video_maker.authoring.driver import MODEL_OPUS, DriverResult, ModelDriver
 from music_video_maker.authoring.hashing import sha256_file, sha256_text
-from music_video_maker.authoring.prompts import SHOT_WRITING_GUIDE_DOC, beats_system_prompt
+from music_video_maker.authoring.prompts import (
+    SHOT_WRITING_GUIDE_DOC,
+    beats_system_prompt,
+    song_facts_block,
+)
 from music_video_maker.config import RunConfig
 from music_video_maker.contracts import AudioChunk
 from music_video_maker.shot_plan import ShotLength
@@ -640,11 +644,17 @@ def beats_input_hashes(
     than silently leaving a beat sheet that descends from a paragraph nobody
     approved -- reported, never auto-healed.
     """
-    return {
+    hashes = {
         "skeleton": sha256_text(skeleton_table_text(chunks)),
         "concept": sha256_text(json.dumps(dict(concept), sort_keys=True)),
         "shot_writing_guide": sha256_file(SHOT_WRITING_GUIDE_DOC),
     }
+    if config.song_facts:
+        # Issue #86: present only when there are facts -- see
+        # concept.concept_input_hashes for why an unconditional key would
+        # falsely stale every pre-#86 run.
+        hashes["song_facts"] = sha256_text(json.dumps(list(config.song_facts)))
+    return hashes
 
 
 def _reading_block(reading: Mapping[str, Any]) -> list[str]:
@@ -729,7 +739,13 @@ def build_beats_prompt(
     instrumental = sum(c.duration for c in chunks if c.is_instrumental)
     cast_lines = "\n".join(f"- {name}: {member.role}" for name, member in config.cast.items())
 
-    parts = [
+    parts: list[str] = []
+    facts = song_facts_block(config.song_facts)
+    if facts:
+        # Issue #86: composed FIRST, same position as
+        # concept.build_concept_prompt -- see that function's comment.
+        parts += [*facts, ""]
+    parts += [
         "## The approved concept (every beat below descends from this)",
         _concept_block(concept),
         "",

@@ -16,6 +16,7 @@ handful of field checks provide.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -24,7 +25,11 @@ from typing import Any
 from music_video_maker.authoring.chunks import skeleton_table_text
 from music_video_maker.authoring.driver import MODEL_FABLE, DriverResult, ModelDriver
 from music_video_maker.authoring.hashing import sha256_file, sha256_text
-from music_video_maker.authoring.prompts import LYRICS_FORMAT_DOC, concept_system_prompt
+from music_video_maker.authoring.prompts import (
+    LYRICS_FORMAT_DOC,
+    concept_system_prompt,
+    song_facts_block,
+)
 from music_video_maker.config import RunConfig
 from music_video_maker.contracts import AudioChunk
 from music_video_maker.lyrics import parse_lyrics
@@ -320,11 +325,21 @@ def concept_input_hashes(config: RunConfig, chunks: Sequence[AudioChunk]) -> dic
     shared between the real run and :mod:`~music_video_maker.authoring.session`
     staleness checks so the two can never disagree about what "the same
     inputs" means."""
-    return {
+    hashes = {
         "lyrics": sha256_file(config.lyrics_file),
         "skeleton": sha256_text(skeleton_table_text(chunks)),
         "lyrics_format_doc": sha256_file(LYRICS_FORMAT_DOC),
     }
+    if config.song_facts:
+        # Issue #86: present ONLY when there are facts to hash.
+        # `session.stage_staleness` compares hash dicts with `==`, so an
+        # unconditional key here would report every stage of every run
+        # committed before this field existed as stale the moment this
+        # landed, with nothing having actually changed -- the same reasoning
+        # `beats_input_hashes`/`photography_input_hashes`/`prose_input_hashes`
+        # each cross-reference rather than repeat.
+        hashes["song_facts"] = sha256_text(json.dumps(list(config.song_facts)))
+    return hashes
 
 
 def build_concept_prompt(
@@ -341,7 +356,19 @@ def build_concept_prompt(
     cast_lines = "\n".join(f"- {name}: {member.role}" for name, member in config.cast.items())
     stats = _summary_stats(chunks)
 
-    parts = [
+    parts: list[str] = []
+    facts = song_facts_block(config.song_facts)
+    if facts:
+        # Issue #86: an operator's established fact about the song, composed
+        # FIRST -- ahead of the lyric text here, and ahead of the approved
+        # concept/window in beats.build_beats_prompt,
+        # photography.build_photography_prompt and prose.build_prose_prompt
+        # (same position in all four on purpose; they cross-reference this
+        # comment rather than repeat it). This is the frame the stage reads
+        # everything else through, not a constraint applied after the fact
+        # the way `setting`/`global_style` are below.
+        parts += [*facts, ""]
+    parts += [
         "## Lyric text (verbatim, tag-stripped; empty means this song is "
         "authored with nobody shown singing)",
         lyric_text or "(none -- no lyric is ever sung on screen in this video)",

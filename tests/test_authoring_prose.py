@@ -14,6 +14,7 @@ a judgement call that a later reader will otherwise assume was an oversight.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -921,3 +922,53 @@ def test_the_preamble_tells_a_plant_to_show_the_before_state():
     assert "6:26" in PROSE_PREAMBLE
     assert "6:31" in PROSE_PREAMBLE
     assert "6:38" in PROSE_PREAMBLE
+
+
+# --------------------------------------------------------------------------- #
+# Issue #86: song_facts, composed the same way and in the same position as
+# concept.build_concept_prompt (see that module's tests for the direct unit
+# tests of prompts.song_facts_block itself).
+# --------------------------------------------------------------------------- #
+
+
+def test_prompt_has_no_established_facts_section_by_default(tmp_path):
+    beats = (_beat(1),)
+    prompt = build_prose_prompt(
+        _config(tmp_path), CONCEPT, beats, beats, _chunks([""]), camera={}, notes=None
+    )
+    assert "Established facts about this song" not in prompt
+
+
+def test_prompt_puts_song_facts_first_when_the_config_has_them(tmp_path):
+    config = replace(_config(tmp_path), song_facts=("the mill was destroyed in act 5",))
+    beats = (_beat(1),)
+
+    prompt = build_prose_prompt(config, CONCEPT, beats, beats, _chunks([""]), camera={}, notes=None)
+
+    assert prompt.startswith("## Established facts about this song")
+    assert "the mill was destroyed in act 5" in prompt
+    assert prompt.index("Established facts") < prompt.index("The approved concept")
+
+
+def test_input_hashes_have_no_song_facts_key_by_default(tmp_path):
+    chunks = _chunks(["", ""])
+    beats = (_beat(1), _beat(2))
+
+    hashes = prose_input_hashes(_config(tmp_path), chunks, CONCEPT, beats)
+
+    assert "song_facts" not in hashes
+    assert set(hashes) == {"skeleton", "concept", "beats", "shot_writing_guide"}
+
+
+def test_input_hashes_include_song_facts_when_set_and_change_with_it(tmp_path):
+    chunks = _chunks(["", ""])
+    beats = (_beat(1), _beat(2))
+    config = replace(_config(tmp_path), song_facts=("fact one",))
+
+    before = prose_input_hashes(config, chunks, CONCEPT, beats)
+    after = prose_input_hashes(
+        replace(config, song_facts=("fact two",)), chunks, CONCEPT, beats
+    )
+
+    assert "song_facts" in before
+    assert before["song_facts"] != after["song_facts"]

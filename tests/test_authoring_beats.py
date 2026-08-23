@@ -15,6 +15,7 @@ whole guide exists to fix.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -949,3 +950,46 @@ def test_the_beats_preamble_puts_a_sung_beat_on_its_own_singer():
     lowered = BEATS_PREAMBLE.lower()
     assert "singer" in lowered
     assert "25 of 41" in BEATS_PREAMBLE
+
+
+# --------------------------------------------------------------------------- #
+# Issue #86: song_facts, composed the same way and in the same position as
+# concept.build_concept_prompt (see that module's tests for the direct unit
+# tests of prompts.song_facts_block itself).
+# --------------------------------------------------------------------------- #
+
+
+def test_prompt_has_no_established_facts_section_by_default(tmp_path):
+    prompt = build_beats_prompt(_config(tmp_path), _chunks(), CONCEPT)
+    assert "Established facts about this song" not in prompt
+
+
+def test_prompt_puts_song_facts_first_when_the_config_has_them(tmp_path):
+    config = replace(_config(tmp_path), song_facts=("the mill was destroyed in act 5",))
+
+    prompt = build_beats_prompt(config, _chunks(), CONCEPT)
+
+    assert prompt.startswith("## Established facts about this song")
+    assert "the mill was destroyed in act 5" in prompt
+    assert prompt.index("Established facts") < prompt.index("The approved concept")
+
+
+def test_input_hashes_have_no_song_facts_key_by_default(tmp_path):
+    config = _config(tmp_path)
+    chunks = _chunks()
+
+    hashes = beats_input_hashes(config, chunks, CONCEPT)
+
+    assert "song_facts" not in hashes
+    assert set(hashes) == {"skeleton", "concept", "shot_writing_guide"}
+
+
+def test_input_hashes_include_song_facts_when_set_and_change_with_it(tmp_path):
+    config = replace(_config(tmp_path), song_facts=("fact one",))
+    chunks = _chunks()
+
+    before = beats_input_hashes(config, chunks, CONCEPT)
+    after = beats_input_hashes(replace(config, song_facts=("fact two",)), chunks, CONCEPT)
+
+    assert "song_facts" in before
+    assert before["song_facts"] != after["song_facts"]

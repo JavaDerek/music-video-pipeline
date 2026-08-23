@@ -1027,6 +1027,43 @@ Session state — `.authoring/session.json`, `concept.json`, `beats.json`,
 `~/mvm-runs/<song>/`, exactly like `output/` and `shot_plan.toml`, never in
 the repo.
 
+#### Established facts about the song (`song_facts`)
+
+`--notes` steers one stage's single call and is then gone: not recorded in
+`.authoring/`, not carried to the next stage, not in any input hash. That is
+the right shape for a one-off objection ("less handheld, hold the wides"),
+but wrong for a fact the operator has actually established about the song —
+"the narrator is unreliable", "the mill was destroyed and the run's later
+chunks are its aftermath" — which would otherwise have to be retyped,
+correctly, on every future invocation of every stage it matters to.
+
+`song_facts` (in the run config, not on the command line, so it is committed
+and diffable) is a short list of declarative statements every stage sees:
+
+```toml
+song_facts = [
+  "the island is vaporised, not eroded",
+  "the narrator is unreliable",
+]
+```
+
+- **Composed first**, ahead of the lyric text (`concept`) or the approved
+  concept and window (`beats`/`photography`/`prose`) — the frame each stage
+  reads everything else through, not a constraint applied after the fact.
+- **Hashed into every stage's inputs**, but only when `song_facts` is
+  non-empty — editing a fact reports the descendant stages `STALE` by the
+  same comparison `status` already uses for an edited lyrics file. A config
+  that never sets it hashes exactly as it did before this existed.
+- **Written into `shot_plan.toml`** as a header comment (never a TOML key),
+  so a human reviewing the plan can see what it was authored under.
+- **Shown by `status`** beside `reading.subject` — the model's own answer to
+  "what is this song about" (see below) next to the operator's.
+
+Deliberately **not** accompanied by a check that the plan "honours" a fact:
+that is not mechanically decidable, and pretending otherwise is the kind of
+lint this project has already had to retire twice. The value here is
+durability and visibility, not enforcement.
+
 #### What the beats stage is for
 
 It does not write prose. It says *what happens* in each chunk and tags it:

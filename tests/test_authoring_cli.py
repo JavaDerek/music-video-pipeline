@@ -91,6 +91,7 @@ def _write_config(
     instrumental_coverage: bool = True,
     master_seconds: float = 20.0,
     instrumental_shot_seconds: float | None = None,
+    song_facts: tuple[str, ...] | None = None,
 ) -> Path:
     master_audio = write_silent_wav(tmp_path / "audio" / "master.wav", seconds=master_seconds)
     lyrics_file = tmp_path / "lyrics.txt"
@@ -116,6 +117,7 @@ chunks_dir = "{tmp_path / "output" / "chunks"}"
 final_video_dir = "{tmp_path / "output" / "final"}"
 instrumental_coverage = {"true" if instrumental_coverage else "false"}
 {f"instrumental_shot_seconds = {instrumental_shot_seconds}" if instrumental_shot_seconds else ""}
+{f"song_facts = {json.dumps(list(song_facts))}" if song_facts else ""}
 
 [cast.Dianne]
 role = "Lead Vocalist"
@@ -484,6 +486,51 @@ def test_status_reports_ok_after_a_successful_concept_run(tmp_path, monkeypatch,
     assert "claude-fable-5" in concept_line
 
 
+def test_status_prints_reading_subject_and_song_facts_side_by_side(
+    tmp_path, monkeypatch, capsys
+):
+    """Issue #86 point 1: the model's answer to "what is this song about"
+    (issue #69's `reading.subject`) and the operator's own answer
+    (`song_facts`), shown together."""
+    config_path = _write_config(
+        tmp_path, lyrics_text="", song_facts=("the island is vaporised, not eroded",)
+    )
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([VALID_CONCEPT]))
+    auth_cli.main(["--config", str(config_path), "concept"])
+    capsys.readouterr()
+
+    auth_cli.main(["--config", str(config_path), "status"])
+
+    out = capsys.readouterr().out
+    assert f"reading.subject: {VALID_CONCEPT['reading']['subject']}" in out
+    assert "song_facts:" in out
+    assert "  - the island is vaporised, not eroded" in out
+
+
+def test_status_prints_no_extra_section_when_there_is_neither(tmp_path, capsys):
+    config_path = _write_config(tmp_path, lyrics_text="")
+
+    auth_cli.main(["--config", str(config_path), "status"])
+
+    out = capsys.readouterr().out
+    assert "reading.subject" not in out
+    assert "song_facts" not in out
+
+
+def test_status_prints_song_facts_even_before_a_concept_has_run(tmp_path, capsys):
+    """`song_facts` is a config value, not something the concept stage
+    produces -- it must show up in `status` whether or not `concept` has
+    ever been run."""
+    config_path = _write_config(tmp_path, lyrics_text="", song_facts=("a settled fact",))
+
+    auth_cli.main(["--config", str(config_path), "status"])
+
+    out = capsys.readouterr().out
+    assert "song_facts:" in out
+    assert "  - a settled fact" in out
+    assert "reading.subject" not in out  # no concept has run yet
+
+
 def test_status_reports_stale_after_the_lyrics_file_changes(tmp_path, monkeypatch, capsys):
     config_path = _write_config(tmp_path, lyrics_text="")
     monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([VALID_CONCEPT]))
@@ -672,8 +719,10 @@ def test_prose_rejects_a_beat_sheet_the_alignment_has_moved_under(tmp_path, monk
     assert any("no longer produces" in r.message for r in caplog.records)
 
 
-def _author_through_prose(tmp_path, monkeypatch) -> Path:
-    config_path = _write_config(tmp_path, lyrics_text="")
+def _author_through_prose(
+    tmp_path, monkeypatch, *, song_facts: tuple[str, ...] | None = None
+) -> Path:
+    config_path = _write_config(tmp_path, lyrics_text="", song_facts=song_facts)
     _run_concept(config_path, monkeypatch)
     _run_beats(config_path, monkeypatch)
     monkeypatch.setattr(
@@ -730,6 +779,30 @@ def test_write_records_provenance_in_the_file(tmp_path, monkeypatch):
     assert provenance["beats_model"] == "claude-opus-5"
     assert provenance["prose_model"] == "claude-sonnet-5"
     assert len(provenance["lyrics_sha256"]) == 64
+
+
+def test_write_omits_the_song_facts_header_when_the_config_has_none(tmp_path, monkeypatch):
+    config_path = _author_through_prose(tmp_path, monkeypatch)
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([]))
+    auth_cli.main(["--config", str(config_path), "write"])
+
+    text = (config_path.parent / "shot_plan.toml").read_text()
+    assert "Authored under these established facts" not in text
+
+
+def test_write_puts_the_configs_song_facts_in_the_plan_header(tmp_path, monkeypatch):
+    """Issue #86: `Provenance(song_facts=...)` comes straight from
+    `config.song_facts`, so a human reviewing the plan sees what it was
+    authored under."""
+    config_path = _author_through_prose(
+        tmp_path, monkeypatch, song_facts=("the island is vaporised, not eroded",)
+    )
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([]))
+    auth_cli.main(["--config", str(config_path), "write"])
+
+    text = (config_path.parent / "shot_plan.toml").read_text()
+    assert "# Authored under these established facts about the song" in text
+    assert "#   - the island is vaporised, not eroded" in text
 
 
 def test_write_refuses_before_prose_exists(tmp_path, monkeypatch, caplog):

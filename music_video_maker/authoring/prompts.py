@@ -15,10 +15,19 @@ against the old version.
 or read from an environment variable -- correct for the editable install
 (``pip install -e .``) this project's README documents as the only supported
 install, where ``__file__`` always resolves inside the real checkout.
+
+This module also composes the one *user*-prompt fragment every stage shares:
+:func:`song_facts_block` (issue #86). Every other per-stage fragment
+(``## The approved concept``, the beat table, the window) is stage-specific
+and lives in that stage's own ``build_*_prompt``; this one is not, because an
+operator's established fact about the song has to read identically to
+``concept``, ``beats``, ``photography`` and ``prose`` alike -- a fourth copy
+pasted into each is a fourth place for the wording to drift out of sync.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -37,6 +46,30 @@ def read_doc(path: Path) -> str:
         return path.read_text(encoding="utf-8")
     except OSError as exc:
         raise PromptError(f"could not read {path}: {exc}") from exc
+
+
+def song_facts_block(facts: Sequence[str]) -> list[str]:
+    """Issue #86: an operator's established facts about this song, composed
+    as lines ready to drop at the top of a ``parts`` list -- the same shape
+    every ``build_*_prompt`` already assembles its own sections in.
+
+    Returns ``[]`` for an empty (or all-blank) ``facts``, so a config that
+    never sets ``song_facts`` -- every config committed before this issue --
+    produces a prompt byte-identical to before it existed. Callers are
+    expected to put this block FIRST, ahead of the lyric text / approved
+    concept / window, and to add their own blank-line separator only when
+    this returns something (see ``concept.build_concept_prompt`` for the
+    canonical call site and why this position is the same in all four
+    stages)."""
+    lines = [fact.strip() for fact in facts if fact and fact.strip()]
+    if not lines:
+        return []
+    return [
+        "## Established facts about this song (from the person running this)",
+        "These are settled. Treat them as true, do not contradict them, and do not",
+        "re-litigate them in your reply.",
+        *[f"- {fact}" for fact in lines],
+    ]
 
 
 CONCEPT_PREAMBLE = """\
@@ -541,4 +574,5 @@ __all__ = [
     "photography_system_prompt",
     "prose_system_prompt",
     "read_doc",
+    "song_facts_block",
 ]
