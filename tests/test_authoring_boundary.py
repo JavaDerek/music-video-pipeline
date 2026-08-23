@@ -48,6 +48,7 @@ SUBPROCESS_ALLOWLIST = frozenset(
         "continuity.py",  # ffprobe/ffmpeg frame extraction (issue #12) -- no model
         "alignment_quality.py",  # ffmpeg astats vocal-energy check (issue #71) -- no model
         "luminance.py",  # ffmpeg frame sampling for the darkness floor (issue #77) -- no model
+        "scenecuts.py",  # ffmpeg scene-detection probe (issue #81) -- no model
     }
 )
 
