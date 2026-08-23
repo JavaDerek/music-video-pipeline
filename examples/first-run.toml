@@ -74,19 +74,20 @@ global_appearance = "everyone slim, trim and healthy looking"
 # global_demeanour = "nobody smiles; this is a war"
 
 # Things this video must NEVER show, anywhere, e.g. bass guitar, microphone,
-# stage -- composed into every prompt as a final "must never depict" clause.
+# stage. Read by `mvm-author` (the authoring layer, a model reading English)
+# and deliberately NOT composed into any render prompt (issue #73).
 #
-# Read this as a best-effort hint, not a guarantee: it is textual negation in
-# the same prompt channel role's own prohibitions failed in (see the warning
-# below [cast.Dianne]) -- the committed workflow templates give H3 exactly one
-# `prompt` input, with no separate negative-conditioning channel for this list
-# to use instead. It is here because a hint that sometimes works beats an
-# authored "avoid" list that never reaches a prompt at all, which is what this
-# project shipped with until issue #73 -- not because it is expected to
-# reliably prevent the thing it names. A shot line that explicitly stages the
-# forbidden object (a hand closing around a needle, say) will still win; only
-# a lint comparing the authored shot text against this list closes that gap,
-# and this config file cannot see whether one has been run.
+# It used to be composed as a final "must never depict" clause, and a
+# single-variable A/B at an identical seed showed why that cannot work: the
+# committed workflow templates give H3 exactly one `prompt` input with no
+# negative-conditioning channel, so a prohibition can only ADD the nouns it
+# names -- "no climbing equipment, ropes or harnesses" put a full harness and
+# rope on a character whose shot had no climbing in it, and changed nothing on
+# a chunk that already had a rope to suppress. Say what IS true in `role`,
+# `appearance` and the shot lines instead. A shot line that explicitly stages
+# a forbidden object (a hand closing around a needle, say) still wins; the
+# `lint_role_prohibition_contradiction` lint is what catches that, and this
+# config file cannot see whether it has been run.
 # avoid = ["bass guitar", "microphone", "stage"]
 
 # Facts about THIS SONG that you have settled and every authoring stage must
@@ -314,9 +315,9 @@ between_chunk_min_free_vram_gb = 1.0
 # carries no weight. `music-video-maker` now warns at load time when `role`
 # or `demeanour` reads as a prohibition ("never"/"no"/"without"), but the fix
 # is still yours to make: say what IS true instead ("empty-handed, hands
-# always at his sides"), never what is not. For a whole-video exclusion, see
-# the `avoid` list above -- though read its own comment first: it shares this
-# exact limitation and is a hint, not a guarantee.
+# always at his sides"), never what is not. There is no whole-video
+# exclusion that reaches the render: the `avoid` list above is read by the
+# authoring layer only, for the reason its own comment gives.
 #
 # `appearance` is optional and is how this member should be PRESENTED --
 # lighting, styling, a flattering look. It applies to every chunk they are in,

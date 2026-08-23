@@ -3060,6 +3060,7 @@ __all__ = [
     "resolve_camera",
     "resolve_conditions",
     "resolve_location",
+    "resolve_present",
     "resolve_shot",
     "resolve_subject",
     "shot_length_requests",
