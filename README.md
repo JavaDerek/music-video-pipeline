@@ -504,6 +504,41 @@ i2v_require_seed_face = true             # refuse to chain from a faceless frame
 Leave `i2v_continuity = false` for a first run — it needs a second authored
 template and is much easier to debug once the base path is known good.
 
+#### Measuring face presence across a render
+
+`python -m music_video_maker.facescan <chunks_dir> [--samples 12] [--out report.csv]`
+samples evenly-spaced frames from every chunk video in a directory and
+reports face presence, reusing the exact YuNet detector the `i2v_require_seed_face`
+gate above uses. It replaces a run-local script that quietly measured the
+*wrong* render for over a week (issue #93): the script hardcoded its input
+directory, and only the output filename was ever updated between renders, so
+a CSV named for one render turned out to be a byte-identical re-save of a
+scan of a different, older one — the "0.0% face presence" it reported on two
+shots with obvious faces was correct for the frames it had actually (and
+accidentally) read, just not for the frames its own filename claimed.
+
+The fix is not a better detector — the detector was right on both frames,
+once pointed at them. **A measurement artefact must record what it read; a
+filename is not provenance.** Every row `facescan` writes carries the
+resolved absolute path, size and mtime of the file it actually scanned, and
+the report as a whole records the resolved input directory, the detector
+model and its sha256, the score threshold, the inspection floor, and the
+samples-per-chunk, once, as a header — so a stale or mismatched input
+directory is visible on the first row, not after a viewer notices something
+off two years later.
+
+`facescan` also carries the other half of #93's finding: a bare zero from
+`faces.detect_faces` has never meant "no face" — it has only ever meant
+"nothing cleared the 0.9 confidence floor". Passing `inspect_floor` (on by
+default in `facescan`, at `faces.DEFAULT_INSPECTION_FLOOR` = 0.15) runs a
+*second*, independent detector call at a lower floor purely to record what
+else was there, without changing the primary decision — the one the #47 gate
+depends on — at all. That makes a zero inspectable as `detected` /
+`inconclusive` / `absent` / `unexamined` (`FaceObservation.verdict`) instead
+of silently trusted. `inconclusive` is the state a plain face-presence count
+could never express: the detector saw something face-shaped, it just was not
+confident enough to act on.
+
 #### Conditioning on an isolated vocal stem
 
 `vocal_stem` points at a vocals-only track and uses it as H3's *conditioning*
