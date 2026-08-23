@@ -3056,6 +3056,118 @@ def test_stageable_noun_stems_normalises_multiword_phrases():
     assert "with" not in stems and "" not in stems
 
 
+# --------------------------------------------------------------------------- #
+# Issue #67: `lyric_literalness` moves the #37 lint between silence, warning
+# and error. The config knows what kind of video this run is trying to make;
+# the heuristic must stop arguing with it -- "a lint that guesses loses to a
+# stage that knows", one level up from where #69 first said it.
+# --------------------------------------------------------------------------- #
+
+
+def _printer_fixture():
+    plan = _lyric_plan(
+        **{
+            "0": "A beige printer sits blinking on the sill.",
+            "9": "She walks past a bare wall.",
+        }
+    )
+    chunks = [_lyric_chunk(9, "I hoped your printer would explode")]
+    return plan, chunks
+
+
+def test_literalness_free_silences_the_lint_and_logs_why(caplog):
+    """At `free` a lyric naming an object the plan stages elsewhere is the
+    brief, not a defect -- no warning, no error, and exactly one INFO line,
+    so a silenced lint is never mistaken for a lint that found nothing."""
+    plan, chunks = _printer_fixture()
+    with caplog.at_level(logging.INFO):
+        lint_shots_against_lyrics(plan, chunks, literalness="free")
+    assert "names 'printer'" not in caplog.text
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+    info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+    assert len(info_records) == 1
+    assert "free" in info_records[0].getMessage()
+
+
+def test_literalness_free_logs_even_with_nothing_to_check(caplog):
+    """The 'silenced, not silent' INFO line fires before the empty-input
+    short-circuit too -- an empty plan must not swallow the reason a run
+    saw no findings."""
+    with caplog.at_level(logging.INFO):
+        lint_shots_against_lyrics({}, [], literalness="free")
+    info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+    assert len(info_records) == 1
+    assert "free" in info_records[0].getMessage()
+
+
+def test_literalness_literal_promotes_the_finding_to_error(caplog):
+    """At `literal` the same finding fires as an authoring error: the tier
+    `authoring/plan.check_plan` sends into a targeted revision round. On the
+    render side an ERROR log stays loud but never fatal -- one lever, two
+    consumers, each behaving as it already does."""
+    plan, chunks = _printer_fixture()
+    with caplog.at_level(logging.INFO):
+        lint_shots_against_lyrics(plan, chunks, literalness="literal")
+    assert not any(r.levelno == logging.WARNING for r in caplog.records)
+    error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(error_records) == 1
+    message = error_records[0].getMessage()
+    assert "names 'printer'" in message
+    assert "literal" in message
+    assert "authoring error" in message
+
+
+def test_literalness_thematic_message_is_unchanged(caplog):
+    """`thematic` -- and no `literalness` argument at all, today's every
+    existing call site -- must reproduce the exact pre-#67 warning text."""
+    plan, chunks = _printer_fixture()
+    expected = (
+        "Shot plan chunk_id=9: the lyric names 'printer' but this shot does not show it "
+        "-- the plan stages 'printer' in chunk(s) [0]. If the object belongs on screen here "
+        "too, say so; a repeated verse is a chance to plant it early and pay it off "
+        "later (issue #37). Shot: 'She walks past a bare wall.' | "
+        "lyric: 'I hoped your printer would explode'"
+    )
+
+    with caplog.at_level(logging.WARNING):
+        lint_shots_against_lyrics(plan, chunks, literalness="thematic")
+    thematic_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(thematic_records) == 1
+    assert thematic_records[0].levelno == logging.WARNING
+    assert thematic_records[0].getMessage() == expected
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        lint_shots_against_lyrics(plan, chunks)  # no literalness kwarg at all
+    default_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(default_records) == 1
+    assert default_records[0].getMessage() == expected
+
+
+def test_literalness_unrecognised_value_behaves_as_thematic(caplog):
+    """An unrecognised value must never raise: `load_config` is the gate for
+    the vocabulary, and a lint refusing a run on a bad string would violate
+    'a false positive must never block a run' by a different route."""
+    plan, chunks = _printer_fixture()
+    with caplog.at_level(logging.WARNING):
+        lint_shots_against_lyrics(plan, chunks, literalness="not-a-real-band")
+    records = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert "names 'printer'" in records[0].getMessage()
+
+
+def test_lint_literalness_vocabulary_matches_config_bands():
+    """`shot_plan.py` imports only `contracts`, never `config` (the same
+    convention `MAX_NOISE_SEED`/`DEFAULT_ALIGNMENT_MODEL_SIZE` already
+    follow), so it keeps its own copy of the recognised bands. A test
+    asserts the two stay equal so the vocabularies cannot silently drift
+    apart -- gaining or losing a band on either side fails this."""
+    from music_video_maker import config as config_module
+
+    assert shot_plan_module._LYRIC_LITERALNESS_BANDS == config_module.LYRIC_LITERALNESS_BANDS
+
+
 def test_subject_binds_a_pronoun_for_the_unbound_companion_lint(caplog):
     """Issue #82 added `subject`; #64's lint only knew about `present`, so an
     instrumental chunk whose pronoun is bound by `subject` was reported as

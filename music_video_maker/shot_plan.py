@@ -1553,10 +1553,40 @@ def lint_voiced_framing(
             )
 
 
+_STAGED_ELSEWHERE_MESSAGE = (
+    "Shot plan chunk_id=%d: the lyric names %r but this shot does not show it "
+    "-- the plan stages %r in chunk(s) %s. If the object belongs on screen here "
+    "too, say so; a repeated verse is a chance to plant it early and pay it off "
+    "later (issue #37). Shot: %r | lyric: %r"
+)
+_STAGED_ELSEWHERE_MESSAGE_LITERAL = (
+    "Shot plan chunk_id=%d: the lyric names %r but this shot does not show it "
+    "-- the plan stages %r in chunk(s) %s. If the object belongs on screen here "
+    "too, say so; a repeated verse is a chance to plant it early and pay it off "
+    "later (issue #37). Shot: %r | lyric: %r Under lyric_literalness = 'literal', "
+    "an object the lyric names and this shot does not stage is an authoring "
+    "error, not a style note (issue #67)."
+)
+"""Two full templates rather than one built with `+` at the call site: ruff's
+G003 flags string concatenation inside a logging statement, and building the
+`"literal"` variant ahead of time is also simply clearer than assembling it
+per finding."""
+
+_LYRIC_LITERALNESS_BANDS: tuple[str, ...] = ("free", "thematic", "literal")
+"""Mirrors :data:`music_video_maker.config.LYRIC_LITERALNESS_BANDS` (issue
+#67; a test asserts the two stay equal). This module compares the
+``literalness`` argument against plain string literals rather than importing
+``config`` for it -- the same convention :data:`MAX_NOISE_SEED` and
+:data:`DEFAULT_ALIGNMENT_MODEL_SIZE` already follow: ``shot_plan.py``
+deliberately imports only ``contracts``."""
+
+
 def lint_shots_against_lyrics(
     plan: Mapping[int, ShotPlanEntry],
     chunks: Sequence[AudioChunk],
     stageable_nouns: Iterable[str] = (),
+    *,
+    literalness: str = "thematic",
 ) -> None:
     """Warn when a chunk's lyric names an object this plan stages *elsewhere*.
 
@@ -1594,12 +1624,52 @@ def lint_shots_against_lyrics(
     may fire" -- the same convention ``locations`` and ``acts`` already use,
     and what keeps every existing call site behaving as it did.
 
-    Warning only, never an error: this is a heuristic firing on prose a human
+    ``literalness`` (issue #67) is one of
+    :data:`music_video_maker.config.LYRIC_LITERALNESS_BANDS` and moves this
+    lint between three tiers rather than leaving it one fixed opinion:
+
+    * ``"free"`` -- silenced outright, before any comparison runs. At this
+      end of the range a lyric naming an object the plan stages elsewhere is
+      the brief, not a defect: "a lint that guesses loses to a stage that
+      knows" (#69), one level up -- the config already knows what kind of
+      video this run is trying to make, so the heuristic must not argue
+      with it. Exactly one ``INFO`` line is logged regardless of whether a
+      finding would otherwise have fired, so a silenced lint is never
+      mistaken for a lint that looked and found nothing.
+    * ``"thematic"`` -- the default, and every pre-#67 call site's exact
+      behaviour: a ``WARNING``, unchanged.
+    * ``"literal"`` -- the identical detection, but each finding is a
+      ``logger.error`` with one sentence appended naming the tier. A level,
+      not a boolean, because the same lever means two different things to
+      its two consumers: ``authoring/plan.check_plan`` classifies an ERROR
+      record into its error tier, where errors get a targeted revision of
+      the offending chunks and then abort with nothing written if they
+      don't clear -- while on the render side (``cli.py``) an ERROR log is
+      loud and *never* fatal, because "a false positive must never block a
+      run" and "one chunk failing must not kill the run" are both still in
+      force there. One lever, two consumers, each behaving as it already
+      does.
+
+    Any other value (including an unrecognised string) is treated as
+    ``"thematic"`` rather than raising: ``load_config`` is the gate for the
+    vocabulary, and a lint must never be the thing that refuses a run.
+
+    Warning (or, at ``"literal"``, error) only -- never a raise: this is a
+    heuristic firing on prose a human (or a model, in conversation with one)
     wrote deliberately, so a false positive must never block a run.
     """
+    if literalness == "free":
+        logger.info(
+            "Shot-vs-lyric check (issue #37) silenced: lyric_literalness='free' means "
+            "a lyric naming an object staged elsewhere is this run's brief, not a "
+            "defect worth a warning."
+        )
+        return
+
     if not plan or not chunks:
         return
 
+    literal_mode = literalness == "literal"
     allowed = stageable_noun_stems(stageable_nouns)
 
     # Every content word the author used anywhere in their own shot text, and
@@ -1629,18 +1699,11 @@ def lint_shots_against_lyrics(
             elsewhere = sorted(set(staged.get(word, ())) - nearby)
             if word in here or not elsewhere:
                 continue
-            logger.warning(
-                "Shot plan chunk_id=%d: the lyric names %r but this shot does not show it "
-                "-- the plan stages %r in chunk(s) %s. If the object belongs on screen here "
-                "too, say so; a repeated verse is a chance to plant it early and pay it off "
-                "later (issue #37). Shot: %r | lyric: %r",
-                chunk.chunk_id,
-                word,
-                word,
-                elsewhere,
-                entry.shot[:80],
-                chunk.text[:60],
-            )
+            args = (chunk.chunk_id, word, word, elsewhere, entry.shot[:80], chunk.text[:60])
+            if literal_mode:
+                logger.error(_STAGED_ELSEWHERE_MESSAGE_LITERAL, *args)
+            else:
+                logger.warning(_STAGED_ELSEWHERE_MESSAGE, *args)
 
 
 # --------------------------------------------------------------------------- #

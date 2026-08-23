@@ -568,8 +568,14 @@ def run_pipeline(
             lint_subject_on_voiced_chunk(plan, chunks)
             # Issue #37: both strings are in hand here -- a lyric naming an
             # object the plan stages only elsewhere is mechanically visible,
-            # for free, before any GPU time is spent on it.
-            lint_shots_against_lyrics(plan, chunks)
+            # for free, before any GPU time is spent on it. Issue #67: the
+            # run's own lyric_literalness decides how loudly this fires --
+            # silenced at "free", promoted to ERROR at "literal" -- but the
+            # render never refuses on it either way. "A false positive must
+            # never block a run" and "one chunk failing must not kill the
+            # run" both still apply here; the error tier only means
+            # something in the authoring layer's revision round.
+            lint_shots_against_lyrics(plan, chunks, literalness=config.lyric_literalness)
             # Issue #58: a camera direction that turns her away from the
             # lens on a voiced chunk costs that chunk's lip-sync.
             lint_camera_face_away_on_voiced_chunks(plan, chunks)

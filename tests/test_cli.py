@@ -1319,6 +1319,39 @@ def test_run_pipeline_wires_the_present_location_mismatch_lint(tmp_path: Path, m
     assert len(chunks_arg) == 3
 
 
+def test_run_pipeline_passes_lyric_literalness_to_the_shot_vs_lyric_lint(
+    tmp_path: Path, monkeypatch
+):
+    """Issue #67: the config's `lyric_literalness` has to actually reach
+    `lint_shots_against_lyrics`, not just exist as a field nobody reads --
+    the same wiring-must-be-proven discipline as the #78/#82 lints above.
+    The render never refuses on this either way; only which log level the
+    lint uses changes."""
+    rig = Rig(tmp_path)
+    plan_path = tmp_path / "shot_plan.toml"
+    plan_path.write_text(
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks alone."\n'
+    )
+    rig.config = replace(
+        rig.config, shot_plan=plan_path, lyric_literalness="literal"
+    )
+
+    calls = []
+    real_lint = cli.lint_shots_against_lyrics
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs)
+        return real_lint(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "lint_shots_against_lyrics", spy)
+    sequences = [build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)]
+
+    rig.run(sequences)
+
+    assert len(calls) == 1
+    assert calls[0].get("literalness") == "literal"
+
+
 # --------------------------------------------------------------------------- #
 # `subject`: whose shot this is on an instrumental chunk (issue #82)
 # --------------------------------------------------------------------------- #
