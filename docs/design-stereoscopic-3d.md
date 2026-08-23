@@ -93,7 +93,7 @@ to span the difficulty range rather than to look good:
 | chunk | camera clause | why |
 |---|---|---|
 | 0 | "extreme wide, locked off, the silhouette small and central against the flat horizon" | almost no depth cues; the hardest case |
-| 20 | "close and slightly low on her upturned face" (looking up at a distant silhouette) | where a wrong depth map is most visible — the cardboard cut-out effect — with a real near/far pair in one frame. Also a frame YuNet scores 0.0% on, so it is worth knowing whether depth sees a face where detection does not |
+| 20 | "close and slightly low on her upturned face" (looking up at a distant silhouette) | where a wrong depth map is most visible — the cardboard cut-out effect — with a real near/far pair in one frame. Also the chunk with the song's largest leading vocal offset (+2.650 s, #79) that no viewer reported, so it is worth knowing what depth makes of a face pitched that far up |
 | 73 | "medium close on his face and chest, locked off", above "an ash-grey, burnt-over valley lying still and quiet below" | a genuine two-plane composition, and the chunk whose far ground already caused trouble in the #78 location work; the case the feature is for |
 
 **Procedure.**

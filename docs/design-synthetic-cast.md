@@ -53,12 +53,15 @@ render rather than after.
 
 Two caveats to carry into any such measurement:
 
-* **The detector is the weak link.** `faces.detect_faces`/YuNet scores 0.0%
-  face presence on a front-facing medium close-up filling a third of the frame
-  when the subject wears a hat, beard and glasses, and on a large, fully-lit
-  upturned face. A synthetic character in a hat that cannot be *detected*
-  cannot be *recognised* either, and the number will read as "inconsistent"
-  when it means "invisible to YuNet". Check the frame before believing a zero.
+* **A zero from the detector is not "no face".** A bare 0.0% from
+  `faces.detect_faces` has only ever meant "nothing cleared the 0.9 gate"; use
+  the `FaceObservation.verdict` (`detected` / `inconclusive` / `absent` /
+  `unexamined`, issue #93) and `music_video_maker.facescan`, which stamps the
+  input it actually read — the one documented "YuNet cannot see hats" case
+  turned out to be a scan of the wrong render. A synthetic character that
+  cannot be *detected* cannot be *recognised* either, so an `inconclusive`
+  verdict must be looked at, not averaged in. Check the frame before believing
+  a zero.
 * **The floor was calibrated on photographs of real people.** Generated faces
   may have a different similarity distribution entirely (generated faces are
   often *more* similar to each other than real photographs of the same person
