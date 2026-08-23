@@ -1211,6 +1211,9 @@ terms of:
   open gaps.
 - [`docs/lyrics-format.md`](docs/lyrics-format.md) — the lyrics file format
   and `[Character: Role]` tag syntax.
+- [`docs/design-multi-vocalist.md`](docs/design-multi-vocalist.md) — design
+  (not yet built) for automatic vocalist detection, and why hand-tagging with
+  `[Name: Role]` is the correct answer until it lands.
 - [`docs/shot-writing-guide.md`](docs/shot-writing-guide.md) — how to write
   the `shot` lines themselves so cause and effect read as connected: the
   three-beat rule, one beat per shot, naming the contact. Written from what
