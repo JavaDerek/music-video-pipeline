@@ -1124,3 +1124,44 @@ def test_status_reports_photography(tmp_path, monkeypatch, capsys):
         row for row in capsys.readouterr().out.splitlines() if row.startswith("photography")
     )
     assert "ok" in line and "claude-opus-5" in line
+
+
+# --------------------------------------------------------------------------- #
+# Issue #85: the plant-vs-consequence check reaches the written plan.
+# --------------------------------------------------------------------------- #
+
+
+def test_write_runs_the_plant_end_state_check_over_the_current_shots(
+    tmp_path, monkeypatch
+):
+    """#85's check lives in the authoring layer, not in `shot_plan.py`, because
+    it needs `beat_role`/`beat_group` -- and it is re-derived on the *current*
+    text for the same reason `advisory_issues` is, so a revision round cannot
+    leave the file complaining about a sentence that no longer exists."""
+    from music_video_maker.authoring.prose import ProseIssue
+
+    config_path = _author_through_prose(tmp_path, monkeypatch)
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([]))
+
+    seen: list[tuple[dict, tuple]] = []
+
+    def spy(shots, beats):
+        seen.append((dict(shots), tuple(beats)))
+        return (
+            ProseIssue(
+                chunk_id=sorted(shots)[0],
+                severity="warning",
+                message="chunk_id=0 the plant already states the end state (issue #85)",
+            ),
+        )
+
+    monkeypatch.setattr(auth_cli.prose_module, "plant_end_state_issues", spy)
+
+    assert auth_cli.main(["--config", str(config_path), "write"]) == auth_cli.EXIT_SUCCESS
+
+    assert seen, "plant_end_state_issues was never called"
+    shots, beats = seen[-1]
+    assert shots, "the check must see the shot lines"
+    assert beats, "the check must see the beat sheet -- it is what knows the roles"
+    written = (config_path.parent / "shot_plan.toml").read_text(encoding="utf-8")
+    assert "issue #85" in written

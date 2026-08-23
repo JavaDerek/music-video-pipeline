@@ -919,10 +919,19 @@ def _cmd_write(args: argparse.Namespace) -> int:
     camera = _load_camera(run_dir)
 
     def advisory(current_shots):
-        """The prose stage's own warning-tier prohibitions, re-derived on the
+        """The prose stage's own warning-tier checks, re-derived on the
         current text so a revision round cannot leave the file annotated with
-        a complaint about a sentence that no longer exists."""
-        return prose_module.advisory_issues(current_shots, camera=camera)
+        a complaint about a sentence that no longer exists.
+
+        Issue #85's plant-vs-consequence check joins them here rather than in
+        ``shot_plan.py``: it needs ``beat_role`` and ``beat_group``, which
+        only the authoring layer has -- the render sees finished prose and a
+        chunk timeline and could not tell a plant from a payoff without
+        guessing, which is the thing this project keeps having to retire.
+        """
+        return prose_module.advisory_issues(
+            current_shots, camera=camera
+        ) + prose_module.plant_end_state_issues(current_shots, beats)
 
     try:
         built = plan_module.build_plan(
