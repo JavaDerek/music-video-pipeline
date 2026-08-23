@@ -504,6 +504,41 @@ i2v_require_seed_face = true             # refuse to chain from a faceless frame
 Leave `i2v_continuity = false` for a first run — it needs a second authored
 template and is much easier to debug once the base path is known good.
 
+#### Measuring face presence across a render
+
+`python -m music_video_maker.facescan <chunks_dir> [--samples 12] [--out report.csv]`
+samples evenly-spaced frames from every chunk video in a directory and
+reports face presence, reusing the exact YuNet detector the `i2v_require_seed_face`
+gate above uses. It replaces a run-local script that quietly measured the
+*wrong* render for over a week (issue #93): the script hardcoded its input
+directory, and only the output filename was ever updated between renders, so
+a CSV named for one render turned out to be a byte-identical re-save of a
+scan of a different, older one — the "0.0% face presence" it reported on two
+shots with obvious faces was correct for the frames it had actually (and
+accidentally) read, just not for the frames its own filename claimed.
+
+The fix is not a better detector — the detector was right on both frames,
+once pointed at them. **A measurement artefact must record what it read; a
+filename is not provenance.** Every row `facescan` writes carries the
+resolved absolute path, size and mtime of the file it actually scanned, and
+the report as a whole records the resolved input directory, the detector
+model and its sha256, the score threshold, the inspection floor, and the
+samples-per-chunk, once, as a header — so a stale or mismatched input
+directory is visible on the first row, not after a viewer notices something
+off two years later.
+
+`facescan` also carries the other half of #93's finding: a bare zero from
+`faces.detect_faces` has never meant "no face" — it has only ever meant
+"nothing cleared the 0.9 confidence floor". Passing `inspect_floor` (on by
+default in `facescan`, at `faces.DEFAULT_INSPECTION_FLOOR` = 0.70) runs a
+*second*, independent detector call at a lower floor purely to record what
+else was there, without changing the primary decision — the one the #47 gate
+depends on — at all. That makes a zero inspectable as `detected` /
+`inconclusive` / `absent` / `unexamined` (`FaceObservation.verdict`) instead
+of silently trusted. `inconclusive` is the state a plain face-presence count
+could never express: the detector saw something face-shaped, it just was not
+confident enough to act on.
+
 #### Conditioning on an isolated vocal stem
 
 `vocal_stem` points at a vocals-only track and uses it as H3's *conditioning*
@@ -763,6 +798,8 @@ Flags (see `music_video_maker/cli.py`'s `build_parser()`):
 | `--ignore-prompt-changes` | With `--resume`, reuse chunks whose span is unchanged but whose *prompt* was edited — a shot-plan tweak, a reworded cast role. Chunks whose span, frame count or render resolution moved are re-rendered regardless. One-way; the config equivalent is `resume_ignore_prompt_changes`. |
 | `--strict-alignment` | Refuse to render when forced alignment produces implausible timings — zero-length segments, a lyric placed where nothing is sung, a line split across a huge gap (see below). Report-only without it. One-way; the config equivalent is `strict_alignment`. |
 | `--only-chunks IDS` | Render only these chunk ids (`32,33,34,35`) and skip Stage 5 assembly. Stages 1–2 still run over the *whole* track, so each chunk gets exactly the span, prompt and frame count a full run would give it — re-slicing around a selection would validate a chunk the real run never produces. This is the validation slice: prove a prompt-shape or gate change on a few chunks before committing hours of exclusive GPU custody. A slice loads prior run state and augments it, and always re-renders its own chunks even when their fingerprints still match. |
+| `--reseed IDS` | Re-roll these chunk ids (`12,29`) under a different, deterministic seed and re-render just them, reusing every other cached chunk — the common case of watching a render and finding one shot bad. **Implies `--resume`.** The new seed is derived from `--reseed-generation`, never random, so an interrupted `--reseed` run recomposes the same value on restart rather than drifting further each time. See "Seeds" below. |
+| `--reseed-generation N` | Which alternate take `--reseed`'s chunks render (default `1`). Bump it if a previous `--reseed` of the same chunk still wasn't right — each generation is a distinct, reproducible seed, never the same one repeated. Refused below `1` (generation `0` is the seed the chunk already has without `--reseed`, not a re-roll of it). Ignored without `--reseed`. |
 | `--log-level LEVEL` | Root log level, default `INFO`. All diagnostic output goes to stderr (`logging_setup.py`) — there is no separate progress bar; the WebSocket `progress` events logged at `INFO` *are* the progress display. |
 
 Exit codes (`music_video_maker/cli.py`):
@@ -849,6 +886,104 @@ detail drops to `DEBUG`.
 written before fingerprints existed records nothing that can be proven, so it
 is rejected outright and the run starts fresh rather than being misread as
 "everything matches".
+
+#### Post-render checks: darkness and scene cuts (issues #77, #81)
+
+Stage 5 assembly runs two cheap smell tests against every chunk's rendered
+video before concat, both on by default, both informational-only (they never
+block assembly), and both requiring nothing beyond `ffmpeg` already on PATH:
+
+- **Darkness floor** (`music_video_maker/luminance.py`) flags a chunk whose
+  *ending* mean luminance falls below `DEFAULT_DARK_FLOOR` (25.0, on a 0-255
+  scale) — the shape of defect a shot line asking for "the light fades to
+  black" produces on a chunk that also carries a sung line. Scored against
+  all 80 chunks of a full "Deathless" render: the one real case ends at Y
+  14.9 against a next-darkest chunk ending of Y 36.4 — a 21+ Y gap the floor
+  sits in the middle of. A start/end *drift* band was tried first and
+  rejected: 36 of 80 chunks in that render swing by more than ±15 Y because
+  the song's own narrative runs from dusk to dawn, so drift is the song's
+  content, not a defect.
+- **Scene-cut check** (`music_video_maker/scenecuts.py`) flags a chunk
+  containing a cut *inside* a shot authored as "ONE continuous unbroken
+  take" — H3 declining that instruction on a minority of chunks, invisible
+  short of watching the whole video. Uses ffmpeg's own `scene` metric
+  (`select='gte(scene,0)',metadata=print:file=-`) and flags any frame
+  scoring above `DEFAULT_SCENE_THRESHOLD` (0.25). Measured against **two**
+  independent full 80-chunk renders of "Deathless": corpus A (the render
+  that reported the defect) flags 3 chunks / 4 cuts, matching a viewer's
+  own timestamped report exactly; corpus B (a later, independent render)
+  flags 1 chunk / 1 cut — a real, previously unreported cut nobody had
+  caught by watching. 0.25 sits inside a plateau where every threshold from
+  0.15 to 0.30 gives the identical answer on both corpora; see
+  `scenecuts.py`'s module docstring for the excluded thresholds and why.
+
+Both checks are sampled from the *rendered pixels*, not the prompt — the
+general lesson behind #81 is that an instruction in a shot line is not a
+property of the output until something measures the output. A flagged
+chunk is logged at `ERROR` (with the exact times/scores for a scene cut, or
+the measured luminance for a dark ending) and carried on the result of
+assembly (`AssemblyResult.dark_chunk_warnings` /
+`.scene_cut_warnings`) so a caller can report it without re-deriving
+anything. **The remedy is `--reseed CHUNK_IDS`** (issue #38): re-render just
+the flagged chunk(s) at a different noise seed and `--resume` — a collapsed
+or cut shot reproduces identically at a pinned seed, so a different seed is
+the whole fix.
+
+A scene cut also matters more than a cosmetic glitch on the chained I2V
+path (`i2v_continuity` — see "Chaining shots together" above): the *next*
+chunk's identity conditioning is the flagged chunk's own final frame, so a
+chunk that cut mid-take hands the next one a seed frame from a shot nobody
+authored. Both checks disable independently (`check_luminance` /
+`check_scene_cuts`, each `True` by default) and accept their own injected
+runner (`luminance_runner` / `scene_cut_runner`) if you need to point them
+somewhere other than the runner already driving concat/mux.
+
+`python -m music_video_maker.scenecuts <chunks_dir> [--threshold 0.25]` runs
+the scene-cut scan standalone against any directory of already-rendered
+`chunk_*.mp4` files — useful against a finished or partial render, or a
+slice rendered via `--only-chunks`, without re-running any pipeline stage.
+It prints one line per flagged chunk (with every cut's time and score) plus
+a summary count, and exits non-zero if anything was flagged.
+
+#### Seeds: varying a take, and what a seed does *not* transport (issue #38)
+
+`noise_seed` (config, default `0`) is the run-wide base every chunk's seed is
+derived from:
+
+```
+seed = (noise_seed + chunk_id + reseed_generation * 2**32) % (MAX_SEED + 1)
+```
+
+Three properties follow, and all three are the point:
+
+- **Chunks differ from each other**, so a video isn't 80 variations on one
+  noise pattern.
+- **It is a pure function of three integers** — no clock, no RNG state — so a
+  resumed run recomposes exactly the same seed. `--resume` correctness
+  depends on that.
+- **The resolved seed is recorded per chunk** in `run_state.json`'s
+  `ChunkFingerprint`, in the *content* tier. A good take is reproducible, and
+  a changed seed is a visible reason to re-render rather than a silent one.
+  (Being content-tier, it is escapable via `--ignore-prompt-changes` — unlike
+  the encoder or LoRA, which are not.)
+
+To re-roll a bad shot: `--reseed 12` (implies `--resume`). Only chunk 12
+re-renders; bump `--reseed-generation` if the second take is no better.
+
+**What a seed does not do — plan around this, not around the hope.** A seed
+does **not** transport a composition across a change in resolution,
+precision, GPU, or attention kernel. Diffusion sampling is chaotic with
+respect to those numerics, so the same seed on different hardware or at a
+different resolution gives a *different* video — not a higher-fidelity
+version of the same one. Resolution is the clearest case: the latent shape
+changes, so the seed's noise tensor is a different object entirely.
+
+This matters because the intended workflow is to iterate cheaply at 864×480
+until the *script* is right, then re-render at higher quality — and the
+second half of that does not preserve the takes you approved in the first.
+What transports is the **authored layer**: lyrics, vocal map, chunk
+timeline, shot plan, reference photos. That is most of the work, and it is
+the part worth protecting.
 
 ### GPU custody
 

@@ -578,6 +578,171 @@ appearence = "typo'd on purpose"
 
 
 # --------------------------------------------------------------------------- #
+# voiced_by -- a voice on the track is not a character in the story (#89).
+# --------------------------------------------------------------------------- #
+
+
+def test_voiced_by_is_a_known_cast_key(tmp_path: Path) -> None:
+    assert "voiced_by" in config_module.CAST_KEYS
+
+
+def test_voiced_by_entry_inherits_the_performers_image(tmp_path: Path) -> None:
+    """The premise the issue rests on is false: the missing piece is one
+    validation rule, not a new architecture. A character with no photograph
+    of her own borrows the performer's."""
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Jan]
+role = "Kashay Besmertny the Deathless, an immortal watchman"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+
+[cast."The Dead"]
+voiced_by = "Jan"
+role = "the war's dead, speaking collectively"
+demeanour = "flat, tireless, without appetite"
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Jan")
+
+    cfg = load_config(config_path)
+
+    assert cfg.cast["The Dead"].voiced_by == "Jan"
+    assert cfg.cast["The Dead"].image == cfg.cast["Jan"].image
+    assert cfg.cast["The Dead"].role == "the war's dead, speaking collectively"
+    # The inherited path is real -- the existing per-cast-entry file check
+    # (_validate_file) ran against it and did not raise.
+    assert cfg.cast["The Dead"].image.exists()
+
+
+def test_voiced_by_entry_defined_before_its_performer_still_resolves(
+    tmp_path: Path,
+) -> None:
+    """File order must not matter: cast entries are parsed in file order, so
+    a character may be written before the performer it names. Resolution
+    happens in a second pass over the completed cast dict, not inline in the
+    first loop."""
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast."The Dead"]
+voiced_by = "Jan"
+role = "the war's dead, speaking collectively"
+
+[cast.Jan]
+role = "Kashay Besmertny the Deathless, an immortal watchman"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Jan")
+
+    cfg = load_config(config_path)
+
+    assert cfg.cast["The Dead"].image == cfg.cast["Jan"].image
+
+
+def test_voiced_by_entry_with_explicit_image_wins(tmp_path: Path) -> None:
+    """An invented character with its own generated portrait is the
+    better-conditioned case, not a special one -- an explicit image is never
+    overridden by inheritance."""
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Jan]
+role = "Kashay Besmertny the Deathless, an immortal watchman"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+
+[cast."The Dead"]
+voiced_by = "Jan"
+role = "the war's dead, speaking collectively"
+image = "{tmp_path / "cast" / "rex_ref.jpg"}"
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Jan")
+
+    cfg = load_config(config_path)
+
+    assert cfg.cast["The Dead"].image == tmp_path / "cast" / "rex_ref.jpg"
+    assert cfg.cast["The Dead"].image != cfg.cast["Jan"].image
+
+
+def test_voiced_by_naming_an_unknown_entry_raises(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Jan]
+role = "Kashay Besmertny the Deathless, an immortal watchman"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+
+[cast."The Dead"]
+voiced_by = "Nobody"
+role = "the war's dead, speaking collectively"
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Jan")
+
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError, match="89"):
+        load_config(config_path)
+
+    assert "Nobody" in caplog.text
+
+
+def test_voiced_by_naming_itself_raises(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast."The Dead"]
+voiced_by = "The Dead"
+role = "the war's dead, speaking collectively"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="The Dead")
+
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError, match="89"):
+        load_config(config_path)
+
+    assert "itself" in caplog.text
+
+
+def test_voiced_by_chain_raises(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """No chains (CLAUDE.md's recurrence-relation hazard): an entry named by
+    voiced_by must not itself set voiced_by."""
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Jan]
+role = "Kashay Besmertny the Deathless, an immortal watchman"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+
+[cast."The Dead"]
+voiced_by = "Jan"
+role = "the war's dead, speaking collectively"
+
+[cast.Echo]
+voiced_by = "The Dead"
+role = "an echo of the dead"
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Jan")
+
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError, match="89"):
+        load_config(config_path)
+
+    assert "chain" in caplog.text.lower()
+
+
+def test_voiced_by_does_not_excuse_a_plain_entry_from_needing_its_own_image(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """image is optional ONLY for an entry that sets voiced_by -- every other
+    entry still fails with the existing message."""
+    _create_default_assets(tmp_path)
+    cast_block = """
+[cast.Dianne]
+role = "Lead Vocalist, smiling constantly, oblivious"
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block)
+
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError, match="cast.Dianne.image"):
+        load_config(config_path)
+
+    assert "cast.Dianne.image" in caplog.text
+
+
+# --------------------------------------------------------------------------- #
 # Demeanour (issue #74)
 # --------------------------------------------------------------------------- #
 

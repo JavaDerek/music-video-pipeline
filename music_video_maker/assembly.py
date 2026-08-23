@@ -15,9 +15,9 @@ Two non-negotiable invariants (see project ``CLAUDE.md``):
    chunk is present, which is why gaps are validated *before* concat runs.
 
 Nothing here imports ComfyUI, torch, or pydub -- only ``contracts``,
-``luminance`` (itself contracts-and-stdlib-only) and the stdlib. The
-subprocess runner is injectable so unit tests can assert on the exact
-argument lists without ever invoking a real ``ffmpeg`` binary.
+``luminance``/``scenecuts`` (themselves contracts-and-stdlib-only) and the
+stdlib. The subprocess runner is injectable so unit tests can assert on the
+exact argument lists without ever invoking a real ``ffmpeg`` binary.
 
 **Post-render darkness check (issue #77).** Before concat runs, every
 available chunk's video is sampled for its ending luminance via
@@ -30,6 +30,23 @@ every lint in ``shot_plan.py`` follows. The whole check is wrapped in its own
 try/except here too, on top of ``luminance``'s own internal guards -- a
 Stage-5 smell test must never be the reason a finished render doesn't get
 written.
+
+**Post-render scene-cut check (issue #81), same shape.** Also before concat,
+every available chunk is scanned for a cut *inside* what was authored as one
+continuous take, via :func:`music_video_maker.scenecuts.check_scene_cuts` --
+same injected-runner reuse, same never-raises internal guards, same second
+try/except here, same "logged loudly, never blocks" discipline. See
+``scenecuts.py``'s module docstring for the two-corpus measurement behind
+its default threshold.
+
+A flagged chunk here is also a chained-path hazard the check does not
+detect: on the chained I2V path (project ``CLAUDE.md``, "the seed frame IS
+the identity conditioning"), a chunk that cut to a different scene hands the
+*next* chunk a final frame from a shot nobody authored. Wiring the actual
+``i2v_chain_scope`` lookup into this module to detect that mechanically was
+judged not worth the coupling for this issue; the ERROR log line below names
+the hazard in text instead, so it reaches whoever reads the log without this
+module needing to know anything about continuity.
 """
 
 from __future__ import annotations
@@ -42,6 +59,8 @@ from pathlib import Path
 
 from music_video_maker.contracts import AudioChunk, ChunkResult, ChunkStatus, RunState
 from music_video_maker.luminance import DEFAULT_DARK_FLOOR, DarkChunkWarning, check_dark_chunks
+from music_video_maker.scenecuts import DEFAULT_SCENE_THRESHOLD, SceneCutWarning
+from music_video_maker.scenecuts import check_scene_cuts as _run_scene_cut_check
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +132,13 @@ class AssemblyResult:
     (issue #77) -- informational only. The video was still assembled; a
     non-empty tuple here means a human should look at these chunks before
     trusting the final cut, not that anything failed."""
+    scene_cut_warnings: tuple[SceneCutWarning, ...] = ()
+    """Chunks containing at least one scene cut inside what was authored as
+    a single continuous take (issue #81) -- informational only, same as
+    :attr:`dark_chunk_warnings`. A non-empty tuple here means a human should
+    look at these chunks -- and, on the chained I2V path, that the *next*
+    chunk's seed frame may not depict what its prompt describes -- not that
+    anything failed."""
 
 
 def _escape_concat_path(path: Path) -> str:
@@ -251,6 +277,9 @@ def assemble_final_video(
     check_luminance: bool = True,
     luminance_floor: float = DEFAULT_DARK_FLOOR,
     luminance_runner: SubprocessRunner | None = None,
+    check_scene_cuts: bool = True,
+    scene_cut_threshold: float = DEFAULT_SCENE_THRESHOLD,
+    scene_cut_runner: SubprocessRunner | None = None,
 ) -> AssemblyResult:
     """Concat every chunk's rendered video (chronological ``chunk_id`` order)
     and mux the master audio track over it.
@@ -265,6 +294,11 @@ def assemble_final_video(
     runner already used for concat/mux is enough to exercise or disable it in
     tests. The check never raises and never blocks assembly; see
     :func:`music_video_maker.luminance.check_dark_chunks`.
+
+    ``check_scene_cuts`` (default ``True``) runs the issue #81 scene-cut
+    check the same way, using ``scene_cut_runner`` if given or ``runner``
+    otherwise. Also never raises and never blocks assembly; see
+    :func:`music_video_maker.scenecuts.check_scene_cuts`.
     """
     runner = runner or _default_runner
     output_dir = Path(output_dir)
@@ -313,6 +347,33 @@ def assemble_final_video(
                 [w.chunk_id for w in dark_chunk_warnings],
             )
 
+    scene_cut_warnings: tuple[SceneCutWarning, ...] = ()
+    if check_scene_cuts:
+        try:
+            scene_cut_warnings = _run_scene_cut_check(
+                [c for c in chunks if c.chunk_id in available_ids],
+                result_map,
+                threshold=scene_cut_threshold,
+                runner=scene_cut_runner or runner,
+            )
+        except Exception:  # noqa: BLE001 - a smell test must never block assembly.
+            logger.exception(
+                "The issue #81 scene-cut check raised unexpectedly -- skipping it and "
+                "continuing with assembly. This must never abort a run."
+            )
+            scene_cut_warnings = ()
+        if scene_cut_warnings:
+            logger.error(
+                "Assembly: %d chunk(s) contain a scene cut inside a single take "
+                "(scene>%.2f) -- a human should check these before trusting the final "
+                "video, and a flagged chunk's final frame is an unauthored seed on the "
+                "chained path (its identity conditioning for the next chunk may not "
+                "depict what that chunk's prompt describes): %s",
+                len(scene_cut_warnings),
+                scene_cut_threshold,
+                [w.chunk_id for w in scene_cut_warnings],
+            )
+
     concat_file = output_dir / CONCAT_LIST_FILENAME
     write_concat_file(video_paths, concat_file)  # type: ignore[arg-type]
 
@@ -339,4 +400,5 @@ def assemble_final_video(
         concat_args=tuple(concat_args),
         mux_args=tuple(mux_args),
         dark_chunk_warnings=dark_chunk_warnings,
+        scene_cut_warnings=scene_cut_warnings,
     )

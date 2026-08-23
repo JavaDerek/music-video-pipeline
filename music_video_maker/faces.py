@@ -171,6 +171,71 @@ being non-frontal in a way a benchmark portrait pair is not, and exactly why
 this constant is measured against this project's own material rather than
 imported from someone else's calibration."""
 
+DEFAULT_INSPECTION_FLOOR = 0.70
+"""Score floor for a *second*, inspection-only detector call (issue #93) --
+never the primary decision floor, which stays :data:`DEFAULT_SCORE_THRESHOLD`
+(0.9), untouched. This exists to answer a different question than the
+primary call: not "is there a face confident enough to condition on", but
+"did the detector see *anything* down there, or genuinely nothing at all".
+
+#93 was filed as a detector recall bug ("0.0% on two obvious faces") and that
+diagnosis did not survive measurement: the run-local scan script that
+produced those zeros had a stale, mismatched input directory and had never
+actually read the frames it claimed to (see :mod:`music_video_maker.facescan`
+and its README section). The detector itself was correct on both frames. But
+the proposal it was filed alongside is still right on its own terms -- a bare
+zero from :func:`detect_faces` has never meant "no face"; it has only ever
+meant "nothing cleared ``score_threshold``" -- and that is a distinction a
+plain CSV count could never express.
+
+Calibrated on the 27 chunks of the "Deathless" ``chunks_v12`` render that
+score 0.0% face presence at the 0.9 gate (324 sampled frames, 12/chunk),
+scored per candidate floor for whether *any* sampled frame in the chunk
+turns up a candidate at all:
+
+=====  ===========================  ==========================
+floor  chunk-level "inconclusive"   frame-level candidate rate
+=====  ===========================  ==========================
+0.15   26/27  (96.3%)                265/324  (81.8%)
+0.30   24/27  (88.9%)                190/324  (58.6%)
+0.50   22/27  (81.5%)                132/324  (40.7%)
+0.70   16/27  (59.3%)                106/324  (32.7%)
+0.80   13/27  (48.1%)                 99/324  (30.6%)
+=====  ===========================  ==========================
+
+Excluded candidates, measured and rejected:
+
+- **0.15 -- rejected.** 96.3% of the zero-scoring chunks turn up a
+  candidate at this floor -- a verdict that fires on nearly every zero
+  qualifies nothing. Worse, its extra candidates are not reliably
+  face-shaped: chunk 7 of ``chunks_v12`` turns up a 0.239-confidence box at
+  ~4.0s that is, checked against the actual pixels, the *back of her head*
+  (hair, no face at all). YuNet is correct to score it low; a 0.15 floor
+  would wrongly promote a true absence to "inconclusive".
+- **0.05 and 0.01 -- rejected.** At 0.05, YuNet emits 4-13 boxes per frame,
+  including boxes 0.60-1.07x the area of the *entire frame* -- a "face"
+  larger than the frame it was found in is not a face, it is noise. At
+  0.01, 22-112 boxes per frame.
+- **0.80 -- plausible, not chosen.** 48.1% vs. 0.70's 59.3% is a small move
+  for a full extra step, and 0.80 sits close enough to the 0.9 primary gate
+  that "inconclusive" starts to mean "nearly cleared it" rather than
+  "genuinely uncertain". 0.70 leaves a visible band between the two.
+
+0.70 is where the split becomes informative: 16 of 27 zero-scoring chunks
+turn up a real candidate worth a second look, 11 do not -- both
+``inconclusive`` and ``absent`` become claims worth making, which they are
+not at 0.15 (``absent`` fires on only 1 chunk of 27) or below. The near-miss
+it keeps is a real one, checked on pixels: chunk 76 of the same render
+scores 0.7828 at ~4.0s -- a hat, glasses and full beard plainly in frame,
+missed by the 0.9 gate for exactly the reason #93 was filed, and precisely
+the case ``inconclusive`` exists to surface.
+
+One consequence of gathering at 0.70 rather than lower:
+:attr:`FaceObservation.candidate_scores` holds only near-misses, not the
+full low-confidence tail -- deliberate, since the measured tail below 0.70
+is mostly noise (a back of a head at 0.24; boxes larger than the frame at
+0.05), and keeping it would dilute the field rather than inform it."""
+
 RECOGNITION_MODEL_FILENAME = "face_recognition_sface_2021dec.onnx"
 RECOGNITION_MODEL_SOURCE = "https://github.com/opencv/opencv_zoo/tree/main/models/face_recognition_sface"
 """Upstream source (issue #49). SFace is contributed by Yaoyao Zhong
@@ -244,6 +309,56 @@ class FaceObservation:
     when nothing was detected."""
     score: float
     """Detector confidence for that largest face; ``0.0`` when none."""
+
+    candidate_scores: tuple[float, ...] = ()
+    """Every detection's confidence from a *second*, inspection-only detector
+    call at :attr:`inspection_floor` (issue #93), sorted descending. Empty
+    when no inspection pass ran, or when one ran and found nothing at all --
+    :attr:`verdict` is what distinguishes those two cases; this field alone
+    cannot. New field, defaulted, so every pre-#93 construction site
+    (positional or keyword) keeps working unchanged."""
+
+    inspection_floor: float | None = None
+    """The score floor :attr:`candidate_scores` was gathered at, or ``None``
+    if no inspection pass ran. ``None`` is not "zero" -- it means nobody
+    asked the second question at all, which is the honest state of every
+    call site that predates issue #93 (in particular the #47 seed-face gate,
+    which must never observe this and stays on the original single-call
+    path -- see :func:`detect_faces`'s docstring for why a second call, never
+    a lowered first one)."""
+
+    @property
+    def verdict(self) -> str:
+        """One of four states a bare ``face_count`` collapses into one bit.
+
+        Issue #93's corrected finding is that a run-local measurement script
+        read the *wrong render's* frames -- a provenance bug, not a detector
+        bug -- but its underlying proposal stands on its own: "no detection"
+        and "no face" are different claims, and a plain zero cannot tell you
+        which one it is. This property is what makes that inspectable:
+
+        * ``"detected"`` -- ``face_count > 0``. A face cleared
+          ``score_threshold`` outright.
+        * ``"inconclusive"`` -- nothing cleared ``score_threshold``, but an
+          inspection pass (:func:`detect_faces`'s ``inspect_floor``) found at
+          least one candidate down at that lower floor. This is the state a
+          bare CSV column could never express: the detector saw *something*
+          face-shaped, it just was not confident enough to act on.
+        * ``"absent"`` -- an inspection pass ran and found nothing at all,
+          even at the permissive floor. This is the one state that is
+          actually evidence of absence.
+        * ``"unexamined"`` -- ``face_count == 0`` and no inspection pass ran
+          (``inspection_floor is None``): we genuinely do not know. This is
+          the honest default for the legacy call shape (no ``inspect_floor``
+          passed), and it must be read plainly: **a bare zero from
+          detect_faces has never meant "no face" -- it has always meant
+          "nothing cleared score_threshold".** Every pre-#93 zero anywhere in
+          this codebase's measurements was in this state, not "absent"."""
+        if self.face_count > 0:
+            return "detected"
+        if self.inspection_floor is None:
+            return "unexamined"
+        return "inconclusive" if self.candidate_scores else "absent"
 
     def __bool__(self) -> bool:
         """``bool(observation)`` is "was anything detected at all".
@@ -361,6 +476,7 @@ def detect_faces(
     *,
     model_path: Path | str | None = None,
     score_threshold: float = DEFAULT_SCORE_THRESHOLD,
+    inspect_floor: float | None = None,
 ) -> FaceObservation:
     """Detect faces in ``frame_path`` with YuNet.
 
@@ -368,6 +484,12 @@ def detect_faces(
     chains -- keeps working without OpenCV installed. Raises
     :class:`FaceDetectionError` rather than propagating OpenCV's own errors,
     so callers have one thing to catch.
+
+    ``inspect_floor`` (issue #93) is ``None`` by default, which reproduces
+    the exact pre-#93 behaviour: one detector call at ``score_threshold``,
+    nothing more. Passing it (see :data:`DEFAULT_INSPECTION_FLOOR`) makes a
+    ``face_count == 0`` result inspectable rather than opaque -- see
+    :meth:`FaceObservation.verdict`.
     """
     cv2 = _import_cv2("seed frames cannot be checked for a face", "issue #47")
 
@@ -383,18 +505,53 @@ def detect_faces(
         raise FaceDetectionError(f"could not read seed frame {frame_path}")
 
     height, width = image.shape[:2]
+
+    # The primary decision -- byte-for-byte the same call this function has
+    # always made. detect_faces feeds the #47 gate, whose decision feeds
+    # chained_from, which is fingerprinted: this result must stay exactly
+    # what it has always been, whether or not a caller also asks for an
+    # inspection pass below.
     faces = _detect_yunet_faces(cv2, image, model, score_threshold)
 
     if faces is None or len(faces) == 0:
-        return FaceObservation(face_count=0, largest_fraction=0.0, score=0.0)
+        face_count, largest_fraction, score = 0, 0.0, 0.0
+    else:
+        # YuNet rows are [x, y, w, h, <5 landmarks>, score]; compare by area
+        # so the nearest face wins, which is the performer in every
+        # calibration frame where she is facing camera at all.
+        largest = _largest_face(faces)
+        face_count = len(faces)
+        largest_fraction = (float(largest[2]) * float(largest[3])) / float(width * height)
+        score = float(largest[-1])
 
-    # YuNet rows are [x, y, w, h, <5 landmarks>, score]; compare by area so the
-    # nearest face wins, which is the performer in every calibration frame
-    # where she is facing camera at all.
-    largest = _largest_face(faces)
-    fraction = (float(largest[2]) * float(largest[3])) / float(width * height)
+    if inspect_floor is None:
+        return FaceObservation(
+            face_count=face_count, largest_fraction=largest_fraction, score=score
+        )
+
+    # A SECOND, independent detector call at the (lower) inspection floor --
+    # never a replacement for the primary call above, and never implemented
+    # as "call once at inspect_floor and filter candidates >= score_threshold
+    # in Python". YuNet's score_threshold participates in its own internal
+    # non-max suppression, so a single low-floor call is not guaranteed to
+    # reproduce the same above-threshold survivors the primary call picked --
+    # two independent calls is the only way to keep the primary decision
+    # (fingerprinted, via the #47 gate) untouched while still answering "did
+    # the detector see anything down there at all" (issue #93).
+    inspection_faces = _detect_yunet_faces(cv2, image, model, inspect_floor)
+    if inspection_faces is None or len(inspection_faces) == 0:
+        candidate_scores: tuple[float, ...] = ()
+    else:
+        candidate_scores = tuple(
+            sorted((float(row[-1]) for row in inspection_faces), reverse=True)
+        )
+
     return FaceObservation(
-        face_count=len(faces), largest_fraction=fraction, score=float(largest[-1])
+        face_count=face_count,
+        largest_fraction=largest_fraction,
+        score=score,
+        candidate_scores=candidate_scores,
+        inspection_floor=inspect_floor,
     )
 
 
@@ -582,6 +739,7 @@ def build_seed_face_gate(
 
 
 __all__ = [
+    "DEFAULT_INSPECTION_FLOOR",
     "DEFAULT_MIN_FACE_FRACTION",
     "DEFAULT_MIN_FACE_SIMILARITY",
     "DEFAULT_SCORE_THRESHOLD",

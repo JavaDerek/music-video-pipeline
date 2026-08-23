@@ -356,9 +356,16 @@ def test_happy_path_every_chunk_renders_through_the_base_template_without_contin
     workflows = [s["workflow"] for s in rig.submitted]
     assert len(workflows) == 3
     assert all(_is_base(w) and not _is_i2v(w) for w in workflows)
-    # No continuity frame extraction (ffprobe / "-vf" select) without continuity enabled --
-    # Stage 5's concat/mux calls are the only ffmpeg invocations.
-    assert not any(call[0] == "ffprobe" or "-vf" in call for call in rig.ffmpeg.calls)
+    # Continuity's frame extraction (ffprobe, then ffmpeg's own last-frame
+    # grab) must not run when continuity is disabled -- Stage 5's concat/mux
+    # calls plus the #77 luminance and #81 scene-cut probes are the only
+    # legitimate ffmpeg invocations here. Discriminate on "-vframes", not
+    # bare "-vf": continuity.extract_last_frame is the only caller that
+    # passes it (its select-one-frame extraction), while both post-render
+    # probes also use "-vf" for their own, unrelated filter expressions --
+    # "-vf" stopped being unique to continuity the day a second check shipped,
+    # so don't revert this back to a bare "-vf" match.
+    assert not any(call[0] == "ffprobe" or "-vframes" in call for call in rig.ffmpeg.calls)
 
 
 # --------------------------------------------------------------------------- #

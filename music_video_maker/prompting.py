@@ -83,6 +83,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from pathlib import Path
 
 from music_video_maker.config import RunConfig
 from music_video_maker.contracts import AudioChunk, CastMember, ExpandedPrompt
@@ -232,6 +233,7 @@ def expand_prompt(
     """
     members = _resolve_active_members(config, chunk, subject)
     present_members = _resolve_present_members(config, chunk, present, members)
+    _warn_on_shared_reference_photo(chunk, members, present_members)
     prompt = _compose_prompt(
         config,
         members,
@@ -377,6 +379,46 @@ def _resolve_present_members(
         if member not in members:
             members.append(member)
     return tuple(members)
+
+
+def _warn_on_shared_reference_photo(
+    chunk: AudioChunk,
+    active: tuple[CastMember, ...],
+    present: tuple[CastMember, ...],
+) -> None:
+    """Warn -- never raise, never change what composes -- when this chunk
+    stages two *different* cast entries against the same reference photo
+    (issue #89).
+
+    The base H3 path (``MiniMaxH3ReferenceToVideo``) conditions on a
+    reference image per staged member. A ``voiced_by`` character with no
+    photo of its own inherits its performer's (see ``config.py``), which is
+    exactly right when that character is the only one in the shot -- but if
+    the performer is *also* staged, via ``present`` or as another active
+    member, the graph is asked to condition on one photograph for two
+    different identities at once. That is the same contradiction #82 measured
+    H3 resolving by morphing one character into the other mid-chunk, deliberately
+    introduced this time by a shared image rather than a config fallback.
+
+    This never blocks a render: a false positive here costs a log line, and
+    the design's own verification plan (``docs/design-voiced-as.md``) is what
+    settles whether the combination is actually safe to render, not a
+    refusal at prompt-composition time.
+    """
+    seen: dict[Path, str] = {}
+    for member in (*active, *present):
+        prior = seen.get(member.image)
+        if prior is not None and prior != member.name:
+            logger.warning(
+                "chunk_id=%s stages %r and %r against the same reference photo "
+                "%s -- the graph will condition on one photograph for two "
+                "different characters (issue #89)",
+                chunk.chunk_id,
+                prior,
+                member.name,
+                member.image,
+            )
+        seen.setdefault(member.image, member.name)
 
 
 def _present_clause(
