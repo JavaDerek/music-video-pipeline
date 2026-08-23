@@ -12,6 +12,7 @@ against the *config file's* directory, not the process cwd)::
     lyrics_file         = "lyrics.txt"
     global_style        = "Refestramus progressive rock music video, gently comic tone"
     cinematography      = "35mm film, shallow depth of field, warm natural light"  # issue #53
+    cinematography_profile = "profiles/refestramus-house-v1.toml"  # issue #55
     narrative_concept   = "Wandering through a surgery, kicking a life support plug out"
     setting             = "London, UK -- contemporary, overcast winter"   # issue #32
     global_appearance   = "everyone slim, trim and healthy looking"       # issue #31
@@ -87,6 +88,8 @@ from music_video_maker.faces import (
     RECOGNITION_MODEL_SOURCE,
     resolve_recognition_model_path,
 )
+from music_video_maker.profiles import LOOK_FIELDS as PROFILE_LOOK_FIELDS
+from music_video_maker.profiles import Profile, ProfileError, load_profile, resolve_look
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -485,6 +488,31 @@ class RunConfig:
     statement and belongs in :attr:`music_video_maker.shot_plan.ShotPlanEntry.camera`
     instead -- see that field's docstring for why sentence position matters
     there in a way it does not here."""
+
+    cinematography_profile: Profile | None = None
+    """Issue #55: a locked "house style" this run inherits look fields from --
+    :data:`music_video_maker.profiles.LOOK_FIELDS`, currently
+    ``cinematography``, ``face_treatment``, ``lora``, ``lora_strength`` and
+    ``lora_trigger``.
+
+    Without a lock, every video re-rolls the look from scratch and a
+    catalogue of videos has no through-line -- the way an A24 film is
+    identifiable before the title card, a body of work under one profile
+    should be too. This holds the *loaded* :class:`~music_video_maker.profiles.Profile`,
+    not the path a config named -- the path is on ``Profile.path`` if
+    needed.
+
+    The run config always wins on a field it sets itself (see
+    :func:`~music_video_maker.profiles.resolve_look`): a profile fills in
+    only the look fields this config left unset, never overrides one it
+    did set. The alternative -- profile beats run config -- would mean a
+    single video could never deviate from a house style without editing the
+    file every other video in the catalogue shares, which is exactly the
+    coupling that makes locking a look dangerous in the first place.
+
+    ``None`` (the default) means no profile: every config written before
+    this field existed keeps loading and rendering exactly as it always
+    has, since nothing here changes a value that config already sets."""
 
     between_chunk_min_free_vram_gb: float | None = None
     """Issue #23: optional free-VRAM floor re-checked *between* chunks.
@@ -1212,6 +1240,43 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
     merged.update(overrides)
 
     values: dict[str, object] = {}
+
+    # Issue #55: resolve cinematography_profile before any look field
+    # (cinematography, face_treatment, lora*) is read below, so a value the
+    # profile supplies can fill an unset field without disturbing the order
+    # those fields are already read in.
+    profile_value = merged.get("cinematography_profile")
+    profile: Profile | None
+    if isinstance(profile_value, Profile):
+        profile = profile_value
+    elif profile_value:
+        try:
+            profile = load_profile(_resolve_path(profile_value, base_dir))
+        except (ProfileError, OSError) as exc:
+            logger.exception("Failed to load cinematography_profile %s", profile_value)
+            raise ConfigError(f"cinematography_profile: {exc}") from exc
+    else:
+        profile = None
+
+    effective, overridden = resolve_look(profile, merged)
+    if profile is not None:
+        inherited = tuple(
+            field
+            for field in PROFILE_LOOK_FIELDS
+            if field in profile.values and merged.get(field) is None
+        )
+        for field in inherited:
+            merged[field] = effective[field]
+        logger.info(
+            "cinematography_profile %s v%d (%s): inherited %s; run config overrides %s",
+            profile.name,
+            profile.version,
+            profile.path,
+            inherited,
+            overridden,
+        )
+    values["cinematography_profile"] = profile
+
     for key in _SCALAR_FIELDS:
         values[key] = _require(merged, key)
 
