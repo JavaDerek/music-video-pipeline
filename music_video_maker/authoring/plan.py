@@ -23,12 +23,25 @@ Three things happen here, in order:
 
 3. **Revise, in two deliberately different tiers.** Errors must be fixed:
    targeted revision of the offending chunk ids, bounded at 2 rounds, then
-   abort and write nothing. Warnings get **one** round and then stop -- every
-   one of those lints is documented as "a false positive must never block a
-   run", and a loop that grinds them to zero will happily rewrite a correct
-   shot to please a heuristic. Whatever survives is written into the file as a
+   abort and write nothing. Warnings get **one** round, and it is **off by
+   default** (issue #87, ``revise_warnings=False``): measured on "Deathless"
+   ``shot_plan_v6.toml``, that round rewrote 37 of 80 shot lines away from
+   what the prose stage wrote, and running ``write`` a second time on
+   unchanged prose changed 41 lines relative to the first run -- it is a
+   model call, so its own output is not even stable. Every one of those
+   lints is documented as "a false positive must never block a run", so
+   spending a model call rewriting approved prose to satisfy one is a
+   *stronger* action than blocking, not a weaker one; a loop that grinds them
+   to zero would be stronger still, which is why the round -- when opted
+   into -- stops after exactly one pass regardless. Whatever survives (by
+   default, everything the check found) is written into the file as a
    ``# lint:`` comment above its entry, where the human reviewing the plan
    sees it in context rather than in a log they have already scrolled past.
+   Anything a revision round *did* change gets its own ``# revised`` comment
+   carrying the prose stage's original line, so that diff is visible in the
+   one file a reviewer actually opens -- not something they have to
+   reconstruct by loading ``.authoring/prose.json`` alongside it, which is
+   how the 37-line rewrite went unnoticed in the first place.
 
 Provenance (design section 8) lives in the file rather than a sidecar,
 because a sidecar gets separated from the plan the first time someone copies
@@ -153,6 +166,7 @@ def render_plan_toml(
     camera: Mapping[int, str] | None = None,
     present: Mapping[int, Sequence[str]] | None = None,
     lint_comments: Mapping[int | None, Sequence[str]] | None = None,
+    revisions: Mapping[int, tuple[str, str]] | None = None,
 ) -> str:
     """Compose the text of a generated ``shot_plan.toml``.
 
@@ -161,10 +175,17 @@ def render_plan_toml(
     cannot drift. Every other field is optional and omitted when absent, the
     same convention the hand-authored format already uses: an absent
     ``length_seconds`` means "no editorial opinion", never a default.
+
+    ``revisions`` (issue #87 item 2) is ``{chunk_id: (tier, original_text)}``
+    for every chunk a revision round actually changed and that stuck --
+    ``build_plan`` is what decides which chunks qualify. Absent or omitted
+    entries emit nothing, so a caller that never mentions it (every call site
+    before this one) gets byte-identical output to before.
     """
     camera = dict(camera or {})
     present = {k: list(v) for k, v in (present or {}).items()}
     lint_comments = {k: list(v) for k, v in (lint_comments or {}).items()}
+    revisions = dict(revisions or {})
     beats_by_id = {beat.chunk_id: beat for beat in beats}
 
     lines = [
@@ -193,6 +214,18 @@ def render_plan_toml(
 
         for note in lint_comments.get(chunk.chunk_id, ()):
             block.append(f"# lint: {_comment(note)}")
+
+        if chunk.chunk_id in revisions:
+            tier, original = revisions[chunk.chunk_id]
+            # Same whitespace-collapse-and-quote-swap as the `# lyric:`
+            # comment above: this is a free-form comment, not a TOML value,
+            # so a quote in the original prose can never make it look like
+            # the comment ended early.
+            quoted = _comment(original).replace('"', "'")
+            block.append(
+                f"# revised by the lint round ({tier} tier); the prose stage wrote: "
+                f'"{quoted}"'
+            )
 
         duration = chunk.end - chunk.start
         frames = f", {chunk.frame_count} frames" if chunk.frame_count is not None else ""
@@ -462,6 +495,19 @@ class BuiltPlan:
     cost record. Untyped here so this module stays free of any dependency on
     the prose stage -- it takes the reviser as a callable."""
 
+    lint_round_edits: dict[int, tuple[str, str]] = field(default_factory=dict)
+    """``{chunk_id: (tier, original_text)}`` for every shot line a revision
+    round changed relative to what the *prose stage* supplied (the ``shots``
+    argument ``build_plan`` was called with) and that is still different in
+    the plan actually written -- a chunk revised and then rolled back is not
+    here, and neither is one a revision happened to reproduce verbatim.
+
+    ``.authoring/prose.json`` already holds the same originals, but nothing
+    forced anyone to load it next to the written plan and diff the two --
+    which is exactly how a 37-of-80-line rewrite (issue #87) went unnoticed.
+    This field, and the ``# revised`` comment ``render_plan_toml`` composes
+    from it, put the diff in the one file a reviewer actually opens."""
+
 
 def build_plan(
     config,
@@ -476,6 +522,7 @@ def build_plan(
     extra_checks=None,
     scratch_dir: Path | None = None,
     stageable_nouns: Sequence[str] = (),
+    revise_warnings: bool = False,
 ) -> BuiltPlan:
     """Compose, check, revise, and annotate -- the loop of design section 6.
 
@@ -491,17 +538,45 @@ def build_plan(
     sentence a warning was about -- annotating the file with a complaint about
     a sentence that no longer exists is worse than not annotating it.
 
-    The tiers are not symmetric and must not be made so. Errors get up to
-    :data:`MAX_ERROR_ROUNDS` and then abort with nothing written; warnings get
+    The tiers are not symmetric and must not be made so. Errors always get up
+    to :data:`MAX_ERROR_ROUNDS` and then abort with nothing written -- a
+    generated plan is not allowed to ship broken. Warnings get, at most,
     exactly one round -- written as a single ``if`` rather than a bounded loop
-    so there is no number to tune upward -- because every one of those lints is
-    documented as a heuristic firing on prose a human wrote deliberately.
+    so there is no number to tune upward -- and that round does not run at all
+    unless ``revise_warnings`` says so (issue #87, default ``False``).
+
+    Every one of the warning-tier lints is documented as a heuristic firing on
+    prose a human wrote deliberately ("a false positive must never block a
+    run"), so spending a model call rewriting approved prose to satisfy one is
+    a *stronger* action than blocking, not a weaker one -- it should be opted
+    into, not assumed. Measured on "Deathless" ``shot_plan_v6.toml``: the
+    round rewrote 37 of 80 shot lines away from what the prose stage wrote,
+    and running ``write`` a second time on the *same* unchanged prose changed
+    41 lines relative to the first run, because the round is itself a model
+    call and its output is not stable between runs. With ``revise_warnings``
+    left at its default, every warning the check produced survives untouched
+    and is written into the file as a ``# lint:`` comment, exactly as before
+    this option existed. With it set, behaviour is exactly the one round this
+    project shipped with, including the rollback-on-new-errors path below.
+
+    Whichever tier revises a chunk's text, and whether that revision survives
+    to the returned plan, is tracked and surfaced as
+    :attr:`BuiltPlan.lint_round_edits` (issue #87 item 2) -- a chunk whose
+    final text differs from what ``shots`` arrived with is marked with the
+    tier that produced the difference, so a reviewer can see a revision
+    round's actual footprint in the one file they open, rather than having to
+    load ``.authoring/prose.json`` alongside it and diff by hand.
     """
     shots = dict(shots)
+    original_shots = dict(shots)
     present = dict(present or {})
     spent: list[object] = []
+    chunk_tier: dict[int, str] = {}
 
-    def compose(comments: Mapping[int | None, Sequence[str]] | None = None) -> str:
+    def compose(
+        comments: Mapping[int | None, Sequence[str]] | None = None,
+        revisions: Mapping[int, tuple[str, str]] | None = None,
+    ) -> str:
         return render_plan_toml(
             chunks,
             beats,
@@ -510,6 +585,7 @@ def build_plan(
             camera=camera,
             present=present,
             lint_comments=comments,
+            revisions=revisions,
         )
 
     def inspect() -> PlanCheck:
@@ -545,6 +621,8 @@ def build_plan(
         revision = reviser(shots, objections)
         spent.extend(revision.driver_results)
         shots.update(revision.shots)
+        for chunk_id in revision.shots:
+            chunk_tier[chunk_id] = "error"
         check = inspect()
 
     if not check.ok:
@@ -561,7 +639,7 @@ def build_plan(
 
     if check.warnings:
         objections = objections_by_chunk(check.warnings)
-        if objections:
+        if revise_warnings and objections:
             logger.info(
                 "Candidate plan has %d warning(s) on chunk(s) %s; one revision round, then "
                 "whatever survives is written into the file as a comment",
@@ -569,22 +647,28 @@ def build_plan(
                 sorted(objections),
             )
             before_revision = dict(shots)
+            tier_before_round = dict(chunk_tier)
             revision = reviser(shots, objections)
             spent.extend(revision.driver_results)
             shots.update(revision.shots)
+            for chunk_id in revision.shots:
+                chunk_tier[chunk_id] = "warning"
             after = inspect()
             if not after.ok:
                 # A revision that fixed a heuristic and broke the loader is
                 # strictly worse than the warning it was chasing. Roll the
                 # *prose* back too, not just the verdict -- keeping the new
                 # lines while reporting the old warnings would write out a
-                # plan that neither check ever passed.
+                # plan that neither check ever passed. Roll the tier
+                # bookkeeping back with it: this round's edits never happened,
+                # as far as the written plan is concerned.
                 logger.warning(
                     "The warning revision introduced %d error(s); rolling back to the "
                     "pre-revision prose and keeping its warnings instead.",
                     len(after.errors),
                 )
                 shots = before_revision
+                chunk_tier = tier_before_round
             else:
                 check = after
 
@@ -595,11 +679,26 @@ def build_plan(
             "they are advisory, and some of them are false positives",
             len(surviving),
         )
+
+    lint_round_edits = {
+        chunk_id: (tier, original_shots.get(chunk_id, ""))
+        for chunk_id, tier in chunk_tier.items()
+        if shots.get(chunk_id, "") != original_shots.get(chunk_id, "")
+    }
+    if lint_round_edits:
+        logger.info(
+            "%d shot line(s) differ from what the prose stage wrote, after the revision "
+            "round(s); marked '# revised' in the file: chunk(s) %s",
+            len(lint_round_edits),
+            sorted(lint_round_edits),
+        )
+
     return BuiltPlan(
-        text=compose(lint_comments_for(surviving)),
+        text=compose(lint_comments_for(surviving), lint_round_edits),
         shots=shots,
         surviving_warnings=surviving,
         revision_results=tuple(spent),
+        lint_round_edits=lint_round_edits,
     )
 
 

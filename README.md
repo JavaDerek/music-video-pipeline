@@ -1016,7 +1016,8 @@ mvm-author --config run.toml photography --candidates 3   # three looks, side by
 mvm-author --config run.toml photography --pick 2         # freeze one, no model call
 mvm-author --config run.toml prose               # the shot lines -> .authoring/prose.json
 mvm-author --config run.toml prose --groups 3-5 --notes "stop putting her in doorways"
-mvm-author --config run.toml write               # compose, lint, revise -> shot_plan.toml
+mvm-author --config run.toml write               # compose, lint, revise errors -> shot_plan.toml
+mvm-author --config run.toml write --revise-warnings   # also spend a call on warning-tier lints
 mvm-author --config run.toml all                 # every stage, stopping for approval
 mvm-author --config run.toml status              # what's been generated, and whether it's stale
 ```
@@ -1080,11 +1081,23 @@ symmetric:
 - **Errors** (a blank line, a malformed entry, drift) get a *targeted*
   revision of just the offending chunks, bounded at two rounds. Then it
   aborts and writes nothing.
-- **Warnings** get exactly one round, and whatever survives is written into
-  the file as a `# lint:` comment above its entry. They are not ground to
-  zero on purpose: every one of these lints is documented as a heuristic
-  firing on prose a human wrote deliberately, and a loop that retried until
-  they went quiet would happily rewrite a correct shot to please one.
+- **Warnings** get, at most, exactly one round, and it is **off by default**
+  (`--revise-warnings` to opt in). Measured on "Deathless"
+  `shot_plan_v6.toml`: that round rewrote 37 of 80 shot lines away from what
+  the prose stage wrote, and running `write` a second time on the same,
+  unchanged prose changed 41 lines relative to the first run — it is a model
+  call, so its own output is not stable between runs. Warnings are
+  documented as advisory ("a false positive must never block a run"), so
+  spending a model call rewriting approved prose to satisfy one is a
+  *stronger* action than blocking, not a weaker one; ground to zero it never
+  is, on purpose, because a loop that retried until they went quiet would
+  happily rewrite a correct shot to please a heuristic. With the default,
+  every warning the check finds is written into the file as a `# lint:`
+  comment above its entry and nothing is rewritten to silence it. Whatever a
+  revision round *does* change — either tier — is marked with its own
+  `# revised` comment quoting exactly what the prose stage wrote, so the diff
+  is visible in the file itself rather than something you have to reconstruct
+  by loading `.authoring/prose.json` next to it.
 
 `chunk_id` and `start` are copied from the chunks, never from anything a
 model said, so a generated plan loaded back against the run it was generated

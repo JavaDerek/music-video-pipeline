@@ -951,6 +951,82 @@ def test_write_works_with_no_photography_at_all(tmp_path, monkeypatch):
     assert load_shot_plan(config_path.parent / "shot_plan.toml")[0].camera is None
 
 
+# --------------------------------------------------------------------------- #
+# Issue #87 item 3: `--revise-warnings` (default off) reaches `build_plan`.
+# --------------------------------------------------------------------------- #
+
+
+def _spy_on_build_plan(monkeypatch, captured: dict):
+    """Records the ``revise_warnings`` kwarg `write`/`all` pass through,
+    while still calling the real ``build_plan`` so the rest of the command
+    behaves normally."""
+    real_build_plan = auth_cli.plan_module.build_plan
+
+    def spy(*args, **kwargs):
+        captured["revise_warnings"] = kwargs.get("revise_warnings")
+        return real_build_plan(*args, **kwargs)
+
+    monkeypatch.setattr(auth_cli.plan_module, "build_plan", spy)
+
+
+def test_write_defaults_to_not_revising_warnings(tmp_path, monkeypatch):
+    config_path = _author_through_prose(tmp_path, monkeypatch)
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([]))
+    captured: dict = {}
+    _spy_on_build_plan(monkeypatch, captured)
+
+    assert auth_cli.main(["--config", str(config_path), "write"]) == auth_cli.EXIT_SUCCESS
+
+    assert captured["revise_warnings"] is False
+
+
+def test_write_revise_warnings_flag_reaches_build_plan(tmp_path, monkeypatch):
+    config_path = _author_through_prose(tmp_path, monkeypatch)
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([]))
+    captured: dict = {}
+    _spy_on_build_plan(monkeypatch, captured)
+
+    exit_code = auth_cli.main(
+        ["--config", str(config_path), "write", "--revise-warnings"]
+    )
+
+    assert exit_code == auth_cli.EXIT_SUCCESS
+    assert captured["revise_warnings"] is True
+
+
+def test_write_reports_lines_rewritten_by_the_lint_round(tmp_path, monkeypatch, capsys):
+    """`_cmd_write` prints a line naming how many shot lines a revision round
+    rewrote and that they are marked `# revised` in the file -- so a reviewer
+    sees it without having to open the plan and grep for the comment."""
+    config_path = _author_through_prose(tmp_path, monkeypatch)
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([]))
+    fake_built = SimpleNamespace(
+        text="# fake generated plan\n",
+        shots={},
+        surviving_warnings=(),
+        revision_results=(),
+        lint_round_edits={2: ("warning", "the original line"), 5: ("error", "another")},
+    )
+    monkeypatch.setattr(auth_cli.plan_module, "build_plan", lambda *a, **k: fake_built)
+
+    exit_code = auth_cli.main(["--config", str(config_path), "write"])
+
+    assert exit_code == auth_cli.EXIT_SUCCESS
+    out = capsys.readouterr().out
+    assert "2" in out
+    assert "# revised" in out
+
+
+def test_write_prints_nothing_extra_when_nothing_was_revised(tmp_path, monkeypatch, capsys):
+    config_path = _author_through_prose(tmp_path, monkeypatch)
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([]))
+
+    exit_code = auth_cli.main(["--config", str(config_path), "write"])
+
+    assert exit_code == auth_cli.EXIT_SUCCESS
+    assert "# revised" not in capsys.readouterr().out
+
+
 def test_all_runs_every_stage_and_writes_the_plan(tmp_path, monkeypatch, capsys):
     config_path = _write_config(tmp_path, lyrics_text="")
     # One driver shared across every stage: each stage constructs its own, so
@@ -968,6 +1044,43 @@ def test_all_runs_every_stage_and_writes_the_plan(tmp_path, monkeypatch, capsys)
     out = capsys.readouterr().out
     for stage in ("CONCEPT", "BEATS", "PHOTOGRAPHY", "PROSE", "WRITE"):
         assert stage in out
+
+
+def test_all_defaults_to_not_revising_warnings(tmp_path, monkeypatch):
+    config_path = _write_config(tmp_path, lyrics_text="")
+    driver = ScriptedDriver(
+        [VALID_CONCEPT, _beat_sheet(config_path), _photography_reply(config_path)]
+        + _prose_replies(config_path)
+    )
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: driver)
+    captured: dict = {}
+    _spy_on_build_plan(monkeypatch, captured)
+
+    exit_code = auth_cli.main(["--config", str(config_path), "all", "--yes"])
+
+    assert exit_code == auth_cli.EXIT_SUCCESS
+    assert captured["revise_warnings"] is False
+
+
+def test_all_revise_warnings_flag_reaches_write(tmp_path, monkeypatch):
+    """`all`'s own `--revise-warnings` has to travel through the hand-built
+    `argparse.Namespace` `_cmd_all` constructs for the final `write` call --
+    it is not one of `write`'s own parsed args at that point."""
+    config_path = _write_config(tmp_path, lyrics_text="")
+    driver = ScriptedDriver(
+        [VALID_CONCEPT, _beat_sheet(config_path), _photography_reply(config_path)]
+        + _prose_replies(config_path)
+    )
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: driver)
+    captured: dict = {}
+    _spy_on_build_plan(monkeypatch, captured)
+
+    exit_code = auth_cli.main(
+        ["--config", str(config_path), "all", "--yes", "--revise-warnings"]
+    )
+
+    assert exit_code == auth_cli.EXIT_SUCCESS
+    assert captured["revise_warnings"] is True
 
 
 def test_all_stops_rather_than_approving_itself_without_a_tty(tmp_path, monkeypatch, capsys):

@@ -332,6 +332,77 @@ def test_lint_comments_land_above_their_entry(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Issue #87 item 2: the revision round's own edits, visible in the file.
+# --------------------------------------------------------------------------- #
+
+
+def test_no_revisions_supplied_leaves_the_toml_byte_identical(tmp_path):
+    """The whole point of an optional keyword: a caller that never mentions
+    ``revisions`` gets exactly today's output, byte for byte."""
+    chunks = _chunks(["x", "y"])
+    args = (chunks, (_beat(1), _beat(2)), LINES)
+    without_kwarg = render_plan_toml(*args, provenance=PROVENANCE, camera=CAMERAS)
+    with_none = render_plan_toml(*args, provenance=PROVENANCE, camera=CAMERAS, revisions=None)
+
+    assert without_kwarg == with_none
+    assert "# revised" not in without_kwarg
+
+
+def test_revised_comment_lands_after_lint_comments_and_before_the_entry(tmp_path):
+    """Design: "after any # lint: comments and immediately before [[shot]]"."""
+    chunks = _chunks(["x", "y"])
+    text = render_plan_toml(
+        chunks,
+        (_beat(1), _beat(2)),
+        LINES,
+        provenance=PROVENANCE,
+        lint_comments={2: ["the lyric names 'printer' but this shot does not show it"]},
+        revisions={2: ("warning", 'She stood by the door, "waiting" for him')},
+    )
+
+    lines = text.splitlines()
+    lint_at = next(i for i, line in enumerate(lines) if line.startswith("# lint:"))
+    revised_at = next(i for i, line in enumerate(lines) if line.startswith("# revised"))
+    shot_at = next(
+        i for i, line in enumerate(lines) if line == "[[shot]]" and i > revised_at
+    )
+
+    assert revised_at == lint_at + 1
+    assert shot_at == revised_at + 1
+    assert "(warning tier)" in lines[revised_at]
+    assert 'the prose stage wrote: "' in lines[revised_at]
+    # Run through the same whitespace-collapse and quote-swap as `# lyric:`,
+    # so a quote embedded in the original prose can never look like the
+    # comment ended early.
+    assert "'waiting'" in lines[revised_at]
+    assert '"waiting"' not in lines[revised_at]
+
+    # Still valid TOML that loads.
+    (tmp_path / "p.toml").write_text(text)
+    assert set(load_shot_plan(tmp_path / "p.toml")) == {1, 2}
+
+
+def test_revised_comment_omitted_for_a_chunk_with_no_entry_in_the_mapping(tmp_path):
+    chunks = _chunks(["x", "y"])
+    text = render_plan_toml(
+        chunks,
+        (_beat(1), _beat(2)),
+        LINES,
+        provenance=PROVENANCE,
+        revisions={2: ("error", "the original")},
+    )
+
+    # Exactly one `# revised` comment in the whole file, and it belongs to
+    # chunk 2 -- immediately followed by that chunk's own `[[shot]]`/
+    # `chunk_id`, not chunk 1's.
+    lines = text.splitlines()
+    revised_at = [i for i, line in enumerate(lines) if line.startswith("# revised")]
+    assert len(revised_at) == 1
+    assert lines[revised_at[0] + 1] == "[[shot]]"
+    assert lines[revised_at[0] + 2] == "chunk_id = 2"
+
+
+# --------------------------------------------------------------------------- #
 # check_plan, through the real loaders
 # --------------------------------------------------------------------------- #
 
@@ -523,7 +594,8 @@ def test_an_unfixable_error_aborts_after_the_bound_and_writes_nothing(tmp_path):
 def test_a_warning_gets_exactly_one_revision_round_then_is_annotated(tmp_path):
     """Design section 6: "one revision round, then stop. Do not grind them to
     zero." A loop that retried until the heuristics were silent would happily
-    rewrite a correct shot to please one."""
+    rewrite a correct shot to please one. Opted in with ``revise_warnings``
+    (issue #87) -- the default is exercised separately below."""
     chunks = _chunks(["a first line", "a second line"])
     shots = {1: "She crosses Central Park as the shutters come down", 2: LINES[2]}
     # The reviser is unhelpful: it hands back a line that still trips the lint.
@@ -533,6 +605,7 @@ def test_a_warning_gets_exactly_one_revision_round_then_is_annotated(tmp_path):
         _config(tmp_path), chunks, (_beat(1), _beat(2)), shots, provenance=PROVENANCE,
         reviser=reviser,
         camera=CAMERAS,
+        revise_warnings=True,
     )
 
     assert len(reviser.calls) == 1  # exactly one, never a second
@@ -552,6 +625,7 @@ def test_a_revision_that_breaks_the_plan_is_discarded(tmp_path):
         _config(tmp_path), chunks, (_beat(1), _beat(2)), shots, provenance=PROVENANCE,
         reviser=reviser,
         camera=CAMERAS,
+        revise_warnings=True,
     )
 
     # The prose is rolled back too, not just the verdict: keeping the new line
@@ -559,6 +633,108 @@ def test_a_revision_that_breaks_the_plan_is_discarded(tmp_path):
     assert built.shots[1] == shots[1]
     assert check_plan(built.text, _config(tmp_path), chunks).ok
     assert built.surviving_warnings
+    # Rolled back means it never happened, as far as the written file is
+    # concerned -- issue #87 item 2's "must NOT be marked".
+    assert built.lint_round_edits == {}
+    assert "# revised" not in built.text
+
+
+# --------------------------------------------------------------------------- #
+# Issue #87 item 3: the warning revision round is opt-in, defaulting off.
+# --------------------------------------------------------------------------- #
+
+
+def test_by_default_a_warning_spends_no_reviser_call_and_is_still_annotated(tmp_path):
+    """The default (``revise_warnings=False``): no reviser call, no model
+    call -- every warning the check produced survives untouched and is still
+    written into the file as a ``# lint:`` comment, exactly as if a round had
+    run and changed nothing."""
+    chunks = _chunks(["a first line", "a second line"])
+    shots = {1: "She crosses Central Park as the shutters come down", 2: LINES[2]}
+    reviser = _Reviser([{1: "would fix it, but must never be asked"}])
+
+    built = build_plan(
+        _config(tmp_path), chunks, (_beat(1), _beat(2)), shots, provenance=PROVENANCE,
+        reviser=reviser,
+        camera=CAMERAS,
+    )
+
+    assert reviser.calls == []  # no reviser call at all
+    assert built.shots[1] == shots[1]  # untouched
+    assert built.surviving_warnings
+    assert "# lint:" in built.text
+    assert "central park" in built.text.lower()
+    assert built.lint_round_edits == {}
+    assert "# revised" not in built.text
+
+
+def test_a_surviving_warning_revision_is_marked_with_the_prose_original(tmp_path):
+    """Issue #87 item 2: a line the warning round *did* change (and that
+    stuck) is marked in the composed TOML, carrying what the prose stage
+    actually wrote -- so a reviewer can see the diff without loading
+    ``.authoring/prose.json`` alongside it."""
+    chunks = _chunks(["a first line", "a second line"])
+    original = "She crosses Central Park as the shutters come down"
+    shots = {1: original, 2: LINES[2]}
+    fixed = "She crosses the market square as the shutters come down"
+    reviser = _Reviser([{1: fixed}])
+
+    built = build_plan(
+        _config(tmp_path), chunks, (_beat(1), _beat(2)), shots, provenance=PROVENANCE,
+        reviser=reviser,
+        camera=CAMERAS,
+        revise_warnings=True,
+    )
+
+    assert built.shots[1] == fixed
+    assert built.lint_round_edits[1] == ("warning", original)
+    assert (
+        f'# revised by the lint round (warning tier); the prose stage wrote: "{original}"'
+        in built.text
+    )
+
+
+def test_a_revision_reproducing_the_original_text_is_not_marked(tmp_path):
+    """The comparison is on text, not on "was it in the objection list" --
+    a chunk the reviser touched but which comes back byte-identical to what
+    the prose stage wrote is not a change worth flagging."""
+    chunks = _chunks(["a first line", "a second line"])
+    original = "She crosses Central Park as the shutters come down"
+    shots = {1: original, 2: LINES[2]}
+    reviser = _Reviser([{1: original}])  # "revises" to the same text
+
+    built = build_plan(
+        _config(tmp_path), chunks, (_beat(1), _beat(2)), shots, provenance=PROVENANCE,
+        reviser=reviser,
+        camera=CAMERAS,
+        revise_warnings=True,
+    )
+
+    assert built.lint_round_edits == {}
+    assert "# revised" not in built.text
+
+
+def test_an_error_tier_revision_is_marked_with_the_error_tier(tmp_path):
+    """The same bookkeeping applies to the error tier, which is unaffected by
+    ``revise_warnings`` and always runs."""
+    chunks = _chunks(["a line", ""])
+    beats = (_beat(1), _beat(2))
+    reviser = _Reviser([{2: LINES[2]}])
+
+    built = build_plan(
+        _config(tmp_path),
+        chunks,
+        beats,
+        {1: LINES[1]},  # chunk 2 is blank -> an error; chunk 2 was never in `shots`
+        provenance=PROVENANCE,
+        reviser=reviser,
+        camera=CAMERAS,
+    )
+
+    assert built.lint_round_edits[2] == ("error", "")
+    assert (
+        '# revised by the lint round (error tier); the prose stage wrote: ""' in built.text
+    )
 
 
 def test_a_clean_plan_calls_the_reviser_not_at_all(tmp_path):
@@ -715,6 +891,7 @@ def test_extra_checks_are_re_run_on_the_revised_text_not_the_original(tmp_path):
         reviser=reviser,
         camera=CAMERAS,
         extra_checks=extra_checks,
+        revise_warnings=True,
     )
 
     assert len(seen) > 1  # re-run, not carried over

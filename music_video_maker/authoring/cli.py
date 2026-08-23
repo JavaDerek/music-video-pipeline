@@ -194,6 +194,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Overwrite an existing plan. An authored shot plan is real work, so this "
         "refuses to clobber one without it -- the same rule as --prepare.",
     )
+    write_parser.add_argument(
+        "--revise-warnings",
+        action="store_true",
+        help="Spend one extra model call rewriting approved prose to satisfy "
+        "warning-tier lints (issue #87). Off by default: measured on 'Deathless' "
+        "shot_plan_v6.toml, this round rewrote 37 of 80 shot lines away from what the "
+        "prose stage wrote, and a second `write` on unchanged prose changed 41 lines "
+        "relative to the first -- the round is a model call, so its own output is not "
+        "stable. Warnings are advisory ('a false positive must never block a run'), so "
+        "spending a model call rewriting approved prose to satisfy one is a stronger "
+        "action than blocking, not a weaker one.",
+    )
 
     all_parser = subparsers.add_parser(
         "all",
@@ -216,6 +228,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Overwrite an existing plan at the output path.",
+    )
+    all_parser.add_argument(
+        "--revise-warnings",
+        action="store_true",
+        help="Same as `write --revise-warnings`: spend one extra model call rewriting "
+        "approved prose to satisfy warning-tier lints. Off by default -- see `write "
+        "--help` for the measured cost.",
     )
 
     subparsers.add_parser("status", help="Report every stage's state: ok, stale, or not started.")
@@ -918,10 +937,14 @@ def _cmd_write(args: argparse.Namespace) -> int:
             extra_checks=advisory,
             # Issue #87: the concrete objects this song's lyrics actually
             # name (issue #69's `reading.nouns`), so the shot-vs-lyric lint
-            # can stop firing on function words -- and so `write`'s one
-            # warning round stops spending a model call rewriting approved
-            # prose to satisfy them.
+            # can stop firing on function words -- and so a warning round,
+            # if one runs at all, stops spending a model call rewriting
+            # approved prose to satisfy them.
             stageable_nouns=tuple((concept.get("reading") or {}).get("nouns") or ()),
+            # Issue #87 item 3: off unless the operator asks for it -- see
+            # build_parser's --revise-warnings help text for the measured
+            # cost of turning it on.
+            revise_warnings=args.revise_warnings,
         )
     except (PlanError, DriverError, ProseValidationError):
         logger.exception("Could not compose a shot plan that loads cleanly")
@@ -943,6 +966,15 @@ def _cmd_write(args: argparse.Namespace) -> int:
         for issue in built.surviving_warnings:
             where = f"chunk {issue.chunk_id}" if issue.chunk_id is not None else "file"
             print(f"  [{where}] {issue.message}")
+    # Issue #87 item 2: the revision round's own footprint, surfaced the same
+    # way the surviving warnings are -- so a --revise-warnings run reports
+    # what it changed, not just what it left alone.
+    if built.lint_round_edits:
+        print(
+            f"{len(built.lint_round_edits)} shot line(s) were rewritten by the lint "
+            "revision round and are marked '# revised' in the file -- diff them against "
+            "what's quoted there before trusting the line."
+        )
     return EXIT_SUCCESS
 
 
@@ -1004,7 +1036,12 @@ def _cmd_all(args: argparse.Namespace) -> int:
 
     print(f"\n{'=' * 80}\nWRITE\n{'=' * 80}")
     return _cmd_write(
-        argparse.Namespace(config=args.config, out=args.out, force=args.force)
+        argparse.Namespace(
+            config=args.config,
+            out=args.out,
+            force=args.force,
+            revise_warnings=args.revise_warnings,
+        )
     )
 
 
