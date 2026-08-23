@@ -483,6 +483,50 @@ class ShotPlanEntry:
     before this field was rendered: falling straight through to
     ``config.setting`` exactly as it always did."""
 
+    conditions: str | None = None
+    """What the world looks like right now, inside its own ``setting`` and
+    at its own ``location`` (issue #83) -- weather, light, season, and the
+    persistent aftermath of events the video has already shown, e.g.
+    ``"snow"`` or ``"smoke, embers still rising from the collapsed tower"``.
+
+    The third continuity axis, not a facet of either of the first two.
+    ``setting`` (issue #32) anchors the world's *identity* -- one geography
+    for the whole video. ``location`` (issue #78) anchors *where inside it*
+    a character stands at a given moment. Neither says what that moment
+    *looks like*. A viewer on the second full "Deathless" render, three
+    consecutive chunks spanning about fifteen seconds: "4:44 buildings
+    explode (fine), 4:48 Jan and Dianne are climbing snow with no debris,
+    4:55 he is back on non-snowy tower" -- the world gained snow, lost the
+    aftermath of an explosion that had just happened, and lost the snow
+    again.
+
+    As with ``location``, this cannot be fixed in prose: a shot line may
+    not reference another shot (issue #61 -- each chunk renders from its
+    own prompt, for a model that has never seen any other), so "the debris
+    from before is still there" is unavailable by construction. Something
+    other than the shot lines has to carry it.
+
+    Authored by the beats stage from a small closed vocabulary the concept
+    stage defines for the song, the same shape as ``location`` and
+    ``beat_role``/``beat_group``: checkable before a word of prose exists,
+    never guessed from finished text. A generated value is validated
+    against that vocabulary at generation time; this module never sees the
+    concept that defines it and applies no vocabulary check of its own here
+    -- see ``authoring/conditions.py`` for the two checks that run over the
+    authored sequence (a state that flips and immediately reverts; a state
+    a `consequence` beat ended, returning later) and for the measured reason
+    this is a second axis beside ``location`` rather than a facet of one
+    combined record: run over the same real plan, the two checks have
+    opposite correctness shapes on ``location``'s own values -- a character
+    is *supposed* to move back and forth between places; the world is *not*
+    supposed to move back and forth between states.
+
+    ``None`` (the default) is "not authored", never a fabricated value --
+    true of every entry before this field existed and every hand-written
+    plan that does not use it. Unlike ``location``, there is no whole-video
+    fallback field for it to substitute for: an unset ``conditions``
+    composes nothing at all, via :func:`~music_video_maker.prompting._conditions_clause`."""
+
 
 def load_shot_plan(
     path: str | Path,
@@ -2346,7 +2390,7 @@ def lint_instrumental_focus_mismatch(
 ENTRY_KEYS = frozenset(
     {
         "chunk_id", "start", "shot", "focus", "length_seconds", "camera", "present",
-        "location", "subject",
+        "location", "subject", "conditions",
     }
 )
 """Every key this module actually reads out of a ``[[shot]]`` table."""
@@ -2430,6 +2474,7 @@ def _parse_entry(
         present=_parse_present(raw, chunk_id, path),
         location=_parse_location(raw, chunk_id, path),
         subject=_parse_subject(raw, chunk_id, path, cast_names),
+        conditions=_parse_conditions(raw, chunk_id, path),
     )
 
 
@@ -2568,6 +2613,30 @@ def _parse_location(raw: dict, chunk_id: object, path: Path) -> str | None:
             "a string"
         )
     return location.strip() or None
+
+
+def _parse_conditions(raw: dict, chunk_id: object, path: Path) -> str | None:
+    """Read the optional ``conditions`` field (issue #83). Absent/blank means
+    "not authored" -- never a fabricated default, same convention as
+    ``location``. Not validated against any closed vocabulary here: this
+    module never sees the concept that defines one, and a hand-written plan
+    is free to use the field or not at all. The generation-time closed-set
+    check lives in ``authoring/beats.py``, where the vocabulary actually is."""
+    conditions = raw.get("conditions")
+    if conditions is None:
+        return None
+    if not isinstance(conditions, str):
+        logger.error(
+            "Shot plan %s: chunk_id=%s has conditions=%r, which is not a string",
+            path,
+            chunk_id,
+            conditions,
+        )
+        raise ShotPlanError(
+            f"shot plan {path}: chunk_id={chunk_id} has conditions={conditions!r}; it must "
+            "be a string"
+        )
+    return conditions.strip() or None
 
 
 def _parse_length_seconds(raw: dict, chunk_id: object, path: Path) -> float | None:
@@ -2788,6 +2857,30 @@ def resolve_location(
     return entry.location if entry is not None else None
 
 
+def resolve_conditions(
+    plan: Mapping[int, ShotPlanEntry] | None, chunk: AudioChunk
+) -> str | None:
+    """This chunk's authored world-state tag (issue #83), or ``None`` when
+    the plan has no entry for it, the entry never set ``conditions``, or
+    (via :func:`_resolve_entry`) the plan itself is absent.
+
+    Shares :func:`_resolve_entry`'s drift check for the same reason
+    :func:`resolve_location`/:func:`resolve_camera`/:func:`resolve_present`
+    do: a stale plan must refuse every field the same way, not just the
+    ones the render loop consumes directly.
+
+    ``conditions`` **is** composed into a prompt -- ``cli.py`` passes this
+    function's return value into ``expand_prompt(..., conditions=...)``,
+    which adds it as its own sentence immediately after the "Location
+    continuity" sentence (see ``prompting._conditions_clause``). Unlike
+    ``location``, there is no whole-video fallback field for it to
+    substitute for: ``None`` means no conditions sentence is composed at
+    all, true of every chunk in a run whose plan does not use the field, or
+    has no plan."""
+    entry = _resolve_entry(plan, chunk)
+    return entry.conditions if entry is not None else None
+
+
 # --------------------------------------------------------------------------- #
 # Skeleton generation for --prepare (issue #52)
 # --------------------------------------------------------------------------- #
@@ -2902,6 +2995,7 @@ __all__ = [
     "load_shot_plan",
     "render_shot_plan_skeleton",
     "resolve_camera",
+    "resolve_conditions",
     "resolve_location",
     "resolve_shot",
     "resolve_subject",

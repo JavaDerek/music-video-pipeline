@@ -503,6 +503,98 @@ def test_location_composes_at_most_one_location_sentence(config: RunConfig, cast
 
 
 # --------------------------------------------------------------------------- #
+# Conditions (issue #83) -- the third continuity axis: what the world looks
+# like right now (weather, light, the aftermath of an event already shown),
+# as opposed to `setting`'s identity of the world or `location`'s position
+# within it. Composed as its own sentence, immediately after the "Location
+# continuity" sentence in both the base and chained variants -- never folded
+# into `_setting_clause`'s conditional phrasing, because a condition holds
+# whether or not the place is identifiable.
+# --------------------------------------------------------------------------- #
+
+CONDITIONS_TAG = "snow, embers still rising from the collapsed tower"
+
+
+def test_conditions_clause_composes_when_set(config: RunConfig, cast):
+    chunk = _chunk(text="", character=None)
+
+    result = expand_prompt(
+        config, chunk, shot="They cross the ridge", conditions=CONDITIONS_TAG
+    )
+
+    assert f"Conditions in this shot: {CONDITIONS_TAG}" in result.prompt
+
+
+def test_conditions_none_is_byte_identical_to_the_prompt_built_without_the_parameter(
+    config: RunConfig, cast
+):
+    """The one regression this clause must never cause: every pre-#83
+    caller (and every chunk a plan leaves untagged) never passes
+    `conditions` at all, so a prompt built with `conditions=None` must be
+    byte-identical to one built without the keyword argument in the call at
+    all."""
+    cfg = dataclasses.replace(config, setting=SETTING)
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+
+    without_param = expand_prompt(
+        cfg, chunk, shot="An intensive care corridor, monitors either side"
+    )
+    with_explicit_none = expand_prompt(
+        cfg, chunk, shot="An intensive care corridor, monitors either side", conditions=None
+    )
+
+    assert with_explicit_none.prompt == without_param.prompt
+    assert with_explicit_none.chained_prompt == without_param.chained_prompt
+    assert "Conditions in this shot" not in without_param.prompt
+
+
+def test_conditions_clause_composes_on_the_chained_variant_too(config: RunConfig, cast):
+    """Conditions are about the world, not identity, so -- unlike
+    appearance -- the clause must survive on the chained I2V variant exactly
+    like `location`/`camera` do."""
+    chunk = _chunk(text="", character=None)
+
+    result = expand_prompt(
+        config, chunk, shot="They cross the ridge", conditions=CONDITIONS_TAG
+    )
+
+    assert result.chained_prompt is not None
+    assert f"Conditions in this shot: {CONDITIONS_TAG}" in result.chained_prompt
+
+
+def test_conditions_clause_lands_immediately_after_the_location_sentence(
+    config: RunConfig, cast
+):
+    """No other clause -- not the character clause, not a second location
+    sentence -- may land between them."""
+    cfg = dataclasses.replace(config, setting=SETTING)
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+
+    prompt = expand_prompt(
+        cfg, chunk, shot="An intensive care corridor, monitors either side",
+        conditions=CONDITIONS_TAG,
+    ).prompt
+
+    assert (
+        "own described location is what is on screen. "
+        f"Conditions in this shot: {CONDITIONS_TAG}. Dianne, "
+    ) in prompt
+
+
+def test_two_prompts_differing_only_in_conditions_differ_in_text(config: RunConfig, cast):
+    """`ChunkFingerprint.prompt_hash` is computed over this composed text, so
+    two different `conditions` values must produce two different prompt
+    strings -- otherwise `--resume` would treat a chunk whose world-state tag
+    changed as unchanged and reuse a rendered mp4 for the wrong conditions."""
+    chunk = _chunk(text="", character=None)
+
+    snow = expand_prompt(config, chunk, shot="They cross the ridge", conditions="snow")
+    clear = expand_prompt(config, chunk, shot="They cross the ridge", conditions="clear")
+
+    assert snow.prompt != clear.prompt
+
+
+# --------------------------------------------------------------------------- #
 # Appearance (issue #31) -- attaches to the character, never to vocal action
 # --------------------------------------------------------------------------- #
 

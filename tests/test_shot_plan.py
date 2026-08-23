@@ -44,6 +44,7 @@ from music_video_maker.shot_plan import (
     load_shot_plan,
     render_shot_plan_skeleton,
     resolve_camera,
+    resolve_conditions,
     resolve_location,
     resolve_shot,
     resolve_subject,
@@ -2335,6 +2336,111 @@ def test_resolve_location_raises_on_drift_same_as_resolve_shot(tmp_path):
 
     with pytest.raises(ShotPlanDriftError):
         resolve_location(plan, _chunk(3, 21.17 + TOLERANCE_EXCEEDED, 30.0))
+
+
+# --------------------------------------------------------------------------- #
+# `conditions` field (issue #83)
+#
+# `setting` (#32) anchors the world's contents; `location` (#78) anchors
+# where each character is inside it. Neither says what the world *looks
+# like right now* -- weather, light, season, and the persistent aftermath
+# of events the video has already shown. `conditions` is the per-chunk
+# answer -- a tag drawn from a small enumerated set the concept stage
+# defines, assigned by the beats stage, and re-emitted here from the frozen
+# timeline like every other anchor. Mirrors `location` exactly: same
+# shape, same conventions, same drift check via `_resolve_entry`.
+# --------------------------------------------------------------------------- #
+
+
+def test_conditions_is_none_by_default(tmp_path):
+    path = _write_plan(
+        tmp_path, '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks"\n'
+    )
+    assert load_shot_plan(path)[0].conditions is None
+
+
+def test_conditions_is_read_from_the_entry(tmp_path):
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks"\n'
+        'conditions = "snow"\n',
+    )
+    assert load_shot_plan(path)[0].conditions == "snow"
+
+
+def test_a_non_string_conditions_is_rejected(tmp_path):
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks"\nconditions = 5\n',
+    )
+    with pytest.raises(ShotPlanError):
+        load_shot_plan(path)
+
+
+def test_a_blank_conditions_is_treated_as_unset(tmp_path):
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks"\nconditions = "   "\n',
+    )
+    assert load_shot_plan(path)[0].conditions is None
+
+
+def test_conditions_is_not_reported_as_an_unknown_entry_key(tmp_path, caplog):
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks"\nconditions = "snow"\n',
+    )
+
+    with caplog.at_level(logging.WARNING):
+        load_shot_plan(path)
+
+    assert "nothing reads" not in caplog.text
+
+
+def test_resolve_conditions_returns_the_authored_tag(tmp_path):
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks"\nconditions = "snow"\n',
+    )
+    plan = load_shot_plan(path)
+
+    assert resolve_conditions(plan, _chunk(0, 0.0, 5.167)) == "snow"
+
+
+def test_resolve_conditions_applies_even_when_shot_is_blank(tmp_path):
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = ""\nconditions = "smoke"\n',
+    )
+    plan = load_shot_plan(path)
+
+    assert resolve_shot(plan, _chunk(0, 0.0, 5.167)) is None
+    assert resolve_conditions(plan, _chunk(0, 0.0, 5.167)) == "smoke"
+
+
+def test_resolve_conditions_with_no_entry_returns_none(tmp_path, caplog):
+    path = _write_plan(
+        tmp_path, '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "only chunk zero"\n'
+    )
+    plan = load_shot_plan(path)
+
+    with caplog.at_level(logging.WARNING):
+        assert resolve_conditions(plan, _chunk(7, 40.0, 46.0)) is None
+
+
+def test_resolve_conditions_with_no_plan_returns_none():
+    assert resolve_conditions(None, _chunk(0, 0.0, 5.167)) is None
+
+
+def test_resolve_conditions_raises_on_drift_same_as_resolve_shot(tmp_path):
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 3\nstart = 21.17\nshot = "direction"\nconditions = "snow"\n',
+    )
+    plan = load_shot_plan(path)
+
+    with pytest.raises(ShotPlanDriftError):
+        resolve_conditions(plan, _chunk(3, 21.17 + TOLERANCE_EXCEEDED, 30.0))
 
 
 # --------------------------------------------------------------------------- #

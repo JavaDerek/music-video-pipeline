@@ -87,6 +87,7 @@ from music_video_maker.shot_plan import (
     lint_voiced_framing,
     load_shot_plan,
     resolve_camera,
+    resolve_conditions,
     resolve_location,
     resolve_present,
     resolve_shot,
@@ -631,6 +632,10 @@ def run_pipeline(
                 # whose world changes over its own runtime (the "Deathless"
                 # nuclear-glow finding).
                 location=resolve_location(plan, chunk),
+                # Issue #83: what the world looks like right now (weather,
+                # light, the aftermath of an event already shown) -- a third
+                # axis alongside location, composed as its own sentence.
+                conditions=resolve_conditions(plan, chunk),
             )
             for chunk in chunks
         }
