@@ -1523,16 +1523,38 @@ H3 starts the mouth at frame 0 of a chunk regardless of where in that chunk
 the voice actually starts, so this many seconds of a chunk's start is always
 out of phase with what is prompted.
 
-Measured on the real 80-chunk "Deathless" timeline (41 voiced chunks, before
-:func:`_prefer_vocal_onset` gets a chance to reduce any of them): offset >
-0.5s on 15 chunks, > 1.0s on 6 (chunk ids 20, 27, 37, 38, 41, 74), > 2.0s on
-2 (chunk 20 at 4.07s, chunk 38 at 3.30s). The issue that reported this by ear
-named exactly two chunks -- 38 (3.30s) and 41 (1.61s) -- and both clear 1.0s
-comfortably, while none of the other 13 chunks sitting between 0.5s and
-1.0s were ever reported as audible. That is exactly the line the issue's own
-proposal drew ("an offset above ~1s is probably always a defect"), and the
-corpus does not support tightening it to 0.5s -- the wider net would catch
-nothing the measurement can confirm is actually a problem.
+The threshold's original justification ("none of the other 13 chunks sitting
+between 0.5s and 1.0s were ever reported as audible") was **falsified** by a
+later viewing and is retired; keep reading for the re-derivation that
+replaces it. The constant itself is unchanged at 1.0s -- it is the reasoning
+that needed fixing, not the number.
+
+On a later, fully-rendered "Deathless" (v12), a viewer who described
+*symptoms* rather than timestamps named two chunks with "no vocals at the
+start but his mouth is moving, then perfectly in sync when the singing
+starts": chunks 38 (+2.588s) and 41 (+1.607s) -- **ranks 2 and 3 of 41**
+voiced chunks by leading offset. The two chunks they called perfect are 40
+(+0.098s) and 43 (+0.013s), ranks 26 and 29, and they volunteered the
+mechanism unprompted: "starts with singing -- perfect." This is a
+**replication**: an earlier viewing of a *different* render had already named
+the same two chunks (38 and 41) for the same symptom, by ear, before this
+metric existed.
+
+The counter-example is real and is **not** explained away: chunk 20 has the
+largest offset in the song (+2.650s) and has never been reported, on any
+render. A face detector scores it 0.0% face presence, which looks like the
+explanation and is wrong -- the frame shows a large, central, fully lit face
+tilted sharply upward, which YuNet cannot handle (see
+:mod:`music_video_maker.faces` and CLAUDE.md's note on it); the extreme head
+angle may make lip motion hard to read, but that is a guess, not a
+measurement. Any threshold derived from this data has to live with chunk 20
+not fitting it.
+
+Post-refinement distribution on the 41 voiced chunks of "Deathless": 29
+positive, 12 negative, 0 exactly zero; positive > 0.5s on 11, > 1.0s on 4
+(chunks 20, 38, 41, 74), > 2.0s on 2 (20 at +2.650s, 38 at +2.588s); worst
+negative -0.707s. See :func:`_log_leading_vocal_offset` for why only the
+positive side is warned on.
 """
 
 
@@ -1561,10 +1583,24 @@ def _log_leading_vocal_offset(
     is also true of a chunk demoted below :data:`_MIN_VOICED_FRACTION` and
     prompted as instrumental -- has no leading vocal offset to report and is
     skipped.
+
+    Issue #79 follow-up: both signs are counted and reported in the INFO
+    summary. A negative offset -- the first prompted word began BEFORE the
+    chunk did -- is the mirror defect: the mouth opens on a word whose audio
+    has already partly gone by, so it runs *late* rather than early. The
+    WARNING stays positive-side only: measured on "Deathless", 12 of 41
+    voiced chunks are negative, the worst is -0.707s and none reaches -1.0s,
+    so a negative-side warning at any threshold comparable to
+    :data:`LEADING_VOCAL_OFFSET_WARN_SECONDS` would never fire on the only
+    corpus there is to calibrate it against.
     """
     voiced_count = 0
+    positive_count = 0
+    negative_count = 0
+    zero_count = 0
     over_count = 0
-    worst: tuple[int, float, _Piece] | None = None
+    worst_positive: tuple[int, float, _Piece] | None = None
+    worst_negative: tuple[int, float, _Piece] | None = None
 
     for idx, piece in enumerate(covered):
         if not piece.members:
@@ -1575,47 +1611,62 @@ def _log_leading_vocal_offset(
             continue
         voiced_count += 1
         offset = onset - piece.start
-        if offset <= _EPS:
-            continue
-        if worst is None or offset > worst[1]:
-            worst = (idx, offset, piece)
-        if offset > LEADING_VOCAL_OFFSET_WARN_SECONDS:
-            over_count += 1
-            text = _text_within(prompted, piece.start, piece.end)
-            logger.warning(
-                "Chunk %d (%.3f-%.3fs) is prompted to sing starting %.3fs into its own span "
-                "(first word onset %.3fs) -- H3 starts the mouth at frame 0 regardless, so "
-                "the chunk is out of phase for its first %.3fs: %r (issue #79).",
-                idx,
-                piece.start,
-                piece.end,
-                offset,
-                onset,
-                offset,
-                text,
-            )
+
+        if offset > _EPS:
+            positive_count += 1
+            if worst_positive is None or offset > worst_positive[1]:
+                worst_positive = (idx, offset, piece)
+            if offset > LEADING_VOCAL_OFFSET_WARN_SECONDS:
+                over_count += 1
+                text = _text_within(prompted, piece.start, piece.end)
+                logger.warning(
+                    "Chunk %d (%.3f-%.3fs) is prompted to sing starting %.3fs into its own "
+                    "span (first word onset %.3fs) -- H3 starts the mouth at frame 0 "
+                    "regardless, so the chunk is out of phase for its first %.3fs: %r "
+                    "(issue #79).",
+                    idx,
+                    piece.start,
+                    piece.end,
+                    offset,
+                    onset,
+                    offset,
+                    text,
+                )
+        elif offset < -_EPS:
+            negative_count += 1
+            if worst_negative is None or offset < worst_negative[1]:
+                worst_negative = (idx, offset, piece)
+        else:
+            zero_count += 1
 
     if not voiced_count:
         return
-    if worst is None:
+    if worst_positive is None and worst_negative is None:
         logger.info(
             "Leading vocal offset: %d voiced chunk(s), all start at their own first prompted "
             "word.",
             voiced_count,
         )
         return
-    worst_idx, worst_offset, worst_piece = worst
-    logger.info(
-        "Leading vocal offset: %d voiced chunk(s), %d over the %.2fs warning threshold; "
-        "worst is chunk %d at %.3fs (%.3f-%.3fs).",
-        voiced_count,
-        over_count,
-        LEADING_VOCAL_OFFSET_WARN_SECONDS,
-        worst_idx,
-        worst_offset,
-        worst_piece.start,
-        worst_piece.end,
+
+    summary = (
+        f"Leading vocal offset: {voiced_count} voiced chunk(s) ({positive_count} positive, "
+        f"{negative_count} negative, {zero_count} exactly zero), {over_count} over the "
+        f"{LEADING_VOCAL_OFFSET_WARN_SECONDS:.2f}s warning threshold"
     )
+    if worst_positive is not None:
+        idx, offset, piece = worst_positive
+        summary += (
+            f"; worst positive is chunk {idx} at +{offset:.3f}s "
+            f"({piece.start:.3f}-{piece.end:.3f}s)"
+        )
+    if worst_negative is not None:
+        idx, offset, piece = worst_negative
+        summary += (
+            f"; worst negative is chunk {idx} at {offset:.3f}s "
+            f"({piece.start:.3f}-{piece.end:.3f}s)"
+        )
+    logger.info("%s.", summary)
 
 
 def _is_instrumental_span(
@@ -1694,10 +1745,28 @@ def _prefer_vocal_onset(
     clipping the start of the very phrase this exists to protect would just
     relocate issue #79's defect rather than fix it.
 
-    On a chunk that merges two singers' segments (issue #92), the onset used
-    here is :func:`_prompted_members`'s narrowed one -- the ATTRIBUTED
-    singer's own first word, not whichever member's word happens to start
-    earliest.
+    Issue #79 follow-up: every DECLINED candidate whose offset exceeds
+    :data:`LEADING_VOCAL_OFFSET_WARN_SECONDS` is logged at INFO, naming the
+    blocking constraint, so an unfixed defect says why it is unfixed rather
+    than going silent (threshold-gated so it does not spam a line for every
+    one of ~29 chunks whose offset was never going to be reported anyway).
+
+    Measured on "Deathless": all four surviving offsets over 1.0s are
+    blocked by the *same* constraint -- the chunk itself sits at H3's
+    124-frame trained floor and has no grid step to give back::
+
+        chunk 20: +2.650s  frames prev=158 own=124 next=124   prev can grow 2, own can shrink 0
+        chunk 38: +2.588s  frames prev=192 own=124 next=158   prev can grow 0, own can shrink 0
+        chunk 41: +1.607s  frames prev=175 own=124 next=124   prev can grow 1, own can shrink 0
+        chunk 74: +1.067s  frames prev=141 own=124 next=158   prev can grow 3, own can shrink 0
+
+    An alternative was considered and rejected: a *slide* (grow the
+    predecessor by ``k``, move the whole chunk later by ``k`` while keeping
+    its own duration, shrink the successor by ``k``) would rescue exactly
+    one of the four -- chunk 74, +1.067s -> +0.359s -- and none of the other
+    three, because their successors are also at the floor. Not built: it
+    moves two boundaries instead of one and changes the tail text of two
+    chunks, for one chunk's gain on the only song with labels.
     """
     if len(boundaries) < 2:
         return boundaries
@@ -1709,9 +1778,6 @@ def _prefer_vocal_onset(
     step_seconds = grid.frames_to_seconds(step)
 
     for i in range(1, len(frames)):
-        if (i - 1) in pinned_indices or i in pinned_indices:
-            continue
-
         start_i = starts[i]
         end_i = start_i + grid.frames_to_seconds(frames[i])
         members_i = _segments_overlapping(segments, start_i, end_i)
@@ -1729,6 +1795,19 @@ def _prefer_vocal_onset(
         if offset <= _EPS:
             continue
 
+        loggable = offset > LEADING_VOCAL_OFFSET_WARN_SECONDS
+
+        if (i - 1) in pinned_indices or i in pinned_indices:
+            if loggable:
+                logger.info(
+                    "Leading vocal offset: chunk %d's %.3fs offset was not reduced -- "
+                    "boundary %d is pinned by an honoured shot-length request (issue #79).",
+                    i,
+                    offset,
+                    i,
+                )
+            continue
+
         start_prev = starts[i - 1]
         ceiling_prev = (
             filler_max_frames
@@ -1741,6 +1820,26 @@ def _prefer_vocal_onset(
         max_k_i = (frames[i] - min_frames) // step
         max_k = min(max_k_offset, max_k_prev, max_k_i)
         if max_k < 1:
+            if loggable:
+                reasons = []
+                if max_k_prev < 1:
+                    reasons.append(
+                        f"the preceding chunk is already at its {ceiling_prev}-frame ceiling"
+                    )
+                if max_k_i < 1:
+                    reasons.append(
+                        f"this chunk is already at the {min_frames}-frame trained floor and "
+                        "cannot shrink"
+                    )
+                if not reasons:
+                    reasons.append("the offset is smaller than one grid step")
+                logger.info(
+                    "Leading vocal offset: chunk %d's %.3fs offset was not reduced -- %s "
+                    "(issue #79).",
+                    i,
+                    offset,
+                    " and ".join(reasons),
+                )
             continue
 
         accepted_k = None
@@ -1751,6 +1850,15 @@ def _prefer_vocal_onset(
             accepted_k = k
             break
         if accepted_k is None:
+            if loggable:
+                logger.info(
+                    "Leading vocal offset: chunk %d's %.3fs offset was not reduced -- every "
+                    "candidate boundary step (1-%d grid step(s)) lands inside an aligned "
+                    "segment (issue #79).",
+                    i,
+                    offset,
+                    max_k,
+                )
             continue
 
         k = accepted_k

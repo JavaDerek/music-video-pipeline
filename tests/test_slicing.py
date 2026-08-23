@@ -1794,7 +1794,8 @@ def test_leading_vocal_offset_silent_below_threshold_but_counted(caplog):
         slicing_module._log_leading_vocal_offset([piece], (seg,))
 
     assert "is prompted to sing starting" not in caplog.text
-    assert "1 voiced chunk(s), 0 over the 1.00s warning threshold" in caplog.text
+    assert "1 voiced chunk(s) (1 positive, 0 negative, 0 exactly zero), 0 over the 1.00s " \
+        "warning threshold" in caplog.text
 
 
 def test_leading_vocal_offset_skips_chunks_with_no_prompted_words(caplog):
@@ -1834,8 +1835,54 @@ def test_leading_vocal_offset_summary_names_the_worst_chunk(caplog):
     with caplog.at_level(logging.INFO):
         slicing_module._log_leading_vocal_offset([piece1, piece2], (seg1, seg2))
 
-    assert "2 voiced chunk(s), 2 over the 1.00s warning threshold" in caplog.text
-    assert "worst is chunk 0 at 1.500s" in caplog.text
+    assert "2 voiced chunk(s) (2 positive, 0 negative, 0 exactly zero), 2 over the 1.00s " \
+        "warning threshold" in caplog.text
+    assert "worst positive is chunk 0 at +1.500s" in caplog.text
+    # Only a positive worst exists here -- the summary must not invent one.
+    assert "worst negative" not in caplog.text
+
+
+def test_leading_vocal_offset_summary_names_both_worst_signs(caplog):
+    """Issue #79 follow-up: the INFO summary reports both signs, not just
+    the (warned-on) positive one, when both are present."""
+    seg_pos = _word_seg(0, "late", 6.5, 9.5, 6.5, 9.5)  # offset +1.5s
+    piece_pos = slicing_module._Piece(
+        members=(seg_pos,), start=5.0, end=11.0, is_split_continuation=False, frame_count=144
+    )
+    # The word's own start (10.5) is BEFORE the chunk's start (11.0) -- a
+    # negative offset: the mouth opens on a word whose audio has already
+    # partly gone by.
+    seg_neg = _word_seg(1, "early", 10.5, 14.0, 10.5, 14.0)
+    piece_neg = slicing_module._Piece(
+        members=(seg_neg,), start=11.0, end=17.0, is_split_continuation=False, frame_count=144
+    )
+
+    with caplog.at_level(logging.INFO):
+        slicing_module._log_leading_vocal_offset([piece_pos, piece_neg], (seg_pos, seg_neg))
+
+    assert "2 voiced chunk(s) (1 positive, 1 negative, 0 exactly zero)" in caplog.text
+    assert "worst positive is chunk 0 at +1.500s" in caplog.text
+    assert "worst negative is chunk 1 at -0.500s" in caplog.text
+
+
+def test_leading_vocal_offset_never_warns_on_negative_offset(caplog):
+    """However large a negative offset is, it must never trigger the
+    per-chunk WARNING -- only the positive side is warned on. Measured: the
+    worst negative offset on "Deathless" is -0.707s and none reaches -1.0s,
+    so a negative-side warning at any threshold comparable to
+    LEADING_VOCAL_OFFSET_WARN_SECONDS would never fire on the only corpus
+    there is to calibrate it against."""
+    # Word spans 3.0-9.0 (midpoint 6.0, inside the chunk's [5.0, 11.0) span)
+    # but STARTS at 3.0 -- 2.0s before the chunk itself starts.
+    seg = _word_seg(0, "long word", 3.0, 9.0, 3.0, 9.0)
+    piece = slicing_module._Piece(
+        members=(seg,), start=5.0, end=11.0, is_split_continuation=False, frame_count=144
+    )
+
+    with caplog.at_level(logging.WARNING):
+        slicing_module._log_leading_vocal_offset([piece], (seg,))
+
+    assert caplog.text == ""
 
 
 # --- _prefer_vocal_onset: the boundary refinement --- #
@@ -1856,35 +1903,45 @@ def test_prefer_vocal_onset_moves_boundary_toward_the_onset():
     assert result[1][0] == pytest.approx(7.291666667, abs=1e-6)
 
 
-def test_prefer_vocal_onset_refuses_when_predecessor_has_no_headroom():
+def test_prefer_vocal_onset_refuses_when_predecessor_has_no_headroom(caplog):
     """The preceding chunk is already at its own ceiling (192 frames, the
     8.0s max) -- there are no frames left to give it, so the pair is
     refused entirely and nothing changes."""
     seg = _word_seg(0, "word", 9.5, 12.5, 9.5, 12.5)
     boundaries = [(0.0, 192, False), (8.0, 158, False)]
 
-    result = slicing_module._prefer_vocal_onset(
-        boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
-    )
+    with caplog.at_level(logging.INFO):
+        result = slicing_module._prefer_vocal_onset(
+            boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
+        )
 
     assert result == boundaries
+    # Issue #79 follow-up: the 1.5s offset clears the warning threshold, so
+    # the decline is logged naming the blocking constraint.
+    assert "chunk 1's 1.500s offset was not reduced" in caplog.text
+    assert "the preceding chunk is already at its 192-frame ceiling" in caplog.text
 
 
-def test_prefer_vocal_onset_refuses_when_chunk_is_already_at_the_floor():
+def test_prefer_vocal_onset_refuses_when_chunk_is_already_at_the_floor(caplog):
     """The chunk with the offset is already at the 124-frame trained floor
     -- it cannot give up any frames without going below the minimum, so the
     pair is refused."""
     seg = _word_seg(0, "word", 7.375, 10.5, 7.375, 10.5)
     boundaries = [(0.0, 141, False), (141 / 24, 124, False)]
 
-    result = slicing_module._prefer_vocal_onset(
-        boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
-    )
+    with caplog.at_level(logging.INFO):
+        result = slicing_module._prefer_vocal_onset(
+            boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
+        )
 
     assert result == boundaries
+    assert "chunk 1's 1.500s offset was not reduced" in caplog.text
+    assert "this chunk is already at the 124-frame trained floor and cannot shrink" in (
+        caplog.text
+    )
 
 
-def test_prefer_vocal_onset_refuses_when_either_side_is_pinned():
+def test_prefer_vocal_onset_refuses_when_either_side_is_pinned(caplog):
     """An honoured ShotLength request's own chunk must never be silently
     nudged -- pinning either the predecessor's or the chunk's own index
     refuses the pair."""
@@ -1892,10 +1949,14 @@ def test_prefer_vocal_onset_refuses_when_either_side_is_pinned():
     boundaries = [(0.0, 141, False), (141 / 24, 158, False)]
 
     for pinned in (frozenset({0}), frozenset({1})):
-        result = slicing_module._prefer_vocal_onset(
-            boundaries, (seg,), pinned, _MIN79, _MAX79, _MAX79, GRID
-        )
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            result = slicing_module._prefer_vocal_onset(
+                boundaries, (seg,), pinned, _MIN79, _MAX79, _MAX79, GRID
+            )
         assert result == boundaries
+        assert "chunk 1's 1.500s offset was not reduced" in caplog.text
+        assert "boundary 1 is pinned by an honoured shot-length request" in caplog.text
 
 
 def test_prefer_vocal_onset_uses_the_filler_ceiling_for_an_instrumental_predecessor():
@@ -1930,7 +1991,7 @@ def test_prefer_vocal_onset_refuses_the_largest_k_and_accepts_a_smaller_clean_on
     assert result[1] == (pytest.approx(141 / 24 + _STEP79_S, abs=1e-6), 141, False)
 
 
-def test_prefer_vocal_onset_refuses_entirely_when_every_candidate_lands_inside_a_segment():
+def test_prefer_vocal_onset_refuses_entirely_when_every_candidate_lands_inside_a_segment(caplog):
     """Same shape as the search-downward case, but the segment's span (6.0-
     11.0) is wide enough to cover every candidate boundary the offset and
     capacity would otherwise permit -- trading the leading-offset defect for
@@ -1938,11 +1999,33 @@ def test_prefer_vocal_onset_refuses_entirely_when_every_candidate_lands_inside_a
     seg = _word_seg(0, "word", 6.0, 11.0, 7.375, 11.0)
     boundaries = [(0.0, 141, False), (141 / 24, 158, False)]
 
-    result = slicing_module._prefer_vocal_onset(
-        boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
-    )
+    with caplog.at_level(logging.INFO):
+        result = slicing_module._prefer_vocal_onset(
+            boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
+        )
 
     assert result == boundaries
+    assert "chunk 1's 1.500s offset was not reduced" in caplog.text
+    assert "every candidate boundary step" in caplog.text
+    assert "lands inside an aligned segment" in caplog.text
+
+
+def test_prefer_vocal_onset_declined_below_threshold_is_not_logged(caplog):
+    """Below the warning threshold, a declined move is silent -- logging one
+    line per candidate under 1.0s would spam a line for every one of the
+    ~29 chunks whose offset was never going to be reported anyway."""
+    # Same "already at the floor" shape as the dedicated test above, but the
+    # offset itself is only 0.5s -- below LEADING_VOCAL_OFFSET_WARN_SECONDS.
+    seg = _word_seg(0, "word", 6.375, 10.0, 6.375, 10.0)
+    boundaries = [(0.0, 141, False), (141 / 24, 124, False)]
+
+    with caplog.at_level(logging.INFO):
+        result = slicing_module._prefer_vocal_onset(
+            boundaries, (seg,), frozenset(), _MIN79, _MAX79, _MAX79, GRID
+        )
+
+    assert result == boundaries
+    assert caplog.text == ""
 
 
 def test_prefer_vocal_onset_never_moves_more_than_the_offset_even_with_room_to_spare():
@@ -2103,7 +2186,7 @@ def test_cover_instrumentals_reduces_a_fixable_offset(caplog):
     assert covered[1].frame_count == 124
     assert covered[1].start == pytest.approx(7.291666667, abs=1e-6)
     assert "is prompted to sing starting" not in caplog.text
-    assert "worst is chunk 1 at 0.875s" in caplog.text
+    assert "worst positive is chunk 1 at +0.875s" in caplog.text
 
 
 def test_cover_instrumentals_does_not_move_a_boundary_pinned_by_a_shot_length():
