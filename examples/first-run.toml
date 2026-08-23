@@ -89,6 +89,41 @@ global_appearance = "everyone slim, trim and healthy looking"
 # and this config file cannot see whether one has been run.
 # avoid = ["bass guitar", "microphone", "stage"]
 
+# Facts about THIS SONG that you have settled and every authoring stage must
+# see (issue #86). Read by `mvm-author` only -- never composed into a render
+# prompt. Short declarative statements: "the narrator is unreliable", "the
+# factory closed years ago", "the island is vaporised, not eroded".
+#
+# The point is durability. `mvm-author <stage> --notes "..."` is interpolated
+# into one prompt and then gone: not recorded, not carried to the next stage,
+# not in any input hash. A fact you have to remember and retype correctly on
+# every future re-roll of every stage is a fact that will drift. These are
+# hashed into every stage's inputs, so editing one reports its descendants
+# stale -- and they are printed as a header comment in the written shot plan,
+# so a reviewer can see what it was authored under. There is deliberately no
+# check that the plan "honours" them: that is not mechanically decidable.
+# song_facts = ["the island is vaporised, not eroded", "the narrator is unreliable"]
+
+# How literally this video reads its lyrics (issue #67) -- "free", "thematic"
+# or "literal". Omit it and you get "thematic", which is what this pipeline
+# always did before the setting existed.
+#
+#   free      the song supplies mood, tempo and title; the video is its own
+#             idea and may share nothing else. The shot-vs-lyric lint is
+#             silenced -- at this end a lyric naming something the plan stages
+#             elsewhere is the brief, not a defect.
+#   thematic  the video tells a story the song is about; specific images
+#             surface where they land well. Lints as they are.
+#   literal   every nameable object and action in a line is on screen in the
+#             chunk that sings it, and the shot-vs-lyric lint is promoted to
+#             the error tier so the authoring layer revises rather than
+#             annotates.
+#
+# An ordinal, not a number: 0.37 would imply a precision no model can act on.
+# The render path never reads this -- the literal lyric text in every prompt
+# is lip-sync conditioning, not a literalness knob.
+# lyric_literalness = "thematic"
+
 # This is the default (issue #50), so it can be omitted entirely -- it
 # assumes the orchestrator runs on the same host as ComfyUI. Pointing it at a
 # remote host instead is a supported override (e.g. a Tailscale hostname --

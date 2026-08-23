@@ -1685,3 +1685,110 @@ def test_instrumental_audio_gain_db_refuses_a_boost(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="instrumental_audio_gain_db"):
         load_config(_write_config(tmp_path, extra_toml="instrumental_audio_gain_db = 6.0\n"))
+
+
+# --------------------------------------------------------------------------- #
+# Operator-established facts about the song (issue #86)
+# --------------------------------------------------------------------------- #
+
+
+def test_song_facts_defaults_to_empty_tuple(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path)
+
+    assert load_config(config_path).song_facts == ()
+
+
+def test_song_facts_is_read_from_toml_and_stripped(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(
+        tmp_path,
+        extra_toml=(
+            'song_facts = ["the island is vaporised, not eroded",'
+            '  "  the narrator is unreliable  "]'
+        ),
+    )
+
+    assert load_config(config_path).song_facts == (
+        "the island is vaporised, not eroded",
+        "the narrator is unreliable",
+    )
+
+
+def test_song_facts_rejects_a_non_list(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path, extra_toml='song_facts = "unreliable narrator"')
+
+    with pytest.raises(ConfigError, match="song_facts"):
+        load_config(config_path)
+
+
+def test_song_facts_rejects_a_non_string_item(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path, extra_toml="song_facts = [1, 2]")
+
+    with pytest.raises(ConfigError, match="song_facts"):
+        load_config(config_path)
+
+
+def test_song_facts_rejects_a_blank_item(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path, extra_toml='song_facts = ["   "]')
+
+    with pytest.raises(ConfigError, match="song_facts"):
+        load_config(config_path)
+
+
+# --------------------------------------------------------------------------- #
+# How literally the video reads its lyrics (issue #67)
+# --------------------------------------------------------------------------- #
+
+
+def test_lyric_literalness_defaults_to_thematic(tmp_path: Path) -> None:
+    """`thematic` is today's implicit behaviour, so every pre-existing config
+    is unchanged by this field existing (issue #67)."""
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path)
+
+    assert load_config(config_path).lyric_literalness == "thematic"
+
+
+@pytest.mark.parametrize("band", ["free", "thematic", "literal"])
+def test_lyric_literalness_accepts_each_band(tmp_path: Path, band: str) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path, extra_toml=f'lyric_literalness = "{band}"')
+
+    assert load_config(config_path).lyric_literalness == band
+
+
+def test_lyric_literalness_is_case_and_whitespace_insensitive(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path, extra_toml='lyric_literalness = "  Literal "')
+
+    assert load_config(config_path).lyric_literalness == "literal"
+
+
+def test_lyric_literalness_rejects_an_unknown_band(tmp_path: Path) -> None:
+    """An ordinal set with documented meanings, never a free string and never
+    a float -- 0.37 implies a resolution no model can act on (issue #67)."""
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path, extra_toml='lyric_literalness = "very literal"')
+
+    with pytest.raises(ConfigError, match="lyric_literalness"):
+        load_config(config_path)
+
+
+def test_lyric_literalness_rejects_a_number(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path, extra_toml="lyric_literalness = 0.37")
+
+    with pytest.raises(ConfigError, match="lyric_literalness"):
+        load_config(config_path)
+
+
+def test_the_literalness_bands_are_ordered_free_to_literal() -> None:
+    """Ordinal, and the order is what a caller compares against -- a lint is
+    silenced at one end and promoted at the other."""
+    from music_video_maker.config import LYRIC_LITERALNESS_BANDS
+
+    assert LYRIC_LITERALNESS_BANDS == ("free", "thematic", "literal")
