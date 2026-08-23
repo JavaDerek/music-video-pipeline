@@ -81,6 +81,38 @@ def test_contracts_are_frozen():
 
 
 # --------------------------------------------------------------------------- #
+# CastMember.voiced_by -- a voice on the track is not a character in the
+# story (issue #89).
+# --------------------------------------------------------------------------- #
+
+
+def test_cast_member_voiced_by_defaults_to_none():
+    """Every existing cast entry is unaffected: ``None`` means "this entry IS
+    a performer," the only meaning the field has ever had."""
+    member = contracts.CastMember(name="Dianne", role="Lead Vocalist", image=Path("d.jpg"))
+    assert member.voiced_by is None
+
+
+def test_cast_member_performer_defaults_to_its_own_name():
+    """A plain performer is audible as themselves."""
+    member = contracts.CastMember(name="Dianne", role="Lead Vocalist", image=Path("d.jpg"))
+    assert member.performer == "Dianne"
+
+
+def test_cast_member_performer_resolves_through_voiced_by():
+    """The seam issue #89 says does not exist, and it is one attribute
+    access: 'The Dead' is a character in the story, but Jan is who is
+    physically audible."""
+    the_dead = contracts.CastMember(
+        name="The Dead",
+        role="the war's dead, speaking collectively",
+        image=Path("jan_ref.jpg"),
+        voiced_by="Jan",
+    )
+    assert the_dead.performer == "Jan"
+
+
+# --------------------------------------------------------------------------- #
 # ChunkFingerprint -- what a cached chunk must prove about itself (issue #34).
 # --------------------------------------------------------------------------- #
 
@@ -161,6 +193,48 @@ def test_chunk_fingerprint_a_recast_character_is_a_content_difference():
     before = contracts.ChunkFingerprint.of(_chunk(), _prompt(character="Dianne"))
     after = contracts.ChunkFingerprint.of(_chunk(), _prompt(character="Rex"))
     assert after.content_differences(before) == ("character",)
+
+
+def test_retagging_a_line_to_a_voiced_by_character_moves_only_character_and_prompt() -> None:
+    """Issue #89's own load-bearing claim, proven at the fingerprint level: no
+    new field is needed for ``--resume`` to re-render exactly a retagged line.
+
+    ``CONTENT_FIELDS`` already carries ``character`` and ``image_ref``
+    separately. Retagging a chunk from the performer (Jan) to a character he
+    voices ('The Dead') that inherited his photo moves ``character`` (a
+    different name) and ``prompt_hash`` (the composed role text differs) --
+    but never ``image_ref``, because the staged photo is the same file either
+    way. That is exactly what makes a resumed run re-render this one chunk
+    and nothing else."""
+    shared_photo = Path("/cast/jan_ref.jpg")
+    chunk = _chunk()
+    as_the_performer = contracts.ChunkFingerprint.of(
+        chunk,
+        contracts.ExpandedPrompt(
+            chunk_id=chunk.chunk_id,
+            prompt="Jan, Kashay Besmertny the Deathless, is the focus of this shot.",
+            image_ref=shared_photo,
+            characters=("Jan",),
+        ),
+    )
+    as_the_character = contracts.ChunkFingerprint.of(
+        chunk,
+        contracts.ExpandedPrompt(
+            chunk_id=chunk.chunk_id,
+            prompt=(
+                "The Dead, the war's dead, speaking collectively, is the focus "
+                "of this shot."
+            ),
+            image_ref=shared_photo,
+            characters=("The Dead",),
+        ),
+    )
+    assert as_the_character.content_differences(as_the_performer) == (
+        "prompt_hash",
+        "character",
+    )
+    assert as_the_character.timeline_differences(as_the_performer) == ()
+    assert as_the_character.image_ref == as_the_performer.image_ref
 
 
 def test_chunk_fingerprint_ignores_sub_millisecond_float_jitter():

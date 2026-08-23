@@ -82,6 +82,50 @@ class CastMember:
     landed; it lives here now, matching :attr:`appearance`'s own shape (#31),
     which is the only place a per-member field like this belongs."""
 
+    voiced_by: str | None = None
+    """This entry is a **character**, not a performer (issue #89): the name
+    of another cast entry whose voice physically sings these lines.
+
+    ``role``, ``appearance`` and ``demeanour`` on *this* entry are what
+    compose into the prompt whenever this character is the active one --
+    never the performer's -- because the entire point of the field is to
+    stage a lyric sung in a voice other than the performer's own (a narrator
+    singing as a chorus of the dead, one singer voicing both halves of a
+    dialogue, an unreliable narrator) with its own face and story role, kept
+    separate from the voice that carries it.
+
+    ``chunk.characters`` (issue #6) is authored text from the lyrics file's
+    ``[Name: Role]`` tags, never derived from the audio -- #89's own finding
+    is that there is no speaker attribution anywhere in this pipeline. So
+    this field does not change what a chunk names; it changes what looking
+    that name up in ``config.cast`` composes.
+
+    ``None`` (every cast entry that predates this field) means "this entry
+    IS a performer," the only meaning it has ever had.
+
+    No chains: an entry named here must not itself set ``voiced_by`` --
+    refused at config load (see ``config.py``). That is the recurrence-
+    relation hazard CLAUDE.md warns of under "Chained rendering makes every
+    per-chunk instruction a recurrence relation"; there is no case here that
+    would need one, so it is refused rather than reasoned about later. See
+    :attr:`performer` for the one attribute this field exists to make
+    derivable."""
+
+    @property
+    def performer(self) -> str:
+        """Who is physically audible when this entry sings (issue #89):
+        :attr:`voiced_by` if this entry is a character voiced by someone
+        else, otherwise its own name.
+
+        This is "the seam the issue says does not exist, and it is one
+        attribute access" -- nothing in the render path consumes it yet. It
+        exists for whatever needs to know who is *literally singing*
+        independent of which character the shot displays: a future
+        vocal-range check, stem routing, or the #92 character-merge billing
+        would all need this and none of them exist today.
+        """
+        return self.voiced_by or self.name
+
 
 @dataclass(frozen=True)
 class LyricLine:

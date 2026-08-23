@@ -752,7 +752,7 @@ def _resolve_path(value: object, base_dir: Path) -> Path:
     return candidate if candidate.is_absolute() else base_dir / candidate
 
 
-CAST_KEYS = frozenset({"role", "image", "appearance", "demeanour"})
+CAST_KEYS = frozenset({"role", "image", "appearance", "demeanour", "voiced_by"})
 """Every key a ``[cast.<Name>]`` table may contain. Closed set, for the same
 reason :data:`HARDWARE_KEYS` is: a misspelled ``appearence`` that is silently
 ignored is config that reads as applied but never reaches a prompt."""
@@ -850,7 +850,21 @@ def _optional_text(entry: dict, key: str) -> str | None:
 
 
 def _build_cast(raw_cast: object, base_dir: Path) -> dict[str, CastMember]:
-    """Build the cast dictionary from the parsed ``[cast.<Name>]`` tables."""
+    """Build the cast dictionary from the parsed ``[cast.<Name>]`` tables.
+
+    Two passes (issue #89). The first validates each entry's own fields in
+    isolation -- unknown keys, a missing ``role``, and (for a plain entry
+    that does not set ``voiced_by``) a missing ``image``, exactly as before
+    this field existed. A ``voiced_by`` entry is exempt from that last check
+    only: it is a *character*, not a performer, and may have no photograph of
+    its own.
+
+    The second pass (:func:`_resolve_cast_voicing`) resolves ``voiced_by``
+    against the now-complete dict of raw entries rather than inline in this
+    loop, because cast entries are parsed in file order and a character's
+    ``voiced_by`` may name a performer defined *later* in the file -- a plain
+    per-key lookup against the finished dict does not care which came first.
+    """
     if isinstance(raw_cast, dict) and raw_cast and all(
         isinstance(v, CastMember) for v in raw_cast.values()
     ):
@@ -860,7 +874,7 @@ def _build_cast(raw_cast: object, base_dir: Path) -> dict[str, CastMember]:
     if not isinstance(raw_cast, dict) or not raw_cast:
         _fail("cast", "config must define at least one [cast.<Name>] entry")
 
-    cast: dict[str, CastMember] = {}
+    raw_entries: dict[str, dict[str, object]] = {}
     for name, entry in raw_cast.items():  # type: ignore[union-attr]
         if not isinstance(entry, dict):
             _fail(f"cast.{name}", "must be a table with 'role' and 'image' keys")
@@ -879,21 +893,81 @@ def _build_cast(raw_cast: object, base_dir: Path) -> dict[str, CastMember]:
             )
         role = entry.get("role")
         image = entry.get("image")
+        voiced_by = _optional_text(entry, "voiced_by")
         if not role:
             _fail(f"cast.{name}.role", "missing required 'role'")
-        if not image:
+        if not image and not voiced_by:
             _fail(f"cast.{name}.image", "missing required 'image'")
         _warn_if_prohibition(f"cast.{name}", "role", role)
         member_demeanour = _optional_text(entry, "demeanour")
         if member_demeanour:
             _warn_if_prohibition(f"cast.{name}", "demeanour", member_demeanour)
             _warn_if_displacement(f"cast.{name}", "demeanour", member_demeanour)
+        raw_entries[name] = {
+            "role": role,
+            "image": image,
+            "appearance": _optional_text(entry, "appearance"),
+            "demeanour": member_demeanour,
+            "voiced_by": voiced_by,
+        }
+    return _resolve_cast_voicing(raw_entries, base_dir)
+
+
+def _resolve_cast_voicing(
+    raw_entries: dict[str, dict[str, object]], base_dir: Path
+) -> dict[str, CastMember]:
+    """Second pass: resolve ``voiced_by`` against the completed dict of raw
+    cast entries and build the real :class:`CastMember` objects (issue #89).
+
+    Refuses, naming issue #89 in every message:
+
+    * ``voiced_by`` naming an entry that is not in the cast;
+    * ``voiced_by`` naming the entry itself;
+    * ``voiced_by`` naming an entry that itself sets ``voiced_by`` -- no
+      chains, the recurrence-relation hazard CLAUDE.md warns of under
+      "Chained rendering makes every per-chunk instruction a recurrence
+      relation".
+
+    An explicit ``image`` always wins over inheritance. Every entry that does
+    NOT set ``voiced_by`` was already required to have its own image in the
+    first pass, so by the time a character's inheritance is resolved here,
+    the performer it names is guaranteed to already have a real path -- this
+    holds regardless of which of the two was written first in the file.
+    """
+    cast: dict[str, CastMember] = {}
+    for name, raw in raw_entries.items():
+        voiced_by = raw["voiced_by"]
+        image = raw["image"]
+        if voiced_by is not None:
+            if voiced_by == name:
+                _fail(
+                    f"cast.{name}.voiced_by",
+                    f"names itself, {voiced_by!r} -- voiced_by must name a "
+                    "different cast member (issue #89)",
+                )
+            target = raw_entries.get(voiced_by)
+            if target is None:
+                _fail(
+                    f"cast.{name}.voiced_by",
+                    f"names {voiced_by!r}, which is not a cast member (issue #89); "
+                    f"known cast members: {sorted(raw_entries)}",
+                )
+            if target["voiced_by"] is not None:
+                _fail(
+                    f"cast.{name}.voiced_by",
+                    f"names {voiced_by!r}, which itself sets voiced_by="
+                    f"{target['voiced_by']!r} -- chains of voiced_by are not "
+                    "supported (issue #89)",
+                )
+            if not image:
+                image = target["image"]
         cast[name] = CastMember(
             name=name,
-            role=role,
+            role=raw["role"],
             image=_resolve_path(image, base_dir),
-            appearance=_optional_text(entry, "appearance"),
-            demeanour=member_demeanour,
+            appearance=raw["appearance"],
+            demeanour=raw["demeanour"],
+            voiced_by=voiced_by,
         )
     return cast
 

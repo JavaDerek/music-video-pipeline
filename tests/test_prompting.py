@@ -1727,3 +1727,177 @@ def test_instrumental_clause_is_a_positive_state_not_a_prohibition():
                 f"{clause!r} names facial anatomy ({anatomy!r}), which pulls the "
                 f"camera onto the face across every instrumental chunk (issue #74)"
             )
+
+
+# --------------------------------------------------------------------------- #
+# voiced_by -- a voice on the track is not a character in the story (#89).
+#
+# The design's central claim is that composition already works with zero
+# code change: `_resolve_active_members` looks up `config.cast[name]` and
+# composes whatever it finds, and a `voiced_by` character is just another
+# `CastMember`. These tests prove that claim rather than assume it, and the
+# one thing this module actually adds is the shared-reference-photo hazard
+# guard.
+# --------------------------------------------------------------------------- #
+
+
+def test_no_voiced_by_anywhere_composes_byte_identically_to_before(
+    config: RunConfig, cast, caplog
+):
+    """Required inertness proof (issue #89): no cast entry in this fixture
+    sets voiced_by, so every prompt this change could touch -- solo, and with
+    a `present` member staged alongside -- must still compose exactly as it
+    did before the field existed. The same standard `location` was held to in
+    commit 888b6d3, and the hazard guard added for #89 must not fire (nobody
+    here shares a photo)."""
+    solo_chunk = _chunk(
+        chunk_id=1,
+        text="walking through the empty halls tonight",
+        character="Dianne",
+        source_segment_indices=(2,),
+    )
+
+    solo_result = expand_prompt(config, solo_chunk)
+
+    assert solo_result == contracts.ExpandedPrompt(
+        chunk_id=1,
+        prompt=(
+            "Refestramus progressive rock music video, atmospheric lighting, "
+            "high quality cinematic. Wandering through a surgery, kicking a "
+            "life support plug out. Dianne, Lead Vocalist, smiling constantly, "
+            "oblivious, is the focus of this shot. The character is actively "
+            "singing the lyric: 'walking through the empty halls tonight'."
+        ),
+        image_ref=cast["Dianne"].image,
+        image_refs=(cast["Dianne"].image,),
+        characters=("Dianne",),
+        chained_prompt=(
+            "Refestramus progressive rock music video, atmospheric lighting, "
+            "high quality cinematic. Wandering through a surgery, kicking a "
+            "life support plug out. Dianne, Lead Vocalist, smiling constantly, "
+            "oblivious, is the focus of this shot. The character is actively "
+            "singing the lyric: 'walking through the empty halls tonight'."
+        ),
+    )
+
+    present_chunk = _chunk(chunk_id=4, text="I'm the lucky one", character="Dianne")
+    with caplog.at_level("WARNING"):
+        present_result = expand_prompt(config, present_chunk, present=("Rex",))
+
+    assert "Also in shot, silent: Rex, Drummer, background, never sings" in present_result.prompt
+    assert present_result.image_refs == (cast["Dianne"].image, cast["Rex"].image)
+    assert not any(record.levelname == "WARNING" for record in caplog.records)
+
+
+def test_voiced_by_character_composes_its_own_role_never_the_performers(
+    config: RunConfig, cast
+):
+    """The whole point of #89: on a chunk `[The Dead]` sings, the render
+    composes The Dead's own role and demeanour -- never Jan's, even though
+    Jan is who is physically audible and whose photo is staged. This needs
+    no new code: `_resolve_active_members` looks up `config.cast["The Dead"]`
+    and composes whatever it finds, exactly as it would for any other name."""
+    jan = contracts.CastMember(
+        name="Jan",
+        role="Kashay Besmertny the Deathless, an immortal watchman",
+        image=Path("cast/jan_ref.png"),
+    )
+    the_dead = contracts.CastMember(
+        name="The Dead",
+        role="the war's dead, speaking collectively",
+        image=jan.image,
+        demeanour="flat, tireless, without appetite",
+        voiced_by="Jan",
+    )
+    cfg = dataclasses.replace(config, cast={**cast, "Jan": jan, "The Dead": the_dead})
+    chunk = _chunk(chunk_id=20, text="our lives are prisons", character="The Dead")
+
+    result = expand_prompt(cfg, chunk)
+
+    assert (
+        "The Dead, the war's dead, speaking collectively, is the focus of "
+        "this shot, flat, tireless, without appetite." in result.prompt
+    )
+    assert "Kashay" not in result.prompt
+    assert "immortal watchman" not in result.prompt
+    assert result.characters == ("The Dead",)
+    assert result.image_ref == jan.image
+
+
+def test_double_staging_a_voiced_by_character_over_its_performer_warns(
+    config: RunConfig, cast, caplog
+):
+    """Issue #89's own named hazard: a character that inherited its
+    performer's photo, staged alongside that same performer via `present`,
+    asks the graph to condition on one photograph for two different
+    identities at once -- the contradiction #82 measured H3 resolving by
+    morphing one into the other mid-chunk. This warns; it must never raise or
+    change what gets composed."""
+    jan = contracts.CastMember(
+        name="Jan",
+        role="Kashay Besmertny the Deathless, an immortal watchman",
+        image=Path("cast/jan_ref.png"),
+    )
+    the_dead = contracts.CastMember(
+        name="The Dead",
+        role="the war's dead, speaking collectively",
+        image=jan.image,
+        voiced_by="Jan",
+    )
+    cfg = dataclasses.replace(config, cast={**cast, "Jan": jan, "The Dead": the_dead})
+    chunk = _chunk(chunk_id=21, text="our lives are prisons", character="The Dead")
+
+    with caplog.at_level("WARNING"):
+        result = expand_prompt(cfg, chunk, present=("Jan",))
+
+    # The hazard is logged, never enforced: the prompt composes exactly as
+    # it would for any other present member.
+    assert result.present_cast == ("Jan",)
+    assert result.image_refs == (jan.image, jan.image)
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any(
+        "The Dead" in record.message
+        and "Jan" in record.message
+        and str(jan.image) in record.message
+        and "21" in record.message
+        for record in warnings
+    )
+
+
+def test_no_shared_photo_means_no_warning(config: RunConfig, cast, caplog):
+    """The control for the hazard guard: two different cast members with
+    different photos staged together must not warn."""
+    chunk = _chunk(chunk_id=4, text="I'm the lucky one", character="Dianne")
+
+    with caplog.at_level("WARNING"):
+        expand_prompt(config, chunk, present=("Rex",))
+
+    assert not any(record.levelname == "WARNING" for record in caplog.records)
+
+
+def test_voiced_by_tag_resolves_through_the_existing_lyrics_tag_syntax(
+    config: RunConfig, cast
+):
+    """No `lyrics.py` change was needed for #89: the tag syntax it already
+    parses selects any cast key, including a voiced_by character. Proven
+    against the real parser, not assumed."""
+    from music_video_maker.lyrics import parse_lyrics_text
+
+    jan = contracts.CastMember(
+        name="Jan",
+        role="Kashay Besmertny the Deathless, an immortal watchman",
+        image=Path("cast/jan_ref.png"),
+    )
+    the_dead = contracts.CastMember(
+        name="The Dead",
+        role="the war's dead, speaking collectively",
+        image=jan.image,
+        voiced_by="Jan",
+    )
+    lyrics_cast = {**cast, "Jan": jan, "The Dead": the_dead}
+    text = "[The Dead: chorus]\nour lives are prisons\n"
+
+    document = parse_lyrics_text(text, lyrics_cast, default_lead_vocalist="Dianne")
+
+    assert document[0].characters == ("The Dead",)
+    assert document[0].text == "our lives are prisons"

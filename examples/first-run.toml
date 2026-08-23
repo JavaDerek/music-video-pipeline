@@ -284,6 +284,18 @@ demeanour  = "smiling constantly, oblivious to everything around her"
 role  = "Drummer, background, never sings"
 image = "cast/rex_ref.jpg"
 
+# `voiced_by` (issue #89): reach for this when a lyric is sung in a voice
+# other than the performer's own -- a narrator singing as a chorus of the
+# dead, one singer voicing both halves of a dialogue. This entry is a
+# CHARACTER, not a performer: its own `role`/`appearance`/`demeanour` compose
+# whenever it is tagged in the lyrics, `image` is optional and defaults to
+# the named performer's photo, and `voiced_by` may not name an entry that
+# itself sets `voiced_by` (no chains).
+# [cast."The Dead"]
+# voiced_by = "Dianne"
+# role      = "the war's dead, speaking collectively"
+# demeanour = "flat, tireless, without appetite"
+
 [hardware]
 name    = "RTX 4090 24GB (doris)"
 vram_gb = 24.0
