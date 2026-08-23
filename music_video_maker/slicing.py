@@ -1453,8 +1453,80 @@ def _voiced_seconds_within(
     )
 
 
+def _log_untenable_segments(
+    segments: tuple[AlignedSegment, ...], eff_max: float, grid: FrameGrid
+) -> None:
+    """Name, once per run, every aligned segment too long for *this run's*
+    ceiling to hold whole (issue #70, reopened).
+
+    A sung phrase longer than the effective maximum chunk duration cannot fit
+    in any chunk, so it is cut mid-utterance on every render no matter where
+    the boundaries fall. That is a different class of defect from a cut that
+    could in principle be moved, and the two have different remedies -- which
+    is why the message distinguishes them:
+
+    * **Longer than ``eff_max`` but inside H3's trained range.** The remedy is
+      a config line. Measured on "Deathless", whose ``max_chunk_seconds`` is
+      **8.0** against a trained ceiling of **15.083s**: segments 24 (9.030s)
+      and 29 (8.020s) are exactly this case, and they are the phrases cut by
+      two of the three chunks issue #70's reopen was built on. Raising the
+      ceiling to 12.0s stops both from being cut at all, and takes the whole
+      song's mid-phrase cuts from 24 to 18 and its cuts deeper than 2.5s from
+      6 to 3.
+    * **Longer than the trained maximum itself.** No setting helps; the lever
+      is a model with a longer trained context, and saying "raise
+      ``max_chunk_seconds``" there would be advice that cannot be taken.
+
+    Note what the first case implies and how easily it is misread: 8.0s looks
+    like a hardware limit in a run config and is not one. Check a segment's
+    duration against ``eff_max``, never against a remembered number.
+    """
+    trained_max_s = grid.frames_to_seconds(grid.trained_max_frames)
+    for segment in segments:
+        if segment.duration <= eff_max + _EPS:
+            continue
+        if segment.duration <= trained_max_s + _EPS:
+            needed_frames = grid.quantize_up(
+                math.ceil(grid.seconds_to_frames(segment.duration) - _EPS)
+            )
+            remedy = (
+                f"it does fit inside H3's trained range (up to {trained_max_s:.3f}s), so "
+                f"raising max_chunk_seconds to at least "
+                f"{grid.frames_to_seconds(needed_frames):.3f}s ({needed_frames} frames) "
+                "would let one chunk hold it -- but nothing longer than "
+                f"{MEASURED_MAX_FRAMES} frames has ever been rendered on this card, so "
+                "prove the VRAM on a short slice first"
+            )
+        else:
+            remedy = (
+                f"it is longer than H3's own trained maximum of {trained_max_s:.3f}s "
+                f"({grid.trained_max_frames} frames), so no max_chunk_seconds setting can "
+                "hold it -- the only lever is a model with a longer trained context"
+            )
+        logger.warning(
+            "Aligned segment index=%d (%r, %.3f-%.3fs, %.3fs) is longer than this run's "
+            "effective maximum chunk duration of %.3fs and so cannot be held whole by any "
+            "chunk: it will be cut mid-utterance on every render regardless of where the "
+            "boundaries fall, and the two halves render as independent shots. %s "
+            "(issue #70).",
+            segment.index,
+            segment.text,
+            segment.start,
+            segment.end,
+            segment.duration,
+            eff_max,
+            remedy,
+        )
+
+
 def _log_final_boundary_segment_cuts(
-    covered: Sequence[_Piece], segments: tuple[AlignedSegment, ...]
+    covered: Sequence[_Piece],
+    segments: tuple[AlignedSegment, ...],
+    *,
+    grid: FrameGrid,
+    min_frames: int,
+    max_frames: int,
+    filler_max_frames: int,
 ) -> None:
     """Issue #70, second mechanism: even where pass 2's segment-edge
     preference had nothing to snap to -- or nothing to say at all, since
@@ -1492,18 +1564,90 @@ def _log_final_boundary_segment_cuts(
     final position a render will use -- unlike pass 2's own warning, whose
     cited timestamp this pass can, and on real material typically does,
     move past.
+
+    Issue #70's 2026-08-23 reopen asked for a *depth-threshold preference* on
+    top of this: prefer a segment edge only when the cut would otherwise land
+    near the middle of a phrase. It was built as a prototype -- the mirror of
+    :func:`_prefer_vocal_onset`, a compensated grid-step transfer moving a
+    boundary *earlier* to the phrase start -- and scored against the real
+    80-chunk "Deathless" timeline, where it **fired 0 times at every threshold
+    tried** (1.0s, 2.0s, 2.5s, 3.0s). Clearing a phrase head is
+    all-or-nothing -- land short of the segment's own start and the cut is
+    still mid-utterance, just somewhere else, which is precisely the mistake
+    the first #70 snap made -- so the move costs 4-6 grid steps of 0.708s,
+    while the chunk that has to pay sits at the 124-frame floor in 20 of the
+    24 cases and is never more than one step above it in the 6 that matter.
+    Depth also failed to separate the labels it was drawn from: the nearest
+    unreported chunk (21, 2.517s into its phrase) and the nearest reported one
+    (39, 2.578s) are 0.061s apart, and chunk 19 at 48.6% is *nearer the
+    middle* than either complaint and was never mentioned in two independent
+    viewings.
+
+    So what this reports is the number that decided it. Per surviving cut:
+    depth in **seconds** as well as percent (a percentage cannot be compared
+    across phrases -- 45% of a 9s phrase and 45% of a 1.5s one are 4.0s and
+    0.7s of already-sung audio, and only the seconds are what a boundary move
+    has to pay for), **which chunk starts there** (every chunk a viewer called
+    defective for this mechanism is named by its own *start* boundary, never
+    its end), and the **transfer budget** in both directions -- what moving it
+    to each phrase edge would cost in grid steps against what the neighbouring
+    chunk actually has. See :func:`_log_untenable_segments` for the lever that
+    *does* move these numbers on real material, and it is the run's own
+    ``max_chunk_seconds``, not a preference.
     """
-    for earlier in covered[:-1]:
+    step = grid.step_frames
+    step_seconds = grid.frames_to_seconds(step)
+    boundary_count = max(0, len(covered) - 1)
+    cut_count = 0
+    deepest: tuple[int, float, float, AlignedSegment] | None = None
+
+    for idx, earlier in enumerate(covered[:-1]):
+        later = covered[idx + 1]
         boundary = earlier.end
         landed = _segment_containing(boundary, segments)
         if landed is None:
             continue
+        cut_count += 1
         pct = _percent_through(boundary, landed)
+        depth = boundary - landed.start
+        remaining = landed.end - boundary
+        if deepest is None or depth > deepest[1]:
+            deepest = (idx + 1, depth, pct, landed)
+
+        # What a move would cost, and what is actually available to spend.
+        # Moving the boundary EARLIER to the phrase start shrinks the
+        # preceding chunk and grows this one; moving it LATER to the phrase
+        # end does the reverse. A filler chunk's ceiling is its own, not a
+        # lyric chunk's -- the same distinction _prefer_vocal_onset draws.
+        earlier_frames = earlier.frame_count or 0
+        later_frames = later.frame_count or 0
+        ceiling_earlier = filler_max_frames if not earlier.members else max_frames
+        ceiling_later = filler_max_frames if not later.members else max_frames
+        back_cost = math.ceil((depth - _EPS) / step_seconds)
+        back_budget = max(
+            0,
+            min(
+                (earlier_frames - min_frames) // step,
+                (ceiling_later - later_frames) // step,
+            ),
+        )
+        forward_cost = math.ceil((remaining - _EPS) / step_seconds)
+        forward_budget = max(
+            0,
+            min(
+                (ceiling_earlier - earlier_frames) // step,
+                (later_frames - min_frames) // step,
+            ),
+        )
+
         logger.warning(
             "Final chunk boundary at %.3fs (after instrumental-coverage retiling) lands "
-            "%.1f%% through segment index=%d (%r, %.3f-%.3fs) -- cutting a sung phrase "
-            "mid-utterance; the two halves will render as independent shots with no error "
-            "anywhere else. This position was not visible to pass 2's own segment-edge "
+            "%.1f%% through segment index=%d (%r, %.3f-%.3fs) -- %.3fs into a %.3fs phrase, "
+            "and chunk %d starts here. Cutting a sung phrase mid-utterance; the two halves "
+            "will render as independent shots with no error anywhere else. Moving it back "
+            "to the phrase start costs %d grid step(s), budget %d; forward to the phrase "
+            "end costs %d, budget %d -- a move is only possible where the cost is within "
+            "the budget. This position was not visible to pass 2's own segment-edge "
             "preference, which only ever sees pre-retiling boundaries (issue #70).",
             boundary,
             pct,
@@ -1511,7 +1655,33 @@ def _log_final_boundary_segment_cuts(
             landed.text,
             landed.start,
             landed.end,
+            depth,
+            landed.duration,
+            idx + 1,
+            back_cost,
+            back_budget,
+            forward_cost,
+            forward_budget,
         )
+
+    if deepest is None:
+        logger.info(
+            "Mid-phrase boundary cuts: none -- no boundary lands inside an aligned segment "
+            "across %d boundary/boundaries (issue #70).",
+            boundary_count,
+        )
+        return
+    deep_idx, deep_depth, deep_pct, deep_segment = deepest
+    logger.info(
+        "Mid-phrase boundary cuts: %d of %d boundaries land inside an aligned segment; "
+        "deepest is chunk %d at %.3fs (%.1f%%) into segment index=%d (issue #70).",
+        cut_count,
+        boundary_count,
+        deep_idx,
+        deep_depth,
+        deep_pct,
+        deep_segment.index,
+    )
 
 
 LEADING_VOCAL_OFFSET_WARN_SECONDS = 1.0
@@ -1995,7 +2165,14 @@ def _cover_instrumentals(
             )
         )
 
-    _log_final_boundary_segment_cuts(covered, segments)
+    _log_final_boundary_segment_cuts(
+        covered,
+        segments,
+        grid=grid,
+        min_frames=min_frames,
+        max_frames=max_frames,
+        filler_max_frames=filler_max_frames,
+    )
     _log_leading_vocal_offset(covered, segments)
 
     voiced = sum(1 for p in covered if p.members)
@@ -2086,6 +2263,12 @@ def slice_audio(
     eff_min, eff_max, grid = _effective_bounds(hardware)
 
     segments = tuple(sorted(alignment.segments, key=lambda s: s.start))
+
+    # Issue #70: a phrase longer than this run's ceiling is cut mid-utterance
+    # by every render there is, so it is worth naming before any of them --
+    # and separately from the boundaries below, which are placement choices
+    # rather than arithmetic. Runs whether or not instrumental coverage is on.
+    _log_untenable_segments(segments, eff_max, grid)
 
     groups = _merge_for_minimum(segments, alignment.track_duration, eff_min)
     raw_pieces = _split_for_maximum(groups, eff_min, eff_max, grid)
