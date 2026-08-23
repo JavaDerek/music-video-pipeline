@@ -105,7 +105,14 @@ logger = logging.getLogger(__name__)
 PROFILE_FORMAT_VERSION = 1
 """The profile *file format* this build reads and writes -- distinct from a
 profile's own ``version`` field (the house style's content version). See the
-module docstring's closing paragraph."""
+module docstring's closing paragraph. Written into every record
+:func:`write_profile_record` produces, so a reader of an old sidecar knows
+which shape it is reading rather than guessing from the keys present."""
+
+PROFILE_RECORD_FILENAME = "cinematography_profile.json"
+"""Where :func:`write_profile_record`'s sidecar lands, by convention, inside a
+run's ``chunks_dir`` -- beside ``run_state.json``, so everything that proves
+what a finished video is made of lives in one directory."""
 
 LOOK_FIELDS: tuple[str, ...] = (
     "cinematography",

@@ -71,6 +71,8 @@ from music_video_maker.faces import build_seed_face_gate
 from music_video_maker.hardware import scan_workflow_for_missing_optimizations
 from music_video_maker.logging_setup import configure_logging
 from music_video_maker.lyrics import parse_lyrics
+from music_video_maker.profiles import LOOK_FIELDS as PROFILE_LOOK_FIELDS
+from music_video_maker.profiles import PROFILE_RECORD_FILENAME, write_profile_record
 from music_video_maker.prompting import expand_prompt
 from music_video_maker.resilience import DiskUsage, ResilientRunner, Sleeper
 from music_video_maker.shot_plan import (
@@ -498,6 +500,37 @@ def run_pipeline(
     session = comfyui_session if comfyui_session is not None else requests.Session()
     custody = build_custody_manager(config, session=session)
 
+    # Issue #55: record the resolved house style verbatim beside this run's
+    # outputs, before any GPU time is spent. prompt_hash proves that a look
+    # *changed*; it cannot say what the look *was* once the profile has moved
+    # on to v3. Never allowed to abort a run -- a provenance sidecar failing
+    # is a thing to log, not a reason to lose a render.
+    if config.cinematography_profile is not None:
+        try:
+            # The effective value of a look field IS what is on the resolved
+            # config -- that is what `load_config` composed and what the
+            # prompts will carry. Which fields the run config *took back*,
+            # though, is not recoverable here (lora_strength defaults to 1.0,
+            # so "set" and "defaulted" look identical after load), which is
+            # why load_config records it as it goes.
+            effective = {
+                name: getattr(config, name)
+                for name in PROFILE_LOOK_FIELDS
+                if getattr(config, name, None) is not None
+            }
+            write_profile_record(
+                config.cinematography_profile,
+                effective,
+                config.cinematography_profile_overrides,
+                Path(config.chunks_dir) / PROFILE_RECORD_FILENAME,
+            )
+        except Exception:  # noqa: BLE001 - provenance must never block a render.
+            logger.exception(
+                "Could not write the cinematography profile record -- continuing with the "
+                "run. The look is still recoverable from %s, which prompt_hash pins.",
+                config.cinematography_profile.path,
+            )
+
     # Issue #43: outside the GPU custody block on purpose. Custody is about the
     # card; this is about the machine driving it staying awake long enough to
     # hear the card finish -- and it must cover Stage 1 too, since alignment
@@ -875,7 +908,15 @@ def run_pipeline(
             )
         else:
             assembly_result = assemble_final_video(
-                chunks, run_state, config.master_audio, config.final_video_dir, runner=ffmpeg_runner
+                chunks,
+                run_state,
+                # Issue #22: None means no audio stream at all, for a concert
+                # backdrop where the band is the audio. See the field's own
+                # docstring for which invariant that suspends and which it
+                # leaves alone.
+                None if config.silent_output else config.master_audio,
+                config.final_video_dir,
+                runner=ffmpeg_runner,
             )
             output_video = assembly_result.output_video
 
