@@ -60,6 +60,7 @@ from music_video_maker.authoring.hashing import sha256_file, sha256_text
 from music_video_maker.authoring.prompts import SHOT_WRITING_GUIDE_DOC, prose_system_prompt
 from music_video_maker.config import RunConfig
 from music_video_maker.contracts import AudioChunk
+from music_video_maker.shot_plan import _content_words, _singularish
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +263,161 @@ def advisory_issues(
                     ),
                 )
             )
+    return tuple(issues)
+
+
+_PLANT_END_STATE_PATTERNS: tuple[str, ...] = (
+    # "where the island once stood" -- the shipped, measured pattern.
+    r"where (?:the |its |that )?{noun}s? (?:once |formerly |used to )?"
+    r"(?:stood|stand|was|were|rose|turned|ran|lay|hung)\b",
+    # "no needle left" -- the issue's own proposal; unmeasured (0 occurrences
+    # in the scored corpus), shipped anchored on the shared noun.
+    r"\bno {noun}s? (?:left|remaining|anywhere|in sight|to be seen)\b",
+    # "nothing of the tower remains" -- the issue's other proposal, same
+    # anchoring, same unmeasured status.
+    r"\bnothing of (?:the |its )?{noun}s? (?:remains|is left|remained|was left)\b",
+)
+
+
+def _plant_end_state_match(line: str, noun: str) -> str | None:
+    """The first of the three end-state phrasings ``line`` matches for
+    ``noun``, or ``None``."""
+    escaped = re.escape(noun)
+    for template in _PLANT_END_STATE_PATTERNS:
+        match = re.search(template.format(noun=escaped), line, re.IGNORECASE)
+        if match:
+            return match.group(0)
+    return None
+
+
+def plant_end_state_issues(
+    shots: Mapping[int, str], beats: Sequence[Beat]
+) -> tuple[ProseIssue, ...]:
+    """Warn when a `plant`'s own line already states the end state its own
+    beat group's `consequence` delivers (issue #85).
+
+    Rule 5 in ``PROSE_PREAMBLE`` says describe the end state, not the
+    motion -- right for a `contact` or a `consequence`, wrong for a `plant`,
+    whose whole job is the *before*. On "Deathless"
+    ``shot_plan_v6.toml.before_g5fix``, beat group 5 put an island GONE at
+    6:26 (the plant), PRESENT at 6:31 (the contact) and GONE again at 6:38
+    (the consequence) -- three internally-consistent lines, and no existing
+    check could see the contradiction, because none of them refers to
+    another.
+
+    Pure and re-derivable from finished text alone, exactly like
+    :func:`advisory_issues` and for the same reason: shot lines move under a
+    revision round, so this has to be recomputed against whatever they say
+    now rather than annotated once and left stale.
+
+    Algorithm: group beats by ``beat_group``. For every `plant` P and
+    `consequence` C in the same group with ``P.chunk_id < C.chunk_id``, take
+    the nouns P's and C's shot lines share -- :func:`~music_video_maker.
+    shot_plan._content_words` / :func:`~music_video_maker.shot_plan.
+    _singularish`, the exact stemming :func:`~music_video_maker.shot_plan.
+    lint_shots_against_lyrics` uses, so "the same word" means the same thing
+    here as it does there. For each shared noun, check whether the *plant's
+    own line* already asserts that noun's absence in one of three fixed
+    phrasings. First match wins; at most one warning per plant chunk.
+
+    Scored on the real corpus before shipping (the #60/#76 rule: a lint that
+    cannot be scored ships saying so, or does not ship) -- 8 real
+    "Deathless" plans (``shot_plan_v4``, ``v5``, ``v6.toml.before_g5fix``,
+    ``v6``, ``v8``, ``v10``, ``v11``, ``v12``), 140 plant -> consequence
+    pairs in total:
+
+    * The shipped ``where ... once stood`` pattern fires ONCE across all 140
+      pairs: ``shot_plan_v6.toml.before_g5fix``, beat group 5, plant
+      chunk 59 against consequence chunk 61, shared noun ``'island'``,
+      matched ``'where the island once stood'`` -- the exact defect this
+      issue was filed about. Silent on the other 15 groups and on every
+      later plan (chunk 59 was restored by hand from
+      ``.authoring/prose.json``, so ``shot_plan_v6.toml`` itself now scores
+      zero).
+    * Excluded: requiring the word "once" (``where N once|formerly|used to
+      stood``) -- identical score, 1 hit / 0 false positives. Shipped
+      without that requirement anyway: "where the island stood" with no
+      "once" is the *same* ambiguity the issue diagnoses in the beat itself,
+      and a warning is the right response to an ambiguity. That widening is
+      untested at n=0 occurrences.
+    * Excluded: "once" anywhere within ~30 characters of the shared noun,
+      either order -- one measured FALSE POSITIVE, ``'a needle glints
+      once'``, the plant on chunk 4 of the same group, where "once" means
+      one time, not "formerly".
+    * Excluded: a generic absence-noun list not anchored to the shared noun
+      (``no (trace|sign|silhouette|shape|mark) ... left``) -- fires on the
+      same single true positive, via ``'no silhouette left to mark'``, but
+      through the generic alternative rather than the shared noun, so its
+      anchor is inert. Shipping it would be shipping an unanchored phrase
+      list on n=1, exactly what #78's landmark lint needed three narrowing
+      passes to stop doing.
+    * Tested and DEAD: the vocabulary-free alternative -- "the plant line
+      repeats a phrase from its own consequence line" -- which would need
+      no word list at all and would have been the better mechanism. It does
+      not separate: the longest shared word run between a plant and its
+      consequence gives the true positive n = 5 (``'where the island once
+      stood'``) and a legitimate pair -- ``shot_plan_v6``/``v12``, group 14,
+      plant chunk 38 against consequence chunk 45, ``'lines across the
+      valley floor'`` -- n = 5 too. Tied, so there is no threshold.
+      Recorded as a failed hypothesis rather than left as a to-do.
+    * The other two shipped patterns (``no N left``, ``nothing of N
+      remains``) are the issue's own proposals and have ZERO occurrences in
+      all 140 pairs -- no evidence for or against either way. They ship
+      anchored on the same shared noun as the measured pattern, which is
+      the property that makes the measured one safe; that is a statement
+      about the anchor, not a measurement of these two.
+    """
+    groups: dict[int, list[Beat]] = {}
+    for beat in beats:
+        groups.setdefault(beat.beat_group, []).append(beat)
+
+    issues: list[ProseIssue] = []
+    for group_id in sorted(groups):
+        members = groups[group_id]
+        plants = sorted(
+            (b for b in members if b.beat_role == "plant"), key=lambda b: b.chunk_id
+        )
+        consequences = sorted(
+            (b for b in members if b.beat_role == "consequence"), key=lambda b: b.chunk_id
+        )
+        for plant in plants:
+            plant_line = shots.get(plant.chunk_id)
+            if not plant_line:
+                continue
+            plant_words = {_singularish(w) for w in _content_words(plant_line)}
+            found: tuple[int, str, str] | None = None
+            for consequence in consequences:
+                if consequence.chunk_id <= plant.chunk_id:
+                    continue
+                consequence_line = shots.get(consequence.chunk_id)
+                if not consequence_line:
+                    continue
+                consequence_words = {_singularish(w) for w in _content_words(consequence_line)}
+                for noun in sorted(plant_words & consequence_words):
+                    phrase = _plant_end_state_match(plant_line, noun)
+                    if phrase:
+                        found = (consequence.chunk_id, noun, phrase)
+                        break
+                if found:
+                    break
+            if found:
+                consequence_chunk_id, noun, phrase = found
+                issues.append(
+                    ProseIssue(
+                        chunk_id=plant.chunk_id,
+                        severity="warning",
+                        message=(
+                            f"plant on chunk_id={plant.chunk_id} (beat_group={group_id}) "
+                            f"already states the end state its own consequence on "
+                            f"chunk_id={consequence_chunk_id} delivers: shared noun "
+                            f"{noun!r}, matched {phrase!r} in this plant's own line. A "
+                            f"plant shows the BEFORE and this group's consequence is what "
+                            f"removes {noun!r} -- stating it here spends the payoff before "
+                            "the payoff lands (issue #85). This is advisory and may be a "
+                            "false positive"
+                        ),
+                    )
+                )
     return tuple(issues)
 
 
@@ -703,6 +859,7 @@ __all__ = [
     "beat_windows",
     "build_prose_prompt",
     "generate_prose",
+    "plant_end_state_issues",
     "prose_input_hashes",
     "revise_prose",
     "validate_prose",

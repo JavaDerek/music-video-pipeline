@@ -26,6 +26,7 @@ from music_video_maker.authoring.prose import (
     beat_windows,
     build_prose_prompt,
     generate_prose,
+    plant_end_state_issues,
     prose_input_hashes,
     validate_prose,
 )
@@ -742,3 +743,181 @@ def test_the_preamble_warns_that_every_noun_renders_literally():
     assert "rendered literally" in lowered or "idiom" in lowered
     # The measured example, so a future editor cannot mistake it for taste.
     assert "holds her line" in PROSE_PREAMBLE
+
+
+# --------------------------------------------------------------------------- #
+# A plant's prose can state the end state its own consequence delivers
+# (issue #85).
+#
+# "Describe the end state, not the motion" (rule 5) is right for a `contact`
+# or a `consequence` and wrong for a `plant`, whose whole job is the BEFORE.
+# On "Deathless" `shot_plan_v6.toml.before_g5fix`, beat group 5 put an island
+# GONE at 6:26 (the plant), PRESENT at 6:31 (the contact) and GONE again at
+# 6:38 (the consequence) -- each line internally consistent, so nothing that
+# compares a shot line to itself could ever see the contradiction.
+# --------------------------------------------------------------------------- #
+
+PLANT_ISLAND_GONE = (
+    "She casts a glance out across the flat, grey sea toward the empty "
+    "horizon where the island once stood, no silhouette left to mark it."
+)
+PLANT_ISLAND_PRESENT = (
+    "A low dark island holds firm along the horizon across the flat grey "
+    "sea, filling the middle distance in the pale light, as she glances "
+    "out toward it."
+)
+CONSEQUENCE_ISLAND_GONE = (
+    "The seabed lies bare and drained, the island fully gone, no needle "
+    "glinting anywhere in it."
+)
+
+
+def test_fires_on_the_real_island_plant_and_consequence_pair():
+    """The exact defect #85 was filed about: a plant that already states the
+    end state its own group's consequence delivers."""
+    beats = (
+        _beat(59, group=5, role="plant"),
+        _beat(60, group=5, role="contact"),
+        _beat(61, group=5, role="consequence"),
+    )
+    shots = {59: PLANT_ISLAND_GONE, 60: "the light sweeps the sea", 61: CONSEQUENCE_ISLAND_GONE}
+
+    issues = plant_end_state_issues(shots, beats)
+
+    assert [i.chunk_id for i in issues] == [59]
+    assert issues[0].severity == "warning"
+    assert "island" in issues[0].message
+    assert "61" in issues[0].message
+
+
+def test_silent_when_the_plant_states_the_before_state():
+    """The restored line -- the island holding firm -- is exactly what a
+    plant is supposed to say, and must not be flagged."""
+    beats = (
+        _beat(59, group=5, role="plant"),
+        _beat(60, group=5, role="contact"),
+        _beat(61, group=5, role="consequence"),
+    )
+    shots = {
+        59: PLANT_ISLAND_PRESENT,
+        60: "the light sweeps the sea",
+        61: CONSEQUENCE_ISLAND_GONE,
+    }
+
+    assert plant_end_state_issues(shots, beats) == ()
+
+
+def test_silent_when_the_two_lines_share_no_noun():
+    beats = (_beat(1, group=1, role="plant"), _beat(2, group=1, role="consequence"))
+    shots = {
+        1: "A battered kettle sits cold on the shelf near the door.",
+        2: "The lantern gutters out completely, its flame gone for good.",
+    }
+
+    assert plant_end_state_issues(shots, beats) == ()
+
+
+def test_silent_when_the_group_has_no_consequence():
+    beats = (_beat(1, group=1, role="plant"), _beat(2, group=1, role="contact"))
+    shots = {1: PLANT_ISLAND_GONE, 2: CONSEQUENCE_ISLAND_GONE}
+
+    assert plant_end_state_issues(shots, beats) == ()
+
+
+def test_silent_when_the_plant_comes_after_the_consequence():
+    """Only a plant whose chunk_id precedes the consequence's counts -- a
+    'plant' authored later in the timeline is not this defect."""
+    beats = (
+        _beat(61, group=5, role="plant"),
+        _beat(59, group=5, role="consequence"),
+    )
+    shots = {61: PLANT_ISLAND_GONE, 59: CONSEQUENCE_ISLAND_GONE}
+
+    assert plant_end_state_issues(shots, beats) == ()
+
+
+def test_one_issue_per_plant_chunk_even_when_several_nouns_match():
+    beats = (_beat(1, group=1, role="plant"), _beat(2, group=1, role="consequence"))
+    shots = {
+        1: (
+            "No needle left where the island once stood, nothing of the "
+            "shrine remains either."
+        ),
+        2: "The island sinks as the needle vanishes and the shrine crumbles into the sea.",
+    }
+
+    issues = plant_end_state_issues(shots, beats)
+
+    assert len(issues) == 1
+    assert issues[0].chunk_id == 1
+
+
+def test_pattern_where_it_once_stood():
+    beats = (_beat(1, group=1, role="plant"), _beat(2, group=1, role="consequence"))
+    shots = {
+        1: "The old bridge holds firm where it has always crossed the ravine below.",
+        2: "The bridge finally gives way and falls into the ravine.",
+    }
+    # This one shares "bridge" but has no absence phrasing -- silent.
+    assert plant_end_state_issues(shots, beats) == ()
+
+    shots_gone = {
+        1: "She looks out toward the far bank, where the bridge once stood.",
+        2: "The bridge finally gives way and falls into the ravine.",
+    }
+    issues = plant_end_state_issues(shots_gone, beats)
+    assert len(issues) == 1
+    assert "bridge" in issues[0].message
+
+
+def test_pattern_no_noun_left():
+    beats = (_beat(1, group=1, role="plant"), _beat(2, group=1, role="consequence"))
+    shots = {
+        1: "The valley holds no bridge left, its ruins hidden in the mist below.",
+        2: "The bridge finally gives way and falls into the ravine.",
+    }
+
+    issues = plant_end_state_issues(shots, beats)
+
+    assert len(issues) == 1
+    assert issues[0].chunk_id == 1
+
+
+def test_pattern_nothing_of_noun_remains():
+    beats = (_beat(1, group=1, role="plant"), _beat(2, group=1, role="consequence"))
+    shots = {
+        1: (
+            "Nothing of the tower remains against the skyline, a bare field "
+            "stretching where the walls once framed the square."
+        ),
+        2: "The tower crumbles into rubble as dust rises over the square.",
+    }
+
+    issues = plant_end_state_issues(shots, beats)
+
+    assert len(issues) == 1
+    assert issues[0].chunk_id == 1
+
+
+def test_the_returned_severity_is_warning():
+    beats = (_beat(1, group=1, role="plant"), _beat(2, group=1, role="consequence"))
+    issues = plant_end_state_issues(
+        {1: PLANT_ISLAND_GONE, 2: CONSEQUENCE_ISLAND_GONE}, beats
+    )
+
+    assert issues
+    assert all(issue.severity == "warning" for issue in issues)
+
+
+def test_the_preamble_tells_a_plant_to_show_the_before_state():
+    """Issue #85: rule 5 ("describe the end state, not the motion") is right
+    for a contact or a consequence and wrong for a plant, and nothing
+    arbitrated that until this rule existed."""
+    from music_video_maker.authoring.prompts import PROSE_PREAMBLE
+
+    lowered = PROSE_PREAMBLE.lower()
+    assert "plant" in lowered and "before" in lowered
+    # The measured numbers, so a future editor cannot mistake it for taste.
+    assert "6:26" in PROSE_PREAMBLE
+    assert "6:31" in PROSE_PREAMBLE
+    assert "6:38" in PROSE_PREAMBLE

@@ -495,7 +495,22 @@ shadow sprawling up the rock face", a mountain "worn down now to little more \
 than a bare hill", a whole video's `setting` describing time itself as \
 "smeared" all render exactly as intended in the same song. The test is not \
 whether a line uses a figure of speech; it's whether that figure of speech \
-happens to be the name of a physical thing you don't want in the frame.\
+happens to be the name of a physical thing you don't want in the frame.
+13. A `plant` SHOWS THE STATE BEFORE ANYTHING HAPPENS TO ITS OBJECT. Rule 5 \
+above tells you to describe the end state rather than the motion, and that is \
+right for a `contact` or a `consequence` -- the end state it means is the end \
+state of THAT shot's own action. It is wrong for a plant, whose whole job is \
+the before: the object standing, turning, intact, present. A plant line must \
+not use absence or past tense about the object its own beat group later removes \
+-- no "where it once stood", no "nothing left of it", no "the empty horizon \
+where the X was". Measured on a real plan: a plant, a contact and a consequence \
+twelve seconds apart put an island GONE at 6:26, PRESENT at 6:31 and GONE again \
+at 6:38. All three lines were internally consistent and no existing check could \
+see it, because each was a complete, self-contained description and none \
+referred to any other. If the beat you were given is itself ambiguous about \
+tense -- "she looks out toward the sea where the island stood" reads equally as \
+"has always stood" and "used to stand" -- resolve it toward the before-state, \
+because that is what a plant is for.\
 """
 
 
