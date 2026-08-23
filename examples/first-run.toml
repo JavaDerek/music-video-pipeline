@@ -130,6 +130,36 @@ render_width  = 864
 render_height = 480
 
 # --------------------------------------------------------------------------- #
+# Noise seed (issue #38)
+# --------------------------------------------------------------------------- #
+
+# The run-wide base every chunk's seed derives from:
+#
+#   seed = (noise_seed + chunk_id + reseed_generation * 2**32) % (MAX + 1)
+#
+# so chunks differ from one another, the value is a pure function of three
+# integers (no clock, no RNG state -- `--resume` recomposes exactly the same
+# seed), and the resolved seed is recorded per chunk in run_state.json.
+#
+# Left at 0 you get what this project has always rendered. To re-roll one bad
+# shot after watching a render: `--reseed 12` (implies --resume, re-renders
+# only chunk 12); bump `--reseed-generation` if the second take is no better.
+#
+# WHAT A SEED DOES NOT DO -- plan around this, not around the hope. A seed
+# does NOT transport a composition across a change in resolution, precision,
+# GPU, or attention kernel. Diffusion sampling is chaotic with respect to
+# those numerics: the same seed at a different resolution is a DIFFERENT
+# video, not a higher-fidelity version of the same one (the latent shape
+# changes, so the seed's noise tensor is a different object entirely).
+#
+# This bites the obvious workflow. Iterating cheaply at 864x480 and then
+# re-rendering "the same thing" at higher quality does not preserve the takes
+# you approved. What transports is the AUTHORED layer -- lyrics, vocal map,
+# chunk timeline, shot plan, reference photos -- which is most of the work.
+
+noise_seed = 0
+
+# --------------------------------------------------------------------------- #
 # Coverage
 # --------------------------------------------------------------------------- #
 

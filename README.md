@@ -798,6 +798,8 @@ Flags (see `music_video_maker/cli.py`'s `build_parser()`):
 | `--ignore-prompt-changes` | With `--resume`, reuse chunks whose span is unchanged but whose *prompt* was edited — a shot-plan tweak, a reworded cast role. Chunks whose span, frame count or render resolution moved are re-rendered regardless. One-way; the config equivalent is `resume_ignore_prompt_changes`. |
 | `--strict-alignment` | Refuse to render when forced alignment produces implausible timings — zero-length segments, a lyric placed where nothing is sung, a line split across a huge gap (see below). Report-only without it. One-way; the config equivalent is `strict_alignment`. |
 | `--only-chunks IDS` | Render only these chunk ids (`32,33,34,35`) and skip Stage 5 assembly. Stages 1–2 still run over the *whole* track, so each chunk gets exactly the span, prompt and frame count a full run would give it — re-slicing around a selection would validate a chunk the real run never produces. This is the validation slice: prove a prompt-shape or gate change on a few chunks before committing hours of exclusive GPU custody. A slice loads prior run state and augments it, and always re-renders its own chunks even when their fingerprints still match. |
+| `--reseed IDS` | Re-roll these chunk ids (`12,29`) under a different, deterministic seed and re-render just them, reusing every other cached chunk — the common case of watching a render and finding one shot bad. **Implies `--resume`.** The new seed is derived from `--reseed-generation`, never random, so an interrupted `--reseed` run recomposes the same value on restart rather than drifting further each time. See "Seeds" below. |
+| `--reseed-generation N` | Which alternate take `--reseed`'s chunks render (default `1`). Bump it if a previous `--reseed` of the same chunk still wasn't right — each generation is a distinct, reproducible seed, never the same one repeated. Refused below `1` (generation `0` is the seed the chunk already has without `--reseed`, not a re-roll of it). Ignored without `--reseed`. |
 | `--log-level LEVEL` | Root log level, default `INFO`. All diagnostic output goes to stderr (`logging_setup.py`) — there is no separate progress bar; the WebSocket `progress` events logged at `INFO` *are* the progress display. |
 
 Exit codes (`music_video_maker/cli.py`):
@@ -942,6 +944,46 @@ the scene-cut scan standalone against any directory of already-rendered
 slice rendered via `--only-chunks`, without re-running any pipeline stage.
 It prints one line per flagged chunk (with every cut's time and score) plus
 a summary count, and exits non-zero if anything was flagged.
+
+#### Seeds: varying a take, and what a seed does *not* transport (issue #38)
+
+`noise_seed` (config, default `0`) is the run-wide base every chunk's seed is
+derived from:
+
+```
+seed = (noise_seed + chunk_id + reseed_generation * 2**32) % (MAX_SEED + 1)
+```
+
+Three properties follow, and all three are the point:
+
+- **Chunks differ from each other**, so a video isn't 80 variations on one
+  noise pattern.
+- **It is a pure function of three integers** — no clock, no RNG state — so a
+  resumed run recomposes exactly the same seed. `--resume` correctness
+  depends on that.
+- **The resolved seed is recorded per chunk** in `run_state.json`'s
+  `ChunkFingerprint`, in the *content* tier. A good take is reproducible, and
+  a changed seed is a visible reason to re-render rather than a silent one.
+  (Being content-tier, it is escapable via `--ignore-prompt-changes` — unlike
+  the encoder or LoRA, which are not.)
+
+To re-roll a bad shot: `--reseed 12` (implies `--resume`). Only chunk 12
+re-renders; bump `--reseed-generation` if the second take is no better.
+
+**What a seed does not do — plan around this, not around the hope.** A seed
+does **not** transport a composition across a change in resolution,
+precision, GPU, or attention kernel. Diffusion sampling is chaotic with
+respect to those numerics, so the same seed on different hardware or at a
+different resolution gives a *different* video — not a higher-fidelity
+version of the same one. Resolution is the clearest case: the latent shape
+changes, so the seed's noise tensor is a different object entirely.
+
+This matters because the intended workflow is to iterate cheaply at 864×480
+until the *script* is right, then re-render at higher quality — and the
+second half of that does not preserve the takes you approved in the first.
+What transports is the **authored layer**: lyrics, vocal map, chunk
+timeline, shot plan, reference photos. That is most of the work, and it is
+the part worth protecting.
 
 ### GPU custody
 
