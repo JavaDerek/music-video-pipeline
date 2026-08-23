@@ -27,7 +27,20 @@ This package ships in phases (issue #54 design, section 12).
   the timeline their own ``length_seconds`` produced. Its render-side twin is
   ``--prepare --from-plan``.
 
-Photography and prose follow in later phases against the same seam.
+* **Phases 3 and 4** add :mod:`~music_video_maker.authoring.photography`
+  (Stage 3 -- the look, and per-shot framing) and
+  :mod:`~music_video_maker.authoring.prose` (Stage 4 -- the shot lines
+  themselves), plus :mod:`~music_video_maker.authoring.plan`, which composes,
+  checks and writes the ``shot_plan.toml``. All four phases have landed.
+
+Two modules sit beside the four stages rather than inside them, and both
+answer "is this beat sheet internally consistent" before a word of prose
+exists: :mod:`~music_video_maker.authoring.worldstate`, an event-sourced
+timeline whose one write choke point makes "an irreversible fact is never
+contradicted" true of the whole log by construction, and
+:mod:`~music_video_maker.authoring.conditions` (issue #83), which writes a
+beat sheet's world-state tags into that log and reports what the choke point
+refuses. Neither is imported by anything that runs during a render.
 """
 
 from __future__ import annotations

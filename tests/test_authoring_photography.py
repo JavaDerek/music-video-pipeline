@@ -16,6 +16,7 @@ check exists and it is the first thing tested.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -426,3 +427,49 @@ def test_the_preamble_requires_a_close_framing_on_sung_chunks():
     assert "not optional" in lowered
     # Measured, so it reads as evidence rather than taste.
     assert "0-33%" in PHOTOGRAPHY_PREAMBLE
+
+
+# --------------------------------------------------------------------------- #
+# Issue #86: song_facts, composed the same way and in the same position as
+# concept.build_concept_prompt (see that module's tests for the direct unit
+# tests of prompts.song_facts_block itself).
+# --------------------------------------------------------------------------- #
+
+
+def test_prompt_has_no_established_facts_section_by_default(tmp_path):
+    prompt = build_photography_prompt(_config(tmp_path), CONCEPT, (_beat(1),), _chunks())
+    assert "Established facts about this song" not in prompt
+
+
+def test_prompt_puts_song_facts_first_when_the_config_has_them(tmp_path):
+    config = replace(_config(tmp_path), song_facts=("the mill was destroyed in act 5",))
+
+    prompt = build_photography_prompt(config, CONCEPT, (_beat(1),), _chunks())
+
+    assert prompt.startswith("## Established facts about this song")
+    assert "the mill was destroyed in act 5" in prompt
+    assert prompt.index("Established facts") < prompt.index("The approved concept")
+
+
+def test_input_hashes_have_no_song_facts_key_by_default(tmp_path):
+    chunks = _chunks()
+    beats = (_beat(1), _beat(2))
+
+    hashes = photography_input_hashes(_config(tmp_path), chunks, CONCEPT, beats)
+
+    assert "song_facts" not in hashes
+    assert set(hashes) == {"skeleton", "concept", "beats"}
+
+
+def test_input_hashes_include_song_facts_when_set_and_change_with_it(tmp_path):
+    chunks = _chunks()
+    beats = (_beat(1), _beat(2))
+    config = replace(_config(tmp_path), song_facts=("fact one",))
+
+    before = photography_input_hashes(config, chunks, CONCEPT, beats)
+    after = photography_input_hashes(
+        replace(config, song_facts=("fact two",)), chunks, CONCEPT, beats
+    )
+
+    assert "song_facts" in before
+    assert before["song_facts"] != after["song_facts"]

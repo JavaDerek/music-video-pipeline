@@ -16,6 +16,7 @@ handful of field checks provide.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -24,7 +25,11 @@ from typing import Any
 from music_video_maker.authoring.chunks import skeleton_table_text
 from music_video_maker.authoring.driver import MODEL_FABLE, DriverResult, ModelDriver
 from music_video_maker.authoring.hashing import sha256_file, sha256_text
-from music_video_maker.authoring.prompts import LYRICS_FORMAT_DOC, concept_system_prompt
+from music_video_maker.authoring.prompts import (
+    LYRICS_FORMAT_DOC,
+    concept_system_prompt,
+    song_facts_block,
+)
 from music_video_maker.config import RunConfig
 from music_video_maker.contracts import AudioChunk
 from music_video_maker.lyrics import parse_lyrics
@@ -115,7 +120,10 @@ being config rather than a preamble opinion."""
 CONCEPT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["reading", "logline", "setting", "tone", "motifs", "avoid", "locations", "acts"],
+    "required": [
+        "reading", "logline", "setting", "tone", "motifs", "avoid", "locations", "acts",
+        "conditions",
+    ],
     "properties": {
         "reading": READING_SCHEMA,
         "logline": {"type": "string", "minLength": 1},
@@ -131,6 +139,21 @@ CONCEPT_SCHEMA: dict[str, Any] = {
         "acts": {
             "type": "array",
             "items": ACT_SCHEMA,
+            "minItems": 1,
+        },
+        # Issue #83: the third continuity axis -- what the world LOOKS LIKE
+        # at a given moment (weather, light, the persistent aftermath of an
+        # event), separate from `locations` (where anyone is) and `setting`
+        # (what world this is). Required and non-empty like `locations`, but
+        # for a sharper reason than "the beats stage needs a vocabulary":
+        # unlike `reading.references`, where an empty list is a first-class,
+        # CORRECT answer for a song with no mythology in it, a video always
+        # has SOME weather and light. #83's whole defect was a world state
+        # nobody had named anywhere -- "nobody said" is exactly the gap this
+        # field exists to close, so leaving it out is never the right reply.
+        "conditions": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
             "minItems": 1,
         },
     },
@@ -177,6 +200,20 @@ def validate_concept(data: object) -> None:
             "concept.locations must be a non-empty list of non-empty strings (issue #78: "
             f"the beats stage has no vocabulary to assign `location` from otherwise), got "
             f"{locations!r}"
+        )
+
+    conditions = data["conditions"]
+    if (
+        not isinstance(conditions, list)
+        or not conditions
+        or not all(isinstance(v, str) and v.strip() for v in conditions)
+    ):
+        raise ConceptValidationError(
+            "concept.conditions must be a non-empty list of non-empty strings (issue #83: "
+            "the beats stage has no vocabulary to assign `conditions` from otherwise -- and, "
+            "unlike `reading.references`, an empty list is never the correct reply here, "
+            "because a video always has SOME weather and light), got "
+            f"{conditions!r}"
         )
 
     problems = _validate_reading(data["reading"]) + _validate_acts(data["acts"])
@@ -320,11 +357,21 @@ def concept_input_hashes(config: RunConfig, chunks: Sequence[AudioChunk]) -> dic
     shared between the real run and :mod:`~music_video_maker.authoring.session`
     staleness checks so the two can never disagree about what "the same
     inputs" means."""
-    return {
+    hashes = {
         "lyrics": sha256_file(config.lyrics_file),
         "skeleton": sha256_text(skeleton_table_text(chunks)),
         "lyrics_format_doc": sha256_file(LYRICS_FORMAT_DOC),
     }
+    if config.song_facts:
+        # Issue #86: present ONLY when there are facts to hash.
+        # `session.stage_staleness` compares hash dicts with `==`, so an
+        # unconditional key here would report every stage of every run
+        # committed before this field existed as stale the moment this
+        # landed, with nothing having actually changed -- the same reasoning
+        # `beats_input_hashes`/`photography_input_hashes`/`prose_input_hashes`
+        # each cross-reference rather than repeat.
+        hashes["song_facts"] = sha256_text(json.dumps(list(config.song_facts)))
+    return hashes
 
 
 def build_concept_prompt(
@@ -341,7 +388,19 @@ def build_concept_prompt(
     cast_lines = "\n".join(f"- {name}: {member.role}" for name, member in config.cast.items())
     stats = _summary_stats(chunks)
 
-    parts = [
+    parts: list[str] = []
+    facts = song_facts_block(config.song_facts)
+    if facts:
+        # Issue #86: an operator's established fact about the song, composed
+        # FIRST -- ahead of the lyric text here, and ahead of the approved
+        # concept/window in beats.build_beats_prompt,
+        # photography.build_photography_prompt and prose.build_prose_prompt
+        # (same position in all four on purpose; they cross-reference this
+        # comment rather than repeat it). This is the frame the stage reads
+        # everything else through, not a constraint applied after the fact
+        # the way `setting`/`global_style` are below.
+        parts += [*facts, ""]
+    parts += [
         "## Lyric text (verbatim, tag-stripped; empty means this song is "
         "authored with nobody shown singing)",
         lyric_text or "(none -- no lyric is ever sung on screen in this video)",
@@ -384,7 +443,10 @@ def generate_concept(
     driver itself propagate -- either way, nothing is returned to write, per
     design section 3: "a half-written session is worse than no session."
     """
-    system = concept_system_prompt()
+    # Issue #67: the directorial literalness choice reaches the model through
+    # the system prompt, straight from config -- never re-derived or defaulted
+    # here a second time.
+    system = concept_system_prompt(literalness=config.lyric_literalness)
     prompt = build_concept_prompt(config, chunks, hints=hints)
 
     last_error: ConceptValidationError | None = None

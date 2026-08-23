@@ -39,6 +39,7 @@ from music_video_maker.authoring import prose as prose_module
 from music_video_maker.authoring.beats import Beat, BeatsValidationError, beat_length_requests
 from music_video_maker.authoring.chunks import SkeletonError, load_chunk_skeleton
 from music_video_maker.authoring.concept import ConceptValidationError, generate_concept
+from music_video_maker.authoring.conditions import check_conditions, conditions_from_beats
 from music_video_maker.authoring.driver import ClaudeCliDriver, DriverError
 from music_video_maker.authoring.hashing import sha256_file, sha256_text
 from music_video_maker.authoring.photography import PhotographyValidationError
@@ -194,6 +195,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Overwrite an existing plan. An authored shot plan is real work, so this "
         "refuses to clobber one without it -- the same rule as --prepare.",
     )
+    write_parser.add_argument(
+        "--revise-warnings",
+        action="store_true",
+        help="Spend one extra model call rewriting approved prose to satisfy "
+        "warning-tier lints (issue #87). Off by default: measured on 'Deathless' "
+        "shot_plan_v6.toml, this round rewrote 37 of 80 shot lines away from what the "
+        "prose stage wrote, and a second `write` on unchanged prose changed 41 lines "
+        "relative to the first -- the round is a model call, so its own output is not "
+        "stable. Warnings are advisory ('a false positive must never block a run'), so "
+        "spending a model call rewriting approved prose to satisfy one is a stronger "
+        "action than blocking, not a weaker one.",
+    )
 
     all_parser = subparsers.add_parser(
         "all",
@@ -216,6 +229,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Overwrite an existing plan at the output path.",
+    )
+    all_parser.add_argument(
+        "--revise-warnings",
+        action="store_true",
+        help="Same as `write --revise-warnings`: spend one extra model call rewriting "
+        "approved prose to satisfy warning-tier lints. Off by default -- see `write "
+        "--help` for the measured cost.",
     )
 
     subparsers.add_parser("status", help="Report every stage's state: ok, stale, or not started.")
@@ -269,7 +289,7 @@ def _cmd_concept(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         _print_prompts(
-            concept_system_prompt(),
+            concept_system_prompt(config.lyric_literalness),
             concept_module.build_concept_prompt(config, chunks, hints=args.notes),
         )
         return EXIT_SUCCESS
@@ -350,6 +370,11 @@ def _cmd_concept(args: argparse.Namespace) -> int:
     # is generated against them.
     acts = result.data.get("acts") or []
     print(f"acts: {' -> '.join(a.get('name', '') for a in acts)}")
+    # Issue #83: the third continuity axis, at the same review point as
+    # `locations` and for the same reason -- a world state missing from this
+    # list cannot be authored later, and a video whose weather nobody named
+    # is exactly the gap this closes.
+    print(f"conditions: {', '.join(result.data.get('conditions', []))}")
     return EXIT_SUCCESS
 
 
@@ -399,7 +424,7 @@ def _cmd_beats(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         _print_prompts(
-            beats_system_prompt(),
+            beats_system_prompt(config.lyric_literalness),
             beats_module.build_beats_prompt(config, chunks, concept, notes=args.notes),
         )
         return EXIT_SUCCESS
@@ -460,7 +485,36 @@ def _cmd_beats(args: argparse.Namespace) -> int:
             f"{beat.chunk_id:>4}  {beat.start:>8.3f}  {beat.beat_role:<13}"
             f"g{beat.beat_group:<3} [{beat.location}] {act_tag}{beat.beat}{merged}"
         )
+    _report_condition_findings(plan.beats)
     return EXIT_SUCCESS
+
+
+def _report_condition_findings(beats: Sequence[Beat]) -> tuple:
+    """Issue #83's two world-state checks, reported at the beats review
+    point -- which is where they can actually be acted on.
+
+    A flip-flop or a regression is a defect in *what happens*, not in how a
+    sentence is worded, so the remedy is ``mvm-author beats --notes "..."``
+    and the place to say so is here, before three more stages have been
+    generated on top of it. They are also written into the plan later as
+    ``# lint:`` comments (see ``_cmd_write``), marked non-revisable so no
+    revision round is ever asked to fix them by rewriting prose.
+
+    Warning tier: never blocks, never raises. Returns the findings so the
+    caller can reuse them."""
+    findings = check_conditions(conditions_from_beats(beats))
+    if not findings:
+        return findings
+    logger.warning(
+        "%d world-state continuity finding(s) on this beat sheet (issue #83)", len(findings)
+    )
+    print(
+        f"\n{len(findings)} world-state continuity finding(s) (issue #83) -- advisory, and "
+        "fixed by re-rolling the beats, not by rewording a shot:"
+    )
+    for finding in findings:
+        print(f"  [chunk {finding.ref}] {finding.message}")
+    return findings
 
 
 def _load_stage_json(run_dir: Path, name: str, *, quiet: bool = False) -> dict | None:
@@ -559,7 +613,7 @@ def _cmd_prose(args: argparse.Namespace) -> int:
             logger.error("No beat group matches --groups %r", args.groups)
             return EXIT_ERROR
         _print_prompts(
-            prose_system_prompt(),
+            prose_system_prompt(config.lyric_literalness),
             prose_module.build_prose_prompt(
                 config, concept, windows[0], beats, chunks, camera={}, notes=args.notes
             ),
@@ -881,6 +935,14 @@ def _cmd_write(args: argparse.Namespace) -> int:
             "lyrics": sha256_file(config.lyrics_file),
             "skeleton": sha256_text(beats_module.skeleton_table_text(chunks)),
         },
+        # Issue #86: straight from the run config, so a human reviewing the
+        # plan sees what it was authored under.
+        song_facts=tuple(config.song_facts),
+        # Issue #67: which brief this plan was written to. A plan authored
+        # `free` and later loaded by a run configured `literal` will trip
+        # lints it was never meant to satisfy; this is how that is
+        # diagnosable rather than mysterious.
+        lyric_literalness=config.lyric_literalness,
     )
 
     driver = ClaudeCliDriver()
@@ -899,11 +961,37 @@ def _cmd_write(args: argparse.Namespace) -> int:
 
     camera = _load_camera(run_dir)
 
+    # Issue #83: a function of the BEAT SHEET, not of the shot text, so it is
+    # computed once rather than re-derived per round -- and marked
+    # `revisable=False`, because the remedy is a re-rolled beat and a
+    # revision round handed one would rewrite a shot line to satisfy a
+    # complaint the shot line did not cause (#87's lesson).
+    condition_issues = tuple(
+        prose_module.ProseIssue(
+            chunk_id=finding.ref if isinstance(finding.ref, int) else None,
+            severity="warning",
+            message=finding.message,
+            revisable=False,
+        )
+        for finding in check_conditions(conditions_from_beats(beats))
+    )
+
     def advisory(current_shots):
-        """The prose stage's own warning-tier prohibitions, re-derived on the
+        """The prose stage's own warning-tier checks, re-derived on the
         current text so a revision round cannot leave the file annotated with
-        a complaint about a sentence that no longer exists."""
-        return prose_module.advisory_issues(current_shots, camera=camera)
+        a complaint about a sentence that no longer exists.
+
+        Issue #85's plant-vs-consequence check joins them here rather than in
+        ``shot_plan.py``: it needs ``beat_role`` and ``beat_group``, which
+        only the authoring layer has -- the render sees finished prose and a
+        chunk timeline and could not tell a plant from a payoff without
+        guessing, which is the thing this project keeps having to retire.
+        """
+        return (
+            prose_module.advisory_issues(current_shots, camera=camera)
+            + prose_module.plant_end_state_issues(current_shots, beats)
+            + condition_issues
+        )
 
     try:
         built = plan_module.build_plan(
@@ -918,10 +1006,14 @@ def _cmd_write(args: argparse.Namespace) -> int:
             extra_checks=advisory,
             # Issue #87: the concrete objects this song's lyrics actually
             # name (issue #69's `reading.nouns`), so the shot-vs-lyric lint
-            # can stop firing on function words -- and so `write`'s one
-            # warning round stops spending a model call rewriting approved
-            # prose to satisfy them.
+            # can stop firing on function words -- and so a warning round,
+            # if one runs at all, stops spending a model call rewriting
+            # approved prose to satisfy them.
             stageable_nouns=tuple((concept.get("reading") or {}).get("nouns") or ()),
+            # Issue #87 item 3: off unless the operator asks for it -- see
+            # build_parser's --revise-warnings help text for the measured
+            # cost of turning it on.
+            revise_warnings=args.revise_warnings,
         )
     except (PlanError, DriverError, ProseValidationError):
         logger.exception("Could not compose a shot plan that loads cleanly")
@@ -943,6 +1035,15 @@ def _cmd_write(args: argparse.Namespace) -> int:
         for issue in built.surviving_warnings:
             where = f"chunk {issue.chunk_id}" if issue.chunk_id is not None else "file"
             print(f"  [{where}] {issue.message}")
+    # Issue #87 item 2: the revision round's own footprint, surfaced the same
+    # way the surviving warnings are -- so a --revise-warnings run reports
+    # what it changed, not just what it left alone.
+    if built.lint_round_edits:
+        print(
+            f"{len(built.lint_round_edits)} shot line(s) were rewritten by the lint "
+            "revision round and are marked '# revised' in the file -- diff them against "
+            "what's quoted there before trusting the line."
+        )
     return EXIT_SUCCESS
 
 
@@ -1004,7 +1105,12 @@ def _cmd_all(args: argparse.Namespace) -> int:
 
     print(f"\n{'=' * 80}\nWRITE\n{'=' * 80}")
     return _cmd_write(
-        argparse.Namespace(config=args.config, out=args.out, force=args.force)
+        argparse.Namespace(
+            config=args.config,
+            out=args.out,
+            force=args.force,
+            revise_warnings=args.revise_warnings,
+        )
     )
 
 
@@ -1102,6 +1208,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
     for stage, state, detail in rows:
         print(f"{stage:<14}{state:<12}{detail}")
 
+    _report_song_facts_and_reading(config, concept)
     _report_human_edits(config, run_dir)
     return EXIT_SUCCESS
 
@@ -1118,6 +1225,23 @@ def _prose_timeline(
     except SkeletonError:
         return tuple(fallback)
     return recut if recut is not None else tuple(fallback)
+
+
+def _report_song_facts_and_reading(config: RunConfig, concept: dict | None) -> None:
+    """Issue #86 point 1: the model's answer to "what is this song about"
+    (issue #69's ``reading.subject``) beside the operator's own answer
+    (``song_facts``) -- printed only when there is something to print, so a
+    run with neither a concept yet nor any facts gets no extra output."""
+    lines: list[str] = []
+    if concept is not None:
+        subject = str((concept.get("reading") or {}).get("subject") or "").strip()
+        if subject:
+            lines.append(f"reading.subject: {subject}")
+    if config.song_facts:
+        lines.append("song_facts:")
+        lines += [f"  - {fact}" for fact in config.song_facts]
+    if lines:
+        print("\n" + "\n".join(lines))
 
 
 def _report_human_edits(config: RunConfig, run_dir: Path) -> None:

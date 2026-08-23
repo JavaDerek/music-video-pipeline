@@ -313,6 +313,59 @@ def test_provenance_keys_do_not_trip_the_unknown_key_lint(tmp_path, caplog):
     assert "nothing reads" not in caplog.text
 
 
+# --------------------------------------------------------------------------- #
+# Issue #86: song_facts surfaced as a header comment, so a human reviewing
+# the plan can see what it was authored under.
+# --------------------------------------------------------------------------- #
+
+
+def test_provenance_song_facts_defaults_to_empty():
+    """Every `Provenance(...)` call site that predates issue #86 -- and
+    `PROVENANCE` above is one -- must keep working unchanged."""
+    assert PROVENANCE.song_facts == ()
+
+
+def test_no_song_facts_header_when_the_provenance_has_none():
+    text = render_plan_toml(_chunks(["x"]), (_beat(1),), LINES, provenance=PROVENANCE)
+    assert "Authored under these established facts" not in text
+
+
+def test_a_song_facts_header_is_written_when_the_provenance_has_them():
+    provenance = replace(
+        PROVENANCE,
+        song_facts=("the island is vaporised, not eroded", "the narrator is unreliable"),
+    )
+    text = render_plan_toml(_chunks(["x"]), (_beat(1),), LINES, provenance=provenance)
+
+    lines = text.splitlines()
+    header_index = lines.index(
+        "# Authored under these established facts about the song (run config `song_facts`):"
+    )
+    assert lines[header_index + 1] == "#   - the island is vaporised, not eroded"
+    assert lines[header_index + 2] == "#   - the narrator is unreliable"
+    # Immediately after the existing four header comment lines, before the
+    # blank line preceding [provenance].
+    assert lines[header_index - 1].startswith("# raised and nobody silenced")
+    assert lines[header_index + 3] == ""
+    assert lines[header_index + 4] == "[provenance]"
+
+
+def test_a_song_facts_bullet_collapses_whitespace_like_every_other_comment():
+    provenance = replace(PROVENANCE, song_facts=("a fact\nwith  a   line break",))
+    text = render_plan_toml(_chunks(["x"]), (_beat(1),), LINES, provenance=provenance)
+
+    assert "#   - a fact with a line break" in text.splitlines()
+
+
+def test_song_facts_header_does_not_break_the_real_loader(tmp_path):
+    provenance = replace(PROVENANCE, song_facts=("a settled fact",))
+    path = tmp_path / "shot_plan.toml"
+    path.write_text(render_plan_toml(_chunks(["x"]), (_beat(1),), LINES, provenance=provenance))
+
+    plan = load_shot_plan(path)  # must not raise
+    assert set(plan) == {1}
+
+
 def test_lint_comments_land_above_their_entry(tmp_path):
     chunks = _chunks(["x", "y"])
     text = render_plan_toml(
@@ -329,6 +382,77 @@ def test_lint_comments_land_above_their_entry(tmp_path):
     # ...and it is still valid TOML that loads.
     (tmp_path / "p.toml").write_text(text)
     assert set(load_shot_plan(tmp_path / "p.toml")) == {1, 2}
+
+
+# --------------------------------------------------------------------------- #
+# Issue #87 item 2: the revision round's own edits, visible in the file.
+# --------------------------------------------------------------------------- #
+
+
+def test_no_revisions_supplied_leaves_the_toml_byte_identical(tmp_path):
+    """The whole point of an optional keyword: a caller that never mentions
+    ``revisions`` gets exactly today's output, byte for byte."""
+    chunks = _chunks(["x", "y"])
+    args = (chunks, (_beat(1), _beat(2)), LINES)
+    without_kwarg = render_plan_toml(*args, provenance=PROVENANCE, camera=CAMERAS)
+    with_none = render_plan_toml(*args, provenance=PROVENANCE, camera=CAMERAS, revisions=None)
+
+    assert without_kwarg == with_none
+    assert "# revised" not in without_kwarg
+
+
+def test_revised_comment_lands_after_lint_comments_and_before_the_entry(tmp_path):
+    """Design: "after any # lint: comments and immediately before [[shot]]"."""
+    chunks = _chunks(["x", "y"])
+    text = render_plan_toml(
+        chunks,
+        (_beat(1), _beat(2)),
+        LINES,
+        provenance=PROVENANCE,
+        lint_comments={2: ["the lyric names 'printer' but this shot does not show it"]},
+        revisions={2: ("warning", 'She stood by the door, "waiting" for him')},
+    )
+
+    lines = text.splitlines()
+    lint_at = next(i for i, line in enumerate(lines) if line.startswith("# lint:"))
+    revised_at = next(i for i, line in enumerate(lines) if line.startswith("# revised"))
+    shot_at = next(
+        i for i, line in enumerate(lines) if line == "[[shot]]" and i > revised_at
+    )
+
+    assert revised_at == lint_at + 1
+    assert shot_at == revised_at + 1
+    assert "(warning tier)" in lines[revised_at]
+    assert 'the prose stage wrote: "' in lines[revised_at]
+    # Run through the same whitespace-collapse and quote-swap as `# lyric:`,
+    # so a quote embedded in the original prose can never look like the
+    # comment ended early.
+    assert "'waiting'" in lines[revised_at]
+    assert '"waiting"' not in lines[revised_at]
+
+    # Still valid TOML that loads.
+    (tmp_path / "p.toml").write_text(text)
+    assert set(load_shot_plan(tmp_path / "p.toml")) == {1, 2}
+
+
+def test_revised_comment_omitted_for_a_chunk_with_no_entry_in_the_mapping(tmp_path):
+    chunks = _chunks(["x", "y"])
+    text = render_plan_toml(
+        chunks,
+        (_beat(1), _beat(2)),
+        LINES,
+        provenance=PROVENANCE,
+        revisions={2: ("error", "the original")},
+    )
+
+    # Exactly one `# revised` comment in the whole file, and it belongs to
+    # chunk 2 -- immediately followed by that chunk's own `[[shot]]`/
+    # `chunk_id`, not chunk 1's.
+    lines = text.splitlines()
+    revised_at = [i for i, line in enumerate(lines) if line.startswith("# revised")]
+    assert len(revised_at) == 1
+    assert lines[revised_at[0] + 1] == "[[shot]]"
+    assert lines[revised_at[0] + 2] == "chunk_id = 2"
 
 
 # --------------------------------------------------------------------------- #
@@ -523,7 +647,8 @@ def test_an_unfixable_error_aborts_after_the_bound_and_writes_nothing(tmp_path):
 def test_a_warning_gets_exactly_one_revision_round_then_is_annotated(tmp_path):
     """Design section 6: "one revision round, then stop. Do not grind them to
     zero." A loop that retried until the heuristics were silent would happily
-    rewrite a correct shot to please one."""
+    rewrite a correct shot to please one. Opted in with ``revise_warnings``
+    (issue #87) -- the default is exercised separately below."""
     chunks = _chunks(["a first line", "a second line"])
     shots = {1: "She crosses Central Park as the shutters come down", 2: LINES[2]}
     # The reviser is unhelpful: it hands back a line that still trips the lint.
@@ -533,6 +658,7 @@ def test_a_warning_gets_exactly_one_revision_round_then_is_annotated(tmp_path):
         _config(tmp_path), chunks, (_beat(1), _beat(2)), shots, provenance=PROVENANCE,
         reviser=reviser,
         camera=CAMERAS,
+        revise_warnings=True,
     )
 
     assert len(reviser.calls) == 1  # exactly one, never a second
@@ -552,6 +678,7 @@ def test_a_revision_that_breaks_the_plan_is_discarded(tmp_path):
         _config(tmp_path), chunks, (_beat(1), _beat(2)), shots, provenance=PROVENANCE,
         reviser=reviser,
         camera=CAMERAS,
+        revise_warnings=True,
     )
 
     # The prose is rolled back too, not just the verdict: keeping the new line
@@ -559,6 +686,108 @@ def test_a_revision_that_breaks_the_plan_is_discarded(tmp_path):
     assert built.shots[1] == shots[1]
     assert check_plan(built.text, _config(tmp_path), chunks).ok
     assert built.surviving_warnings
+    # Rolled back means it never happened, as far as the written file is
+    # concerned -- issue #87 item 2's "must NOT be marked".
+    assert built.lint_round_edits == {}
+    assert "# revised" not in built.text
+
+
+# --------------------------------------------------------------------------- #
+# Issue #87 item 3: the warning revision round is opt-in, defaulting off.
+# --------------------------------------------------------------------------- #
+
+
+def test_by_default_a_warning_spends_no_reviser_call_and_is_still_annotated(tmp_path):
+    """The default (``revise_warnings=False``): no reviser call, no model
+    call -- every warning the check produced survives untouched and is still
+    written into the file as a ``# lint:`` comment, exactly as if a round had
+    run and changed nothing."""
+    chunks = _chunks(["a first line", "a second line"])
+    shots = {1: "She crosses Central Park as the shutters come down", 2: LINES[2]}
+    reviser = _Reviser([{1: "would fix it, but must never be asked"}])
+
+    built = build_plan(
+        _config(tmp_path), chunks, (_beat(1), _beat(2)), shots, provenance=PROVENANCE,
+        reviser=reviser,
+        camera=CAMERAS,
+    )
+
+    assert reviser.calls == []  # no reviser call at all
+    assert built.shots[1] == shots[1]  # untouched
+    assert built.surviving_warnings
+    assert "# lint:" in built.text
+    assert "central park" in built.text.lower()
+    assert built.lint_round_edits == {}
+    assert "# revised" not in built.text
+
+
+def test_a_surviving_warning_revision_is_marked_with_the_prose_original(tmp_path):
+    """Issue #87 item 2: a line the warning round *did* change (and that
+    stuck) is marked in the composed TOML, carrying what the prose stage
+    actually wrote -- so a reviewer can see the diff without loading
+    ``.authoring/prose.json`` alongside it."""
+    chunks = _chunks(["a first line", "a second line"])
+    original = "She crosses Central Park as the shutters come down"
+    shots = {1: original, 2: LINES[2]}
+    fixed = "She crosses the market square as the shutters come down"
+    reviser = _Reviser([{1: fixed}])
+
+    built = build_plan(
+        _config(tmp_path), chunks, (_beat(1), _beat(2)), shots, provenance=PROVENANCE,
+        reviser=reviser,
+        camera=CAMERAS,
+        revise_warnings=True,
+    )
+
+    assert built.shots[1] == fixed
+    assert built.lint_round_edits[1] == ("warning", original)
+    assert (
+        f'# revised by the lint round (warning tier); the prose stage wrote: "{original}"'
+        in built.text
+    )
+
+
+def test_a_revision_reproducing_the_original_text_is_not_marked(tmp_path):
+    """The comparison is on text, not on "was it in the objection list" --
+    a chunk the reviser touched but which comes back byte-identical to what
+    the prose stage wrote is not a change worth flagging."""
+    chunks = _chunks(["a first line", "a second line"])
+    original = "She crosses Central Park as the shutters come down"
+    shots = {1: original, 2: LINES[2]}
+    reviser = _Reviser([{1: original}])  # "revises" to the same text
+
+    built = build_plan(
+        _config(tmp_path), chunks, (_beat(1), _beat(2)), shots, provenance=PROVENANCE,
+        reviser=reviser,
+        camera=CAMERAS,
+        revise_warnings=True,
+    )
+
+    assert built.lint_round_edits == {}
+    assert "# revised" not in built.text
+
+
+def test_an_error_tier_revision_is_marked_with_the_error_tier(tmp_path):
+    """The same bookkeeping applies to the error tier, which is unaffected by
+    ``revise_warnings`` and always runs."""
+    chunks = _chunks(["a line", ""])
+    beats = (_beat(1), _beat(2))
+    reviser = _Reviser([{2: LINES[2]}])
+
+    built = build_plan(
+        _config(tmp_path),
+        chunks,
+        beats,
+        {1: LINES[1]},  # chunk 2 is blank -> an error; chunk 2 was never in `shots`
+        provenance=PROVENANCE,
+        reviser=reviser,
+        camera=CAMERAS,
+    )
+
+    assert built.lint_round_edits[2] == ("error", "")
+    assert (
+        '# revised by the lint round (error tier); the prose stage wrote: ""' in built.text
+    )
 
 
 def test_a_clean_plan_calls_the_reviser_not_at_all(tmp_path):
@@ -715,6 +944,7 @@ def test_extra_checks_are_re_run_on_the_revised_text_not_the_original(tmp_path):
         reviser=reviser,
         camera=CAMERAS,
         extra_checks=extra_checks,
+        revise_warnings=True,
     )
 
     assert len(seen) > 1  # re-run, not carried over
@@ -900,3 +1130,181 @@ def test_check_plan_accepts_a_subject_on_an_instrumental_chunk(tmp_path):
     check = check_plan(text, _config(tmp_path), chunks)
 
     assert check.ok
+
+
+# --------------------------------------------------------------------------- #
+# Issue #67: `literal` promotes the shot-vs-lyric lint into the ERROR tier, and
+# the plan's provenance records which brief it was written to.
+# --------------------------------------------------------------------------- #
+
+
+def _literalness_plan(tmp_path, band: str):
+    """A plan whose lyric names an object staged only elsewhere -- the #37
+    case -- checked under `band`."""
+    config = replace(_config(tmp_path), lyric_literalness=band)
+    chunks = _chunks(["a printer explodes", "", "", "", "", "a printer explodes"])
+    beats = [_beat(i, role="transition") for i in range(1, 7)]
+    shots = {
+        1: "She rounds the aisle, medium close on her face, the desks bare behind her",
+        2: "Rain crosses the pavement outside the window",
+        3: "The stairwell door swings shut on an empty landing",
+        4: "Cables lie coiled under a bare desk",
+        5: "A ceiling tile hangs loose over the aisle",
+        6: "The printer at the end of the aisle erupts, medium close, her face in frame",
+    }
+    text = render_plan_toml(chunks, beats, shots, provenance=PROVENANCE)
+    return check_plan(text, config, chunks, beats=beats, scratch_dir=tmp_path)
+
+
+def test_thematic_leaves_the_shot_vs_lyric_finding_in_the_warning_tier(tmp_path):
+    found = _literalness_plan(tmp_path, "thematic")
+
+    assert found.ok
+    assert any("does not show it" in issue.message for issue in found.warnings)
+
+
+def test_literal_promotes_the_shot_vs_lyric_finding_into_the_error_tier(tmp_path):
+    """One lever, two consumers (issue #67): the lint chooses the log LEVEL,
+    and `check_plan` is the consumer for which an ERROR means "revise this or
+    write nothing". On the render side the same record is loud and never
+    fatal."""
+    found = _literalness_plan(tmp_path, "literal")
+
+    assert not found.ok
+    assert any("does not show it" in issue.message for issue in found.errors)
+    assert not any("does not show it" in issue.message for issue in found.warnings)
+
+
+def test_free_silences_the_shot_vs_lyric_finding_entirely(tmp_path):
+    """Structurally, not by a second check: a silenced lint emits nothing, so
+    there is nothing for the revision round to be handed."""
+    found = _literalness_plan(tmp_path, "free")
+
+    assert found.ok
+    assert not any("does not show it" in issue.message for issue in found.warnings)
+
+
+def test_a_loader_error_still_reports_its_records_as_warnings(tmp_path):
+    """The level-based promotion applies only when the plan actually LOADED.
+    Every ERROR `shot_plan.py` logs on the raising path precedes a raise, and
+    the raise is already reported -- promoting those records too would report
+    one failure twice and hand a composition bug to a prose reviser."""
+    config = _config(tmp_path)
+    chunks = _chunks(["a line"])
+    text = render_plan_toml(chunks, [_beat(1)], {1: "x"}, provenance=PROVENANCE)
+    text = text.replace("chunk_id = 1", "chunk_id = 1\nsubject = 12")
+
+    found = check_plan(text, config, chunks, beats=[_beat(1)], scratch_dir=tmp_path)
+
+    assert not found.ok
+    assert all(issue.severity == "warning" for issue in found.warnings)
+
+
+def test_the_provenance_records_the_literalness_the_plan_was_written_to(tmp_path):
+    provenance = replace(PROVENANCE, lyric_literalness="literal")
+    text = render_plan_toml(
+        _chunks(["a line"]), [_beat(1)], {1: "x"}, provenance=provenance
+    )
+
+    assert 'lyric_literalness = "literal"' in text
+
+
+def test_an_unset_literalness_writes_no_provenance_key(tmp_path):
+    text = render_plan_toml(_chunks(["a line"]), [_beat(1)], {1: "x"}, provenance=PROVENANCE)
+
+    assert "lyric_literalness" not in text
+
+
+# --------------------------------------------------------------------------- #
+# A finding the prose stage cannot act on must not reach the reviser.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_non_revisable_issue_is_annotated_but_never_objected_with():
+    """Issue #83's world-state findings belong to the beat sheet: the remedy
+    is `mvm-author beats --notes`, not a shot-line rewrite. #87 is the
+    standing evidence that a revision round will rewrite approved prose to
+    satisfy anything it is handed."""
+    issues = [
+        PlanIssue(chunk_id=4, severity="warning", message="prose can fix this"),
+        PlanIssue(chunk_id=5, severity="warning", message="beats own this", revisable=False),
+    ]
+
+    assert objections_by_chunk(issues) == {4: ["prose can fix this"]}
+    assert lint_comments_for(issues) == {4: ["prose can fix this"], 5: ["beats own this"]}
+
+
+def test_plan_issues_are_revisable_by_default():
+    assert PlanIssue(chunk_id=1, severity="warning", message="m").revisable is True
+
+
+# --------------------------------------------------------------------------- #
+# Issue #83: the beat's world-state tag reaches the written plan.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_beats_conditions_are_re_emitted_into_the_plan():
+    """Copied from the beat, never from anything a later stage could inject
+    -- the same rule `location` follows."""
+    text = render_plan_toml(
+        _chunks(["a line"]),
+        [replace(_beat(1), conditions="heavy falling snow")],
+        {1: "She climbs"},
+        provenance=PROVENANCE,
+    )
+
+    assert 'conditions = "heavy falling snow"' in text
+
+
+def test_a_pre_83_beat_sheet_emits_no_conditions_key():
+    text = render_plan_toml(
+        _chunks(["a line"]), [_beat(1)], {1: "She climbs"}, provenance=PROVENANCE
+    )
+
+    assert "conditions" not in text
+
+
+def test_a_non_revisable_extra_check_is_annotated_but_never_revised(tmp_path):
+    """The seam `extra_checks` uses has to carry `revisable` through, or a
+    world-state finding the beat sheet owns would still be handed to a prose
+    reviser (issue #83, and #87's reason for caring)."""
+    from music_video_maker.authoring.prose import ProseIssue
+
+    config = _config(tmp_path)
+    chunks = _chunks(["a line"])
+    beats = [_beat(1)]
+    calls: list[dict] = []
+
+    class _NoRevision:
+        shots: dict = {}
+        driver_results: tuple = ()
+
+    def reviser(shots, objections):
+        calls.append(dict(objections))
+        return _NoRevision()
+
+    built = build_plan(
+        config,
+        chunks,
+        beats,
+        {1: "She climbs, medium close on her face"},
+        provenance=PROVENANCE,
+        reviser=reviser,
+        extra_checks=lambda shots: (
+            ProseIssue(
+                chunk_id=1,
+                severity="warning",
+                message="the world flips back for one shot (issue #83)",
+                revisable=False,
+            ),
+        ),
+        scratch_dir=tmp_path,
+        revise_warnings=True,
+    )
+
+    # Other lints may legitimately object to this fixture and drive the
+    # round; what must never appear in an objection is the non-revisable one.
+    objected = [m for call in calls for messages in call.values() for m in messages]
+    assert not any("issue #83" in m for m in objected)
+    # ...and it is still annotated into the file the human reads.
+    assert "issue #83" in built.text

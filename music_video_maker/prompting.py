@@ -161,6 +161,7 @@ def expand_prompt(
     present: Sequence[str] = (),
     subject: str | None = None,
     location: str | None = None,
+    conditions: str | None = None,  # #83
 ) -> ExpandedPrompt:
     """Compose the deterministic Stage 2b prompt for one audio chunk.
 
@@ -227,6 +228,17 @@ def expand_prompt(
     plan simply never tagged) falls straight through to ``config.setting``,
     composing byte-identically to before this parameter existed.
 
+    ``conditions`` (issue #83) is this chunk's authored world-state tag,
+    from ``ShotPlanEntry.conditions`` -- what the world looks like right
+    now (weather, light, the aftermath of an event already shown), as
+    opposed to ``location``'s claim about where the camera stands. Composed
+    as its own sentence by :func:`_conditions_clause`, immediately after
+    ``_setting_clause``'s "Location continuity" sentence, in both the base
+    and chained variants. ``None`` (the default -- every caller before this
+    parameter existed, and any chunk a plan never tagged) composes nothing,
+    byte-identically to before this parameter existed; unlike ``location``
+    there is no whole-video fallback field it substitutes for.
+
     Passing the text in rather than looking it up keeps this module free of
     file I/O and keeps it a pure function of its arguments -- resolution
     (including the drift check) happens once, upstream, in ``cli``.
@@ -243,6 +255,7 @@ def expand_prompt(
         camera=camera,
         present=present_members,
         location=location,
+        conditions=conditions,  # #83
     )
     # Issue #46: the chained I2V path has no reference photo, so the seed
     # frame (the predecessor's own output) is already the output of the
@@ -251,6 +264,7 @@ def expand_prompt(
     # drift out of step with each other. Camera direction is about framing,
     # not identity, so it stays on the chained variant unchanged -- and so
     # does location, for the same reason: it is about place, not identity.
+    # Conditions are about the world too, for the same reason (#83).
     chained_prompt = _compose_prompt(
         config,
         members,
@@ -261,6 +275,7 @@ def expand_prompt(
         camera=camera,
         present=present_members,
         location=location,
+        conditions=conditions,  # #83
     )
 
     logger.debug(
@@ -461,6 +476,7 @@ def _compose_prompt(
     camera: str | None = None,
     present: tuple[CastMember, ...] = (),
     location: str | None = None,
+    conditions: str | None = None,  # #83
 ) -> str:
     character_clause = _character_clause(config, members, subject_is_focus, include_appearance)
     lyric_clause = _lyric_clause(chunk.text, len(members), singers=members if present else ())
@@ -476,6 +492,7 @@ def _compose_prompt(
         concept,
         None if subject_is_focus else REFOCUS_SENTENCE,
         _setting_clause(config.setting, location),
+        _conditions_clause(conditions),  # #83
         character_clause,
         _present_clause(present, include_appearance),
         lyric_clause,
@@ -582,6 +599,42 @@ def _setting_clause(setting: str | None, location: str | None = None) -> str | N
         "action or add landmarks to establish it, this shot's own described location "
         "is what is on screen"
     )
+
+
+def _conditions_clause(conditions: str | None) -> str | None:  # #83
+    """Compose this chunk's authored world-state tag (issue #83) as its own
+    sentence, e.g. ``"Conditions in this shot: snow, embers still rising
+    from the collapsed tower"``.
+
+    Two decisions here, both measured rather than stylistic:
+
+    1. **Its own sentence, not folded into `_setting_clause`'s.** That
+       sentence is conditional -- "wherever the location is identifiable it
+       is X" -- because `location` is a claim about where the camera stands,
+       and not every shot shows a recognisable place. A condition holds
+       whether or not the place is identifiable: it is not raining only
+       when the rain happens to be in frame. Folding it into the same
+       conditional would make it as optional as the thing it is not.
+    2. **Short, positive, and never a prohibition.** #73 measured that a
+       prohibition manufactures what it forbids -- ``avoid = [..., "modern
+       climbing equipment, ropes, harnesses or safety gear"]`` rendered a
+       full harness, at an identical seed, on a chunk with no climbing in
+       it at all, because ``MiniMaxH3ReferenceToVideo`` has no
+       negative-conditioning channel for "not this" to land in. And the
+       2026-08-22 location-tag A/B measured that a longer clause competes
+       with the shot line for the frame: the arm that *replaced* a
+       do-nothing sky clause (79 -> 86 characters) beat the arm that
+       *added* to it (79 -> 114) on every axis, including a regression
+       control the longer arm alone disturbed. So this clause says only
+       what IS true, and says it in as few words as the caller gave it --
+       no editorialising, no "do not" ever added here.
+
+    ``None``/blank composes nothing -- never a fabricated "clear" or
+    "unremarkable" default, the same convention every optional prompt
+    component in this module follows."""
+    if not conditions or not conditions.strip():
+        return None
+    return f"Conditions in this shot: {conditions.strip().rstrip('.')}"
 
 
 REFOCUS_SENTENCE = (

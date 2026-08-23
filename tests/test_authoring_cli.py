@@ -58,6 +58,13 @@ VALID_CONCEPT = {
     # `check_act_structure`'s own docstring). The arc checks get their own
     # dedicated coverage in tests/test_authoring_beats.py.
     "acts": [{"name": "the whole song", "function": "start to finish, one movement"}],
+    # Issue #83: the closed vocabulary the beats stage assigns `conditions`
+    # from. One entry on purpose, for the same reason `acts` has one: a
+    # single world state means the flip-flop and regression checks are
+    # trivially satisfied by every fixture in this file, so a CLI test never
+    # fails on a continuity finding it was not written to exercise. Those
+    # checks get their own coverage in tests/test_authoring_conditions.py.
+    "conditions": ["flat grey overcast"],
 }
 
 
@@ -91,6 +98,7 @@ def _write_config(
     instrumental_coverage: bool = True,
     master_seconds: float = 20.0,
     instrumental_shot_seconds: float | None = None,
+    song_facts: tuple[str, ...] | None = None,
 ) -> Path:
     master_audio = write_silent_wav(tmp_path / "audio" / "master.wav", seconds=master_seconds)
     lyrics_file = tmp_path / "lyrics.txt"
@@ -116,6 +124,7 @@ chunks_dir = "{tmp_path / "output" / "chunks"}"
 final_video_dir = "{tmp_path / "output" / "final"}"
 instrumental_coverage = {"true" if instrumental_coverage else "false"}
 {f"instrumental_shot_seconds = {instrumental_shot_seconds}" if instrumental_shot_seconds else ""}
+{f"song_facts = {json.dumps(list(song_facts))}" if song_facts else ""}
 
 [cast.Dianne]
 role = "Lead Vocalist"
@@ -308,6 +317,11 @@ def _beat_sheet(config_path: Path, *, lengths: dict[int, float] | None = None) -
                 # Issue #84: required, and validated against VALID_CONCEPT's
                 # own single-entry `acts` list above.
                 "act": "the whole song",
+                # Issue #83: required once the concept supplies a
+                # `conditions` vocabulary, and validated against it -- one
+                # world state everywhere, so no fixture in this file trips a
+                # continuity check it was not written to exercise.
+                "conditions": "flat grey overcast",
                 **({"length_seconds": lengths[c.chunk_id]} if c.chunk_id in lengths else {}),
             }
             for c in chunks
@@ -482,6 +496,51 @@ def test_status_reports_ok_after_a_successful_concept_run(tmp_path, monkeypatch,
     concept_line = next(line for line in out.splitlines() if line.startswith("concept"))
     assert "ok" in concept_line
     assert "claude-fable-5" in concept_line
+
+
+def test_status_prints_reading_subject_and_song_facts_side_by_side(
+    tmp_path, monkeypatch, capsys
+):
+    """Issue #86 point 1: the model's answer to "what is this song about"
+    (issue #69's `reading.subject`) and the operator's own answer
+    (`song_facts`), shown together."""
+    config_path = _write_config(
+        tmp_path, lyrics_text="", song_facts=("the island is vaporised, not eroded",)
+    )
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([VALID_CONCEPT]))
+    auth_cli.main(["--config", str(config_path), "concept"])
+    capsys.readouterr()
+
+    auth_cli.main(["--config", str(config_path), "status"])
+
+    out = capsys.readouterr().out
+    assert f"reading.subject: {VALID_CONCEPT['reading']['subject']}" in out
+    assert "song_facts:" in out
+    assert "  - the island is vaporised, not eroded" in out
+
+
+def test_status_prints_no_extra_section_when_there_is_neither(tmp_path, capsys):
+    config_path = _write_config(tmp_path, lyrics_text="")
+
+    auth_cli.main(["--config", str(config_path), "status"])
+
+    out = capsys.readouterr().out
+    assert "reading.subject" not in out
+    assert "song_facts" not in out
+
+
+def test_status_prints_song_facts_even_before_a_concept_has_run(tmp_path, capsys):
+    """`song_facts` is a config value, not something the concept stage
+    produces -- it must show up in `status` whether or not `concept` has
+    ever been run."""
+    config_path = _write_config(tmp_path, lyrics_text="", song_facts=("a settled fact",))
+
+    auth_cli.main(["--config", str(config_path), "status"])
+
+    out = capsys.readouterr().out
+    assert "song_facts:" in out
+    assert "  - a settled fact" in out
+    assert "reading.subject" not in out  # no concept has run yet
 
 
 def test_status_reports_stale_after_the_lyrics_file_changes(tmp_path, monkeypatch, capsys):
@@ -672,8 +731,10 @@ def test_prose_rejects_a_beat_sheet_the_alignment_has_moved_under(tmp_path, monk
     assert any("no longer produces" in r.message for r in caplog.records)
 
 
-def _author_through_prose(tmp_path, monkeypatch) -> Path:
-    config_path = _write_config(tmp_path, lyrics_text="")
+def _author_through_prose(
+    tmp_path, monkeypatch, *, song_facts: tuple[str, ...] | None = None
+) -> Path:
+    config_path = _write_config(tmp_path, lyrics_text="", song_facts=song_facts)
     _run_concept(config_path, monkeypatch)
     _run_beats(config_path, monkeypatch)
     monkeypatch.setattr(
@@ -730,6 +791,30 @@ def test_write_records_provenance_in_the_file(tmp_path, monkeypatch):
     assert provenance["beats_model"] == "claude-opus-5"
     assert provenance["prose_model"] == "claude-sonnet-5"
     assert len(provenance["lyrics_sha256"]) == 64
+
+
+def test_write_omits_the_song_facts_header_when_the_config_has_none(tmp_path, monkeypatch):
+    config_path = _author_through_prose(tmp_path, monkeypatch)
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([]))
+    auth_cli.main(["--config", str(config_path), "write"])
+
+    text = (config_path.parent / "shot_plan.toml").read_text()
+    assert "Authored under these established facts" not in text
+
+
+def test_write_puts_the_configs_song_facts_in_the_plan_header(tmp_path, monkeypatch):
+    """Issue #86: `Provenance(song_facts=...)` comes straight from
+    `config.song_facts`, so a human reviewing the plan sees what it was
+    authored under."""
+    config_path = _author_through_prose(
+        tmp_path, monkeypatch, song_facts=("the island is vaporised, not eroded",)
+    )
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([]))
+    auth_cli.main(["--config", str(config_path), "write"])
+
+    text = (config_path.parent / "shot_plan.toml").read_text()
+    assert "# Authored under these established facts about the song" in text
+    assert "#   - the island is vaporised, not eroded" in text
 
 
 def test_write_refuses_before_prose_exists(tmp_path, monkeypatch, caplog):
@@ -951,6 +1036,82 @@ def test_write_works_with_no_photography_at_all(tmp_path, monkeypatch):
     assert load_shot_plan(config_path.parent / "shot_plan.toml")[0].camera is None
 
 
+# --------------------------------------------------------------------------- #
+# Issue #87 item 3: `--revise-warnings` (default off) reaches `build_plan`.
+# --------------------------------------------------------------------------- #
+
+
+def _spy_on_build_plan(monkeypatch, captured: dict):
+    """Records the ``revise_warnings`` kwarg `write`/`all` pass through,
+    while still calling the real ``build_plan`` so the rest of the command
+    behaves normally."""
+    real_build_plan = auth_cli.plan_module.build_plan
+
+    def spy(*args, **kwargs):
+        captured["revise_warnings"] = kwargs.get("revise_warnings")
+        return real_build_plan(*args, **kwargs)
+
+    monkeypatch.setattr(auth_cli.plan_module, "build_plan", spy)
+
+
+def test_write_defaults_to_not_revising_warnings(tmp_path, monkeypatch):
+    config_path = _author_through_prose(tmp_path, monkeypatch)
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([]))
+    captured: dict = {}
+    _spy_on_build_plan(monkeypatch, captured)
+
+    assert auth_cli.main(["--config", str(config_path), "write"]) == auth_cli.EXIT_SUCCESS
+
+    assert captured["revise_warnings"] is False
+
+
+def test_write_revise_warnings_flag_reaches_build_plan(tmp_path, monkeypatch):
+    config_path = _author_through_prose(tmp_path, monkeypatch)
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([]))
+    captured: dict = {}
+    _spy_on_build_plan(monkeypatch, captured)
+
+    exit_code = auth_cli.main(
+        ["--config", str(config_path), "write", "--revise-warnings"]
+    )
+
+    assert exit_code == auth_cli.EXIT_SUCCESS
+    assert captured["revise_warnings"] is True
+
+
+def test_write_reports_lines_rewritten_by_the_lint_round(tmp_path, monkeypatch, capsys):
+    """`_cmd_write` prints a line naming how many shot lines a revision round
+    rewrote and that they are marked `# revised` in the file -- so a reviewer
+    sees it without having to open the plan and grep for the comment."""
+    config_path = _author_through_prose(tmp_path, monkeypatch)
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([]))
+    fake_built = SimpleNamespace(
+        text="# fake generated plan\n",
+        shots={},
+        surviving_warnings=(),
+        revision_results=(),
+        lint_round_edits={2: ("warning", "the original line"), 5: ("error", "another")},
+    )
+    monkeypatch.setattr(auth_cli.plan_module, "build_plan", lambda *a, **k: fake_built)
+
+    exit_code = auth_cli.main(["--config", str(config_path), "write"])
+
+    assert exit_code == auth_cli.EXIT_SUCCESS
+    out = capsys.readouterr().out
+    assert "2" in out
+    assert "# revised" in out
+
+
+def test_write_prints_nothing_extra_when_nothing_was_revised(tmp_path, monkeypatch, capsys):
+    config_path = _author_through_prose(tmp_path, monkeypatch)
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([]))
+
+    exit_code = auth_cli.main(["--config", str(config_path), "write"])
+
+    assert exit_code == auth_cli.EXIT_SUCCESS
+    assert "# revised" not in capsys.readouterr().out
+
+
 def test_all_runs_every_stage_and_writes_the_plan(tmp_path, monkeypatch, capsys):
     config_path = _write_config(tmp_path, lyrics_text="")
     # One driver shared across every stage: each stage constructs its own, so
@@ -968,6 +1129,43 @@ def test_all_runs_every_stage_and_writes_the_plan(tmp_path, monkeypatch, capsys)
     out = capsys.readouterr().out
     for stage in ("CONCEPT", "BEATS", "PHOTOGRAPHY", "PROSE", "WRITE"):
         assert stage in out
+
+
+def test_all_defaults_to_not_revising_warnings(tmp_path, monkeypatch):
+    config_path = _write_config(tmp_path, lyrics_text="")
+    driver = ScriptedDriver(
+        [VALID_CONCEPT, _beat_sheet(config_path), _photography_reply(config_path)]
+        + _prose_replies(config_path)
+    )
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: driver)
+    captured: dict = {}
+    _spy_on_build_plan(monkeypatch, captured)
+
+    exit_code = auth_cli.main(["--config", str(config_path), "all", "--yes"])
+
+    assert exit_code == auth_cli.EXIT_SUCCESS
+    assert captured["revise_warnings"] is False
+
+
+def test_all_revise_warnings_flag_reaches_write(tmp_path, monkeypatch):
+    """`all`'s own `--revise-warnings` has to travel through the hand-built
+    `argparse.Namespace` `_cmd_all` constructs for the final `write` call --
+    it is not one of `write`'s own parsed args at that point."""
+    config_path = _write_config(tmp_path, lyrics_text="")
+    driver = ScriptedDriver(
+        [VALID_CONCEPT, _beat_sheet(config_path), _photography_reply(config_path)]
+        + _prose_replies(config_path)
+    )
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: driver)
+    captured: dict = {}
+    _spy_on_build_plan(monkeypatch, captured)
+
+    exit_code = auth_cli.main(
+        ["--config", str(config_path), "all", "--yes", "--revise-warnings"]
+    )
+
+    assert exit_code == auth_cli.EXIT_SUCCESS
+    assert captured["revise_warnings"] is True
 
 
 def test_all_stops_rather_than_approving_itself_without_a_tty(tmp_path, monkeypatch, capsys):
@@ -1011,3 +1209,165 @@ def test_status_reports_photography(tmp_path, monkeypatch, capsys):
         row for row in capsys.readouterr().out.splitlines() if row.startswith("photography")
     )
     assert "ok" in line and "claude-opus-5" in line
+
+
+# --------------------------------------------------------------------------- #
+# Issue #85: the plant-vs-consequence check reaches the written plan.
+# --------------------------------------------------------------------------- #
+
+
+def test_write_runs_the_plant_end_state_check_over_the_current_shots(
+    tmp_path, monkeypatch
+):
+    """#85's check lives in the authoring layer, not in `shot_plan.py`, because
+    it needs `beat_role`/`beat_group` -- and it is re-derived on the *current*
+    text for the same reason `advisory_issues` is, so a revision round cannot
+    leave the file complaining about a sentence that no longer exists."""
+    from music_video_maker.authoring.prose import ProseIssue
+
+    config_path = _author_through_prose(tmp_path, monkeypatch)
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([]))
+
+    seen: list[tuple[dict, tuple]] = []
+
+    def spy(shots, beats):
+        seen.append((dict(shots), tuple(beats)))
+        return (
+            ProseIssue(
+                chunk_id=sorted(shots)[0],
+                severity="warning",
+                message="chunk_id=0 the plant already states the end state (issue #85)",
+            ),
+        )
+
+    monkeypatch.setattr(auth_cli.prose_module, "plant_end_state_issues", spy)
+
+    assert auth_cli.main(["--config", str(config_path), "write"]) == auth_cli.EXIT_SUCCESS
+
+    assert seen, "plant_end_state_issues was never called"
+    shots, beats = seen[-1]
+    assert shots, "the check must see the shot lines"
+    assert beats, "the check must see the beat sheet -- it is what knows the roles"
+    written = (config_path.parent / "shot_plan.toml").read_text(encoding="utf-8")
+    assert "issue #85" in written
+
+
+def test_write_records_the_runs_literalness_in_the_plans_provenance(tmp_path, monkeypatch):
+    """Issue #67: a shot plan should be able to prove which brief it was
+    written to. A plan authored `free` and later loaded by a run configured
+    `literal` will trip lints it was never meant to satisfy."""
+    config_path = _author_through_prose(tmp_path, monkeypatch)
+    # Above the first table header, or TOML makes it a [hardware] key -- the
+    # footgun `config.py` goes out of its way to catch, and does here.
+    original = config_path.read_text(encoding="utf-8")
+    head, marker, tail = original.partition("\n[")
+    config_path.write_text(
+        f'{head}\nlyric_literalness = "free"\n{marker}{tail}', encoding="utf-8"
+    )
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([]))
+
+    assert auth_cli.main(["--config", str(config_path), "write"]) == auth_cli.EXIT_SUCCESS
+
+    written = (config_path.parent / "shot_plan.toml").read_text(encoding="utf-8")
+    assert 'lyric_literalness = "free"' in written
+
+
+# --------------------------------------------------------------------------- #
+# Issue #83: the world-state checks reach the two places a human looks.
+# --------------------------------------------------------------------------- #
+
+
+def test_concept_prints_the_conditions_vocabulary_for_review(tmp_path, monkeypatch, capsys):
+    """Same review point as `locations`, and for the same reason: a world
+    state missing from this list cannot be authored later."""
+    config_path = _write_config(tmp_path, lyrics_text="")
+    _run_concept(config_path, monkeypatch)
+
+    assert "conditions: flat grey overcast" in capsys.readouterr().out
+
+
+def test_beats_reports_a_world_state_flip_flop_at_the_review_point(
+    tmp_path, monkeypatch, capsys
+):
+    """A flip-flop is a defect in what HAPPENS, so it is reported where it
+    can be fixed by re-rolling the beats -- not three stages later."""
+    from music_video_maker.authoring.beats import Beat
+    from music_video_maker.authoring.cli import _report_condition_findings
+
+    def beat(chunk_id, conditions, role="transition"):
+        return Beat(
+            chunk_id=chunk_id,
+            start=float(chunk_id) * 8.0,
+            end=float(chunk_id) * 8.0 + 8.0,
+            beat=f"beat {chunk_id}",
+            beat_role=role,
+            beat_group=1,
+            location="the boardwalk",
+            act="the whole song",
+            conditions=conditions,
+        )
+
+    findings = _report_condition_findings(
+        [beat(0, "smoke"), beat(1, "heavy falling snow"), beat(2, "smoke")]
+    )
+
+    assert [f.ref for f in findings] == [1]
+    out = capsys.readouterr().out
+    assert "world-state continuity finding" in out
+    assert "chunk 1" in out
+
+
+def test_beats_says_nothing_when_the_world_state_is_consistent(capsys):
+    from music_video_maker.authoring.cli import _report_condition_findings
+
+    assert _report_condition_findings([]) == ()
+    assert "world-state" not in capsys.readouterr().out
+
+
+def test_write_annotates_a_world_state_finding_without_offering_it_for_revision(
+    tmp_path, monkeypatch
+):
+    """The finding belongs to the beat sheet, so `write` writes it into the
+    plan as a `# lint:` comment and marks it non-revisable -- a revision
+    round handed one would reword a shot line to satisfy a complaint the shot
+    line did not cause (issue #87's lesson, issue #83's finding)."""
+    from music_video_maker.authoring.conditions import ConditionFinding
+
+    config_path = _author_through_prose(tmp_path, monkeypatch)
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([]))
+    monkeypatch.setattr(
+        auth_cli,
+        "check_conditions",
+        lambda spans: (
+            ConditionFinding(
+                kind="flip_flop",
+                ref=0,
+                conditions="heavy falling snow",
+                message="the world flips for one shot and comes back (issue #83)",
+                at_t=0.0,
+            ),
+        ),
+    )
+
+    assert auth_cli.main(["--config", str(config_path), "write"]) == auth_cli.EXIT_SUCCESS
+
+    written = (config_path.parent / "shot_plan.toml").read_text(encoding="utf-8")
+    assert "issue #83" in written
+
+
+def test_concept_dry_run_carries_the_runs_literalness_band(tmp_path, capsys):
+    """Issue #67: `--dry-run` prints the prompt that WOULD be sent, so it has
+    to be the same prompt -- band included, or the preview lies."""
+    config_path = _write_config(tmp_path, lyrics_text="")
+    original = config_path.read_text(encoding="utf-8")
+    head, marker, tail = original.partition("\n[")
+    config_path.write_text(
+        f'{head}\nlyric_literalness = "literal"\n{marker}{tail}', encoding="utf-8"
+    )
+
+    assert (
+        auth_cli.main(["--config", str(config_path), "concept", "--dry-run"])
+        == auth_cli.EXIT_SUCCESS
+    )
+
+    assert "READS ITS LYRICS: LITERAL" in capsys.readouterr().out

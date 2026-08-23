@@ -483,6 +483,50 @@ class ShotPlanEntry:
     before this field was rendered: falling straight through to
     ``config.setting`` exactly as it always did."""
 
+    conditions: str | None = None
+    """What the world looks like right now, inside its own ``setting`` and
+    at its own ``location`` (issue #83) -- weather, light, season, and the
+    persistent aftermath of events the video has already shown, e.g.
+    ``"snow"`` or ``"smoke, embers still rising from the collapsed tower"``.
+
+    The third continuity axis, not a facet of either of the first two.
+    ``setting`` (issue #32) anchors the world's *identity* -- one geography
+    for the whole video. ``location`` (issue #78) anchors *where inside it*
+    a character stands at a given moment. Neither says what that moment
+    *looks like*. A viewer on the second full "Deathless" render, three
+    consecutive chunks spanning about fifteen seconds: "4:44 buildings
+    explode (fine), 4:48 Jan and Dianne are climbing snow with no debris,
+    4:55 he is back on non-snowy tower" -- the world gained snow, lost the
+    aftermath of an explosion that had just happened, and lost the snow
+    again.
+
+    As with ``location``, this cannot be fixed in prose: a shot line may
+    not reference another shot (issue #61 -- each chunk renders from its
+    own prompt, for a model that has never seen any other), so "the debris
+    from before is still there" is unavailable by construction. Something
+    other than the shot lines has to carry it.
+
+    Authored by the beats stage from a small closed vocabulary the concept
+    stage defines for the song, the same shape as ``location`` and
+    ``beat_role``/``beat_group``: checkable before a word of prose exists,
+    never guessed from finished text. A generated value is validated
+    against that vocabulary at generation time; this module never sees the
+    concept that defines it and applies no vocabulary check of its own here
+    -- see ``authoring/conditions.py`` for the two checks that run over the
+    authored sequence (a state that flips and immediately reverts; a state
+    a `consequence` beat ended, returning later) and for the measured reason
+    this is a second axis beside ``location`` rather than a facet of one
+    combined record: run over the same real plan, the two checks have
+    opposite correctness shapes on ``location``'s own values -- a character
+    is *supposed* to move back and forth between places; the world is *not*
+    supposed to move back and forth between states.
+
+    ``None`` (the default) is "not authored", never a fabricated value --
+    true of every entry before this field existed and every hand-written
+    plan that does not use it. Unlike ``location``, there is no whole-video
+    fallback field for it to substitute for: an unset ``conditions``
+    composes nothing at all, via :func:`~music_video_maker.prompting._conditions_clause`."""
+
 
 def load_shot_plan(
     path: str | Path,
@@ -1509,10 +1553,40 @@ def lint_voiced_framing(
             )
 
 
+_STAGED_ELSEWHERE_MESSAGE = (
+    "Shot plan chunk_id=%d: the lyric names %r but this shot does not show it "
+    "-- the plan stages %r in chunk(s) %s. If the object belongs on screen here "
+    "too, say so; a repeated verse is a chance to plant it early and pay it off "
+    "later (issue #37). Shot: %r | lyric: %r"
+)
+_STAGED_ELSEWHERE_MESSAGE_LITERAL = (
+    "Shot plan chunk_id=%d: the lyric names %r but this shot does not show it "
+    "-- the plan stages %r in chunk(s) %s. If the object belongs on screen here "
+    "too, say so; a repeated verse is a chance to plant it early and pay it off "
+    "later (issue #37). Shot: %r | lyric: %r Under lyric_literalness = 'literal', "
+    "an object the lyric names and this shot does not stage is an authoring "
+    "error, not a style note (issue #67)."
+)
+"""Two full templates rather than one built with `+` at the call site: ruff's
+G003 flags string concatenation inside a logging statement, and building the
+`"literal"` variant ahead of time is also simply clearer than assembling it
+per finding."""
+
+_LYRIC_LITERALNESS_BANDS: tuple[str, ...] = ("free", "thematic", "literal")
+"""Mirrors :data:`music_video_maker.config.LYRIC_LITERALNESS_BANDS` (issue
+#67; a test asserts the two stay equal). This module compares the
+``literalness`` argument against plain string literals rather than importing
+``config`` for it -- the same convention :data:`MAX_NOISE_SEED` and
+:data:`DEFAULT_ALIGNMENT_MODEL_SIZE` already follow: ``shot_plan.py``
+deliberately imports only ``contracts``."""
+
+
 def lint_shots_against_lyrics(
     plan: Mapping[int, ShotPlanEntry],
     chunks: Sequence[AudioChunk],
     stageable_nouns: Iterable[str] = (),
+    *,
+    literalness: str = "thematic",
 ) -> None:
     """Warn when a chunk's lyric names an object this plan stages *elsewhere*.
 
@@ -1550,12 +1624,52 @@ def lint_shots_against_lyrics(
     may fire" -- the same convention ``locations`` and ``acts`` already use,
     and what keeps every existing call site behaving as it did.
 
-    Warning only, never an error: this is a heuristic firing on prose a human
+    ``literalness`` (issue #67) is one of
+    :data:`music_video_maker.config.LYRIC_LITERALNESS_BANDS` and moves this
+    lint between three tiers rather than leaving it one fixed opinion:
+
+    * ``"free"`` -- silenced outright, before any comparison runs. At this
+      end of the range a lyric naming an object the plan stages elsewhere is
+      the brief, not a defect: "a lint that guesses loses to a stage that
+      knows" (#69), one level up -- the config already knows what kind of
+      video this run is trying to make, so the heuristic must not argue
+      with it. Exactly one ``INFO`` line is logged regardless of whether a
+      finding would otherwise have fired, so a silenced lint is never
+      mistaken for a lint that looked and found nothing.
+    * ``"thematic"`` -- the default, and every pre-#67 call site's exact
+      behaviour: a ``WARNING``, unchanged.
+    * ``"literal"`` -- the identical detection, but each finding is a
+      ``logger.error`` with one sentence appended naming the tier. A level,
+      not a boolean, because the same lever means two different things to
+      its two consumers: ``authoring/plan.check_plan`` classifies an ERROR
+      record into its error tier, where errors get a targeted revision of
+      the offending chunks and then abort with nothing written if they
+      don't clear -- while on the render side (``cli.py``) an ERROR log is
+      loud and *never* fatal, because "a false positive must never block a
+      run" and "one chunk failing must not kill the run" are both still in
+      force there. One lever, two consumers, each behaving as it already
+      does.
+
+    Any other value (including an unrecognised string) is treated as
+    ``"thematic"`` rather than raising: ``load_config`` is the gate for the
+    vocabulary, and a lint must never be the thing that refuses a run.
+
+    Warning (or, at ``"literal"``, error) only -- never a raise: this is a
+    heuristic firing on prose a human (or a model, in conversation with one)
     wrote deliberately, so a false positive must never block a run.
     """
+    if literalness == "free":
+        logger.info(
+            "Shot-vs-lyric check (issue #37) silenced: lyric_literalness='free' means "
+            "a lyric naming an object staged elsewhere is this run's brief, not a "
+            "defect worth a warning."
+        )
+        return
+
     if not plan or not chunks:
         return
 
+    literal_mode = literalness == "literal"
     allowed = stageable_noun_stems(stageable_nouns)
 
     # Every content word the author used anywhere in their own shot text, and
@@ -1585,18 +1699,11 @@ def lint_shots_against_lyrics(
             elsewhere = sorted(set(staged.get(word, ())) - nearby)
             if word in here or not elsewhere:
                 continue
-            logger.warning(
-                "Shot plan chunk_id=%d: the lyric names %r but this shot does not show it "
-                "-- the plan stages %r in chunk(s) %s. If the object belongs on screen here "
-                "too, say so; a repeated verse is a chance to plant it early and pay it off "
-                "later (issue #37). Shot: %r | lyric: %r",
-                chunk.chunk_id,
-                word,
-                word,
-                elsewhere,
-                entry.shot[:80],
-                chunk.text[:60],
-            )
+            args = (chunk.chunk_id, word, word, elsewhere, entry.shot[:80], chunk.text[:60])
+            if literal_mode:
+                logger.error(_STAGED_ELSEWHERE_MESSAGE_LITERAL, *args)
+            else:
+                logger.warning(_STAGED_ELSEWHERE_MESSAGE, *args)
 
 
 # --------------------------------------------------------------------------- #
@@ -2346,7 +2453,7 @@ def lint_instrumental_focus_mismatch(
 ENTRY_KEYS = frozenset(
     {
         "chunk_id", "start", "shot", "focus", "length_seconds", "camera", "present",
-        "location", "subject",
+        "location", "subject", "conditions",
     }
 )
 """Every key this module actually reads out of a ``[[shot]]`` table."""
@@ -2430,6 +2537,7 @@ def _parse_entry(
         present=_parse_present(raw, chunk_id, path),
         location=_parse_location(raw, chunk_id, path),
         subject=_parse_subject(raw, chunk_id, path, cast_names),
+        conditions=_parse_conditions(raw, chunk_id, path),
     )
 
 
@@ -2568,6 +2676,30 @@ def _parse_location(raw: dict, chunk_id: object, path: Path) -> str | None:
             "a string"
         )
     return location.strip() or None
+
+
+def _parse_conditions(raw: dict, chunk_id: object, path: Path) -> str | None:
+    """Read the optional ``conditions`` field (issue #83). Absent/blank means
+    "not authored" -- never a fabricated default, same convention as
+    ``location``. Not validated against any closed vocabulary here: this
+    module never sees the concept that defines one, and a hand-written plan
+    is free to use the field or not at all. The generation-time closed-set
+    check lives in ``authoring/beats.py``, where the vocabulary actually is."""
+    conditions = raw.get("conditions")
+    if conditions is None:
+        return None
+    if not isinstance(conditions, str):
+        logger.error(
+            "Shot plan %s: chunk_id=%s has conditions=%r, which is not a string",
+            path,
+            chunk_id,
+            conditions,
+        )
+        raise ShotPlanError(
+            f"shot plan {path}: chunk_id={chunk_id} has conditions={conditions!r}; it must "
+            "be a string"
+        )
+    return conditions.strip() or None
 
 
 def _parse_length_seconds(raw: dict, chunk_id: object, path: Path) -> float | None:
@@ -2788,6 +2920,30 @@ def resolve_location(
     return entry.location if entry is not None else None
 
 
+def resolve_conditions(
+    plan: Mapping[int, ShotPlanEntry] | None, chunk: AudioChunk
+) -> str | None:
+    """This chunk's authored world-state tag (issue #83), or ``None`` when
+    the plan has no entry for it, the entry never set ``conditions``, or
+    (via :func:`_resolve_entry`) the plan itself is absent.
+
+    Shares :func:`_resolve_entry`'s drift check for the same reason
+    :func:`resolve_location`/:func:`resolve_camera`/:func:`resolve_present`
+    do: a stale plan must refuse every field the same way, not just the
+    ones the render loop consumes directly.
+
+    ``conditions`` **is** composed into a prompt -- ``cli.py`` passes this
+    function's return value into ``expand_prompt(..., conditions=...)``,
+    which adds it as its own sentence immediately after the "Location
+    continuity" sentence (see ``prompting._conditions_clause``). Unlike
+    ``location``, there is no whole-video fallback field for it to
+    substitute for: ``None`` means no conditions sentence is composed at
+    all, true of every chunk in a run whose plan does not use the field, or
+    has no plan."""
+    entry = _resolve_entry(plan, chunk)
+    return entry.conditions if entry is not None else None
+
+
 # --------------------------------------------------------------------------- #
 # Skeleton generation for --prepare (issue #52)
 # --------------------------------------------------------------------------- #
@@ -2902,6 +3058,7 @@ __all__ = [
     "load_shot_plan",
     "render_shot_plan_skeleton",
     "resolve_camera",
+    "resolve_conditions",
     "resolve_location",
     "resolve_shot",
     "resolve_subject",
