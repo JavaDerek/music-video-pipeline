@@ -14,12 +14,14 @@ happened, and loses the snow again.
 Issue #83 asks whether this is a second enumerated axis beside ``location``
 or whether both are facets of one "world state at chunk N" record. **It is a
 second axis, and the argument is measured, not aesthetic: the two have
-opposite correctness shapes.** Run the regression check below over the
-``location`` values of the real 80-chunk plans and it fires 10 times on
-``shot_plan_v6.toml`` and 10 on ``shot_plan_v12.toml``, every one of them a
-false positive -- because a character is *supposed* to move back and forth
-between places, and the world is *not* supposed to move back and forth
-between states. One record would have to carry both rules anyway, and a
+opposite correctness shapes.** Run the two checks below over the ``location``
+values of the real 80-chunk plans and they fire 6 times on
+``shot_plan_v6.toml`` and 6 on ``shot_plan_v12.toml``, and **every single one
+is a false positive** -- because a character is *supposed* to move back and
+forth between places, and the world is *not* supposed to move back and forth
+between states. The identical check is wrong 100% of the time on one axis and
+is the whole point on the other (numbers in :func:`check_conditions`).
+One record would have to carry both rules anyway, and a
 combined vocabulary multiplies out (this song's 6 locations x 4 conditions is
 24 tags a generator has to keep consistent) which is the enumeration
 explosion #78 already warns about.
@@ -327,25 +329,40 @@ def check_conditions(spans: Sequence[ConditionSpan]) -> tuple[ConditionFinding, 
     false-positive surface -- how often the SHAPE occurs in a real authored
     sequence of tags -- and measures nothing at all about detection.
 
+    Every number below is produced by THIS function, over spans built from
+    each plan's ``location`` values, counted per run transition.
+
     ===============================================  ======  ======
     check, run over the ``location`` axis            v6      v12
     ===============================================  ======  ======
-    flip-flop, interruption of exactly one span      3       3
-    flip-flop, interruption of any length            6       5
+    flip-flop, one-span interruption (ships)         3       3
+    flip-flop, any-length interruption               6       5
     regression, any earlier value after any
-    consequence (the loose form, REJECTED)           11      10
-    regression, only a value a consequence ended
-    (the form that ships)                            0       0
+    consequence (the loose form, REJECTED)           10      9
+    regression, only a state a consequence ENDED
+    (the form that ships)                            3       3
+    **total, the shipped pair**                      **6**   **6**
     ===============================================  ======  ======
 
-    Read the first and last rows together and they are the argument for two
-    axes rather than one record: the loose regression form fires 10-11 times
-    on locations and every one is correct authoring, while the shipped form
-    fires zero. The single-span flip-flop occurs 3 times in 80 chunks and the
-    any-length form twice as often, which is why the narrow one ships -- and
-    all three of those 3 are legitimate *for a location* (the cut goes to the
-    watch-post for one shot and comes back), which is precisely the asymmetry
-    that makes conditions a different axis.
+    **Every one of those 6 is a false positive, and that is the argument for
+    two axes rather than one record.** On the location axis the cut
+    legitimately goes to the watch-post for one shot and comes back (chunk
+    14), and the story legitimately returns to a place after a consequence
+    somewhere else (chunks 47, 54, 56). A character is *supposed* to move
+    back and forth between places; the world is *not* supposed to move back
+    and forth between states. The identical check is 100% wrong on the
+    position axis and is the whole point on the state axis.
+
+    The tightening is still worth having: the loose forms together fire 16
+    times on v6 and 14 on v12 against the shipped pair's 6.
+
+    *(An earlier revision of this table published ``0`` for the shipped
+    regression row. That number came from a different formulation of the rule
+    than the one that shipped -- "a value that first APPEARS on a consequence
+    beat is frozen" rather than "a consequence ENDS the state that preceded
+    it" -- and re-run against this function it is 3. Corrected, with the
+    reason, because a number this project publishes has to be reproducible
+    from the code that ships.)*
 
     Detection is demonstrated by the viewer-reported sequence in
     ``tests/test_authoring_conditions.py``, and confirming it on a render

@@ -58,6 +58,13 @@ VALID_CONCEPT = {
     # `check_act_structure`'s own docstring). The arc checks get their own
     # dedicated coverage in tests/test_authoring_beats.py.
     "acts": [{"name": "the whole song", "function": "start to finish, one movement"}],
+    # Issue #83: the closed vocabulary the beats stage assigns `conditions`
+    # from. One entry on purpose, for the same reason `acts` has one: a
+    # single world state means the flip-flop and regression checks are
+    # trivially satisfied by every fixture in this file, so a CLI test never
+    # fails on a continuity finding it was not written to exercise. Those
+    # checks get their own coverage in tests/test_authoring_conditions.py.
+    "conditions": ["flat grey overcast"],
 }
 
 
@@ -310,6 +317,11 @@ def _beat_sheet(config_path: Path, *, lengths: dict[int, float] | None = None) -
                 # Issue #84: required, and validated against VALID_CONCEPT's
                 # own single-entry `acts` list above.
                 "act": "the whole song",
+                # Issue #83: required once the concept supplies a
+                # `conditions` vocabulary, and validated against it -- one
+                # world state everywhere, so no fixture in this file trips a
+                # continuity check it was not written to exercise.
+                "conditions": "flat grey overcast",
                 **({"length_seconds": lengths[c.chunk_id]} if c.chunk_id in lengths else {}),
             }
             for c in chunks
@@ -1258,3 +1270,104 @@ def test_write_records_the_runs_literalness_in_the_plans_provenance(tmp_path, mo
 
     written = (config_path.parent / "shot_plan.toml").read_text(encoding="utf-8")
     assert 'lyric_literalness = "free"' in written
+
+
+# --------------------------------------------------------------------------- #
+# Issue #83: the world-state checks reach the two places a human looks.
+# --------------------------------------------------------------------------- #
+
+
+def test_concept_prints_the_conditions_vocabulary_for_review(tmp_path, monkeypatch, capsys):
+    """Same review point as `locations`, and for the same reason: a world
+    state missing from this list cannot be authored later."""
+    config_path = _write_config(tmp_path, lyrics_text="")
+    _run_concept(config_path, monkeypatch)
+
+    assert "conditions: flat grey overcast" in capsys.readouterr().out
+
+
+def test_beats_reports_a_world_state_flip_flop_at_the_review_point(
+    tmp_path, monkeypatch, capsys
+):
+    """A flip-flop is a defect in what HAPPENS, so it is reported where it
+    can be fixed by re-rolling the beats -- not three stages later."""
+    from music_video_maker.authoring.beats import Beat
+    from music_video_maker.authoring.cli import _report_condition_findings
+
+    def beat(chunk_id, conditions, role="transition"):
+        return Beat(
+            chunk_id=chunk_id,
+            start=float(chunk_id) * 8.0,
+            end=float(chunk_id) * 8.0 + 8.0,
+            beat=f"beat {chunk_id}",
+            beat_role=role,
+            beat_group=1,
+            location="the boardwalk",
+            act="the whole song",
+            conditions=conditions,
+        )
+
+    findings = _report_condition_findings(
+        [beat(0, "smoke"), beat(1, "heavy falling snow"), beat(2, "smoke")]
+    )
+
+    assert [f.ref for f in findings] == [1]
+    out = capsys.readouterr().out
+    assert "world-state continuity finding" in out
+    assert "chunk 1" in out
+
+
+def test_beats_says_nothing_when_the_world_state_is_consistent(capsys):
+    from music_video_maker.authoring.cli import _report_condition_findings
+
+    assert _report_condition_findings([]) == ()
+    assert "world-state" not in capsys.readouterr().out
+
+
+def test_write_annotates_a_world_state_finding_without_offering_it_for_revision(
+    tmp_path, monkeypatch
+):
+    """The finding belongs to the beat sheet, so `write` writes it into the
+    plan as a `# lint:` comment and marks it non-revisable -- a revision
+    round handed one would reword a shot line to satisfy a complaint the shot
+    line did not cause (issue #87's lesson, issue #83's finding)."""
+    from music_video_maker.authoring.conditions import ConditionFinding
+
+    config_path = _author_through_prose(tmp_path, monkeypatch)
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([]))
+    monkeypatch.setattr(
+        auth_cli,
+        "check_conditions",
+        lambda spans: (
+            ConditionFinding(
+                kind="flip_flop",
+                ref=0,
+                conditions="heavy falling snow",
+                message="the world flips for one shot and comes back (issue #83)",
+                at_t=0.0,
+            ),
+        ),
+    )
+
+    assert auth_cli.main(["--config", str(config_path), "write"]) == auth_cli.EXIT_SUCCESS
+
+    written = (config_path.parent / "shot_plan.toml").read_text(encoding="utf-8")
+    assert "issue #83" in written
+
+
+def test_concept_dry_run_carries_the_runs_literalness_band(tmp_path, capsys):
+    """Issue #67: `--dry-run` prints the prompt that WOULD be sent, so it has
+    to be the same prompt -- band included, or the preview lies."""
+    config_path = _write_config(tmp_path, lyrics_text="")
+    original = config_path.read_text(encoding="utf-8")
+    head, marker, tail = original.partition("\n[")
+    config_path.write_text(
+        f'{head}\nlyric_literalness = "literal"\n{marker}{tail}', encoding="utf-8"
+    )
+
+    assert (
+        auth_cli.main(["--config", str(config_path), "concept", "--dry-run"])
+        == auth_cli.EXIT_SUCCESS
+    )
+
+    assert "READS ITS LYRICS: LITERAL" in capsys.readouterr().out

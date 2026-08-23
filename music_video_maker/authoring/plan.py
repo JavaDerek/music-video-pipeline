@@ -315,6 +315,13 @@ def render_plan_toml(
             # field entirely.
             if beat.location:
                 block.append(f"location = {_toml_string(beat.location)}")
+            # Issue #83: what the world looks like at this beat -- the third
+            # continuity axis, re-emitted from the beat exactly like
+            # `location` and never from anything a later stage could inject.
+            # Absent on a pre-#83 beat sheet, which composes byte-identically
+            # to before this field existed.
+            if beat.conditions:
+                block.append(f"conditions = {_toml_string(beat.conditions)}")
         if chunk.chunk_id in camera:
             block.append(f"camera = {_toml_string(camera[chunk.chunk_id])}")
         # Issue #59: omitted entirely when nobody else is in shot, the same
@@ -678,7 +685,18 @@ def build_plan(
         if extra_checks is None:
             return found
         advisory = tuple(
-            PlanIssue(chunk_id=issue.chunk_id, severity="warning", message=issue.message)
+            PlanIssue(
+                chunk_id=issue.chunk_id,
+                severity="warning",
+                message=issue.message,
+                # Issue #83: carried through rather than defaulted, or a
+                # world-state finding the BEAT SHEET owns would still be
+                # handed to a prose reviser. `getattr` because
+                # `extra_checks` is injected and its issues only have to
+                # quack -- a caller predating the flag keeps today's
+                # behaviour.
+                revisable=getattr(issue, "revisable", True),
+            )
             for issue in extra_checks(shots)
         )
         return PlanCheck(errors=found.errors, warnings=found.warnings + advisory)

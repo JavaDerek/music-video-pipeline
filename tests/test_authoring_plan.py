@@ -1236,3 +1236,75 @@ def test_a_non_revisable_issue_is_annotated_but_never_objected_with():
 
 def test_plan_issues_are_revisable_by_default():
     assert PlanIssue(chunk_id=1, severity="warning", message="m").revisable is True
+
+
+# --------------------------------------------------------------------------- #
+# Issue #83: the beat's world-state tag reaches the written plan.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_beats_conditions_are_re_emitted_into_the_plan():
+    """Copied from the beat, never from anything a later stage could inject
+    -- the same rule `location` follows."""
+    text = render_plan_toml(
+        _chunks(["a line"]),
+        [replace(_beat(1), conditions="heavy falling snow")],
+        {1: "She climbs"},
+        provenance=PROVENANCE,
+    )
+
+    assert 'conditions = "heavy falling snow"' in text
+
+
+def test_a_pre_83_beat_sheet_emits_no_conditions_key():
+    text = render_plan_toml(
+        _chunks(["a line"]), [_beat(1)], {1: "She climbs"}, provenance=PROVENANCE
+    )
+
+    assert "conditions" not in text
+
+
+def test_a_non_revisable_extra_check_is_annotated_but_never_revised(tmp_path):
+    """The seam `extra_checks` uses has to carry `revisable` through, or a
+    world-state finding the beat sheet owns would still be handed to a prose
+    reviser (issue #83, and #87's reason for caring)."""
+    from music_video_maker.authoring.prose import ProseIssue
+
+    config = _config(tmp_path)
+    chunks = _chunks(["a line"])
+    beats = [_beat(1)]
+    calls: list[dict] = []
+
+    class _NoRevision:
+        shots: dict = {}
+        driver_results: tuple = ()
+
+    def reviser(shots, objections):
+        calls.append(dict(objections))
+        return _NoRevision()
+
+    built = build_plan(
+        config,
+        chunks,
+        beats,
+        {1: "She climbs, medium close on her face"},
+        provenance=PROVENANCE,
+        reviser=reviser,
+        extra_checks=lambda shots: (
+            ProseIssue(
+                chunk_id=1,
+                severity="warning",
+                message="the world flips back for one shot (issue #83)",
+                revisable=False,
+            ),
+        ),
+        scratch_dir=tmp_path,
+        revise_warnings=True,
+    )
+
+    # Other lints may legitimately object to this fixture and drive the
+    # round; what must never appear in an objection is the non-revisable one.
+    objected = [m for call in calls for messages in call.values() for m in messages]
+    assert not any("issue #83" in m for m in objected)
+    # ...and it is still annotated into the file the human reads.
+    assert "issue #83" in built.text

@@ -560,27 +560,42 @@ does exist is the only other enumerated per-chunk tag this project has:
 measures **false-positive surface** -- how often the shape occurs in real
 authored tag sequences -- and measures **nothing at all about detection**.
 
+Every number below is produced by the **shipped** `check_conditions`, run
+over spans built from each plan's `location` values, counted per run
+transition. (An earlier draft of this table published a `0` for the last row.
+It came from a different formulation of the rule than the one that shipped --
+"a value that first *appears* on a consequence beat is frozen" rather than
+"a consequence *ends* the state that preceded it" -- and the shipped
+semantics, which are the ones the issue and the module docstring describe,
+give 3. Corrected here; a number this file publishes has to be reproducible
+from the code that ships.)
+
 | check, run over the `location` axis | v6 | v12 | verdict |
 |---|---|---|---|
-| flip-flop, interruption of exactly one span | 3 | 3 | SHIPPED |
+| flip-flop, interruption of exactly one span | **3** | **3** | SHIPPED |
 | flip-flop, interruption of any length | 6 | 5 | EXCLUDED: twice the surface, and the reported defect is the single-span one |
-| regression: any earlier value after any consequence | 11 | 10 | EXCLUDED |
-| regression: only a value a consequence ENDED | **0** | **0** | SHIPPED |
+| regression: any earlier value after any consequence | 10 | 9 | EXCLUDED |
+| regression: only a state a `consequence` ENDED | **3** | **3** | SHIPPED |
+| **total, the shipped pair** | **6** | **6** | |
 
-Read the last two rows together and they are the measured argument for
-`conditions` being a **second axis** rather than a facet of `location`: the
-loose regression form fires 10-11 times on locations and every one is
-correct authoring, because a character is supposed to move back and forth
-between places and the world is not supposed to move back and forth between
-states. Opposite correctness shapes, so two axes. The tightened form -- only
-a state that *arrived on a `consequence` beat* is one-way -- is what takes
-that from 10 false positives to 0, and it is expressed as an irreversible
-fact through `authoring/worldstate.WorldState.set_fact`'s existing choke
-point rather than as a second copy of the rule.
+Two things to read off this.
 
-All three single-span flip-flops on the location axis are legitimate *for a
-location* (the cut goes to the watch-post for one shot and comes back),
-which is the same asymmetry stated from the other side.
+**Every one of those 6 is a false positive — and that is the argument.** On
+the location axis the cut legitimately goes to the watch-post for one shot
+and comes back (chunk 14), and the story legitimately returns to a place
+after a consequence somewhere else (chunks 47, 54, 56). A character is
+*supposed* to move back and forth between places; the world is *not* supposed
+to move back and forth between states. The identical check is 100% wrong on
+the position axis and is the whole point on the state axis, which is what
+makes `conditions` a **second axis** rather than a facet of `location`.
+
+**The tightening is worth roughly 60% of the surface.** The loose forms
+together would fire 16 times on v6 and 14 on v12; the shipped pair fires 6 on
+each. The tightened regression is expressed as an irreversible fact through
+`authoring/worldstate.WorldState.set_fact`'s existing choke point rather than
+as a second copy of the rule, and it is keyed per condition *value* so that a
+further consequence of a consequence -- ash settling into a flat grey
+stillness -- is not reported as a regression.
 
 ### 7c: a pixel check that cannot substitute (negative result)
 

@@ -39,6 +39,7 @@ from music_video_maker.authoring import prose as prose_module
 from music_video_maker.authoring.beats import Beat, BeatsValidationError, beat_length_requests
 from music_video_maker.authoring.chunks import SkeletonError, load_chunk_skeleton
 from music_video_maker.authoring.concept import ConceptValidationError, generate_concept
+from music_video_maker.authoring.conditions import check_conditions, conditions_from_beats
 from music_video_maker.authoring.driver import ClaudeCliDriver, DriverError
 from music_video_maker.authoring.hashing import sha256_file, sha256_text
 from music_video_maker.authoring.photography import PhotographyValidationError
@@ -288,7 +289,7 @@ def _cmd_concept(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         _print_prompts(
-            concept_system_prompt(),
+            concept_system_prompt(config.lyric_literalness),
             concept_module.build_concept_prompt(config, chunks, hints=args.notes),
         )
         return EXIT_SUCCESS
@@ -369,6 +370,11 @@ def _cmd_concept(args: argparse.Namespace) -> int:
     # is generated against them.
     acts = result.data.get("acts") or []
     print(f"acts: {' -> '.join(a.get('name', '') for a in acts)}")
+    # Issue #83: the third continuity axis, at the same review point as
+    # `locations` and for the same reason -- a world state missing from this
+    # list cannot be authored later, and a video whose weather nobody named
+    # is exactly the gap this closes.
+    print(f"conditions: {', '.join(result.data.get('conditions', []))}")
     return EXIT_SUCCESS
 
 
@@ -418,7 +424,7 @@ def _cmd_beats(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         _print_prompts(
-            beats_system_prompt(),
+            beats_system_prompt(config.lyric_literalness),
             beats_module.build_beats_prompt(config, chunks, concept, notes=args.notes),
         )
         return EXIT_SUCCESS
@@ -479,7 +485,36 @@ def _cmd_beats(args: argparse.Namespace) -> int:
             f"{beat.chunk_id:>4}  {beat.start:>8.3f}  {beat.beat_role:<13}"
             f"g{beat.beat_group:<3} [{beat.location}] {act_tag}{beat.beat}{merged}"
         )
+    _report_condition_findings(plan.beats)
     return EXIT_SUCCESS
+
+
+def _report_condition_findings(beats: Sequence[Beat]) -> tuple:
+    """Issue #83's two world-state checks, reported at the beats review
+    point -- which is where they can actually be acted on.
+
+    A flip-flop or a regression is a defect in *what happens*, not in how a
+    sentence is worded, so the remedy is ``mvm-author beats --notes "..."``
+    and the place to say so is here, before three more stages have been
+    generated on top of it. They are also written into the plan later as
+    ``# lint:`` comments (see ``_cmd_write``), marked non-revisable so no
+    revision round is ever asked to fix them by rewriting prose.
+
+    Warning tier: never blocks, never raises. Returns the findings so the
+    caller can reuse them."""
+    findings = check_conditions(conditions_from_beats(beats))
+    if not findings:
+        return findings
+    logger.warning(
+        "%d world-state continuity finding(s) on this beat sheet (issue #83)", len(findings)
+    )
+    print(
+        f"\n{len(findings)} world-state continuity finding(s) (issue #83) -- advisory, and "
+        "fixed by re-rolling the beats, not by rewording a shot:"
+    )
+    for finding in findings:
+        print(f"  [chunk {finding.ref}] {finding.message}")
+    return findings
 
 
 def _load_stage_json(run_dir: Path, name: str, *, quiet: bool = False) -> dict | None:
@@ -578,7 +613,7 @@ def _cmd_prose(args: argparse.Namespace) -> int:
             logger.error("No beat group matches --groups %r", args.groups)
             return EXIT_ERROR
         _print_prompts(
-            prose_system_prompt(),
+            prose_system_prompt(config.lyric_literalness),
             prose_module.build_prose_prompt(
                 config, concept, windows[0], beats, chunks, camera={}, notes=args.notes
             ),
@@ -926,6 +961,21 @@ def _cmd_write(args: argparse.Namespace) -> int:
 
     camera = _load_camera(run_dir)
 
+    # Issue #83: a function of the BEAT SHEET, not of the shot text, so it is
+    # computed once rather than re-derived per round -- and marked
+    # `revisable=False`, because the remedy is a re-rolled beat and a
+    # revision round handed one would rewrite a shot line to satisfy a
+    # complaint the shot line did not cause (#87's lesson).
+    condition_issues = tuple(
+        prose_module.ProseIssue(
+            chunk_id=finding.ref if isinstance(finding.ref, int) else None,
+            severity="warning",
+            message=finding.message,
+            revisable=False,
+        )
+        for finding in check_conditions(conditions_from_beats(beats))
+    )
+
     def advisory(current_shots):
         """The prose stage's own warning-tier checks, re-derived on the
         current text so a revision round cannot leave the file annotated with
@@ -937,9 +987,11 @@ def _cmd_write(args: argparse.Namespace) -> int:
         chunk timeline and could not tell a plant from a payoff without
         guessing, which is the thing this project keeps having to retire.
         """
-        return prose_module.advisory_issues(
-            current_shots, camera=camera
-        ) + prose_module.plant_end_state_issues(current_shots, beats)
+        return (
+            prose_module.advisory_issues(current_shots, camera=camera)
+            + prose_module.plant_end_state_issues(current_shots, beats)
+            + condition_issues
+        )
 
     try:
         built = plan_module.build_plan(
