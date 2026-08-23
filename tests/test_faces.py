@@ -18,8 +18,10 @@ import pytest
 
 from music_video_maker import faces
 from music_video_maker.faces import (
+    DEFAULT_INSPECTION_FLOOR,
     DEFAULT_MIN_FACE_FRACTION,
     DEFAULT_MIN_FACE_SIMILARITY,
+    DEFAULT_SCORE_THRESHOLD,
     FaceDetectionError,
     FaceObservation,
     build_seed_face_gate,
@@ -407,3 +409,196 @@ def test_face_observation_truthiness_ignores_size_and_confidence():
     tiny = faces.FaceObservation(face_count=1, largest_fraction=0.0001, score=0.1)
     assert tiny
     assert not tiny.carries_identity()
+
+
+# --------------------------------------------------------------------------- #
+# Making a zero inspectable (issue #93).
+#
+# #93 was filed as "the detector returns 0.0% on obvious faces" -- measurement
+# showed the run-local scan script never read the frames it claimed to (a
+# provenance bug, fixed by facescan.py, not a detector bug). What #93's
+# proposal 1 still gets right: a bare zero from detect_faces has never meant
+# "no face" -- it has only ever meant "nothing cleared score_threshold". These
+# tests cover the new `verdict` state machine that makes that distinction
+# inspectable instead of silently collapsed into `face_count == 0`.
+# --------------------------------------------------------------------------- #
+
+
+def test_face_observation_defaults_have_no_inspection_metadata():
+    """Every pre-#93 construction site (this file has dozens, all positional
+    or with only the first three keywords) must keep working unchanged --
+    the two new fields are additive, with defaults."""
+    obs = FaceObservation(0, 0.0, 0.0)
+    assert obs.candidate_scores == ()
+    assert obs.inspection_floor is None
+
+
+def test_verdict_is_detected_whenever_a_face_was_found():
+    """`face_count > 0` always wins, regardless of whether an inspection pass
+    also ran -- detection and inspection are independent questions."""
+    assert FaceObservation(1, 0.02, 0.95).verdict == "detected"
+    assert (
+        FaceObservation(
+            1, 0.02, 0.95, candidate_scores=(0.95, 0.3), inspection_floor=0.15
+        ).verdict
+        == "detected"
+    )
+
+
+def test_verdict_is_unexamined_when_nothing_was_found_and_no_inspection_ran():
+    """The honest default for the legacy path (no `inspect_floor` passed):
+    we do not know whether a face was there, only that nothing cleared
+    `score_threshold`. This is the state every pre-#93 zero was actually in,
+    silently misread as 'no face' by every downstream analysis."""
+    assert FaceObservation(0, 0.0, 0.0).verdict == "unexamined"
+    assert FaceObservation(0, 0.0, 0.0, candidate_scores=(), inspection_floor=None).verdict == (
+        "unexamined"
+    )
+
+
+def test_verdict_is_absent_when_an_inspection_pass_found_nothing_at_all():
+    """An inspection pass ran, at a floor far more permissive than the
+    primary decision, and still found zero candidates -- this is the one
+    state that is actually evidence of absence."""
+    assert (
+        FaceObservation(0, 0.0, 0.0, candidate_scores=(), inspection_floor=0.15).verdict
+        == "absent"
+    )
+
+
+def test_verdict_is_inconclusive_when_an_inspection_pass_found_a_candidate():
+    """The state a bare CSV column could never express: nothing cleared the
+    production threshold, but the detector saw *something* face-shaped down
+    at the inspection floor. 'Absent' would be a lie here."""
+    assert (
+        FaceObservation(
+            0, 0.0, 0.0, candidate_scores=(0.253,), inspection_floor=0.15
+        ).verdict
+        == "inconclusive"
+    )
+
+
+def test_default_inspection_floor_sits_between_the_rejected_noise_floors_and_the_score_threshold():
+    """0.05 and 0.01 were measured on real rendered frames and rejected: at
+    0.05 YuNet emits boxes up to 1.07x the whole frame's area (not a face,
+    noise), and at 0.01 it emits 22-112 boxes per frame. 0.15 is the floor
+    low enough to surface a genuine low-confidence candidate (a real
+    0.253-confidence face-shaped box) without flooding on detector noise."""
+    assert 0.05 < DEFAULT_INSPECTION_FLOOR < DEFAULT_SCORE_THRESHOLD
+
+
+def test_detect_faces_accepts_inspect_floor_as_a_keyword_only_argument():
+    """A construction-level check that the parameter exists with the right
+    default, without needing OpenCV -- the real detector behaviour is
+    covered by the integration tests below."""
+    import inspect
+
+    sig = inspect.signature(faces.detect_faces)
+    assert "inspect_floor" in sig.parameters
+    assert sig.parameters["inspect_floor"].default is None
+    assert sig.parameters["inspect_floor"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+# --------------------------------------------------------------------------- #
+# The inspection pass against the real detector (issue #93). Skipped unless
+# OpenCV and the committed YuNet model are present -- same shape as every
+# other real-detector test in this file.
+# --------------------------------------------------------------------------- #
+
+
+def test_detect_faces_with_and_without_inspect_floor_agree_on_the_primary_result():
+    """CRITICAL: adding `inspect_floor` must never change the primary
+    decision. detect_faces's result feeds the #47 gate, whose decision feeds
+    `chained_from`, which is fingerprinted -- the existing decision must stay
+    byte-identical and deterministic whether or not anyone asks for an
+    inspection pass alongside it. This is *why* the implementation must run a
+    second, independent detector call rather than lowering the one call's
+    threshold and filtering in Python: YuNet's score_threshold participates
+    in its own non-max suppression, so a single low-floor call is not
+    guaranteed to reproduce the same above-threshold survivors."""
+    pytest.importorskip("cv2")
+    if not faces.resolve_model_path().exists():
+        pytest.skip("YuNet model not available")
+
+    for frame in ("seed_frontal_chunk15.png", "seed_faceless_chunk21.png"):
+        path = CALIBRATION / frame
+        without = faces.detect_faces(path)
+        with_inspection = faces.detect_faces(path, inspect_floor=DEFAULT_INSPECTION_FLOOR)
+        assert with_inspection.face_count == without.face_count, frame
+        assert with_inspection.largest_fraction == without.largest_fraction, frame
+        assert with_inspection.score == without.score, frame
+
+
+def test_detect_faces_records_the_inspection_floor_when_asked():
+    pytest.importorskip("cv2")
+    if not faces.resolve_model_path().exists():
+        pytest.skip("YuNet model not available")
+
+    observation = faces.detect_faces(
+        CALIBRATION / "seed_faceless_chunk21.png", inspect_floor=DEFAULT_INSPECTION_FLOOR
+    )
+    assert observation.inspection_floor == DEFAULT_INSPECTION_FLOOR
+
+
+def test_detect_faces_without_inspect_floor_never_runs_an_inspection_pass():
+    """No `inspect_floor` given (the #47 gate's own call shape, unchanged) --
+    `inspection_floor` stays `None` and `candidate_scores` stays empty, i.e.
+    `verdict` reports `unexamined` rather than `absent`, even on a frame with
+    no face."""
+    pytest.importorskip("cv2")
+    if not faces.resolve_model_path().exists():
+        pytest.skip("YuNet model not available")
+
+    observation = faces.detect_faces(CALIBRATION / "seed_faceless_chunk21.png")
+    assert observation.inspection_floor is None
+    assert observation.candidate_scores == ()
+    assert observation.verdict == "unexamined"
+
+
+def test_detect_faces_reports_inconclusive_on_a_real_frame_a_bare_zero_would_hide():
+    """`seed_faceless_chunk21.png` is the committed #47 calibration fixture a
+    human confirmed has no identifiable face (back to camera, drums
+    obscuring) -- and it scores 0.0 at the production threshold (0.9), same
+    as before. But it is not *evidence of absence*: at the inspection floor
+    YuNet reports a real 0.82-confidence candidate on the same frame. This is
+    exactly #93's corrected point -- 'no detection' must be distinguishable
+    from 'no face' -- measured on a fixture already in this repo, not a new
+    claim about a frame nobody can check."""
+    pytest.importorskip("cv2")
+    if not faces.resolve_model_path().exists():
+        pytest.skip("YuNet model not available")
+
+    observation = faces.detect_faces(
+        CALIBRATION / "seed_faceless_chunk21.png", inspect_floor=DEFAULT_INSPECTION_FLOOR
+    )
+    assert observation.face_count == 0
+    assert observation.verdict == "inconclusive"
+    assert observation.candidate_scores  # at least one candidate recorded
+    assert observation.candidate_scores == tuple(sorted(observation.candidate_scores, reverse=True))
+
+
+def test_verdict_stays_detected_even_when_an_inspection_pass_also_ran():
+    pytest.importorskip("cv2")
+    if not faces.resolve_model_path().exists():
+        pytest.skip("YuNet model not available")
+
+    observation = faces.detect_faces(
+        CALIBRATION / "seed_frontal_chunk15.png", inspect_floor=DEFAULT_INSPECTION_FLOOR
+    )
+    assert observation.face_count > 0
+    assert observation.verdict == "detected"
+
+
+def test_build_seed_face_gate_still_calls_detect_faces_without_inspect_floor(monkeypatch):
+    """The #47/#49 gate's behaviour must not change: it never asks for an
+    inspection pass, so it can never observe `verdict == "inconclusive"` --
+    a chain decision stays exactly as deterministic as before #93."""
+    seen = {}
+
+    def fake_detect(path, *, model_path=None, score_threshold=None):
+        seen["kwargs_ok"] = True
+        return FaceObservation(0, 0.0, 0.0)
+
+    monkeypatch.setattr(faces, "detect_faces", fake_detect)
+    assert build_seed_face_gate()(Path("seed.png")) is False
+    assert seen.get("kwargs_ok") is True
