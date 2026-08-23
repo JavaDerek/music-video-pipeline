@@ -29,6 +29,37 @@ singer, split screen, or an intercut is the shot plan's decision, not the
 transcript's. A tag also does not distinguish unison from harmony — both
 render identically as "these names are singing this line."
 
+## More than one singer: this is how you do it today
+
+If a song has more than one vocalist, **`[Name]` / `[Name: Role]` tags are
+the only supported way to say so.** There is no automatic detection of who
+is singing — nothing in this project listens to the audio and guesses a
+speaker. Every line's active character comes from the most recent tag above
+it (or `config.default_lead_vocalist` if there has never been one), full
+stop. This is a documented, tested, working feature
+(`tests/test_multi_vocalist.py` walks it end to end, from a two-tag lyrics
+file through alignment and slicing to the composed prompt and the staged
+reference photo) — it is not a fallback or a partial implementation waiting
+on something else to land.
+
+The failure mode is silent and specific: **an untagged or mis-tagged line
+does not raise an error, it inherits whoever was tagged last.** Forget the
+second tag, or put it on the wrong line, and that line renders with the
+wrong cast member's face and role — no exception, no warning, nothing to
+catch it except watching the finished video. This is exactly what happened
+on "The Lucky Ones" before this section existed: the lyrics file carried a
+single `[Dianne: Lead]` tag at line 1 and nothing after it, so Dianne's face
+rendered on every line, including every one that was actually a different
+singer (see ["The motivating bug"](#the-motivating-bug) below for the full
+story, including the level 3 case where the *lyrics themselves* were
+incomplete). **If a song has more than one voice, tag every handoff, not
+just the first one.**
+
+Automatic diarization (detecting who is singing from the audio itself,
+rather than being told) does not exist yet. See
+[`docs/design-multi-vocalist.md`](design-multi-vocalist.md) for the design
+of that feature and why it is not simply "the same thing but automatic."
+
 ## Plain lines, no tags at all
 
 ```
