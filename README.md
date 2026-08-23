@@ -192,6 +192,11 @@ front:
   chunk's own generated audio (even MiniMax H3's own audio VAE output) is
   discarded at assembly time; lip-sync comes entirely from the Stage 1
   alignment timestamps that drove slicing, not from any generated sound.
+  One deliberate exception, and only one: `silent_output = true` (issue #22)
+  produces a file with **no audio stream at all**, for a rear-projection
+  backdrop where a live band is the audio. It suspends this invariant and
+  logs a warning saying so; it does not touch the sentence above about
+  generated audio, which is discarded either way.
 - **Never hardcode ComfyUI node IDs.** Every node the orchestrator touches is
   located by `class_type` (with `_meta.title` or wiring as a disambiguator
   where needed) via graph introspection in `workflow_graph.py` — a user
@@ -659,6 +664,44 @@ the shot/concept sentence — `"<shot>, camera <direction>"` — never as its ow
 sentence, so it can never take the subject slot away from whatever the shot
 is actually about. Both fields are optional and independent of each other and
 of `shot`; a config written before they existed keeps rendering unchanged.
+
+#### Locking the look across videos: `cinematography_profile`
+
+Once a look works, freezing it is what gives a catalogue a through-line
+(issue #55). A profile is a small, versioned TOML file a run points at:
+
+```toml
+cinematography_profile = "profiles/refestramus-house-v1.toml"
+```
+
+See [`examples/profiles/refestramus-house-v1.toml`](examples/profiles/refestramus-house-v1.toml)
+for the annotated format. It may lock only whole-video *look* fields —
+`cinematography`, `face_treatment`, `lora`, `lora_strength`, `lora_trigger`
+— and **the run config wins on anything it sets for itself**, so pointing at
+a house style never stops one video deviating. Every inherited and every
+overridden field is logged at INFO.
+
+Deliberately not lockable: `global_style` (genre and tone are per-song),
+per-shot `camera` (lock the look, keep the shots varied), and
+`render_width`/`render_height` (resolution is the dominant cost lever — a
+look file that silently tripled a run's GPU hours would be the wrong thing
+to inherit invisibly).
+
+To promote the photography stage's approved pick into a profile:
+
+```bash
+python -m music_video_maker.profiles promote \
+    --run-dir ~/mvm-runs/deathless \
+    --name refestramus-house --version 1 \
+    --out profiles/refestramus-house-v1.toml
+```
+
+Every run that names a profile writes
+`<chunks_dir>/cinematography_profile.json` recording the resolved profile
+verbatim, with the file's sha256. `prompt_hash` proves a look *changed*; that
+sidecar is what proves what it *was*, after the profile has moved on to v3.
+Full rationale in
+[`docs/design-cinematography-profiles.md`](docs/design-cinematography-profiles.md).
 
 #### Your first real run
 
@@ -1179,7 +1222,19 @@ docstring for the full design.
 - **`cinematography` is proposed, not applied.** The photography stage
   proposes a look, but it is a `run.toml` value rather than a shot-plan
   field, so `write` prints it for you to copy rather than setting it. Only
-  the per-shot `camera` values reach the plan.
+  the per-shot `camera` values reach the plan. On the one full render this
+  project has, that copy step never happened and the whole-video half of the
+  stage's output reached no prompt at all — `python -m
+  music_video_maker.profiles promote` (issue #55) is the step that closes
+  it, but it is still a deliberate human act, and **no render has yet been
+  produced with `cinematography` set to anything.**
+- **Nothing measures the finished video's duration unless you ask it to.**
+  The chunk timeline ends where the last H3-legal frame count lands, not
+  where the track ends — on "Deathless" that is 1.84 s past the master — and
+  the mux's `-shortest` quietly discards the difference (47 rendered frames,
+  unlogged). That is fine for a music video and wrong for anything cut to an
+  external clock. Pass `expected_duration` to `assemble_final_video`, or set
+  `silent_output` and expect to have to deal with it.
 
 ## License
 
@@ -1223,3 +1278,26 @@ terms of:
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — the offline-tests rule, the
   no-LLM-in-the-render-path invariant, and how the issue history is meant to
   be read.
+
+Design documents for work that is specified but not finished. Each states
+what was measured, what is blocked and on whom, and what a stranger would
+need to pick it up:
+
+- [`docs/design-cinematography-profiles.md`](docs/design-cinematography-profiles.md)
+  — locking a house style (#55), and why every profile field must already be
+  fingerprinted.
+- [`docs/design-concert-mode.md`](docs/design-concert-mode.md) — a
+  click-track-synced backdrop for a live band (#22): the marker contract that
+  is built, and the eight questions only the band can answer.
+- [`docs/design-web-ui.md`](docs/design-web-ui.md) — the pre-render review
+  page and live progress (#36), the loopback+tailnet constraint, and the
+  three things `run_state.json` does not carry.
+- [`docs/design-synthetic-cast.md`](docs/design-synthetic-cast.md) —
+  characters who are nobody (#56), and a measurable definition of "reads as
+  the same person".
+- [`docs/design-prologue-timelines.md`](docs/design-prologue-timelines.md) —
+  a spoken prologue as a second timeline (#66), and the four places joining
+  two timelines will break.
+- [`docs/design-stereoscopic-3d.md`](docs/design-stereoscopic-3d.md) —
+  stereo output and beats that plant for a pop (#68), plus why the pop-beat
+  lint cannot be scored yet.
