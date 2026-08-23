@@ -30,6 +30,29 @@ every lint in ``shot_plan.py`` follows. The whole check is wrapped in its own
 try/except here too, on top of ``luminance``'s own internal guards -- a
 Stage-5 smell test must never be the reason a finished render doesn't get
 written.
+
+**Silent output for concert mode (issue #22).** Invariant 2 above inverts
+for a rear-projection backdrop: the band playing live *is* the audio, so
+shipping a file with an audio stream at all risks double-audio if someone's
+playback rig un-mutes it. Passing ``master_audio=None`` produces a video
+with **no audio stream whatsoever** -- the concat pass (still ``-an``, so
+generated per-chunk audio is discarded exactly as before) writes straight to
+the final output path and no mux pass runs at all. This is a *conditional*
+suspension of invariant 2 for one mode, not a repeal of it: every caller that
+still passes a real ``master_audio`` path gets byte-for-byte the same two
+ffmpeg calls as before this existed. Invariant 1 (no re-encoding) and the
+"generated audio is always discarded" rule are untouched either way.
+
+**Measured duration check, also issue #22.** For a concert backdrop, drifting
+against the click track is a show falling apart live with no chance to
+correct it -- unlike a music video, where being 0.75 s short is merely
+abrupt. ``expected_duration`` is opt-in (default ``None``, no behaviour
+change for any existing caller); when given, the *finished* file's container
+duration is probed with ffprobe through the same injected ``runner`` and
+compared with tolerance. A mismatch raises :class:`DurationMismatchError`
+*after* the file is already written, deliberately: the file stays on disk to
+inspect, and an operator running a show needs to be told loudly, not have it
+buried in a log line read the next day.
 """
 
 from __future__ import annotations
@@ -48,6 +71,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_OUTPUT_FILENAME = "final_video.mp4"
 CONCAT_LIST_FILENAME = "concat_list.txt"
 INTERMEDIATE_VIDEO_FILENAME = "_concat_intermediate.mp4"
+
+DEFAULT_DURATION_TOLERANCE_SECONDS = 0.05
+"""Issue #22: a starting point, not a measured figure -- roughly one frame at
+24 fps (0.0417 s) rounded up. A real playback rig's tolerance should be set
+from the actual show's frame rate and sync requirements, not left at this."""
 
 # Injectable subprocess seam: unit tests supply a fake that never touches a
 # real shell; only the (skippable) integration test exercises the default.
@@ -78,6 +106,37 @@ class FfmpegError(RuntimeError):
         )
 
 
+class DurationMismatchError(RuntimeError):
+    """Raised when a finished video's measured duration drifts beyond tolerance.
+
+    Issue #22: for a concert backdrop, duration accuracy is the acceptance
+    criterion, not cosmetic -- a video that drifts against the click track
+    it's cut to is a show falling apart live, with no opportunity to correct
+    it once the band is playing. Raised *after* the output file is already
+    written, deliberately: the file stays on disk to inspect, and an
+    operator running a show needs to be told loudly, not have this buried in
+    a log line they read tomorrow.
+    """
+
+    def __init__(
+        self,
+        video_path: Path,
+        expected_duration: float,
+        measured_duration: float,
+        tolerance: float,
+    ):
+        self.video_path = Path(video_path)
+        self.expected_duration = expected_duration
+        self.measured_duration = measured_duration
+        self.tolerance = tolerance
+        self.drift = measured_duration - expected_duration
+        super().__init__(
+            f"{self.video_path}: measured duration {measured_duration:.3f}s does not match "
+            f"expected {expected_duration:.3f}s (drift={self.drift:+.3f}s, "
+            f"tolerance={tolerance:.3f}s)"
+        )
+
+
 class MissingChunksError(RuntimeError):
     """Raised when the expected chunk set has gaps -- assembly refuses to run.
 
@@ -104,15 +163,28 @@ class AssemblyResult:
     output_video: Path
     concat_file: Path
     intermediate_video: Path
+    """The concat pass's own output. Equal to ``output_video`` when there is
+    no mux pass (``master_audio=None``, issue #22 concert mode) -- there is
+    no second pass to feed, so the concat pass writes the deliverable
+    directly and the two are the same file."""
     chunk_ids: tuple[int, ...]
     """Chunk ids actually concatenated, in the chronological order used."""
     concat_args: tuple[str, ...]
     mux_args: tuple[str, ...]
+    """Empty when ``master_audio=None`` -- no mux pass ran (issue #22)."""
     dark_chunk_warnings: tuple[DarkChunkWarning, ...] = ()
     """Chunks whose sampled ending luminance fell below the darkness floor
     (issue #77) -- informational only. The video was still assembled; a
     non-empty tuple here means a human should look at these chunks before
     trusting the final cut, not that anything failed."""
+    has_audio: bool = True
+    """What the output actually contains, so a caller never has to re-derive
+    it from whether ``mux_args`` is empty. ``False`` only for the issue #22
+    silent-output path (``master_audio=None``)."""
+    measured_duration: float | None = None
+    """The probed container duration of the finished file (issue #22), or
+    ``None`` when no duration check was requested (``expected_duration`` not
+    given)."""
 
 
 def _escape_concat_path(path: Path) -> str:
@@ -220,6 +292,72 @@ def validate_chunk_availability(
     return available, missing, dead
 
 
+def build_duration_probe_args(video_path: Path) -> list[str]:
+    """Args for probing a finished file's *container* duration via ffprobe.
+
+    ``format=duration`` rather than a stream duration: the container
+    duration is what a playback rig will actually honour, and it's what a
+    ``-c:v copy`` concat pass produces (issue #22)."""
+    return [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=nw=1:nk=1",
+        str(video_path),
+    ]
+
+
+def _decode(value: bytes | str | None) -> str:
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else value.decode("utf-8", errors="replace")
+
+
+def probe_duration_seconds(video_path: Path, runner: SubprocessRunner) -> float:
+    """Measure a finished file's actual container duration via ffprobe.
+
+    Issue #22: for a concert backdrop the acceptance criterion is *measured*
+    duration against the click track, not the sum of chunk lengths computed
+    upstream -- a ``-c:v copy`` concat is exact per chunk, but the container
+    duration a playback rig actually honours is the only thing worth
+    checking against.
+
+    Raises :class:`FfmpegError` (logged first) if ffprobe exits non-zero or
+    its stdout isn't parseable as a float.
+    """
+    video_path = Path(video_path)
+    args = build_duration_probe_args(video_path)
+    result = runner(args)
+    if result.returncode != 0:
+        stderr = _decode(result.stderr)
+        logger.error(
+            "ffprobe duration probe failed for %s (exit=%s): %s",
+            video_path,
+            result.returncode,
+            stderr,
+        )
+        raise FfmpegError(
+            "ffprobe duration probe failed", cmd=args, returncode=result.returncode, stderr=stderr
+        )
+
+    stdout = _decode(result.stdout).strip()
+    try:
+        return float(stdout)
+    except ValueError as exc:
+        logger.error(
+            "ffprobe returned an unparseable duration for %s: %r", video_path, stdout
+        )
+        raise FfmpegError(
+            f"ffprobe returned an unparseable duration for {video_path}: {stdout!r}",
+            cmd=args,
+            returncode=result.returncode,
+            stderr=stdout,
+        ) from exc
+
+
 def _run_ffmpeg(args: Sequence[str], runner: SubprocessRunner, *, step: str) -> None:
     logger.info("Running ffmpeg step=%s: %s", step, " ".join(args))
     result = runner(args)
@@ -243,7 +381,7 @@ def _run_ffmpeg(args: Sequence[str], runner: SubprocessRunner, *, step: str) -> 
 def assemble_final_video(
     chunks: Sequence[AudioChunk],
     results: Mapping[int, ChunkResult] | RunState,
-    master_audio: Path,
+    master_audio: Path | None,
     output_dir: Path,
     *,
     output_filename: str = DEFAULT_OUTPUT_FILENAME,
@@ -251,13 +389,15 @@ def assemble_final_video(
     check_luminance: bool = True,
     luminance_floor: float = DEFAULT_DARK_FLOOR,
     luminance_runner: SubprocessRunner | None = None,
+    expected_duration: float | None = None,
+    duration_tolerance_seconds: float = DEFAULT_DURATION_TOLERANCE_SECONDS,
 ) -> AssemblyResult:
     """Concat every chunk's rendered video (chronological ``chunk_id`` order)
     and mux the master audio track over it.
 
     Raises :class:`MissingChunksError` -- before any subprocess runs -- if
     any chunk in ``chunks`` lacks a succeeded, video-bearing result. Raises
-    :class:`FfmpegError` if either ffmpeg subprocess exits non-zero.
+    :class:`FfmpegError` if any ffmpeg/ffprobe subprocess exits non-zero.
 
     ``check_luminance`` (default ``True``) runs the issue #77 darkness check
     against every available chunk before concat, using ``luminance_runner``
@@ -265,6 +405,26 @@ def assemble_final_video(
     runner already used for concat/mux is enough to exercise or disable it in
     tests. The check never raises and never blocks assembly; see
     :func:`music_video_maker.luminance.check_dark_chunks`.
+
+    ``master_audio=None`` (issue #22 concert mode) produces a video with no
+    audio stream at all: the concat pass writes straight to the final output
+    path (there's no mux pass to feed) and :attr:`AssemblyResult.mux_args` is
+    ``()``. This is a deliberate, per-run suspension of the "master track is
+    the only audio" invariant -- a WARNING names it so a run that hits this
+    by accident is discoverable in the log. ``-an`` on the concat pass still
+    strips the chunks' own generated audio either way; "generated audio is
+    always discarded" is untouched by this parameter.
+
+    ``expected_duration`` (default ``None``) is an opt-in, *measured* check
+    (issue #22): when given, ffprobe measures the finished file's real
+    container duration and raises :class:`DurationMismatchError` if it drifts
+    from ``expected_duration`` by more than ``duration_tolerance_seconds``
+    (default 0.05 s -- roughly one frame at 24 fps, a starting point rather
+    than a measured figure; set it from the real playback rig). The raise
+    happens *after* the file is written, on purpose, so the file remains on
+    disk for inspection. When ``expected_duration`` is ``None`` (every
+    existing caller), no probe runs and :attr:`AssemblyResult.measured_duration`
+    stays ``None``.
     """
     runner = runner or _default_runner
     output_dir = Path(output_dir)
@@ -316,20 +476,66 @@ def assemble_final_video(
     concat_file = output_dir / CONCAT_LIST_FILENAME
     write_concat_file(video_paths, concat_file)  # type: ignore[arg-type]
 
-    intermediate_video = output_dir / INTERMEDIATE_VIDEO_FILENAME
-    concat_args = build_concat_args(concat_file, intermediate_video)
-    _run_ffmpeg(concat_args, runner, step="concat")
-
     output_path = output_dir / output_filename
-    mux_args = build_mux_args(intermediate_video, master_audio, output_path)
-    _run_ffmpeg(mux_args, runner, step="mux")
+
+    if master_audio is None:
+        # Issue #22 concert mode: the band playing live is the audio, so
+        # shipping a file WITH an audio stream risks double-audio if
+        # someone's playback rig un-mutes it. There is no second (mux) pass
+        # to feed, so the concat pass writes the deliverable directly --
+        # copying the file again for nothing is a real cost on an
+        # hours-long render.
+        logger.warning(
+            "master_audio=None: assembling %s as a SILENT video with NO AUDIO STREAM "
+            "at all -- this suspends the CLAUDE.md invariant 'the master audio track "
+            "is the only audio in the final video' for this run (issue #22 concert "
+            "mode: a rear-projection backdrop's audio is the live band, not this "
+            "file). If this run was meant to have audio, master_audio was passed as "
+            "None by mistake.",
+            output_path,
+        )
+        intermediate_video = output_path
+        concat_args = build_concat_args(concat_file, output_path)
+        _run_ffmpeg(concat_args, runner, step="concat")
+        mux_args: tuple[str, ...] = ()
+        has_audio = False
+    else:
+        intermediate_video = output_dir / INTERMEDIATE_VIDEO_FILENAME
+        concat_args = build_concat_args(concat_file, intermediate_video)
+        _run_ffmpeg(concat_args, runner, step="concat")
+
+        mux_args_list = build_mux_args(intermediate_video, master_audio, output_path)
+        _run_ffmpeg(mux_args_list, runner, step="mux")
+        mux_args = tuple(mux_args_list)
+        has_audio = True
 
     logger.info(
-        "Assembled final video at %s from %d chunks (ids=%s)",
+        "Assembled final video at %s from %d chunks (ids=%s) has_audio=%s",
         output_path,
         len(ordered_ids),
         ordered_ids,
+        has_audio,
     )
+
+    measured_duration: float | None = None
+    if expected_duration is not None:
+        measured_duration = probe_duration_seconds(output_path, runner)
+        drift = measured_duration - expected_duration
+        if abs(drift) > duration_tolerance_seconds:
+            logger.error(
+                "Duration mismatch for %s: measured=%.3fs expected=%.3fs drift=%+.3fs "
+                "tolerance=%.3fs -- issue #22: for a concert backdrop this is a show "
+                "falling apart against the click track, so this raises even though "
+                "the file is already written and stays on disk for inspection.",
+                output_path,
+                measured_duration,
+                expected_duration,
+                drift,
+                duration_tolerance_seconds,
+            )
+            raise DurationMismatchError(
+                output_path, expected_duration, measured_duration, duration_tolerance_seconds
+            )
 
     return AssemblyResult(
         output_video=output_path,
@@ -337,6 +543,8 @@ def assemble_final_video(
         intermediate_video=intermediate_video,
         chunk_ids=tuple(ordered_ids),
         concat_args=tuple(concat_args),
-        mux_args=tuple(mux_args),
+        mux_args=mux_args,
         dark_chunk_warnings=dark_chunk_warnings,
+        has_audio=has_audio,
+        measured_duration=measured_duration,
     )

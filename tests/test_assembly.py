@@ -21,12 +21,17 @@ from pathlib import Path
 import pytest
 
 from music_video_maker.assembly import (
+    DEFAULT_OUTPUT_FILENAME,
+    INTERMEDIATE_VIDEO_FILENAME,
     AssemblyResult,
+    DurationMismatchError,
     FfmpegError,
     MissingChunksError,
     assemble_final_video,
     build_concat_args,
+    build_duration_probe_args,
     build_mux_args,
+    probe_duration_seconds,
     validate_chunk_availability,
     write_concat_file,
 )
@@ -76,6 +81,32 @@ class _FakeRunner:
         call_index = len(self.calls)
         if self._fail_at_call == call_index:
             return subprocess.CompletedProcess(args, returncode=1, stdout=b"", stderr=self._stderr)
+        return subprocess.CompletedProcess(args, returncode=0, stdout=b"", stderr=b"")
+
+
+class _DurationCapableFakeRunner:
+    """Answers both kinds of call assemble_final_video can make when a
+    duration check is requested: an issue #22 ffprobe duration probe
+    (identified by ``format=duration`` in the args, matching
+    ``build_duration_probe_args``) returns a scripted duration string;
+    anything else (concat/mux) succeeds and -- like real ffmpeg -- writes a
+    placeholder file at its destination (the last arg), so a test can assert
+    the finished file survives an exception raised after it runs."""
+
+    def __init__(self, *, duration_stdout: bytes | str = b"", write_files: bool = True):
+        self.calls: list[list[str]] = []
+        self._duration_stdout = duration_stdout
+        self._write_files = write_files
+
+    def __call__(self, args) -> subprocess.CompletedProcess:
+        args = list(args)
+        self.calls.append(args)
+        if any("format=duration" in a for a in args):
+            return subprocess.CompletedProcess(
+                args, returncode=0, stdout=self._duration_stdout, stderr=b""
+            )
+        if self._write_files:
+            Path(args[-1]).write_bytes(b"fake-mp4")
         return subprocess.CompletedProcess(args, returncode=0, stdout=b"", stderr=b"")
 
 
@@ -694,6 +725,304 @@ def test_assemble_final_video_uses_separate_luminance_runner_if_given(tmp_path: 
     assert len(result.dark_chunk_warnings) == 1
     assert len(concat_runner.calls) == 2  # only concat + mux, no probe calls
     assert any("-ss" in c for c in luminance_runner.calls)
+
+
+# --------------------------------------------------------------------------- #
+# assemble_final_video: silent output (issue #22 concert mode, master_audio=None)
+# --------------------------------------------------------------------------- #
+
+
+def test_assemble_final_video_silent_output_runs_exactly_one_ffmpeg_call(tmp_path: Path):
+    chunks = [_chunk(0), _chunk(1)]
+    results = {
+        0: _result(0, video_file=tmp_path / "chunk_0.mp4"),
+        1: _result(1, video_file=tmp_path / "chunk_1.mp4"),
+    }
+    output_dir = tmp_path / "final"
+    runner = _FakeRunner()
+
+    result = assemble_final_video(
+        chunks, results, None, output_dir, runner=runner, check_luminance=False
+    )
+
+    assert len(runner.calls) == 1  # no mux pass at all
+    (concat_call,) = runner.calls
+    assert concat_call[0] == "ffmpeg"
+    assert concat_call[-1] == str(result.output_video)
+    assert result.output_video == output_dir / "final_video.mp4"
+    assert result.mux_args == ()
+    assert result.has_audio is False
+
+
+def test_assemble_final_video_silent_output_concat_writes_straight_to_final_path(
+    tmp_path: Path,
+):
+    # There's no second (mux) pass to feed, so the concat args' own output
+    # path must be the final deliverable, not the usual _concat_intermediate.
+    chunks = [_chunk(0)]
+    results = {0: _result(0, video_file=tmp_path / "chunk_0.mp4")}
+    output_dir = tmp_path / "final"
+    runner = _FakeRunner()
+
+    result = assemble_final_video(
+        chunks, results, None, output_dir, runner=runner, check_luminance=False
+    )
+
+    expected_concat_args = build_concat_args(result.concat_file, result.output_video)
+    assert result.concat_args == tuple(expected_concat_args)
+    assert result.intermediate_video == result.output_video
+
+
+def test_assemble_final_video_silent_output_logs_warning_naming_issue_22(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    chunks = [_chunk(0)]
+    results = {0: _result(0, video_file=tmp_path / "chunk_0.mp4")}
+    output_dir = tmp_path / "final"
+    runner = _FakeRunner()
+
+    with caplog.at_level(logging.WARNING, logger="music_video_maker.assembly"):
+        assemble_final_video(
+            chunks, results, None, output_dir, runner=runner, check_luminance=False
+        )
+
+    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("#22" in r.getMessage() for r in warning_records)
+    assert any("no audio" in r.getMessage().lower() for r in warning_records)
+
+
+def test_assemble_final_video_normal_path_is_byte_for_byte_unchanged(tmp_path: Path):
+    # The regression that matters most: adding the silent-output feature must
+    # not perturb the existing master_audio-given path in any observable way.
+    chunks = [_chunk(0), _chunk(1)]
+    video_files = {i: tmp_path / f"chunk_{i}.mp4" for i in range(2)}
+    for p in video_files.values():
+        p.write_bytes(b"fake-mp4")
+    results = {i: _result(i, video_file=video_files[i]) for i in range(2)}
+    master_audio = tmp_path / "master.wav"
+    master_audio.write_bytes(b"fake-wav")
+    output_dir = tmp_path / "final"
+    runner = _FakeRunner()
+
+    result = assemble_final_video(
+        chunks, results, master_audio, output_dir, runner=runner, check_luminance=False
+    )
+
+    assert len(runner.calls) == 2
+    concat_call, mux_call = runner.calls
+
+    expected_intermediate = output_dir / INTERMEDIATE_VIDEO_FILENAME
+    expected_output = output_dir / DEFAULT_OUTPUT_FILENAME
+    expected_concat_args = build_concat_args(result.concat_file, expected_intermediate)
+    expected_mux_args = build_mux_args(expected_intermediate, master_audio, expected_output)
+
+    assert concat_call == expected_concat_args
+    assert mux_call == expected_mux_args
+    assert result.concat_args == tuple(expected_concat_args)
+    assert result.mux_args == tuple(expected_mux_args)
+    assert result.intermediate_video == expected_intermediate
+    assert result.output_video == expected_output
+    assert result.has_audio is True
+    assert result.measured_duration is None
+
+
+# --------------------------------------------------------------------------- #
+# assemble_final_video: measured duration check (issue #22)
+# --------------------------------------------------------------------------- #
+
+
+def test_assemble_final_video_no_expected_duration_issues_no_ffprobe_call(tmp_path: Path):
+    chunks = [_chunk(0)]
+    results = {0: _result(0, video_file=tmp_path / "chunk_0.mp4")}
+    master_audio = tmp_path / "master.wav"
+    output_dir = tmp_path / "final"
+    runner = _FakeRunner()
+
+    result = assemble_final_video(
+        chunks, results, master_audio, output_dir, runner=runner, check_luminance=False
+    )
+
+    assert result.measured_duration is None
+    assert not any("format=duration" in c for c in runner.calls)
+    assert len(runner.calls) == 2  # concat + mux only
+
+
+def test_assemble_final_video_duration_within_tolerance_sets_measured_no_raise(
+    tmp_path: Path,
+):
+    chunks = [_chunk(0)]
+    results = {0: _result(0, video_file=tmp_path / "chunk_0.mp4")}
+    master_audio = tmp_path / "master.wav"
+    output_dir = tmp_path / "final"
+    runner = _DurationCapableFakeRunner(duration_stdout=b"212.510000\n")
+
+    result = assemble_final_video(
+        chunks,
+        results,
+        master_audio,
+        output_dir,
+        runner=runner,
+        check_luminance=False,
+        expected_duration=212.5,
+        duration_tolerance_seconds=0.05,
+    )
+
+    assert result.measured_duration == pytest.approx(212.51)
+
+
+def test_assemble_final_video_duration_outside_tolerance_raises_and_keeps_file(
+    tmp_path: Path,
+):
+    chunks = [_chunk(0)]
+    results = {0: _result(0, video_file=tmp_path / "chunk_0.mp4")}
+    master_audio = tmp_path / "master.wav"
+    output_dir = tmp_path / "final"
+    runner = _DurationCapableFakeRunner(duration_stdout=b"210.0\n")
+
+    with pytest.raises(DurationMismatchError) as excinfo:
+        assemble_final_video(
+            chunks,
+            results,
+            master_audio,
+            output_dir,
+            runner=runner,
+            check_luminance=False,
+            expected_duration=212.5,
+            duration_tolerance_seconds=0.05,
+        )
+
+    message = str(excinfo.value)
+    assert "210.0" in message or "210.000" in message
+    assert "212.5" in message
+    assert "-2.5" in message  # signed drift
+
+    output_video = output_dir / DEFAULT_OUTPUT_FILENAME
+    assert output_video.exists()  # written before the raise; stays for inspection
+
+
+def test_assemble_final_video_duration_drift_exactly_at_tolerance_does_not_raise(
+    tmp_path: Path,
+):
+    # ">" not ">=": a drift exactly equal to the tolerance must not raise.
+    # 200.0 / 0.25 / 200.25 are all exact in binary floating point, so the
+    # subtraction below is bit-exact (no float-rounding false positive) --
+    # unlike e.g. 212.5/0.05/212.55, whose drift lands a ULP over 0.05.
+    chunks = [_chunk(0)]
+    results = {0: _result(0, video_file=tmp_path / "chunk_0.mp4")}
+    master_audio = tmp_path / "master.wav"
+    output_dir = tmp_path / "final"
+    runner = _DurationCapableFakeRunner(duration_stdout=b"200.25\n")
+
+    result = assemble_final_video(
+        chunks,
+        results,
+        master_audio,
+        output_dir,
+        runner=runner,
+        check_luminance=False,
+        expected_duration=200.0,
+        duration_tolerance_seconds=0.25,
+    )
+
+    assert result.measured_duration == pytest.approx(200.25)
+
+
+def test_assemble_final_video_silent_output_combined_with_duration_check(tmp_path: Path):
+    chunks = [_chunk(0)]
+    results = {0: _result(0, video_file=tmp_path / "chunk_0.mp4")}
+    output_dir = tmp_path / "final"
+    runner = _DurationCapableFakeRunner(duration_stdout=b"212.5\n")
+
+    result = assemble_final_video(
+        chunks,
+        results,
+        None,
+        output_dir,
+        runner=runner,
+        check_luminance=False,
+        expected_duration=212.5,
+        duration_tolerance_seconds=0.05,
+    )
+
+    assert result.has_audio is False
+    assert result.mux_args == ()
+    assert result.measured_duration == pytest.approx(212.5)
+    # exactly two calls: the single concat pass + the duration probe
+    assert len(runner.calls) == 2
+    assert any("format=duration" in c for c in runner.calls)
+
+
+# --------------------------------------------------------------------------- #
+# build_duration_probe_args / probe_duration_seconds (issue #22)
+# --------------------------------------------------------------------------- #
+
+
+def test_build_duration_probe_args_shape():
+    video = Path("/out/final_video.mp4")
+
+    args = build_duration_probe_args(video)
+
+    assert args == [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=nw=1:nk=1",
+        "/out/final_video.mp4",
+    ]
+
+
+def test_probe_duration_seconds_parses_bytes_stdout():
+    def runner(args):
+        return subprocess.CompletedProcess(
+            list(args), returncode=0, stdout=b"212.500000\n", stderr=b""
+        )
+
+    assert probe_duration_seconds(Path("/x.mp4"), runner) == pytest.approx(212.5)
+
+
+def test_probe_duration_seconds_parses_str_stdout():
+    def runner(args):
+        return subprocess.CompletedProcess(list(args), returncode=0, stdout="212.5", stderr="")
+
+    assert probe_duration_seconds(Path("/x.mp4"), runner) == pytest.approx(212.5)
+
+
+def test_probe_duration_seconds_nonzero_exit_raises_ffmpeg_error():
+    def runner(args):
+        return subprocess.CompletedProcess(
+            list(args), returncode=1, stdout=b"", stderr=b"No such file or directory"
+        )
+
+    with pytest.raises(FfmpegError) as excinfo:
+        probe_duration_seconds(Path("/x.mp4"), runner)
+
+    assert "No such file or directory" in str(excinfo.value)
+
+
+def test_probe_duration_seconds_unparseable_stdout_raises_ffmpeg_error():
+    def runner(args):
+        return subprocess.CompletedProcess(list(args), returncode=0, stdout=b"N/A\n", stderr=b"")
+
+    with pytest.raises(FfmpegError):
+        probe_duration_seconds(Path("/x.mp4"), runner)
+
+
+def test_probe_duration_seconds_failure_is_logged(caplog: pytest.LogCaptureFixture):
+    def runner(args):
+        return subprocess.CompletedProcess(
+            list(args), returncode=1, stdout=b"", stderr=b"boom: no such file"
+        )
+
+    with (
+        caplog.at_level(logging.ERROR, logger="music_video_maker.assembly"),
+        pytest.raises(FfmpegError),
+    ):
+        probe_duration_seconds(Path("/x.mp4"), runner)
+
+    assert any("boom: no such file" in r.getMessage() for r in caplog.records)
 
 
 # --------------------------------------------------------------------------- #
