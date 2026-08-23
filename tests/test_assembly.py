@@ -318,11 +318,13 @@ def test_assemble_final_video_happy_path_runs_concat_then_mux(tmp_path: Path):
     output_dir = tmp_path / "final"
     runner = _FakeRunner()
 
-    # check_luminance=False: this test asserts on the exact concat/mux call
-    # count and sequence; the issue #77 darkness check is exercised by its
-    # own dedicated tests below, using the same injected runner.
+    # check_luminance=False, check_scene_cuts=False: this test asserts on the
+    # exact concat/mux call count and sequence; the issue #77/#81 post-render
+    # checks are exercised by their own dedicated tests below, using the
+    # same injected runner.
     result = assemble_final_video(
-        chunks, results, master_audio, output_dir, runner=runner, check_luminance=False
+        chunks, results, master_audio, output_dir, runner=runner,
+        check_luminance=False, check_scene_cuts=False,
     )
 
     assert isinstance(result, AssemblyResult)
@@ -371,7 +373,8 @@ def test_assemble_final_video_orders_chunks_chronologically_regardless_of_input_
     runner = _FakeRunner()
 
     result = assemble_final_video(
-        chunks, results, master_audio, output_dir, runner=runner, check_luminance=False
+        chunks, results, master_audio, output_dir, runner=runner,
+        check_luminance=False, check_scene_cuts=False,
     )
 
     assert result.chunk_ids == (0, 1, 2)
@@ -389,7 +392,8 @@ def test_assemble_final_video_accepts_run_state(tmp_path: Path):
     runner = _FakeRunner()
 
     result = assemble_final_video(
-        chunks, run_state, master_audio, output_dir, runner=runner, check_luminance=False
+        chunks, run_state, master_audio, output_dir, runner=runner,
+        check_luminance=False, check_scene_cuts=False,
     )
 
     assert result.chunk_ids == (0, 1)
@@ -411,6 +415,7 @@ def test_assemble_final_video_custom_output_filename(tmp_path: Path):
         output_filename="my_video.mp4",
         runner=runner,
         check_luminance=False,
+        check_scene_cuts=False,
     )
 
     assert result.output_video == output_dir / "my_video.mp4"
@@ -484,7 +489,8 @@ def test_assemble_final_video_raises_ffmpeg_error_on_concat_failure(tmp_path: Pa
 
     with pytest.raises(FfmpegError) as excinfo:
         assemble_final_video(
-            chunks, results, master_audio, output_dir, runner=runner, check_luminance=False
+            chunks, results, master_audio, output_dir, runner=runner,
+            check_luminance=False, check_scene_cuts=False,
         )
 
     assert excinfo.value.returncode == 1
@@ -502,7 +508,8 @@ def test_assemble_final_video_raises_ffmpeg_error_on_mux_failure(tmp_path: Path)
 
     with pytest.raises(FfmpegError) as excinfo:
         assemble_final_video(
-            chunks, results, master_audio, output_dir, runner=runner, check_luminance=False
+            chunks, results, master_audio, output_dir, runner=runner,
+            check_luminance=False, check_scene_cuts=False,
         )
 
     assert excinfo.value.returncode == 1
@@ -524,7 +531,8 @@ def test_assemble_final_video_ffmpeg_failure_is_logged(
         pytest.raises(FfmpegError),
     ):
         assemble_final_video(
-            chunks, results, master_audio, output_dir, runner=runner, check_luminance=False
+            chunks, results, master_audio, output_dir, runner=runner,
+            check_luminance=False, check_scene_cuts=False,
         )
 
     error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
@@ -553,6 +561,7 @@ def test_ffmpeg_error_handles_str_stderr(tmp_path: Path):
             output_dir,
             runner=str_stderr_runner,
             check_luminance=False,
+            check_scene_cuts=False,
         )
 
     assert excinfo.value.stderr == "already a string"
@@ -624,7 +633,8 @@ def test_assemble_final_video_check_luminance_false_skips_probing_entirely(tmp_p
     runner = _luminance_capable_runner(value=10)  # would be flagged if checked
 
     result = assemble_final_video(
-        chunks, results, master_audio, output_dir, runner=runner, check_luminance=False
+        chunks, results, master_audio, output_dir, runner=runner,
+        check_luminance=False, check_scene_cuts=False,
     )
 
     assert result.dark_chunk_warnings == ()
@@ -689,11 +699,167 @@ def test_assemble_final_video_uses_separate_luminance_runner_if_given(tmp_path: 
         output_dir,
         runner=concat_runner,
         luminance_runner=luminance_runner,
+        check_scene_cuts=False,  # isolate: this test is about the luminance runner seam
     )
 
     assert len(result.dark_chunk_warnings) == 1
     assert len(concat_runner.calls) == 2  # only concat + mux, no probe calls
     assert any("-ss" in c for c in luminance_runner.calls)
+
+
+# --------------------------------------------------------------------------- #
+# assemble_final_video: the issue #81 scene-cut check, wired in by default
+# --------------------------------------------------------------------------- #
+
+
+def _frame_lines(pairs: list[tuple[float, float]]) -> str:
+    """Render (time, score) pairs the way ffmpeg's metadata:print does --
+    local copy of ``tests/test_scenecuts.py``'s helper; ``tests/harness`` is
+    off-limits to this module (see the file's own docstring above)."""
+    lines = []
+    for i, (t, s) in enumerate(pairs):
+        lines.append(f"frame:{i}    pts:{int(t * 1000)}    pts_time:{t}")
+        lines.append(f"lavfi.scene_score={s}")
+    return "\n".join(lines) + "\n"
+
+
+def _scene_cut_capable_runner(*, scores: list[tuple[float, float]]):
+    """A fake runner that answers the issue #81 scene probe (identified by
+    ``-vf`` -- unique among assembly's own calls, which use ``-c:v copy``,
+    ``-map``, or (for #77) ``-s``/``-ss`` -- never ``-vf``) with scripted
+    ``metadata=print`` text; anything else (concat/mux/#77 probe) succeeds
+    with empty output, like ``_FakeRunner``'s default."""
+    calls: list[list[str]] = []
+    text = _frame_lines(scores)
+
+    def runner(args):
+        args = list(args)
+        calls.append(args)
+        if "-vf" in args:
+            return subprocess.CompletedProcess(args, returncode=0, stdout=text.encode(), stderr=b"")
+        return subprocess.CompletedProcess(args, returncode=0, stdout=b"", stderr=b"")
+
+    runner.calls = calls
+    return runner
+
+
+def test_assemble_final_video_flags_a_scene_cut_but_still_assembles(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+):
+    chunks = [_chunk(22, start=144.83, end=150.00)]
+    results = {22: _result(22, video_file=tmp_path / "chunk_22.mp4")}
+    master_audio = tmp_path / "master.wav"
+    output_dir = tmp_path / "final"
+    runner = _scene_cut_capable_runner(scores=[(0.0, 0.0), (1.083, 0.752), (3.708, 0.917)])
+
+    with caplog.at_level(logging.ERROR, logger="music_video_maker.assembly"):
+        result = assemble_final_video(chunks, results, master_audio, output_dir, runner=runner)
+
+    # The check never blocks assembly -- concat + mux still ran.
+    assert isinstance(result, AssemblyResult)
+    assert len(result.scene_cut_warnings) == 1
+    assert result.scene_cut_warnings[0].chunk_id == 22
+    assert len(result.scene_cut_warnings[0].cuts) == 2
+    error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("22" in r.getMessage() for r in error_records)
+    # the chained-path hazard is named in the ERROR text, not detected
+    assert any("chained" in r.getMessage() and "seed" in r.getMessage() for r in error_records)
+    # concat + mux calls (no -vf) still present alongside the probe call
+    assert any("-vf" not in c and "-i" in c for c in runner.calls)
+
+
+def test_assemble_final_video_does_not_flag_a_clean_chunk_for_scene_cuts(tmp_path: Path):
+    chunks = [_chunk(7)]
+    results = {7: _result(7, video_file=tmp_path / "chunk_7.mp4")}
+    master_audio = tmp_path / "master.wav"
+    output_dir = tmp_path / "final"
+    runner = _scene_cut_capable_runner(scores=[(0.0, 0.0), (2.0, 0.006)])
+
+    result = assemble_final_video(chunks, results, master_audio, output_dir, runner=runner)
+
+    assert result.scene_cut_warnings == ()
+
+
+def test_assemble_final_video_check_scene_cuts_false_skips_probing_entirely(tmp_path: Path):
+    chunks = [_chunk(0)]
+    results = {0: _result(0, video_file=tmp_path / "chunk_0.mp4")}
+    master_audio = tmp_path / "master.wav"
+    output_dir = tmp_path / "final"
+    runner = _scene_cut_capable_runner(scores=[(1.0, 0.9)])  # would be flagged if checked
+
+    result = assemble_final_video(
+        chunks, results, master_audio, output_dir, runner=runner,
+        check_luminance=False, check_scene_cuts=False,
+    )
+
+    assert result.scene_cut_warnings == ()
+    assert not any("-vf" in c for c in runner.calls)  # no probe calls at all
+
+
+def test_assemble_final_video_scene_cut_threshold_is_configurable(tmp_path: Path):
+    chunks = [_chunk(0)]
+    results = {0: _result(0, video_file=tmp_path / "chunk_0.mp4")}
+    master_audio = tmp_path / "master.wav"
+    output_dir = tmp_path / "final"
+    runner = _scene_cut_capable_runner(scores=[(1.0, 0.3)])
+
+    default_result = assemble_final_video(chunks, results, master_audio, output_dir, runner=runner)
+    assert len(default_result.scene_cut_warnings) == 1  # 0.3 > default threshold (0.25)
+
+    strict_result = assemble_final_video(
+        chunks, results, master_audio, output_dir, runner=runner, scene_cut_threshold=0.35
+    )
+    assert strict_result.scene_cut_warnings == ()  # 0.3 < 0.35
+
+
+def test_assemble_final_video_survives_a_broken_scene_cut_check(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch
+):
+    # Even if the check itself misbehaves, assembly must still complete --
+    # a Stage 5 smell test is never allowed to be the reason a finished
+    # render doesn't get written.
+    import music_video_maker.assembly as assembly_module
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("scene-cut check exploded")
+
+    monkeypatch.setattr(assembly_module, "_run_scene_cut_check", boom)
+
+    chunks = [_chunk(0)]
+    results = {0: _result(0, video_file=tmp_path / "chunk_0.mp4")}
+    master_audio = tmp_path / "master.wav"
+    output_dir = tmp_path / "final"
+    runner = _FakeRunner()
+
+    with caplog.at_level(logging.ERROR, logger="music_video_maker.assembly"):
+        result = assemble_final_video(chunks, results, master_audio, output_dir, runner=runner)
+
+    assert isinstance(result, AssemblyResult)
+    assert result.scene_cut_warnings == ()
+    assert "scene-cut check exploded" in caplog.text
+
+
+def test_assemble_final_video_uses_separate_scene_cut_runner_if_given(tmp_path: Path):
+    chunks = [_chunk(0)]
+    results = {0: _result(0, video_file=tmp_path / "chunk_0.mp4")}
+    master_audio = tmp_path / "master.wav"
+    output_dir = tmp_path / "final"
+    concat_runner = _FakeRunner()  # returns b"" stdout -- unreadable for probes
+    scene_cut_runner = _scene_cut_capable_runner(scores=[(1.0, 0.9)])
+
+    result = assemble_final_video(
+        chunks,
+        results,
+        master_audio,
+        output_dir,
+        runner=concat_runner,
+        scene_cut_runner=scene_cut_runner,
+        check_luminance=False,  # isolate: this test is about the scene-cut runner seam
+    )
+
+    assert len(result.scene_cut_warnings) == 1
+    assert len(concat_runner.calls) == 2  # only concat + mux, no probe calls
+    assert any("-vf" in c for c in scene_cut_runner.calls)
 
 
 # --------------------------------------------------------------------------- #

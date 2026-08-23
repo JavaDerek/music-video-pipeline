@@ -530,7 +530,7 @@ off two years later.
 `facescan` also carries the other half of #93's finding: a bare zero from
 `faces.detect_faces` has never meant "no face" — it has only ever meant
 "nothing cleared the 0.9 confidence floor". Passing `inspect_floor` (on by
-default in `facescan`, at `faces.DEFAULT_INSPECTION_FLOOR` = 0.15) runs a
+default in `facescan`, at `faces.DEFAULT_INSPECTION_FLOOR` = 0.70) runs a
 *second*, independent detector call at a lower floor purely to record what
 else was there, without changing the primary decision — the one the #47 gate
 depends on — at all. That makes a zero inspectable as `detected` /
@@ -884,6 +884,64 @@ detail drops to `DEBUG`.
 written before fingerprints existed records nothing that can be proven, so it
 is rejected outright and the run starts fresh rather than being misread as
 "everything matches".
+
+#### Post-render checks: darkness and scene cuts (issues #77, #81)
+
+Stage 5 assembly runs two cheap smell tests against every chunk's rendered
+video before concat, both on by default, both informational-only (they never
+block assembly), and both requiring nothing beyond `ffmpeg` already on PATH:
+
+- **Darkness floor** (`music_video_maker/luminance.py`) flags a chunk whose
+  *ending* mean luminance falls below `DEFAULT_DARK_FLOOR` (25.0, on a 0-255
+  scale) — the shape of defect a shot line asking for "the light fades to
+  black" produces on a chunk that also carries a sung line. Scored against
+  all 80 chunks of a full "Deathless" render: the one real case ends at Y
+  14.9 against a next-darkest chunk ending of Y 36.4 — a 21+ Y gap the floor
+  sits in the middle of. A start/end *drift* band was tried first and
+  rejected: 36 of 80 chunks in that render swing by more than ±15 Y because
+  the song's own narrative runs from dusk to dawn, so drift is the song's
+  content, not a defect.
+- **Scene-cut check** (`music_video_maker/scenecuts.py`) flags a chunk
+  containing a cut *inside* a shot authored as "ONE continuous unbroken
+  take" — H3 declining that instruction on a minority of chunks, invisible
+  short of watching the whole video. Uses ffmpeg's own `scene` metric
+  (`select='gte(scene,0)',metadata=print:file=-`) and flags any frame
+  scoring above `DEFAULT_SCENE_THRESHOLD` (0.25). Measured against **two**
+  independent full 80-chunk renders of "Deathless": corpus A (the render
+  that reported the defect) flags 3 chunks / 4 cuts, matching a viewer's
+  own timestamped report exactly; corpus B (a later, independent render)
+  flags 1 chunk / 1 cut — a real, previously unreported cut nobody had
+  caught by watching. 0.25 sits inside a plateau where every threshold from
+  0.15 to 0.30 gives the identical answer on both corpora; see
+  `scenecuts.py`'s module docstring for the excluded thresholds and why.
+
+Both checks are sampled from the *rendered pixels*, not the prompt — the
+general lesson behind #81 is that an instruction in a shot line is not a
+property of the output until something measures the output. A flagged
+chunk is logged at `ERROR` (with the exact times/scores for a scene cut, or
+the measured luminance for a dark ending) and carried on the result of
+assembly (`AssemblyResult.dark_chunk_warnings` /
+`.scene_cut_warnings`) so a caller can report it without re-deriving
+anything. **The remedy is `--reseed CHUNK_IDS`** (issue #38): re-render just
+the flagged chunk(s) at a different noise seed and `--resume` — a collapsed
+or cut shot reproduces identically at a pinned seed, so a different seed is
+the whole fix.
+
+A scene cut also matters more than a cosmetic glitch on the chained I2V
+path (`i2v_continuity` — see "Chaining shots together" above): the *next*
+chunk's identity conditioning is the flagged chunk's own final frame, so a
+chunk that cut mid-take hands the next one a seed frame from a shot nobody
+authored. Both checks disable independently (`check_luminance` /
+`check_scene_cuts`, each `True` by default) and accept their own injected
+runner (`luminance_runner` / `scene_cut_runner`) if you need to point them
+somewhere other than the runner already driving concat/mux.
+
+`python -m music_video_maker.scenecuts <chunks_dir> [--threshold 0.25]` runs
+the scene-cut scan standalone against any directory of already-rendered
+`chunk_*.mp4` files — useful against a finished or partial render, or a
+slice rendered via `--only-chunks`, without re-running any pipeline stage.
+It prints one line per flagged chunk (with every cut's time and score) plus
+a summary count, and exits non-zero if anything was flagged.
 
 ### GPU custody
 
