@@ -1238,3 +1238,23 @@ def test_write_runs_the_plant_end_state_check_over_the_current_shots(
     assert beats, "the check must see the beat sheet -- it is what knows the roles"
     written = (config_path.parent / "shot_plan.toml").read_text(encoding="utf-8")
     assert "issue #85" in written
+
+
+def test_write_records_the_runs_literalness_in_the_plans_provenance(tmp_path, monkeypatch):
+    """Issue #67: a shot plan should be able to prove which brief it was
+    written to. A plan authored `free` and later loaded by a run configured
+    `literal` will trip lints it was never meant to satisfy."""
+    config_path = _author_through_prose(tmp_path, monkeypatch)
+    # Above the first table header, or TOML makes it a [hardware] key -- the
+    # footgun `config.py` goes out of its way to catch, and does here.
+    original = config_path.read_text(encoding="utf-8")
+    head, marker, tail = original.partition("\n[")
+    config_path.write_text(
+        f'{head}\nlyric_literalness = "free"\n{marker}{tail}', encoding="utf-8"
+    )
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([]))
+
+    assert auth_cli.main(["--config", str(config_path), "write"]) == auth_cli.EXIT_SUCCESS
+
+    written = (config_path.parent / "shot_plan.toml").read_text(encoding="utf-8")
+    assert 'lyric_literalness = "free"' in written

@@ -1130,3 +1130,109 @@ def test_check_plan_accepts_a_subject_on_an_instrumental_chunk(tmp_path):
     check = check_plan(text, _config(tmp_path), chunks)
 
     assert check.ok
+
+
+# --------------------------------------------------------------------------- #
+# Issue #67: `literal` promotes the shot-vs-lyric lint into the ERROR tier, and
+# the plan's provenance records which brief it was written to.
+# --------------------------------------------------------------------------- #
+
+
+def _literalness_plan(tmp_path, band: str):
+    """A plan whose lyric names an object staged only elsewhere -- the #37
+    case -- checked under `band`."""
+    config = replace(_config(tmp_path), lyric_literalness=band)
+    chunks = _chunks(["a printer explodes", "", "", "", "", "a printer explodes"])
+    beats = [_beat(i, role="transition") for i in range(1, 7)]
+    shots = {
+        1: "She rounds the aisle, medium close on her face, the desks bare behind her",
+        2: "Rain crosses the pavement outside the window",
+        3: "The stairwell door swings shut on an empty landing",
+        4: "Cables lie coiled under a bare desk",
+        5: "A ceiling tile hangs loose over the aisle",
+        6: "The printer at the end of the aisle erupts, medium close, her face in frame",
+    }
+    text = render_plan_toml(chunks, beats, shots, provenance=PROVENANCE)
+    return check_plan(text, config, chunks, beats=beats, scratch_dir=tmp_path)
+
+
+def test_thematic_leaves_the_shot_vs_lyric_finding_in_the_warning_tier(tmp_path):
+    found = _literalness_plan(tmp_path, "thematic")
+
+    assert found.ok
+    assert any("does not show it" in issue.message for issue in found.warnings)
+
+
+def test_literal_promotes_the_shot_vs_lyric_finding_into_the_error_tier(tmp_path):
+    """One lever, two consumers (issue #67): the lint chooses the log LEVEL,
+    and `check_plan` is the consumer for which an ERROR means "revise this or
+    write nothing". On the render side the same record is loud and never
+    fatal."""
+    found = _literalness_plan(tmp_path, "literal")
+
+    assert not found.ok
+    assert any("does not show it" in issue.message for issue in found.errors)
+    assert not any("does not show it" in issue.message for issue in found.warnings)
+
+
+def test_free_silences_the_shot_vs_lyric_finding_entirely(tmp_path):
+    """Structurally, not by a second check: a silenced lint emits nothing, so
+    there is nothing for the revision round to be handed."""
+    found = _literalness_plan(tmp_path, "free")
+
+    assert found.ok
+    assert not any("does not show it" in issue.message for issue in found.warnings)
+
+
+def test_a_loader_error_still_reports_its_records_as_warnings(tmp_path):
+    """The level-based promotion applies only when the plan actually LOADED.
+    Every ERROR `shot_plan.py` logs on the raising path precedes a raise, and
+    the raise is already reported -- promoting those records too would report
+    one failure twice and hand a composition bug to a prose reviser."""
+    config = _config(tmp_path)
+    chunks = _chunks(["a line"])
+    text = render_plan_toml(chunks, [_beat(1)], {1: "x"}, provenance=PROVENANCE)
+    text = text.replace("chunk_id = 1", "chunk_id = 1\nsubject = 12")
+
+    found = check_plan(text, config, chunks, beats=[_beat(1)], scratch_dir=tmp_path)
+
+    assert not found.ok
+    assert all(issue.severity == "warning" for issue in found.warnings)
+
+
+def test_the_provenance_records_the_literalness_the_plan_was_written_to(tmp_path):
+    provenance = replace(PROVENANCE, lyric_literalness="literal")
+    text = render_plan_toml(
+        _chunks(["a line"]), [_beat(1)], {1: "x"}, provenance=provenance
+    )
+
+    assert 'lyric_literalness = "literal"' in text
+
+
+def test_an_unset_literalness_writes_no_provenance_key(tmp_path):
+    text = render_plan_toml(_chunks(["a line"]), [_beat(1)], {1: "x"}, provenance=PROVENANCE)
+
+    assert "lyric_literalness" not in text
+
+
+# --------------------------------------------------------------------------- #
+# A finding the prose stage cannot act on must not reach the reviser.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_non_revisable_issue_is_annotated_but_never_objected_with():
+    """Issue #83's world-state findings belong to the beat sheet: the remedy
+    is `mvm-author beats --notes`, not a shot-line rewrite. #87 is the
+    standing evidence that a revision round will rewrite approved prose to
+    satisfy anything it is handed."""
+    issues = [
+        PlanIssue(chunk_id=4, severity="warning", message="prose can fix this"),
+        PlanIssue(chunk_id=5, severity="warning", message="beats own this", revisable=False),
+    ]
+
+    assert objections_by_chunk(issues) == {4: ["prose can fix this"]}
+    assert lint_comments_for(issues) == {4: ["prose can fix this"], 5: ["beats own this"]}
+
+
+def test_plan_issues_are_revisable_by_default():
+    assert PlanIssue(chunk_id=1, severity="warning", message="m").revisable is True

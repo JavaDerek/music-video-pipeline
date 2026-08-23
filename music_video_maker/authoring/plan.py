@@ -105,6 +105,25 @@ class PlanIssue:
     severity: str
     message: str
 
+    revisable: bool = True
+    """Whether a revision round could plausibly fix this by rewriting the
+    shot line.
+
+    Almost everything can: the lints in ``shot_plan.py`` all object to
+    something *in the prose*. Some findings do not. Issue #83's world-state
+    continuity checks object to the **beat sheet** -- a state that flips for
+    one chunk and comes back is a structural error in what happens, and the
+    remedy is ``mvm-author beats --notes "..."``, not a reworded sentence.
+    Handing one to :func:`objections_by_chunk` would ask the prose stage to
+    fix something it does not control, and issue #87 is the standing evidence
+    that a revision round will happily rewrite approved prose to satisfy
+    anything it is given -- 37 of 80 lines on one real plan.
+
+    So: still annotated into the file (a human reading the plan should see
+    it), never turned into an objection. ``True`` by default, because "the
+    prose can fix it" is the ordinary case and a new lint should have to
+    *say* it is the exception."""
+
 
 @dataclass(frozen=True)
 class PlanCheck:
@@ -139,6 +158,16 @@ class Provenance:
     human reviewing the plan can see what it was authored under. Defaults to
     ``()`` so every ``Provenance(...)`` call site that predates this field
     keeps working, and an unset value emits nothing (byte-identical output)."""
+
+    lyric_literalness: str = ""
+    """Issue #67: which literalness brief this plan was written to -- one of
+    ``config.LYRIC_LITERALNESS_BANDS``. Written as a real ``[provenance]``
+    key rather than a comment, unlike ``song_facts`` above, because this one
+    is a short closed-vocabulary value a tool can compare: a plan authored
+    ``free`` and later loaded by a run configured ``literal`` will trip lints
+    it was never meant to satisfy, and the first question then is "what was
+    it written to". ``""`` (the default, and every call site predating this
+    field) emits nothing at all."""
 
 
 # --------------------------------------------------------------------------- #
@@ -222,6 +251,10 @@ def render_plan_toml(
         lines.append(f"{stage}_model = {_toml_string(provenance.models[stage])}")
     for name in sorted(provenance.hashes):
         lines.append(f"{name}_sha256 = {_toml_string(provenance.hashes[name])}")
+    # Issue #67: the brief this plan was written to, so a plan can prove it.
+    # Omitted when unset, so every pre-#67 caller renders byte-identically.
+    if provenance.lyric_literalness:
+        lines.append(f"lyric_literalness = {_toml_string(provenance.lyric_literalness)}")
 
     for note in lint_comments.get(None, ()):
         lines.append(f"# lint: {_comment(note)}")
@@ -394,6 +427,7 @@ def check_plan(
         candidate = Path(tmp) / "shot_plan.toml"
         candidate.write_text(text, encoding="utf-8")
 
+        loaded = True
         for log in loggers:
             log.addHandler(collector)
         try:
@@ -410,7 +444,16 @@ def check_plan(
             for chunk in chunks:
                 resolve_shot(plan, chunk)
                 resolve_camera(plan, chunk)
-            lint_shots_against_lyrics(plan, chunks, stageable_nouns)
+            # Issue #67: the run's own literalness band decides how loudly
+            # this fires, and here that is not cosmetic -- an ERROR record
+            # is classified into the error tier below, where errors get a
+            # targeted revision and then abort with nothing written. At
+            # "free" the lint emits nothing at all, so the revision round
+            # cannot reach a check the config has silenced; that is
+            # structural rather than a second guard.
+            lint_shots_against_lyrics(
+                plan, chunks, stageable_nouns, literalness=config.lyric_literalness
+            )
             lint_camera_face_away_on_voiced_chunks(plan, chunks)
             lint_voiced_framing(plan, chunks)
             # Issue #72: a pronoun with only one bound candidate but text
@@ -429,6 +472,7 @@ def check_plan(
             # wrong, so it is reported and never quietly retried at a model.
             errors.append(PlanIssue(chunk_id=None, severity="error", message=str(exc)))
             plan = {}
+            loaded = False
         finally:
             for log in loggers:
                 log.removeHandler(collector)
@@ -447,14 +491,27 @@ def check_plan(
                 )
             )
 
-    warnings = tuple(
-        PlanIssue(
-            chunk_id=_chunk_id_from(message),
-            severity="warning",
-            message=message,
+    # Issue #67: a record's LEVEL is the tier. `lint_shots_against_lyrics`
+    # emits at ERROR when the run's `lyric_literalness` is "literal", and an
+    # error here means what it has always meant -- a targeted revision of the
+    # offending chunks, then abort with nothing written.
+    #
+    # Only on the path where the plan actually LOADED. Every `logger.error`
+    # in `shot_plan.py` other than this one immediately precedes a raise, and
+    # that raise is already reported above; promoting those records too would
+    # report one failure twice and hand a composition bug -- which by
+    # construction cannot come from the model, since anchors are copied from
+    # the chunks -- to a prose reviser.
+    collected: list[PlanIssue] = []
+    for record in collector.records:
+        message = _strip_candidate_path(record.getMessage(), candidate)
+        severity = "error" if loaded and record.levelno >= logging.ERROR else "warning"
+        collected.append(
+            PlanIssue(chunk_id=_chunk_id_from(message), severity=severity, message=message)
         )
-        for message in (_strip_candidate_path(r.getMessage(), candidate) for r in collector.records)
-    )
+
+    warnings = tuple(issue for issue in collected if issue.severity == "warning")
+    errors.extend(issue for issue in collected if issue.severity == "error")
     return PlanCheck(
         errors=tuple(errors), warnings=_drop_keyword_consequence_warnings(warnings, beats)
     )
@@ -480,10 +537,15 @@ def _chunk_id_from(message: str) -> int | None:
 def objections_by_chunk(issues: Sequence[PlanIssue]) -> dict[int, list[str]]:
     """Group attributable issues by chunk. Anything the loaders did not tie to
     a chunk is left out on purpose -- there is no targeted revision to make
-    from it, and inventing a scope would rewrite approved lines."""
+    from it, and inventing a scope would rewrite approved lines.
+
+    So is anything marked ``revisable=False``: a finding the prose stage does
+    not control (see :attr:`PlanIssue.revisable`). It is still annotated into
+    the written plan by :func:`lint_comments_for`; it is simply never turned
+    into an objection a model is asked to satisfy."""
     grouped: dict[int, list[str]] = {}
     for issue in issues:
-        if issue.chunk_id is None:
+        if issue.chunk_id is None or not issue.revisable:
             continue
         grouped.setdefault(issue.chunk_id, []).append(issue.message)
     return grouped

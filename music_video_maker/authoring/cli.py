@@ -903,6 +903,11 @@ def _cmd_write(args: argparse.Namespace) -> int:
         # Issue #86: straight from the run config, so a human reviewing the
         # plan sees what it was authored under.
         song_facts=tuple(config.song_facts),
+        # Issue #67: which brief this plan was written to. A plan authored
+        # `free` and later loaded by a run configured `literal` will trip
+        # lints it was never meant to satisfy; this is how that is
+        # diagnosable rather than mysterious.
+        lyric_literalness=config.lyric_literalness,
     )
 
     driver = ClaudeCliDriver()
