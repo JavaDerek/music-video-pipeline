@@ -1210,6 +1210,132 @@ def test_merged_chunk_with_same_character_behaves_as_before(tmp_path, caplog):
 
 
 # --------------------------------------------------------------------------- #
+# Issue #92: a merged chunk is prompted with ONLY the dominant character's
+# words, never the full span's text -- the attribution rule and the text
+# rule used to disagree, and that disagreement is the defect (7:57 "singing
+# the right words, but a couple seconds behind the music" on "Deathless").
+# --------------------------------------------------------------------------- #
+
+
+def test_merged_chunk_is_prompted_with_only_the_dominant_characters_words(tmp_path):
+    """The core #92 fix: Dianne wins the merge (her segment is longer), and
+    the chunk's ``text`` must be exactly her words -- not Marcus's "his
+    line" prepended to it, which is what the pre-#92 code produced."""
+    segments = (
+        make_aligned_segment(0, "his line", 0.0, 2.0, "Marcus"),
+        make_aligned_segment(1, "her line", 2.1, 5.0, "Dianne"),
+    )
+    alignment = AlignmentResult(segments=segments, track_duration=10.0)
+    master = write_silent_wav(tmp_path / "master.wav", alignment.track_duration)
+
+    chunks = slice_audio(master, alignment, DEFAULT_HARDWARE, tmp_path / "chunks")
+
+    assert len(chunks) == 1
+    assert chunks[0].character == "Dianne"
+    assert chunks[0].characters == ("Dianne",)
+    assert chunks[0].text == "her line"
+
+
+def test_single_character_chunk_text_is_untouched_by_the_92_narrowing(tmp_path):
+    """The regression guard that matters most: a chunk with only one
+    character in it must be byte-identical to before -- narrowing to "the
+    dominant character's members" is a no-op when there is only one."""
+    segments = (make_aligned_segment(0, "one two three four five", 0.0, 6.0, "Dianne"),)
+    alignment = AlignmentResult(segments=segments, track_duration=10.0)
+    master = write_silent_wav(tmp_path / "master.wav", alignment.track_duration)
+
+    chunks = slice_audio(master, alignment, DEFAULT_HARDWARE, tmp_path / "chunks")
+
+    assert len(chunks) == 1
+    assert chunks[0].text == "one two three four five"
+
+
+def test_dominant_character_member_uses_in_chunk_overlap_not_whole_segment_duration():
+    """Issue #92's replacement rule, isolated: Marcus's segment is long
+    (8.0s) but only barely clips the chunk's tail (0.5s inside [0.0, 5.0)));
+    Dianne's segment is short (3.0s) but wholly inside the chunk. The OLD
+    whole-segment-duration rule would pick Marcus (8.0s > 3.0s); the in-chunk
+    -overlap rule must pick Dianne (3.0s > 0.5s) -- the two rules disagree,
+    and the chunk is what gets rendered."""
+    marcus = make_aligned_segment(0, "his long song continues on and on", 4.5, 12.5, "Marcus")
+    dianne = make_aligned_segment(1, "her short line", 0.0, 3.0, "Dianne")
+
+    dominant = slicing_module._dominant_character_member((marcus, dianne), 0.0, 5.0)
+
+    assert dominant.character == "Dianne"
+
+
+def test_dominant_character_member_tie_keeps_earliest_character():
+    """Ties keep today's first-wins behaviour (issue #40's explicit
+    carve-out, preserved by #92's replacement measure)."""
+    marcus = make_aligned_segment(0, "his line here", 0.0, 2.5, "Marcus")
+    dianne = make_aligned_segment(1, "her line here", 2.5, 5.0, "Dianne")
+
+    dominant = slicing_module._dominant_character_member((marcus, dianne), 0.0, 5.0)
+
+    assert dominant.character == "Marcus"
+
+
+def test_prompted_members_falls_back_to_full_text_when_narrowing_empties_it(caplog):
+    """Guard case: Dianne is the dominant character by in-chunk voiced
+    overlap (2.0s vs Marcus's 1.0s), but her only word's midpoint (1.0s)
+    falls BEFORE the window starts (2.0s), so narrowing to just her member
+    would leave nothing prompted at all. Falls back to the full tuple and
+    logs a warning rather than silently emptying the prompt."""
+    dianne = _word_seg(0, "her", 0.0, 4.0, 0.0, 2.0, character="Dianne")
+    marcus = _word_seg(1, "his", 4.0, 5.0, 4.0, 5.0, character="Marcus")
+
+    with caplog.at_level(logging.WARNING):
+        narrowed = slicing_module._prompted_members((dianne, marcus), 2.0, 5.0)
+
+    assert narrowed == (dianne, marcus)
+    assert "falling back to the full" in caplog.text
+    assert "'Dianne'" in caplog.text
+
+
+def test_merged_chunk_warning_names_the_dropped_words(tmp_path, caplog):
+    """The rewritten WARNING (issue #92) must name the words that ARE
+    audible in the stem but deliberately absent from the prompt -- not just
+    the bare fact that characters differed."""
+    segments = (
+        make_aligned_segment(0, "his line", 0.0, 2.0, "Marcus"),
+        make_aligned_segment(1, "her line", 2.1, 5.0, "Dianne"),
+    )
+    alignment = AlignmentResult(segments=segments, track_duration=10.0)
+    master = write_silent_wav(tmp_path / "master.wav", alignment.track_duration)
+
+    with caplog.at_level(logging.WARNING):
+        chunks = slice_audio(master, alignment, DEFAULT_HARDWARE, tmp_path / "chunks")
+
+    assert chunks[0].character == "Dianne"
+    assert "'his line'" in caplog.text  # dropped from the prompt, but named
+    assert "'her line'" in caplog.text  # what IS prompted
+    assert "issue #92" in caplog.text
+
+
+def test_log_leading_vocal_offset_reports_the_dominant_characters_onset(caplog):
+    """Issue #92: on a merged chunk, the leading-vocal-offset report must
+    name the ATTRIBUTED singer's own onset -- not whichever member's word
+    happens to start earliest. Marcus's word starts at the chunk's own
+    start (0.0s offset if it were reported), but he contributes only 1.0s of
+    in-chunk voice; Dianne is dominant (4.0s) and her word starts 3.0s into
+    the chunk. Pre-#92, the pooled onset across both members would have
+    reported 0.000s (Marcus's) and stayed silent."""
+    marcus = _word_seg(0, "word", 0.0, 1.0, 0.0, 1.0, character="Marcus")
+    dianne = _word_seg(1, "word", 1.0, 5.0, 3.0, 3.5, character="Dianne")
+    piece = slicing_module._Piece(
+        members=(marcus, dianne), start=0.0, end=5.0, is_split_continuation=False,
+        frame_count=120,
+    )
+
+    with caplog.at_level(logging.INFO):
+        slicing_module._log_leading_vocal_offset([piece], (marcus, dianne))
+
+    assert "starting 3.000s into its own span" in caplog.text
+    assert "starting 0.000s into its own span" not in caplog.text
+
+
+# --------------------------------------------------------------------------- #
 # Instrumental coverage (contiguous timeline tiling)
 #
 # Without this, slice_audio emits chunks only for *voiced* spans. On a real

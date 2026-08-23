@@ -95,6 +95,25 @@ without making. ``_log_leading_vocal_offset`` then reports whatever offset
 survives, unconditionally, so a leftover offset is visible before GPU time
 even where the refinement had no room to act.
 
+A cross-cutting fix, not a seventh pass, because it moves no boundary (issue
+#92): a chunk can merge segments from two singers, and the pipeline picks a
+dominant one to attribute the chunk to but used to hand them the *whole*
+span's text -- including the other singer's words. Measured on "Deathless",
+every one of the three affected chunks sits at a character-change gap of
+0.000-1.510s, well inside H3's 124-frame trained floor (5.167s), so no legal
+chunk boundary can separate the two singers there -- see
+``_merge_for_minimum``'s docstring for the rejected "don't merge across
+characters" alternative. What *can* change without moving anything is what
+the chunk is prompted with: ``_prompted_members`` narrows a chunk's text and
+its issue-#79 onset to whichever character ``_dominant_character_member``
+finds contributes the most voiced duration *inside the chunk* (not the whole
+segment, which may extend well outside it -- the old measure). Used at every
+site that decides what a chunk is prompted with, so "what is this chunk
+prompted with" has one answer everywhere, the same reasoning issue #79
+factored ``_words_attributed_to`` out for. ``source_segment_indices`` is
+deliberately left un-narrowed: it records what the *audio* contains, and the
+audio genuinely contains every singer merged into the chunk.
+
 Timeline integrity is non-negotiable: every chunk's ``start``/``end`` stays
 anchored to the original ``AlignedSegment`` timeline as closely as the frame
 grid allows, ``source_segment_indices`` records exactly which original
@@ -253,6 +272,23 @@ def _effective_bounds(hardware: HardwareProfile) -> tuple[float, float, FrameGri
 def _merge_for_minimum(
     segments: tuple[AlignedSegment, ...], track_duration: float, min_chunk_seconds: float
 ) -> list[_Group]:
+    """Pass 1 (see the module docstring): merge/pad adjacent segments up to
+    ``min_chunk_seconds``, freely across characters.
+
+    Issue #92 proposed refusing to merge across a character change instead.
+    Measured on "Deathless" and found impossible, not merely unimplemented:
+    the three chunks that end up billed to one singer while carrying
+    another's words (ids 35, 58, 73) come from character-change gaps of
+    0.000s, 1.510s and 0.000s -- pass-1 groups ``[23,24]``, ``[38,39]``,
+    ``[52,53]``. H3's trained floor is 124 frames = 5.167s, so *any* legal
+    chunk covering one side of a change that close also covers the other; a
+    refusal here would not even survive to the render, because
+    ``_cover_instrumentals`` re-derives every chunk's members from span
+    overlap afterward regardless of how this pass grouped them. The fix for
+    what a merge like this produces lives downstream, in what the chunk is
+    *prompted with* (``_prompted_members``, issue #92) -- not here, where
+    there is no alternative timeline to fall back to.
+    """
     groups: list[_Group] = []
     n = len(segments)
     i = 0
@@ -1302,6 +1338,111 @@ def _first_prompted_word_onset(
     return best
 
 
+def _voiced_seconds_by_character(
+    members: tuple[AlignedSegment, ...], start: float, end: float
+) -> dict[str | None, float]:
+    """In-chunk voiced seconds per character, summed over every member that
+    carries it -- the same clipped-overlap measure :func:`_voiced_seconds_within`
+    uses for the pooled total, just split by :attr:`AlignedSegment.character`
+    (issue #92)."""
+    totals: dict[str | None, float] = {}
+    for member in members:
+        overlap = max(0.0, min(member.end, end) - max(member.start, start))
+        totals[member.character] = totals.get(member.character, 0.0) + overlap
+    return totals
+
+
+def _dominant_character_member(
+    members: tuple[AlignedSegment, ...], start: float, end: float
+) -> AlignedSegment:
+    """The member whose CHARACTER contributes the most voiced duration
+    actually inside ``[start, end)`` (issue #92).
+
+    Replaces the old rule, which compared :attr:`AlignedSegment.duration` --
+    the whole segment's length, most of which can lie outside the chunk that
+    is actually rendered. Measured on "Deathless": both rules pick the same
+    winner on all three of its cross-character chunks, so this changes no
+    attribution there -- it changes what the log *reports*. Chunk 35's old
+    line credited Jan with "9.030s of the chunk's 10.590s" (his segment's
+    whole duration, most of it outside the chunk); inside the chunk it is
+    4.017s of the chunk's 5.577s total. The chunk is what gets rendered;
+    measure the chunk.
+
+    Strict ``>`` means a later character must *exceed* the current leader's
+    in-chunk total to take over, so an exact tie keeps the earliest
+    character -- unchanged from issue #40's behaviour. Returns the FIRST
+    member carrying the winning character, matching how the caller derives
+    ``AudioChunk.characters`` from a single representative member.
+    """
+    totals = _voiced_seconds_by_character(members, start, end)
+    dominant_character = members[0].character
+    best = totals.get(dominant_character, 0.0)
+    seen = {dominant_character}
+    for member in members[1:]:
+        character = member.character
+        if character in seen:
+            continue
+        seen.add(character)
+        total = totals.get(character, 0.0)
+        if total > best + _EPS:
+            best = total
+            dominant_character = character
+    for member in members:
+        if member.character == dominant_character:
+            return member
+    return members[0]  # unreachable: dominant_character always comes from members
+
+
+def _prompted_members(
+    members: tuple[AlignedSegment, ...], start: float, end: float
+) -> tuple[AlignedSegment, ...]:
+    """The members this chunk is actually prompted with (issue #92).
+
+    Narrows ``members`` down to whichever character
+    :func:`_dominant_character_member` picks, so a chunk that merges two
+    singers' segments is prompted with only the one it is attributed to --
+    never both, which is the disagreement between the attribution rule and
+    the text rule issue #92 reports (naming both risks issue #82's morphing
+    defect; see the module docstring).
+
+    Used at every site that decides what a chunk is prompted with
+    (:func:`slice_audio`'s ``text``/``characters``,
+    :func:`_log_leading_vocal_offset`, :func:`_prefer_vocal_onset`), so those
+    three can never disagree -- the same reasoning issue #79 factored
+    :func:`_words_attributed_to` out for.
+
+    Deliberately NOT used for :func:`_voiced_seconds_within`,
+    :func:`_is_instrumental_span`, or the ``_MIN_VOICED_FRACTION`` demotion:
+    those ask how much voice is in the *audio*, which genuinely contains
+    every singer merged into the chunk, not just the one it is prompted
+    with.
+
+    Guarded against emptying the prompt: narrowing to the dominant
+    character's own members can still leave :func:`_text_within` with
+    nothing, when that character contributes voiced overlap but no word
+    whose midpoint lands in the window. When that happens this falls back to
+    the full ``members`` tuple and logs a warning, rather than silently
+    prompting the chunk as instrumental.
+    """
+    if not members:
+        return members
+    dominant = _dominant_character_member(members, start, end)
+    narrowed = tuple(m for m in members if m.character == dominant.character)
+    if not _text_within(narrowed, start, end):
+        logger.warning(
+            "Chunk span %.3f-%.3fs: narrowing its prompt to the dominant character %r left "
+            "no prompted words (it contributes voiced overlap but no word whose midpoint "
+            "lands in this window); falling back to the full %d-member text rather than "
+            "silently emptying the prompt (issue #92).",
+            start,
+            end,
+            dominant.character,
+            len(members),
+        )
+        return members
+    return narrowed
+
+
 def _voiced_seconds_within(
     segments: tuple[AlignedSegment, ...], start: float, end: float
 ) -> float:
@@ -1408,10 +1549,13 @@ def _log_leading_vocal_offset(
     :func:`_log_final_boundary_segment_cuts`), after
     :func:`_prefer_vocal_onset` has already moved whatever boundaries it
     could -- this reports whatever offset survives that pass, not the
-    pre-refinement position. Uses :func:`_first_prompted_word_onset`, which
-    shares its word-midpoint attribution rule with :func:`_text_within`, so
-    this can never name an offset against a lyric the chunk is not actually
-    prompted with.
+    pre-refinement position. Uses :func:`_first_prompted_word_onset` against
+    :func:`_prompted_members` (issue #92) rather than ``piece.members``
+    directly, so on a chunk that merges two singers this reports the
+    ATTRIBUTED singer's offset, not whichever member's word happens to start
+    earliest -- the same narrowing :func:`slice_audio` uses for the chunk's
+    own ``text``, so the two can never disagree about what is actually
+    prompted.
 
     A chunk with no prompted words at all -- ``piece.members`` empty, which
     is also true of a chunk demoted below :data:`_MIN_VOICED_FRACTION` and
@@ -1425,7 +1569,8 @@ def _log_leading_vocal_offset(
     for idx, piece in enumerate(covered):
         if not piece.members:
             continue
-        onset = _first_prompted_word_onset(piece.members, piece.start, piece.end)
+        prompted = _prompted_members(piece.members, piece.start, piece.end)
+        onset = _first_prompted_word_onset(prompted, piece.start, piece.end)
         if onset is None:
             continue
         voiced_count += 1
@@ -1436,7 +1581,7 @@ def _log_leading_vocal_offset(
             worst = (idx, offset, piece)
         if offset > LEADING_VOCAL_OFFSET_WARN_SECONDS:
             over_count += 1
-            text = _text_within(piece.members, piece.start, piece.end)
+            text = _text_within(prompted, piece.start, piece.end)
             logger.warning(
                 "Chunk %d (%.3f-%.3fs) is prompted to sing starting %.3fs into its own span "
                 "(first word onset %.3fs) -- H3 starts the mouth at frame 0 regardless, so "
@@ -1548,6 +1693,11 @@ def _prefer_vocal_onset(
     boundary only ever approaches the vocal onset and never passes it --
     clipping the start of the very phrase this exists to protect would just
     relocate issue #79's defect rather than fix it.
+
+    On a chunk that merges two singers' segments (issue #92), the onset used
+    here is :func:`_prompted_members`'s narrowed one -- the ATTRIBUTED
+    singer's own first word, not whichever member's word happens to start
+    earliest.
     """
     if len(boundaries) < 2:
         return boundaries
@@ -1571,7 +1721,8 @@ def _prefer_vocal_onset(
         if voiced_i < _MIN_VOICED_FRACTION * (end_i - start_i):
             continue  # will be prompted as instrumental -- no offset applies
 
-        onset = _first_prompted_word_onset(members_i, start_i, end_i)
+        prompted_i = _prompted_members(members_i, start_i, end_i)  # issue #92
+        onset = _first_prompted_word_onset(prompted_i, start_i, end_i)
         if onset is None:
             continue
         offset = onset - start_i
@@ -1936,7 +2087,12 @@ def slice_audio(
                 duration=shortfall_ms, frame_rate=master.frame_rate
             ).set_channels(master.channels).set_sample_width(master.sample_width)
 
-        text = _text_within(piece.members, piece.start, piece.end)
+        # Issue #92: narrow to whichever character _dominant_character_member
+        # picks BEFORE deriving text, so a chunk merging two singers is
+        # prompted with only the one it is attributed to -- never both (see
+        # _prompted_members's docstring for the empty-narrowing fallback).
+        prompted = _prompted_members(piece.members, piece.start, piece.end)
+        text = _text_within(prompted, piece.start, piece.end)
         is_instrumental = not piece.members or not text
 
         # Issue #73 follow-up, measured on the v8 "Deathless" render (F26).
@@ -1986,36 +2142,66 @@ def slice_audio(
             prev_end = piece.end
             continue
 
+        # Issue #40's dominant-voice rule, now measured by in-chunk voiced
+        # overlap rather than whole-segment duration (issue #92) -- see
+        # _dominant_character_member's docstring for why the two agree on
+        # every real "Deathless" case but the old one over-reports how much
+        # of the *chunk* a singer actually holds.
         distinct = {m.character for m in piece.members}
+        dominant = _dominant_character_member(piece.members, piece.start, piece.end)
         if len(distinct) > 1:
-            # Attribute to whichever member contributed the most voiced
-            # duration, not whichever comes first (issue #40). A merge can now
-            # be a genuine mid-chunk handover between singers (issue #33 made
-            # per-line attribution real), and picking by position silently
-            # gave one singer's face to audio that was mostly the other's --
-            # confirmed by ear on "The Lucky Ones" chunk 26. Voiced duration
-            # (``AlignedSegment.duration``, already computed by Stage 1) is
-            # the measure, not word count: a held note with few words can
-            # still dominate a chunk's screen time, which is what perception
-            # tracks. Strict ``>`` means a later member must *exceed* the
-            # current leader to take over, so an exact tie keeps the first
-            # member -- today's behaviour, unchanged.
-            dominant = piece.members[0]
-            for member in piece.members[1:]:
-                if member.duration > dominant.duration + _EPS:
-                    dominant = member
-            total_voiced = sum(m.duration for m in piece.members)
-            logger.warning(
-                "Chunk %d merges segments with differing characters %s; attributing to "
-                "%r, which contributes %.3fs of the chunk's %.3fs total voiced duration.",
-                idx,
-                sorted(c for c in distinct if c is not None),
-                dominant.character,
-                dominant.duration,
-                total_voiced,
+            # Issue #92: this used to name only the winner and the
+            # WHOLE-SEGMENT voiced-duration numbers that (issue #40) decided
+            # it -- true about the attribution, silent about the actual
+            # defect, which is that the chunk is then prompted with the
+            # FULL span's text, including the other singer's words. This
+            # version names, per character, how much of THIS CHUNK (not the
+            # whole segment) it is audible for; who it is attributed to; the
+            # text that IS prompted (already narrowed to `prompted` above);
+            # the words that are audible in the stem but deliberately
+            # dropped from the prompt; and the resulting leading vocal
+            # offset for the attributed singer -- because H3 starts the
+            # mouth at frame 0 regardless, so the dropped singer's seconds
+            # at the head of the chunk are exactly what a viewer hears as
+            # the attributed singer running late (issue #92, #79). One
+            # WARNING per chunk, not per character.
+            totals = _voiced_seconds_by_character(piece.members, piece.start, piece.end)
+            total_voiced_in_chunk = sum(totals.values()) or _EPS
+            breakdown = ", ".join(
+                f"{character!r} {seconds:.3f}s ({100.0 * seconds / total_voiced_in_chunk:.0f}%)"
+                for character, seconds in sorted(totals.items(), key=lambda kv: -kv[1])
             )
-        else:
-            dominant = piece.members[0]
+            dropped_members = tuple(
+                m for m in piece.members if m.character != dominant.character
+            )
+            dropped_text = _text_within(dropped_members, piece.start, piece.end)
+            dominant_onset = _first_prompted_word_onset(prompted, piece.start, piece.end)
+            dominant_offset_text = (
+                f" {dominant_onset - piece.start:.3f}s" if dominant_onset is not None else ""
+            )
+            logger.warning(
+                "Chunk %d (%.3f-%.3fs) merges segments with differing characters %s -- "
+                "in-chunk voiced time: %s. Attributing to %r, which contributes %.3fs of "
+                "the chunk's %.3fs total in-chunk voiced duration. Prompted with %r; %r is "
+                "audible in this chunk's stem but deliberately dropped from the prompt "
+                "because it belongs to the other singer, not %r -- naming both risks #82's "
+                "morphing defect. H3 starts the mouth at frame 0 regardless of where in the "
+                "chunk the voice actually starts, so the dropped singer's time at the head "
+                "of the chunk is what a viewer hears as %r running%s late (issue #92, #79).",
+                idx,
+                piece.start,
+                piece.end,
+                sorted(c for c in distinct if c is not None),
+                breakdown,
+                dominant.character,
+                totals.get(dominant.character, 0.0),
+                total_voiced_in_chunk,
+                text,
+                dropped_text,
+                dominant.character,
+                dominant.character,
+                dominant_offset_text,
+            )
         # Deliberately the dominant member's cast, not the union: who is
         # audible across a merge is a real question (issue #33 widened the
         # field so it *can* be answered), but answering it by union here
@@ -2032,6 +2218,10 @@ def slice_audio(
                 end=piece.end,
                 text=text,
                 characters=characters,
+                # Deliberately NOT narrowed to `prompted` (issue #92): this
+                # records the provenance of the AUDIO, which genuinely
+                # contains every singer merged into the chunk, not just the
+                # one `text` above is narrowed to.
                 source_segment_indices=tuple(m.index for m in piece.members),
                 is_split_continuation=piece.is_split_continuation,
                 frame_count=piece.frame_count,
