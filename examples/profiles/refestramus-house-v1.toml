@@ -1,0 +1,53 @@
+# Example cinematography profile (issue #55) -- a locked "house style" a run
+# config points at with:
+#
+#   cinematography_profile = "profiles/refestramus-house-v1.toml"
+#
+# ORDER MATTERS, same rule examples/first-run.toml documents for a run
+# config: every top-level setting must appear ABOVE the [provenance] table.
+# TOML binds a bare key to whichever table precedes it, so a look field
+# (cinematography, face_treatment, lora, lora_strength, lora_trigger)
+# written below [provenance] silently becomes provenance.<that key> instead
+# -- an unknown key inside that table, not a look field at all. Keep every
+# look field above the header.
+
+version     = 1
+name        = "refestramus-house"
+description = "Refestramus's locked catalogue look, promoted from the Deathless photography stage."
+
+# The look itself: stock, lens family, depth of field, lighting philosophy,
+# grade. This is the whole reason to lock a profile -- composed into every
+# prompt of every video that points here, right after global_style, so the
+# catalogue reads as one body of work rather than a re-roll per song. Keep
+# per-shot framing and movement (ShotPlanEntry.camera) OUT of this file --
+# that has to stay per-video, or every video becomes the same video.
+cinematography = "Shot on 35mm film stock with visible grain and a soft halation around practical lights, shallow depth of field (f/1.4-f/2) keeping the subject sharp against a gently melting background, warm tungsten-biased lighting with one dominant hard key and deep amber shadow fill, and a desaturated, slightly bleach-bypassed grade that pushes toward teal in the shadows and amber in the highlights."
+
+# Optional look fields -- all overridable per run the same way a plain
+# `lora` in run.toml already is; a profile is a default, never a lock on
+# the run config's own ability to set these explicitly.
+face_treatment = "realistic"
+lora           = "h3-realism-people-t2v-i2v-r2v.safetensors"
+lora_strength  = 0.8
+lora_trigger   = "r34l1sm"
+
+# render_width / render_height are deliberately NOT profile fields, on
+# purpose, not an oversight. Resolution is the dominant cost lever measured
+# on this project's own hardware: 864x480 runs ~3.7 min/chunk on the 4090
+# against 1344x768 at ~9 m 15 s for the same chunk -- roughly 3x the GPU
+# hours for the same look. A house style that silently tripled every future
+# run's render time by living in the same file as the grade would be the
+# wrong kind of inheritance, so resolution stays a per-run choice in
+# run.toml, never something this file can move underneath a run.
+
+# Bumping this file to v2 is a deliberate act, not a side effect of
+# regenerating a look: change `version` by hand when the locked style
+# itself actually changes (e.g. rename this file refestramus-house-v2.toml
+# and bump `version` to 2 together), never as a byproduct of an unrelated
+# edit. `ChunkFingerprint.prompt_hash`/`lora`/`lora_strength` change with
+# the content regardless, so `--resume` still detects drift even if the
+# version number is forgotten -- but the number is what a human reads.
+
+[provenance]
+source = "authored"
+notes  = "Hand-authored example for docs/tests -- not promoted from a real photography.json."

@@ -1,0 +1,12 @@
+# Synthetic click-track marker export for a ~3.5 minute song (issue #22).
+# Fabricated for this repo's test suite -- not derived from any real band's
+# session, and no band has been asked to confirm they even use this DAW.
+time,label
+0.0,Count-in
+8.0,Intro
+24.0,Verse 1
+1:04.500,Chorus 1
+1:28.0,Verse 2
+2:08.250,Chorus 2
+2:32.0,Solo
+3:04.0,Outro

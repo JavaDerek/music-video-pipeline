@@ -12,6 +12,7 @@ against the *config file's* directory, not the process cwd)::
     lyrics_file         = "lyrics.txt"
     global_style        = "Refestramus progressive rock music video, gently comic tone"
     cinematography      = "35mm film, shallow depth of field, warm natural light"  # issue #53
+    cinematography_profile = "profiles/refestramus-house-v1.toml"  # issue #55
     narrative_concept   = "Wandering through a surgery, kicking a life support plug out"
     setting             = "London, UK -- contemporary, overcast winter"   # issue #32
     global_appearance   = "everyone slim, trim and healthy looking"       # issue #31
@@ -33,6 +34,7 @@ against the *config file's* directory, not the process cwd)::
     render_width             = 864       # optional; both or neither, multiples of 32
     render_height            = 480       # biggest lever on run time -- see RunConfig
     instrumental_coverage    = true      # render the unvoiced spans too
+    silent_output            = false     # issue #22; no audio stream at all
     i2v_continuity           = false     # issue #12
     i2v_workflow_template    = "workflow_i2v_api.json"          # issue #12
     resume_ignore_prompt_changes = false # issue #34; --ignore-prompt-changes overrides
@@ -87,6 +89,8 @@ from music_video_maker.faces import (
     RECOGNITION_MODEL_SOURCE,
     resolve_recognition_model_path,
 )
+from music_video_maker.profiles import LOOK_FIELDS as PROFILE_LOOK_FIELDS
+from music_video_maker.profiles import Profile, ProfileError, load_profile, resolve_look
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -486,6 +490,47 @@ class RunConfig:
     instead -- see that field's docstring for why sentence position matters
     there in a way it does not here."""
 
+    cinematography_profile: Profile | None = None
+    """Issue #55: a locked "house style" this run inherits look fields from --
+    :data:`music_video_maker.profiles.LOOK_FIELDS`, currently
+    ``cinematography``, ``face_treatment``, ``lora``, ``lora_strength`` and
+    ``lora_trigger``.
+
+    Without a lock, every video re-rolls the look from scratch and a
+    catalogue of videos has no through-line -- the way an A24 film is
+    identifiable before the title card, a body of work under one profile
+    should be too. This holds the *loaded* :class:`~music_video_maker.profiles.Profile`,
+    not the path a config named -- the path is on ``Profile.path`` if
+    needed.
+
+    The run config always wins on a field it sets itself (see
+    :func:`~music_video_maker.profiles.resolve_look`): a profile fills in
+    only the look fields this config left unset, never overrides one it
+    did set. The alternative -- profile beats run config -- would mean a
+    single video could never deviate from a house style without editing the
+    file every other video in the catalogue shares, which is exactly the
+    coupling that makes locking a look dangerous in the first place.
+
+    ``None`` (the default) means no profile: every config written before
+    this field existed keeps loading and rendering exactly as it always
+    has, since nothing here changes a value that config already sets."""
+
+    cinematography_profile_overrides: tuple[str, ...] = ()
+    """Which of :data:`~music_video_maker.profiles.LOOK_FIELDS` the run config
+    set for itself, beating a profile that also set them.
+
+    Its own field because **it cannot be recomputed after the fact.** A
+    resolved :class:`RunConfig` cannot tell "the run config set this" from
+    "the dataclass defaulted it": ``lora_strength`` defaults to ``1.0``, not
+    ``None``, so a reconstruction from the finished object reports it
+    overridden on every run that names a profile at all -- which is how this
+    was found. The distinction only exists while the raw TOML is still
+    visible, i.e. inside :func:`load_config`, so that is where it is written
+    down.
+
+    Empty when there is no profile, and empty when a profile's every field
+    was inherited untouched."""
+
     between_chunk_min_free_vram_gb: float | None = None
     """Issue #23: optional free-VRAM floor re-checked *between* chunks.
 
@@ -560,6 +605,30 @@ class RunConfig:
     render resolution moved is re-rendered regardless -- that is a desync (or,
     for resolution, a concat that Stage 5 cannot copy), not a cosmetic
     difference, and no flag makes it reusable."""
+
+    silent_output: bool = False
+    """Issue #22: assemble a final video with **no audio stream at all**.
+
+    This suspends one of the project's non-negotiable invariants ("the master
+    audio track is the only audio in the final video"), which is why it is a
+    named field with a loud warning rather than a quiet default. It does not
+    touch the other one: the concat pass still passes ``-an``, so H3's own
+    generated audio is discarded exactly as before.
+
+    The case it exists for is a rear-projection backdrop for a live band: the
+    band *is* the audio, and shipping a file with an audio track risks
+    double-audio if someone's playback rig un-mutes it.
+
+    A silent run loses the accidental safety net a muxed run has. Measured on
+    the finished "Deathless" render: the chunk timeline ends at 513.917s
+    against a 512.080s master, because the last tile is padded up to H3's
+    124-frame floor -- and the mux's ``-shortest`` silently trimmed 47
+    rendered frames to hide it. With no audio there is nothing to trim
+    against, so the same pipeline emits a file 1.84s longer than the track it
+    was cut to. Pass ``expected_duration`` to
+    :func:`~music_video_maker.assembly.assemble_final_video` when that
+    difference matters, i.e. whenever something else is playing to the same
+    clock."""
 
     instrumental_coverage: bool = True
     """Render the unvoiced spans too -- intro, outro, and every instrumental
@@ -1286,6 +1355,44 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
     merged.update(overrides)
 
     values: dict[str, object] = {}
+
+    # Issue #55: resolve cinematography_profile before any look field
+    # (cinematography, face_treatment, lora*) is read below, so a value the
+    # profile supplies can fill an unset field without disturbing the order
+    # those fields are already read in.
+    profile_value = merged.get("cinematography_profile")
+    profile: Profile | None
+    if isinstance(profile_value, Profile):
+        profile = profile_value
+    elif profile_value:
+        try:
+            profile = load_profile(_resolve_path(profile_value, base_dir))
+        except (ProfileError, OSError) as exc:
+            logger.exception("Failed to load cinematography_profile %s", profile_value)
+            raise ConfigError(f"cinematography_profile: {exc}") from exc
+    else:
+        profile = None
+
+    effective, overridden = resolve_look(profile, merged)
+    if profile is not None:
+        inherited = tuple(
+            field
+            for field in PROFILE_LOOK_FIELDS
+            if field in profile.values and merged.get(field) is None
+        )
+        for field in inherited:
+            merged[field] = effective[field]
+        logger.info(
+            "cinematography_profile %s v%d (%s): inherited %s; run config overrides %s",
+            profile.name,
+            profile.version,
+            profile.path,
+            inherited,
+            overridden,
+        )
+    values["cinematography_profile"] = profile
+    values["cinematography_profile_overrides"] = overridden
+
     for key in _SCALAR_FIELDS:
         values[key] = _require(merged, key)
 
@@ -1304,6 +1411,7 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
     values["min_free_vram_gb"] = _positive_number(merged, "min_free_vram_gb", 16.0)
     values["render_width"], values["render_height"] = _render_dimensions(merged)
     values["instrumental_coverage"] = _flag(merged, "instrumental_coverage", True)
+    values["silent_output"] = _flag(merged, "silent_output", False)
     values["i2v_continuity"] = _flag(merged, "i2v_continuity", False)
     values["resume_ignore_prompt_changes"] = _flag(merged, "resume_ignore_prompt_changes", False)
     values["strict_alignment"] = _flag(merged, "strict_alignment", False)
