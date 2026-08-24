@@ -93,6 +93,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--config", required=True, help="Path to the run config file.")
     parser.add_argument("--log-level", default="INFO", help="Root log level (default: INFO).")
+    parser.add_argument(
+        "--timeout-seconds",
+        type=_positive_seconds,
+        default=None,
+        help=(
+            "Per-attempt timeout for each claude CLI call (default: the driver's own "
+            "300s). The beats stage's reply grew past 300s the day it started "
+            "carrying acts, locations, conditions and subjects for 80 chunks "
+            "(2026-08-23, three timed-out attempts in a row); a long song needs "
+            "this lever, and editing source is not a lever."
+        ),
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -275,6 +287,31 @@ def _load_run_config(config_path: Path) -> RunConfig | None:
         return None
 
 
+def _positive_seconds(raw: str) -> float:
+    """argparse type for --timeout-seconds: a positive float, refused loudly."""
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"not a number: {raw!r}") from exc
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"timeout must be positive, got {value}")
+    return value
+
+
+def _build_driver(args: argparse.Namespace) -> ClaudeCliDriver:
+    """One construction seam for every stage command.
+
+    With no --timeout-seconds the driver is constructed with NO arguments, so
+    its own default remains the single source of truth for the value (and the
+    test suite's zero-arg fakes keep working). With one, only that keyword is
+    passed -- this function must never grow per-stage variation, or five call
+    sites drift apart again.
+    """
+    if args.timeout_seconds is None:
+        return ClaudeCliDriver()
+    return ClaudeCliDriver(timeout_seconds=args.timeout_seconds)
+
+
 def _cmd_concept(args: argparse.Namespace) -> int:
     config_path = Path(args.config)
     config = _load_run_config(config_path)
@@ -294,7 +331,7 @@ def _cmd_concept(args: argparse.Namespace) -> int:
         )
         return EXIT_SUCCESS
 
-    driver = ClaudeCliDriver()
+    driver = _build_driver(args)
     try:
         result = generate_concept(config, chunks, driver, hints=args.notes)
     except (DriverError, ConceptValidationError):
@@ -437,7 +474,7 @@ def _cmd_beats(args: argparse.Namespace) -> int:
         is, the beats are anchored to a timeline no render produces."""
         return load_chunk_skeleton(config, shot_lengths=requests)
 
-    driver = ClaudeCliDriver()
+    driver = _build_driver(args)
     try:
         plan = plan_beats(
             config, chunks, concept, driver, reslice=reslice, notes=args.notes
@@ -621,7 +658,7 @@ def _cmd_prose(args: argparse.Namespace) -> int:
         print(f"\n({len(windows)} window(s) would be sent; the first is shown above.)")
         return EXIT_SUCCESS
 
-    driver = ClaudeCliDriver()
+    driver = _build_driver(args)
     try:
         result = prose_module.generate_prose(
             config, concept, beats, chunks, driver, notes=args.notes, groups=groups
@@ -720,7 +757,7 @@ def _cmd_photography(args: argparse.Namespace) -> int:
         )
         return EXIT_SUCCESS
 
-    driver = ClaudeCliDriver()
+    driver = _build_driver(args)
     count = args.candidates or 1
     try:
         results = photography_module.photography_candidates(
@@ -945,7 +982,7 @@ def _cmd_write(args: argparse.Namespace) -> int:
         lyric_literalness=config.lyric_literalness,
     )
 
-    driver = ClaudeCliDriver()
+    driver = _build_driver(args)
 
     def reviser(current_shots, objections):
         return prose_module.revise_prose(
@@ -1089,6 +1126,7 @@ def _cmd_all(args: argparse.Namespace) -> int:
             groups=None,
             candidates=None,
             pick=None,
+            timeout_seconds=args.timeout_seconds,
         )
         print(f"\n{'=' * 80}\n{stage.upper()}\n{'=' * 80}")
         exit_code = handler(stage_args)
@@ -1110,6 +1148,7 @@ def _cmd_all(args: argparse.Namespace) -> int:
             out=args.out,
             force=args.force,
             revise_warnings=args.revise_warnings,
+            timeout_seconds=args.timeout_seconds,
         )
     )
 
