@@ -1371,3 +1371,60 @@ def test_concept_dry_run_carries_the_runs_literalness_band(tmp_path, capsys):
     )
 
     assert "READS ITS LYRICS: LITERAL" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# --timeout-seconds: the driver's timeout is an operator lever, not a constant
+# (found 2026-08-23: the first real beats run with acts/location/conditions/
+# subject per beat timed out three times at the hardcoded 300s, and the only
+# fix was editing source)
+# --------------------------------------------------------------------------- #
+
+
+class _RecordingDriverFactory:
+    """Stands in for ClaudeCliDriver and records the kwargs each construction
+    received, so a test can assert what the CLI actually passed."""
+
+    def __init__(self, driver):
+        self._driver = driver
+        self.constructions: list[dict] = []
+
+    def __call__(self, **kwargs):
+        self.constructions.append(kwargs)
+        return self._driver
+
+
+def test_timeout_seconds_reaches_the_driver(tmp_path, monkeypatch):
+    config_path = _write_config(tmp_path, lyrics_text="")
+    factory = _RecordingDriverFactory(ScriptedDriver([VALID_CONCEPT]))
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", factory)
+
+    exit_code = auth_cli.main(
+        ["--config", str(config_path), "--timeout-seconds", "900", "concept"]
+    )
+
+    assert exit_code == auth_cli.EXIT_SUCCESS
+    assert factory.constructions == [{"timeout_seconds": 900.0}]
+
+
+def test_timeout_seconds_default_leaves_the_driver_defaults(tmp_path, monkeypatch):
+    """Without the flag the driver is constructed with NO kwargs, so the
+    driver's own default stays the single source of truth for the value --
+    and every existing zero-arg monkeypatch in this file keeps working."""
+    config_path = _write_config(tmp_path, lyrics_text="")
+    factory = _RecordingDriverFactory(ScriptedDriver([VALID_CONCEPT]))
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", factory)
+
+    exit_code = auth_cli.main(["--config", str(config_path), "concept"])
+
+    assert exit_code == auth_cli.EXIT_SUCCESS
+    assert factory.constructions == [{}]
+
+
+def test_timeout_seconds_must_be_positive(tmp_path, capsys):
+    config_path = _write_config(tmp_path, lyrics_text="")
+
+    with pytest.raises(SystemExit):
+        auth_cli.main(["--config", str(config_path), "--timeout-seconds", "0", "concept"])
+
+    assert "timeout" in capsys.readouterr().err.lower()
