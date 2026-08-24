@@ -175,15 +175,33 @@ happens to hold at the time."""
 MAX_NOISE_SEED = 0xFFFFFFFFFFFFFFFF
 """``RandomNoise.noise_seed``'s ``max`` in ComfyUI (``0 .. 2**64-1``)."""
 
-RESEED_GENERATION_STRIDE = 2**32
+RESEED_GENERATION_STRIDE = 2654435761
 """Per-generation offset :func:`resolve_chunk_seed` adds for ``cli.py``'s
-``--reseed`` (issue #38 CLI). Chosen to sit comfortably between the two
-things it must never collide with: a real song's chunk_id range (H3's
-minimum chunk length is ~5s, so even an hours-long track is only in the low
-thousands of chunks) on one side, and :data:`MAX_NOISE_SEED`'s ~1.8e19 range
-on the other. A reseed's generation bump and another chunk's ordinary
-chunk_id offset can therefore never land on the same value by coincidence --
-see :func:`resolve_chunk_seed`."""
+``--reseed`` (issue #38 CLI).
+
+This was ``2**32``, and that value was a measured no-op: H3's noise
+generation on doris is invariant under seed changes that differ only above
+the low 32 bits. Chunk 4 of "Deathless" submitted with
+``noise_seed = 4294967300`` (4 + 2**32 -- generation 1 under the old
+stride, confirmed in ComfyUI's own ``/history`` for the prompt) rendered
+**bit-identical** decoded frames to its seed-4 predecessor, while the same
+graph resubmitted with seed 777 rendered different frames (2026-08-23,
+decoded-rawvideo md5s). So whatever consumes ``RandomNoise.noise_seed``
+truncates it mod ``2**32``, the widget's advertised 64-bit range
+notwithstanding -- and a stride of exactly ``2**32`` made every ``--reseed``
+spend real GPU minutes re-rendering the same take under a new fingerprint,
+which is worse than doing nothing because it *claims* to be a new take.
+
+The replacement is Knuth's odd 32-bit multiplicative constant. Odd, so
+``generation * stride`` is never ``0 (mod 2**32)`` for any generation
+anyone will reach; and measured to keep every generation's low-32-bit
+residue at least ``5.6e7`` away from zero for generations 1-64, far
+outside any real song's chunk_id range (H3's ~5s floor keeps even an
+hours-long track in the low thousands of chunks). Both properties are
+pinned by test, *modulo 2**32*, because that is the arithmetic the server
+actually performs -- see ``test_reseed_generations_differ_modulo_2_32``.
+Generation 0 is untouched by construction (the stride multiplies by zero),
+so no ordinary chunk's recorded seed moves."""
 
 
 def resolve_chunk_seed(base_seed: int, chunk_id: int, *, reseed_generation: int = 0) -> int:
@@ -211,10 +229,12 @@ def resolve_chunk_seed(base_seed: int, chunk_id: int, *, reseed_generation: int 
     ``reseed_generation`` (default 0 -- what every chunk in an ordinary run
     gets) is ``cli.py``'s ``--reseed``/``--reseed-generation``: naming a
     chunk in that mapping bumps its generation, which shifts the result by a
-    multiple of :data:`RESEED_GENERATION_STRIDE` -- far outside the range any
-    chunk_id offset reaches, so a reseeded chunk's new take can never
-    reproduce its own previous take, a neighbour's ordinary seed, or another
-    generation's value for the same chunk.
+    multiple of :data:`RESEED_GENERATION_STRIDE`. The guarantees -- a
+    reseeded chunk can reproduce neither its own previous take, a
+    neighbour's ordinary seed, nor another generation's value for the same
+    chunk -- are stated and tested **modulo 2**32**, because the server-side
+    noise generator was measured discarding the seed's high bits (see the
+    stride constant's own docstring for the experiment).
 
     Wraps modulo ``MAX_NOISE_SEED + 1`` rather than raising on overflow: the
     result is always a value :class:`WorkflowGraphMutator` (and ComfyUI)

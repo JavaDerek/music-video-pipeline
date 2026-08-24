@@ -1765,3 +1765,45 @@ def test_inserting_twice_is_refused_rather_than_stacking():
     once = insert_lora(_model_graph(), lora="x.safetensors", strength=1.0)
     with pytest.raises(WorkflowGraphError, match="already"):
         insert_lora(once, lora="x.safetensors", strength=1.0)
+
+
+# --------------------------------------------------------------------------- #
+# resolve_chunk_seed: the generation stride must survive a 32-bit noise
+# generator (issue #38, measured 2026-08-23)
+# --------------------------------------------------------------------------- #
+
+
+def test_reseed_generations_differ_modulo_2_32():
+    """Measured on doris: H3's noise generation is invariant under seed
+    changes that only differ above the low 32 bits. Chunk 4 submitted with
+    noise_seed=4294967300 (4 + 2**32, generation 1 under the old stride)
+    rendered BIT-IDENTICAL frames to its seed-4 predecessor, while seed 777
+    rendered different frames -- so the server truncates the seed mod 2**32,
+    and a stride of exactly 2**32 made every --reseed a no-op that spent
+    3.8 GPU minutes re-rendering the same take under a new fingerprint.
+
+    The guarantee --reseed sells is therefore only real modulo 2**32."""
+    base = workflow_graph.resolve_chunk_seed(0, 4)
+    for generation in range(1, 65):
+        reseeded = workflow_graph.resolve_chunk_seed(0, 4, reseed_generation=generation)
+        assert reseeded % 2**32 != base % 2**32, generation
+
+
+def test_reseed_generation_cannot_alias_a_neighbouring_chunk_even_mod_2_32():
+    """The old stride's other promise, re-proven under the truncation the
+    server actually applies: a reseeded chunk must not land on an ordinary
+    chunk's seed. Chunk-id deltas are at most in the low thousands (H3's
+    ~5s floor keeps even an hours-long track there), so the stride's
+    low-32-bit residue must stay far outside that range for every
+    generation anyone will realistically use."""
+    for generation in range(1, 65):
+        offset = (generation * workflow_graph.RESEED_GENERATION_STRIDE) % 2**32
+        assert 10**6 < offset < 2**32 - 10**6, (generation, offset)
+
+
+def test_generation_zero_unchanged_by_the_stride_fix():
+    """Every already-rendered, never-reseeded chunk keeps its recorded seed:
+    generation 0 must stay base + chunk_id exactly, or a stride change would
+    invalidate 80 cached fingerprints per run for a bug that never touched
+    them."""
+    assert workflow_graph.resolve_chunk_seed(7, 12) == 19
