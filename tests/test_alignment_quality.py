@@ -3,13 +3,17 @@
 Fully offline: every fixture is a synthetic ``contracts.AlignmentResult``
 built either from ``tests.harness.factories`` or directly from
 ``contracts`` objects. No model, no audio, no I/O -- matches
-``evaluate_alignment_quality``'s own contract as a pure function.
+``evaluate_alignment_quality``'s own contract as a pure function. "Offline"
+includes owning no opinion about what is installed on the machine: see
+``_ffmpeg_looks_installed`` below, which is what keeps the vocal-energy
+tests from depending on a real ffmpeg on PATH.
 
 The real-timing fixtures below are taken verbatim from issue #35's evidence
 on "The Lucky Ones" (2026-08-08 alignment run).
 """
 
 import math
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -40,6 +44,56 @@ from tests.harness.factories import (
     make_alignment_result_normal_song,
     make_alignment_result_with_gaps,
 )
+
+
+@pytest.fixture(autouse=True)
+def _ffmpeg_looks_installed(request, monkeypatch):
+    """Answer the vocal-energy check's ``shutil.which("ffmpeg")`` gate with a
+    yes, so nothing in this module depends on a real ffmpeg being installed
+    on the machine running it.
+
+    That gate gets consulted *before* the injected ``ffmpeg_runner`` ever is,
+    so injecting a fake runner was never sufficient on its own: with no real
+    binary anywhere on PATH the whole check short-circuits and returns no
+    findings, and a test asserting on a finding fails for a reason that has
+    nothing to do with what it is testing. This went unseen while CI ran on
+    the self-hosted box, which has ffmpeg. Moving CI to GitHub-hosted runners
+    on 2026-09-02, which do not, turned it into 11 failures on main -- 7 of
+    them already there before the story-arc branch landed.
+
+    Autouse rather than opt-in on purpose: it is what makes the section
+    comment further down true by construction, so a vocal-energy test written
+    later cannot quietly reacquire the dependency and pass on a developer
+    laptop that happens to have ffmpeg.
+
+    Only ``alignment_quality``'s own view of ``shutil`` is replaced, never the
+    real module: ``test_vocal_energy_integration_real_ffmpeg`` imports
+    ``shutil`` itself to decide whether to skip, and lying to it would make it
+    fail on a machine with no ffmpeg instead of skipping. Tests marked
+    ``integration`` are exempted outright, for the same reason.
+    """
+    if request.node.get_closest_marker("integration") is not None:
+        # An integration test asked for the real environment; telling it
+        # ffmpeg exists when it does not would turn a clean skip into a
+        # FileNotFoundError halfway through.
+        return
+
+    from music_video_maker import alignment_quality as aq
+
+    class _ShutilReportingFfmpeg:
+        """Proxies the real ``shutil``, except that ffmpeg is always found."""
+
+        def __getattr__(self, name):
+            return getattr(shutil, name)
+
+        @staticmethod
+        def which(cmd, *args, **kwargs):
+            if cmd == "ffmpeg":
+                return "/usr/bin/ffmpeg"
+            return shutil.which(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(aq, "shutil", _ShutilReportingFfmpeg())
+
 
 # --------------------------------------------------------------------------- #
 # "The Lucky Ones" fixtures -- real timings from issue #35's evidence.
@@ -570,6 +624,11 @@ def test_a_counterpoint_segment_with_no_words_is_not_a_finding():
 # All of these (bar the one marked ``@pytest.mark.integration`` at the very
 # end) inject a fake ffmpeg runner and never touch a real ffmpeg binary or a
 # real audio file -- same convention as assembly.py's ``SubprocessRunner``.
+# Injecting the runner is necessary but not sufficient: the check also gates
+# on ``shutil.which("ffmpeg")`` before consulting the runner at all, so the
+# module-level ``_ffmpeg_looks_installed`` autouse fixture answers that gate
+# too. Without it these tests pass only on a machine that happens to have
+# ffmpeg installed.
 # The fake simulates both the decode-once-to-mono-16kHz call (identified by
 # the absence of ``-ss`` in its argv) and the per-window ``astats`` calls
 # (identified by ``-ss``/``-af``), keyed by each window's *intended* HF
@@ -1226,6 +1285,7 @@ def test_gap_check_audio_path_none_is_a_pure_noop_and_never_touches_ffmpeg():
 _DEATHLESS_MASTER = Path.home() / "mvm-runs" / "deathless" / "audio" / "master.wav"
 
 
+@pytest.mark.integration
 @pytest.mark.skipif(
     not _DEATHLESS_MASTER.exists(),
     reason="real 'Deathless' master audio is not present on this machine (deliberately not "
