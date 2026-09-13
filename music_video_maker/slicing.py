@@ -2652,15 +2652,15 @@ def timeline_track_drift_seconds(
     "-shortest" invariant, issue #22) -- 1.837s / 47 frames on "Deathless",
     because the final tile is padded up to H3's 124-frame trained floor when
     less than that much track remains. Negative means the timeline
-    **undershoots**: the muxed master audio outlives the video, which is the
-    *worse* defect for a music video (a viewer watches the last frame frozen
-    or black while the song keeps playing), and it is not merely
+    **undershoots**: the mux's ``-shortest`` ends the file at the
+    end of the video, which is the *worse* defect for a music video (the
+    song's own ending is cut out of the finished file), and it is not merely
     theoretical -- ``instrumental_coverage``'s own trailing-gap filler
     (``_cover_instrumentals``) calls :func:`_plan_frames_run`, which returns
     ``()`` (emits nothing) whenever the gap is shorter than one trained-floor
     chunk (~5.167s), so a trailing gap in ``(0, 5.167)`` seconds is silently
     dropped rather than padded. See
-    ``tests/test_slicing.py::test_short_trailing_gap_undershoots_the_track_silently``
+    ``tests/test_slicing.py::test_short_trailing_gap_is_covered_by_the_timeline``
     for a reproduction -- coverage being on does *not* guarantee this can't
     happen.
 

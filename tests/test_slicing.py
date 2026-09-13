@@ -2596,8 +2596,18 @@ def test_drift_is_zero_for_no_chunks():
     assert timeline_track_drift_seconds((), 29.0) == 0.0
 
 
-def test_short_trailing_gap_undershoots_the_track_silently(tmp_path):
-    """Characterizes a real defect found while building issue #22's
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Known defect, not yet decided: a trailing instrumental gap shorter than "
+        "the trained floor is dropped, so the timeline ends short of the track "
+        "and -shortest trims the song's outro out of the final video. Measured "
+        "2026-09-13: gaps of 1/3/5 s after a segment ending at 26.0 s all leave "
+        "the timeline ending at 26.833 s; a 6 s gap is covered."
+    ),
+)
+def test_short_trailing_gap_is_covered_by_the_timeline(tmp_path):
+    """Asserts the invariant a real defect breaks, found while building issue #22's
     duration-drift reporting: ``instrumental_coverage``'s own trailing-gap
     filler (``_cover_instrumentals`` -> ``_plan_frames_run``) refuses to
     emit ANY filler chunk for a gap shorter than one trained-floor chunk
@@ -2608,14 +2618,16 @@ def test_short_trailing_gap_undershoots_the_track_silently(tmp_path):
     rendered timeline short of the master track, with instrumental_coverage
     ON and nothing logging it before this issue's reporting existed.
 
-    This is a characterization test, not a fix -- the underlying gap-filling
-    behavior is unchanged; it exists so :func:`timeline_track_drift_seconds`
-    (and the run-path/--prepare logging built on it) has a real reproduction
-    to catch, and so this silent-undershoot shape doesn't regress into an
-    even-larger gap unnoticed. Whether to always pad a short trailing gap
-    (mirroring pass 1's "accept the shortfall" for a short *segment*) is a
-    Stage-2 design decision for whoever owns it, same as the overshoot fix
-    CLAUDE.md's "-shortest" bullet already defers.
+    This is worse than an unlogged number. On the music-video path the mux's
+    ``-shortest`` trims to the *video*, so the song's own outro is cut out of
+    the finished file -- "The chunk timeline must cover the whole track" is a
+    non-negotiable invariant, and this breaks it with coverage ON.
+
+    Strict xfail, asserting the correct behaviour, rather than a test that
+    asserts the defect: the fix (pad a floor-length tile past the end, the way
+    a short final *voiced* remainder already overshoots, or grow the previous
+    chunk by grid steps) moves chunk boundaries and is Stage 2's call. When it
+    lands this test XPASSes and fails, which is the prompt to drop the marker.
     """
     seg_start, seg_end = 20.0, 26.0  # 6s segment, already above the trained floor
     gap = 3.0  # inside (0, 5.167s): too short for one filler chunk, not zero
@@ -2631,6 +2643,4 @@ def test_short_trailing_gap_undershoots_the_track_silently(tmp_path):
     )
 
     drift = timeline_track_drift_seconds(chunks, track_duration)
-    assert drift < -1.0, (
-        f"expected the trailing {gap}s gap to be silently dropped (undershoot), got drift={drift}"
-    )
+    assert drift >= 0.0, f"timeline ends {-drift:.3f}s before the track (gap={gap}s)"

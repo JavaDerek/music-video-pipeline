@@ -483,12 +483,12 @@ def _log_timeline_track_drift(
 
     An UNDERshoot -- the timeline finishing short of the track -- is
     reported too, and louder: it is the worse defect for a music video (the
-    muxed master audio keeps playing after the picture has nothing left to
-    show, and ``-shortest`` cannot fix it), and ``instrumental_coverage``
+    mux's ``-shortest`` stops at the end of the *video*, so the song's own
+    ending is cut out of the finished file with no error), and ``instrumental_coverage``
     does not guarantee it can't happen -- see
     :func:`~music_video_maker.slicing.timeline_track_drift_seconds`'s own
     docstring and
-    ``tests/test_slicing.py::test_short_trailing_gap_undershoots_the_track_silently``
+    ``tests/test_slicing.py::test_short_trailing_gap_is_covered_by_the_timeline``
     for a real reproduction.
 
     Silent below ``config.duration_tolerance_seconds`` (default one frame at
@@ -549,12 +549,13 @@ def _log_timeline_track_drift(
         else:
             logger.error(
                 "Stage 2 timeline UNDERshoots the master track by %.3fs (%.1f frames @%dfps): "
-                "the muxed master audio will keep playing after the video has nothing left to "
-                "show. This is the worse defect of the two -- -shortest cannot fix it. Not "
+                "the mux's -shortest stops at the end of the video, so the last %.3fs of the "
+                "song will be cut out of the final video. This is the worse defect of the two. Not "
                 "refusing the run; a human should look at this before trusting the final cut.",
                 undershoot,
                 undershoot * fps,
                 fps,
+                undershoot,
             )
     return drift
 
