@@ -102,5 +102,6 @@
       "severity": "warning"
     }
   ],
-  "plan_errors": []
+  "plan_errors": [],
+  "would_refuse_render": null
 }

@@ -502,6 +502,92 @@ def test_build_review_reports_unreadable_config_shot_plan_instead_of_crashing(tm
 
 
 # --------------------------------------------------------------------------- #
+# Bug: strict_alignment crashed the review instead of reporting it.
+# --------------------------------------------------------------------------- #
+
+
+def test_build_review_does_not_raise_under_strict_alignment(tmp_path: Path):
+    """``prepare_timeline`` passes ``config.strict_alignment`` straight to
+    ``align()``, which raises ``AlignmentQualityError`` once a report has a
+    CRITICAL finding -- exactly the run a reviewer most needs to see, not a
+    traceback for. The review must always finish."""
+    rig = Rig(
+        tmp_path,
+        segment_specs=[
+            ("walking through the empty halls tonight", 0.0, 6.5),
+            ("gone", 8.0, 8.02),  # near-zero duration -> CRITICAL finding
+            ("the lights flicker but i do not mind", 14.0, 19.0),
+        ],
+    )
+    config = dc_replace(rig.config, strict_alignment=True)
+
+    data = build_review(config, align_model=rig.align_model)  # must not raise
+
+    assert "1 critical" in data.alignment_summary
+
+
+def test_build_review_reports_strict_alignment_would_refuse(tmp_path: Path):
+    rig = Rig(
+        tmp_path,
+        segment_specs=[
+            ("walking through the empty halls tonight", 0.0, 6.5),
+            ("gone", 8.0, 8.02),
+            ("the lights flicker but i do not mind", 14.0, 19.0),
+        ],
+    )
+    config = dc_replace(rig.config, strict_alignment=True)
+
+    data = build_review(config, align_model=rig.align_model)
+
+    assert data.would_refuse_render is not None
+    assert "1" in data.would_refuse_render
+
+
+def test_build_review_no_notice_when_strict_but_clean(tmp_path: Path):
+    rig = Rig(tmp_path)  # DEFAULT_SEGMENT_SPECS: no findings
+    config = dc_replace(rig.config, strict_alignment=True)
+
+    data = build_review(config, align_model=rig.align_model)
+
+    assert data.would_refuse_render is None
+
+
+def test_build_review_no_notice_when_findings_but_not_strict(tmp_path: Path):
+    rig = Rig(
+        tmp_path,
+        segment_specs=[
+            ("walking through the empty halls tonight", 0.0, 6.5),
+            ("gone", 8.0, 8.02),
+            ("the lights flicker but i do not mind", 14.0, 19.0),
+        ],
+    )
+    # strict_alignment left at its default (False): a real render would only
+    # report, never refuse, so there is nothing to warn about here.
+
+    data = build_review(rig.config, align_model=rig.align_model)
+
+    assert data.would_refuse_render is None
+
+
+def test_html_shows_strict_alignment_refusal_notice_prominently():
+    data = dc_replace(
+        _golden_review_data(), would_refuse_render="strict_alignment is set and would refuse"
+    )
+
+    output = render_review_html(data)
+
+    assert "strict_alignment is set and would refuse" in output
+    # "Prominently" means before the chunk table, not merely present anywhere.
+    assert output.index("strict_alignment is set and would refuse") < output.index("<h2>Chunks")
+
+
+def test_json_includes_would_refuse_render_field():
+    data = dc_replace(_golden_review_data(), would_refuse_render="would refuse: 2 finding(s)")
+    payload = json.loads(render_review_json(data))
+    assert payload["would_refuse_render"] == "would refuse: 2 finding(s)"
+
+
+# --------------------------------------------------------------------------- #
 # CLI wiring: --review writes <stem>.html and <stem>.json
 # --------------------------------------------------------------------------- #
 

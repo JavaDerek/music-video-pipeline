@@ -136,9 +136,9 @@ lyric text, the shot line, `camera`, `location`, `present`, `subject`,
 `conditions`, every `alignment_quality` finding whose span touches the
 chunk's, and every shot-plan warning that named it. Run-level: the alignment
 quality summary, every shot-plan warning (including the ones that named no
-chunk), and any structural plan failure (`plan_errors` — a plan that would not
+chunk), any structural plan failure (`plan_errors` — a plan that would not
 load, or that a raising lint refused, exactly as a real render would refuse,
-surfaced instead of a stack trace).
+surfaced instead of a stack trace), and `would_refuse_render` (below).
 
 **The timeline it describes is the one a real render produces, not a second
 approximation of it.** `run_pipeline` always slices with
@@ -152,6 +152,16 @@ own lengths, so any plan setting a `length_seconds` got reviewed against the
 *natural* (unmerged) timeline, and every chunk after the first long take
 reported as `ShotPlanDriftError` in `plan_errors` instead of the merged
 chunk the render actually produces.
+
+**`strict_alignment` must never crash the review.** `prepare_timeline` ->
+`align()` raises `AlignmentQualityError` once `strict_alignment` is set and a
+finding reaches CRITICAL — exactly the run a reviewer most needs to see, not
+a traceback for. The review's own call into `prepare_timeline` always aligns
+non-strict (`--prepare` itself is untouched); when the *original* config was
+strict and the report does have a CRITICAL-or-above finding,
+`would_refuse_render` names the count and is rendered at the top of the HTML
+page and included in the JSON, so "this run would in fact refuse" is not
+lost along with the crash it no longer causes.
 
 **Reused, not reimplemented**, on both axes this section originally flagged as
 in flux:

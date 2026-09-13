@@ -57,12 +57,14 @@ import re
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from dataclasses import replace as dc_replace
 from pathlib import Path
 
 from music_video_maker import cli
 from music_video_maker.alignment_quality import (
     AlignmentQualityReport,
     Finding,
+    Severity,
     format_summary,
 )
 from music_video_maker.config import RunConfig
@@ -279,6 +281,15 @@ class ReviewData:
     raises (``lint_subject_on_voiced_chunk``) refused it, or an individual
     chunk's entry drifted (``ShotPlanDriftError``). Never silently dropped --
     a real render would have refused for the same reason."""
+    would_refuse_render: str | None = None
+    """Set when ``config.strict_alignment`` is ``True`` *and* the alignment
+    report has a finding at or above :attr:`~music_video_maker.alignment_quality.Severity.CRITICAL`
+    -- naming the count. A real render with this exact config would raise
+    ``AlignmentQualityError`` and refuse before touching the GPU; the review
+    itself never raises regardless of ``strict_alignment`` (see
+    :func:`build_review`'s docstring), so this is the one place that fact
+    would otherwise go missing. ``None`` when ``strict_alignment`` is unset,
+    or set but nothing would trip it."""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -287,6 +298,7 @@ class ReviewData:
             "alignment_finding_counts": dict(self.alignment_finding_counts),
             "lint_warnings": [warning.to_dict() for warning in self.lint_warnings],
             "plan_errors": list(self.plan_errors),
+            "would_refuse_render": self.would_refuse_render,
         }
 
 
@@ -373,13 +385,26 @@ def build_review(
     it is wired into the config, the same case ``--prepare --from-plan``
     exists for) still overrides it, exactly as passing it explicitly always
     has.
+
+    The alignment step itself always runs non-strict, whatever
+    ``config.strict_alignment`` says: ``prepare_timeline`` -> ``align()``
+    raises ``AlignmentQualityError`` once ``strict_alignment`` is set and a
+    finding reaches CRITICAL, and that is exactly the run a reviewer most
+    needs to see rather than a traceback for. ``--prepare`` itself is
+    untouched -- this override is local to this function's own call into
+    ``prepare_timeline``. When the *original* config was strict and the
+    report does have a CRITICAL-or-above finding, that fact is not silently
+    dropped: it survives as :attr:`ReviewData.would_refuse_render`, naming
+    the count, because "this run would in fact refuse" is exactly the kind
+    of thing the review exists to surface before the GPU is committed.
     """
     effective_from_plan = from_plan if from_plan is not None else config.shot_plan
+    align_config = dc_replace(config, strict_alignment=False) if config.strict_alignment else config
 
     plan_errors: list[str] = []
     try:
         timeline = cli.prepare_timeline(
-            config, align_model=align_model, from_plan=effective_from_plan
+            align_config, align_model=align_model, from_plan=effective_from_plan
         )
     except ShotPlanError as exc:
         # A plan that cannot be read is a hard failure for --prepare (real
@@ -392,7 +417,18 @@ def build_review(
         # file; a caller reads two lines naming one root cause rather than a
         # traceback naming none.
         plan_errors.append(str(exc))
-        timeline = cli.prepare_timeline(config, align_model=align_model, from_plan=None)
+        timeline = cli.prepare_timeline(align_config, align_model=align_model, from_plan=None)
+
+    would_refuse_render: str | None = None
+    if config.strict_alignment:
+        blocking = timeline.quality_report.at_least(Severity.CRITICAL)
+        if blocking:
+            would_refuse_render = (
+                f"strict_alignment is set on this config -- a real render would refuse "
+                f"before touching the GPU: {len(blocking)} finding(s) at "
+                f"{Severity.CRITICAL.name} severity or above (see the alignment findings "
+                "below)"
+            )
 
     plan: Mapping[int, ShotPlanEntry] = {}
     lint_records: tuple[logging.LogRecord, ...] = ()
@@ -452,6 +488,7 @@ def build_review(
         },
         lint_warnings=lint_warnings,
         plan_errors=tuple(plan_errors),
+        would_refuse_render=would_refuse_render,
     )
 
 
@@ -581,12 +618,14 @@ _PAGE_TEMPLATE = """<!doctype html>
   .sev-info {{ background: #4a5568; }}
   .summary {{ background: #f7f7f7; border: 1px solid #ddd; padding: 0.75rem 1rem; }}
   .plan-errors {{ background: #fde8e8; border: 1px solid #b42318; padding: 0.75rem 1rem; }}
+  .refusal {{ background: #b42318; color: #fff; border-radius: 0.25rem;
+              padding: 0.75rem 1rem; font-weight: 600; }}
   code {{ font-size: 0.85em; }}
 </style>
 </head>
 <body>
 <h1>Shot Plan Review</h1>
-
+{refusal_block}
 <div class="summary">
   <p><strong>Alignment quality:</strong> {alignment_summary}</p>
   <p><strong>Findings by severity:</strong> {finding_counts}</p>
@@ -624,6 +663,10 @@ def render_review_html(data: ReviewData) -> str:
         if count
     ) or "none"
 
+    refusal_block = ""
+    if data.would_refuse_render:
+        refusal_block = f'<div class="refusal">{_esc(data.would_refuse_render)}</div>'
+
     unattributed = [w for w in data.lint_warnings if w.chunk_id is None]
     unattributed_block = (
         '<ul class="findings">'
@@ -646,6 +689,7 @@ def render_review_html(data: ReviewData) -> str:
     chunk_rows = "".join(_chunk_row(chunk) for chunk in data.chunks)
 
     return _PAGE_TEMPLATE.format(
+        refusal_block=refusal_block,
         alignment_summary=_esc(data.alignment_summary),
         finding_counts=_esc(finding_counts),
         plan_errors_block=plan_errors_block,
