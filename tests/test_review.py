@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 
 from music_video_maker import cli
+from music_video_maker import review as review_module
 from music_video_maker.review import (
     AlignmentFindingView,
     ChunkReview,
@@ -661,3 +662,26 @@ def test_main_review_and_prepare_together_is_an_error(tmp_path: Path):
     )
 
     assert exit_code == cli.EXIT_ERROR
+
+
+def test_lint_records_are_collected_even_when_the_console_log_level_is_error(capsys):
+    """``--log-level`` is how loud the console is, not what the review page
+    contains. It sets the root logger's level, which gates a record before any
+    handler attached further down sees it -- so without an override,
+    ``--review --log-level ERROR`` wrote a page with every lint warning
+    silently missing. The override must also not leak those warnings to the
+    console the operator asked to keep quiet."""
+    root = logging.getLogger()
+    lint_logger = logging.getLogger("music_video_maker.shot_plan")
+    saved_root_level = root.level
+    saved = (lint_logger.level, lint_logger.propagate)
+    root.setLevel(logging.ERROR)
+    try:
+        with review_module._collecting_lint_records() as collector:
+            lint_logger.warning("chunk_id=3 stages its subject far away")
+        assert [r.getMessage() for r in collector.records] == [
+            "chunk_id=3 stages its subject far away"
+        ]
+        assert (lint_logger.level, lint_logger.propagate) == saved
+    finally:
+        root.setLevel(saved_root_level)
