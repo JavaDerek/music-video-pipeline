@@ -301,6 +301,14 @@ def render_plan_toml(
             tags = f"{beat.beat_role}, group {beat.beat_group}"
             if beat.act:
                 tags += f', act "{beat.act}"'
+            if beat.pop_object is not None:
+                # Issue #68: comment only, like `act` above -- `pop_object`
+                # deliberately never becomes a TOML key. It belongs to the
+                # authoring layer's own corpus (`.authoring/beats.json`); a
+                # mono H3 render has nothing to do with it (rule 5, design
+                # doc), so it must not reach `ShotPlanEntry` or anything
+                # composed into a render-time prompt.
+                tags += f', pop "{beat.pop_object}"'
             block.append(f"# beat: {_comment(beat.beat)}  [{tags}]")
             if beat.focus == "action":
                 block.append('focus = "action"')

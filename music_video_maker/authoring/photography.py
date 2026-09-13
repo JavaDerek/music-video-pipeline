@@ -293,6 +293,10 @@ def build_photography_prompt(
                     or not (by_id[beat.chunk_id].text or "").strip()
                     else f' | lyric: "{by_id[beat.chunk_id].text.strip()}"'
                 )
+                # Issue #68: surfaced the same way `beat_role`/`focus` already
+                # are, so the stage can compose `camera` toward the lens for
+                # this chunk -- see PHOTOGRAPHY_PREAMBLE's own POP paragraph.
+                + ("" if beat.pop_object is None else f" | POP: {beat.pop_object}")
             )
             for beat in sorted(beats, key=lambda b: b.start)
         ],

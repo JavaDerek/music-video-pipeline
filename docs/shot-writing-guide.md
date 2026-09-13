@@ -610,6 +610,51 @@ shot = "A beige printer sits blinking on the office windowsill beside her, close
 not about depth in the frame. A thing she hasn't noticed can still be large
 and near.
 
+## Mark a pop beat, rarely, in `pop_object` (issue #68)
+
+Near-and-large is not only the rule that makes an object render at all — it
+is also the staging that reads as *popping toward the lens* once stereo
+conversion exists (`docs/design-stereoscopic-3d.md`). A beat can be marked
+for this deliberately:
+
+```toml
+[[shot]]
+chunk_id = 12
+# beat: the printer erupts  [consequence, group 3, pop "the printer"]
+shot = "The printer bursts apart toward the camera, papers and casing
+        flying past her shoulder into the foreground"
+```
+
+`pop_object` names the motif that comes at the lens — not a bare flag,
+because the preamble needs a concrete thing to plant earlier and a lint
+needs a concrete noun to check. **It must have an earlier `plant` in its own
+`beat_group`**: the object popping is a motif the concept already
+established, not something invented for the first time as it flies at the
+screen — the same plant/payoff shape a `consequence` is already held to.
+
+**Rare, on purpose.** Every candidate keyword scored for a pop-specific lint
+came back zero on the only real corpus this project has measured — 80 real
+shot lines contained no shot composed at the lens at all. There is no fixed
+cap, but a video where every beat pops is not one where any of them reads as
+a moment.
+
+`pop_object` never becomes a `ShotPlanEntry` field or reaches a render-time
+prompt: it is authoring-layer data (`.authoring/beats.json`'s corpus), and a
+mono H3 render has nothing to do with it. What it does reach, the same way
+`beat_role`/`focus`/`camera` already do, is the beats/prose/photography
+preambles — composing toward the lens, held long enough to read, and kept
+clear of the frame edges (an object in negative parallax clipped by the
+frame edge is a window violation, not depth). And `write`'s advisory checks
+reuse `_lint_distant_staging`'s own vocabulary, scoped to pop beats, for a
+sharper warning when a pop's own line stages its object small or far away —
+the same defect that lint already catches, at a higher cost when it lands on
+the shot the whole beat exists for.
+
+A **pop-specific keyword lint** (flagging an object sent *across* the frame
+rather than staged distant) is design-doc step 3 and is deliberately **not**
+built yet: it needs a real plan containing pop beats to score keywords
+against, and none exists.
+
 ## A voiced consequence chunk can cost the lip-sync, and wording doesn't fix it
 
 A chunk carrying a lyric still needs a mouth to sync — stated above as a note
@@ -1020,6 +1065,9 @@ Run down this list before committing a shot plan:
       subordinate clause?
 - [ ] Is the object of every beat staged in the near or mid ground, in frame
       with her — never described as small, distant, or far behind?
+- [ ] Does every `pop_object` have an earlier `plant` in its own
+      `beat_group`, and is it rare — used only where a beat is genuinely
+      meant to cross toward the lens?
 - [ ] Does any `consequence` beat with `focus = "action"` land on a chunk
       that carries a lyric? If a nearby instrumental chunk in the same beat
       group is available, prefer it — camera wording alone has not been

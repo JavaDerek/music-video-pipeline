@@ -940,6 +940,25 @@ _DISTANT_STAGING_KEYWORDS: frozenset[str] = frozenset({
 })
 
 
+def _distant_staging_match(shot: str) -> str | None:
+    """The first :data:`_DISTANT_STAGING_KEYWORDS` entry ``shot`` contains, or
+    ``None``.
+
+    Factored out of :func:`_lint_distant_staging` so a second caller can reuse
+    the same vocabulary and matching rule without copying either (issue #68:
+    a pop beat -- one composed for an object to cross in front of the screen
+    plane -- staged distant is the same defect this lint already catches, at
+    a higher cost, so the authoring layer's pop check reuses this predicate
+    rather than building a second keyword list). Pure and side-effect free;
+    :func:`_lint_distant_staging` is the only thing that logs.
+    """
+    shot_lower = shot.lower()
+    for keyword in _DISTANT_STAGING_KEYWORDS:
+        if re.search(rf"\b{re.escape(keyword)}\b", shot_lower):
+            return keyword
+    return None
+
+
 def _lint_distant_staging(plan: Mapping[int, ShotPlanEntry], path: Path) -> None:
     """Warn (never raise) when a shot stages its subject as small or far away
     (issue #58).
@@ -957,21 +976,19 @@ def _lint_distant_staging(plan: Mapping[int, ShotPlanEntry], path: Path) -> None
     """
     for chunk_id in sorted(plan):
         entry = plan[chunk_id]
-        shot_lower = entry.shot.lower()
-        for keyword in _DISTANT_STAGING_KEYWORDS:
-            if not re.search(rf"\b{re.escape(keyword)}\b", shot_lower):
-                continue
-            logger.warning(
-                "Shot plan %s: chunk_id=%d stages its subject as %r, which reads as small "
-                "or far away -- H3 has dropped beats staged this way even from grammatical-"
-                "subject position (issue #58). Stage the object in the near or mid ground, "
-                "in frame with her; \"behind her\" is about narrative obliviousness, not "
-                "depth.",
-                path,
-                chunk_id,
-                keyword,
-            )
-            break  # one warning per entry is enough
+        keyword = _distant_staging_match(entry.shot)
+        if keyword is None:
+            continue
+        logger.warning(
+            "Shot plan %s: chunk_id=%d stages its subject as %r, which reads as small "
+            "or far away -- H3 has dropped beats staged this way even from grammatical-"
+            "subject position (issue #58). Stage the object in the near or mid ground, "
+            "in frame with her; \"behind her\" is about narrative obliviousness, not "
+            "depth.",
+            path,
+            chunk_id,
+            keyword,
+        )
 
 
 _ANAPHORA_KEYWORDS: frozenset[str] = frozenset({

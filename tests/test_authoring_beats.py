@@ -15,6 +15,7 @@ whole guide exists to fix.
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -1072,6 +1073,212 @@ def test_the_beats_preamble_documents_subject():
     assert "subject" in lowered
     assert "instrumental" in lowered
     assert "#82" in BEATS_PREAMBLE or "82" in BEATS_PREAMBLE
+
+
+# --------------------------------------------------------------------------- #
+# `pop_object` -- issue #68: the motif a beat is composed to send at the
+# lens. Named, not a bare boolean (see the field's own docstring for why),
+# and structurally required to have an earlier `plant` in its own group --
+# the same plant/payoff machinery a `consequence` already needs, reused
+# rather than reinvented.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_pop_object_with_an_earlier_plant_is_accepted():
+    reply = _reply(
+        _entry(1, role="plant", group=1),
+        _entry(2, role="contact", group=1, pop_object="the printer"),
+        _entry(3, role="transition", group=1),
+    )
+
+    beats = validate_beats(reply, _chunks())
+
+    assert next(b for b in beats if b.chunk_id == 2).pop_object == "the printer"
+
+
+def test_a_pop_object_with_no_earlier_plant_in_its_group_is_rejected():
+    reply = _reply(
+        _entry(1, role="transition", group=1),
+        _entry(2, role="contact", group=1, pop_object="the printer"),
+        _entry(3, role="transition", group=1),
+    )
+
+    with pytest.raises(BeatsValidationError, match="pop_object"):
+        validate_beats(reply, _chunks())
+
+
+def test_a_plant_in_a_different_group_does_not_satisfy_a_pop_object():
+    """Groups are what make "earlier" mean anything -- the same rule a
+    consequence's own plant/contact check already follows."""
+    reply = _reply(
+        _entry(1, role="plant", group=1),
+        _entry(2, role="contact", group=2, pop_object="the printer"),
+        _entry(3, role="transition", group=2),
+    )
+
+    with pytest.raises(BeatsValidationError, match="pop_object"):
+        validate_beats(reply, _chunks())
+
+
+def test_a_pop_object_may_land_on_any_beat_role_given_an_earlier_plant():
+    """No structural restriction by `beat_role` -- a pop can land on a
+    transition or an instrumental beat, not only a consequence, so long as
+    its group has an earlier plant."""
+    reply = _reply(
+        _entry(1, role="plant", group=1),
+        _entry(2, role="instrumental", group=1, pop_object="the printer"),
+        _entry(3, role="transition", group=1),
+    )
+
+    beats = validate_beats(reply, _chunks())
+
+    assert next(b for b in beats if b.chunk_id == 2).pop_object == "the printer"
+
+
+def test_pop_object_is_legal_on_a_voiced_chunk():
+    """Unlike `subject`, `pop_object` is not restricted by voiced/
+    instrumental status: no evidence has measured the risk either way (see
+    the field's own docstring), so nothing here forbids it -- only
+    `BEATS_PREAMBLE` advises weighing it. `_chunks()` produces voiced
+    (non-instrumental) chunks by default."""
+    reply = _reply(
+        _entry(1, role="plant", group=1),
+        _entry(2, role="contact", group=1, pop_object="the printer"),
+        _entry(3, role="transition", group=1),
+    )
+
+    beats = validate_beats(reply, _chunks())
+
+    assert next(b for b in beats if b.chunk_id == 2).pop_object == "the printer"
+
+
+def test_pop_object_is_absent_by_default():
+    beats = validate_beats(_three_beat_gag(), _chunks())
+
+    assert all(b.pop_object is None for b in beats)
+
+
+@pytest.mark.parametrize("bad", [123, [], {}, True])
+def test_a_non_string_pop_object_is_rejected(bad):
+    reply = _reply(
+        _entry(1, role="plant", group=1),
+        _entry(2, role="contact", group=1, pop_object=bad),
+        _entry(3, role="transition", group=1),
+    )
+
+    with pytest.raises(BeatsValidationError):
+        validate_beats(reply, _chunks())
+
+
+def test_an_empty_string_pop_object_is_rejected():
+    reply = _reply(
+        _entry(1, role="plant", group=1),
+        _entry(2, role="contact", group=1, pop_object="   "),
+        _entry(3, role="transition", group=1),
+    )
+
+    with pytest.raises(BeatsValidationError):
+        validate_beats(reply, _chunks())
+
+
+def test_a_pop_object_round_trips():
+    reply = _reply(
+        _entry(1, role="plant", group=1),
+        _entry(2, role="contact", group=1, pop_object="the printer"),
+        _entry(3, role="transition", group=1),
+    )
+    beats = validate_beats(reply, _chunks())
+
+    assert tuple(Beat.from_dict(b.to_dict()) for b in beats) == beats
+
+
+def test_from_dict_tolerates_a_persisted_beat_sheet_with_no_pop_object_key():
+    """A pre-#68 persisted beat sheet has no `pop_object` key at all -- same
+    tolerant `.get` treatment `subject` gets for its own pre-#82 absence."""
+    beats = validate_beats(_three_beat_gag(), _chunks())
+    payload = beats[0].to_dict()
+    assert "pop_object" not in payload
+
+    restored = Beat.from_dict(payload)
+
+    assert restored.pop_object is None
+
+
+def test_to_dict_omits_pop_object_when_unset_and_includes_it_when_set():
+    beats = validate_beats(_three_beat_gag(), _chunks())
+
+    assert "pop_object" not in beats[0].to_dict()
+
+    popped = replace(beats[0], pop_object="the printer")
+    assert popped.to_dict()["pop_object"] == "the printer"
+
+
+def test_a_beat_sheets_serialisation_is_byte_identical_to_pre_68_when_unset():
+    """The exact claim `Beat.to_dict`'s own docstring makes: a beat sheet
+    that never sets `pop_object` must serialise -- and therefore hash, via
+    `prose_input_hashes`/`photography_input_hashes`'s `json.dumps(...,
+    sort_keys=True)` over exactly this list -- byte-identically to what this
+    method produced before this field existed, or every session recorded
+    before #68 would be reported stale by a key nobody set. Same "key absent
+    when empty" precedent as #86's `song_facts`, one level down: there it
+    keeps a session's recorded input hashes stable; here it keeps a beat's
+    own serialisation stable."""
+    beats = validate_beats(_three_beat_gag(), _chunks())
+    ordered = sorted(beats, key=lambda b: b.start)
+
+    # Hand-built, deliberately NOT calling `to_dict()`, so this is a
+    # statement about the pre-#68 shape rather than a tautology against the
+    # method under test.
+    pre_68_shape = [
+        {
+            "chunk_id": b.chunk_id,
+            "start": b.start,
+            "end": b.end,
+            "beat": b.beat,
+            "beat_role": b.beat_role,
+            "beat_group": b.beat_group,
+            "location": b.location,
+            "act": b.act,
+            "conditions": b.conditions,
+            "subject": b.subject,
+            "focus": b.focus,
+            "length_seconds": b.length_seconds,
+            "merged_from": list(b.merged_from),
+        }
+        for b in ordered
+    ]
+
+    assert [b.to_dict() for b in ordered] == pre_68_shape
+    assert json.dumps([b.to_dict() for b in ordered], sort_keys=True) == json.dumps(
+        pre_68_shape, sort_keys=True
+    )
+
+
+def test_a_pop_objects_earlier_plant_check_is_reported_alongside_other_problems():
+    """One retry round costs a whole model call -- a sheet with more than one
+    fault must come back with more than one complaint, not just the first,
+    the same convention every other structural check in this module
+    follows."""
+    reply = _reply(
+        _entry(1, role="transition", group=1, pop_object="the printer"),
+        _entry(2, role="consequence", group=1, focus="subject"),
+    )
+
+    with pytest.raises(BeatsValidationError) as excinfo:
+        validate_beats(reply, _chunks(2))
+
+    message = str(excinfo.value)
+    assert "pop_object" in message
+    assert 'focus = "action"' in message
+
+
+def test_the_beats_preamble_documents_pop_object():
+    from music_video_maker.authoring.prompts import BEATS_PREAMBLE
+
+    lowered = BEATS_PREAMBLE.lower()
+    assert "pop_object" in lowered
+    assert "rare" in lowered
+    assert "#68" in BEATS_PREAMBLE or "68" in BEATS_PREAMBLE
 
 
 def test_the_user_prompt_names_the_default_lead_vocalist(tmp_path):
