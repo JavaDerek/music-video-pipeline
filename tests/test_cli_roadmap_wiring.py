@@ -21,10 +21,12 @@ import json
 from dataclasses import replace as dc_replace
 from pathlib import Path
 
-from music_video_maker.assembly import DEFAULT_OUTPUT_FILENAME
+import pytest
+
+from music_video_maker.assembly import DEFAULT_OUTPUT_FILENAME, DurationMismatchError
 from music_video_maker.config import load_config
 from music_video_maker.profiles import PROFILE_RECORD_FILENAME, load_profile
-from tests.test_cli import Rig, build_success_sequence
+from tests.test_cli import DEFAULT_MASTER_AUDIO_SECONDS, Rig, build_success_sequence
 
 # --------------------------------------------------------------------------- #
 # Issue #22: silent_output
@@ -113,6 +115,82 @@ def test_silent_output_defaults_false(tmp_path: Path):
 def test_silent_output_reads_true_from_the_config_file(tmp_path: Path):
     config = load_config(_minimal_config_toml(tmp_path, "silent_output = true\n"))
     assert config.silent_output is True
+
+
+def test_duration_tolerance_seconds_defaults_to_one_frame_at_24fps(tmp_path: Path):
+    from music_video_maker.assembly import DEFAULT_DURATION_TOLERANCE_SECONDS
+
+    config = load_config(_minimal_config_toml(tmp_path))
+    assert config.duration_tolerance_seconds == DEFAULT_DURATION_TOLERANCE_SECONDS
+
+
+def test_duration_tolerance_seconds_reads_from_the_config_file(tmp_path: Path):
+    config = load_config(
+        _minimal_config_toml(tmp_path, "duration_tolerance_seconds = 0.5\n")
+    )
+    assert config.duration_tolerance_seconds == 0.5
+
+
+def _format_duration_probe_calls(rig: Rig) -> list[list[str]]:
+    return [
+        call
+        for call in rig.ffmpeg.calls
+        if call and call[0] == "ffprobe" and "format=duration" in call
+    ]
+
+
+def test_default_run_never_probes_the_finished_files_duration(tmp_path: Path):
+    """The music-video path's own promise (assembly.py's module docstring,
+    issue #22): ``expected_duration`` stays unset, so no new probe and no new
+    subprocess -- byte-for-byte unchanged behaviour."""
+    rig = Rig(tmp_path)
+    report = _run_three_chunks(rig)
+
+    assert _format_duration_probe_calls(rig) == []
+    assert report.output_video.is_file()
+
+
+def test_silent_output_arms_the_duration_check_against_the_master_tracks_own_duration(
+    tmp_path: Path,
+):
+    """Issue #22's gap: the comment claimed ``silent_output = true`` "wires it
+    end to end" and it did not -- ``expected_duration`` was never passed.
+    Wired now: the probe fires, and it is checked against the master track's
+    own duration (:class:`~music_video_maker.alignment.AlignmentResult`'s
+    ``track_duration``), which is what the run already knows without a
+    second probe -- see the call site's own comment for why that is a
+    stand-in, not the final answer, for design-concert-mode.md question 5."""
+    rig = Rig(tmp_path)
+    rig.config = dc_replace(rig.config, silent_output=True)
+    # The fake ffprobe's duration defaults to DEFAULT_MASTER_AUDIO_SECONDS,
+    # matching the Rig's own master track exactly, so this run must succeed.
+    assert rig.ffmpeg.duration_seconds == DEFAULT_MASTER_AUDIO_SECONDS
+
+    report = _run_three_chunks(rig)
+
+    assert len(_format_duration_probe_calls(rig)) == 1
+    assert report.output_video.is_file()
+
+
+def test_silent_output_duration_mismatch_raises_after_the_file_is_written(tmp_path: Path):
+    """The measured check this issue exists to arm: a drift beyond tolerance
+    must raise, and the file must already be on disk when it does (assembly's
+    own documented "raise after writing" contract)."""
+    rig = Rig(tmp_path)
+    rig.config = dc_replace(rig.config, silent_output=True)
+    # Simulate the assembled file measuring longer than the master track by
+    # more than the default tolerance -- the shape issue #22 measured on
+    # "Deathless" (the final tile padded past the end of the song).
+    rig.ffmpeg.duration_seconds = DEFAULT_MASTER_AUDIO_SECONDS + 1.837
+
+    with pytest.raises(DurationMismatchError) as excinfo:
+        _run_three_chunks(rig)
+
+    assert excinfo.value.expected_duration == pytest.approx(DEFAULT_MASTER_AUDIO_SECONDS)
+    assert excinfo.value.measured_duration == pytest.approx(DEFAULT_MASTER_AUDIO_SECONDS + 1.837)
+    assert (rig.config.final_video_dir / DEFAULT_OUTPUT_FILENAME).is_file(), (
+        "the file must still be written even though the check raises"
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -60,7 +60,13 @@ from music_video_maker.alignment import align
 from music_video_maker.assembly import assemble_final_video
 from music_video_maker.config import ConfigError, RunConfig, load_config
 from music_video_maker.continuity import ContinuityWorkflowProvider, planned_chain_source
-from music_video_maker.contracts import ChunkFingerprint, ChunkStatus, RunState, Workflow
+from music_video_maker.contracts import (
+    AudioChunk,
+    ChunkFingerprint,
+    ChunkStatus,
+    RunState,
+    Workflow,
+)
 from music_video_maker.custody import (
     build_custody_manager,
     build_vram_probe,
@@ -97,7 +103,7 @@ from music_video_maker.shot_plan import (
     shot_length_requests,
     write_shot_plan_skeleton,
 )
-from music_video_maker.slicing import slice_audio
+from music_video_maker.slicing import slice_audio, timeline_track_drift_seconds
 from music_video_maker.staging import ComfyUIAssetStager
 from music_video_maker.stems import slice_stem_for_chunks
 from music_video_maker.workflow_graph import (
@@ -455,6 +461,105 @@ def _parse_chunk_ids(raw: str) -> tuple[int, ...]:
     return ids
 
 
+def _log_timeline_track_drift(
+    chunks: Sequence[AudioChunk], track_duration: float, config: RunConfig
+) -> float:
+    """Issue #22: report Stage 2's chunk timeline against the master track's
+    own duration -- before any GPU time is spent, from both ``run_pipeline``
+    and ``--prepare`` (:func:`prepare_shot_plan`), which is the 50s no-GPU
+    check this project already uses to catch a Stage-2 drift.
+
+    CLAUDE.md's "-shortest" bullet: a music-video mux silently discards a
+    timeline that overshoots the track -- harmless to watch, but real GPU
+    seconds spent rendering frames nobody sees, and nothing has ever logged
+    it. A silent concert backdrop (``silent_output``) has no mux to hide
+    behind, so the same overshoot becomes a file that outruns the click
+    track it was cut to, and the post-assembly ``expected_duration`` check
+    wired up for that path (see ``run_pipeline``) WILL raise once the file
+    is written. This function only reports -- it never refuses the run: the
+    Stage-2 fix (trim the final tile, or pad the track to a legal grid
+    length) is undecided and is a call for whoever owns Stage 2 with a real
+    click track in hand (CLAUDE.md, ``docs/design-concert-mode.md``).
+
+    An UNDERshoot -- the timeline finishing short of the track -- is
+    reported too, and louder: it is the worse defect for a music video (the
+    mux's ``-shortest`` stops at the end of the *video*, so the song's own
+    ending is cut out of the finished file with no error), and ``instrumental_coverage``
+    does not guarantee it can't happen -- see
+    :func:`~music_video_maker.slicing.timeline_track_drift_seconds`'s own
+    docstring and
+    ``tests/test_slicing.py::test_short_trailing_gap_is_covered_by_the_timeline``
+    for a real reproduction.
+
+    Silent below ``config.duration_tolerance_seconds`` (default one frame at
+    24 fps): that is the same window the post-assembly check itself treats
+    as "no news," so this must not cry wolf inside it.
+
+    Returns the drift in seconds (positive = overshoot, negative =
+    undershoot) so a caller can reuse the number instead of recomputing it.
+    """
+    drift = timeline_track_drift_seconds(chunks, track_duration)
+    if abs(drift) <= config.duration_tolerance_seconds:
+        return drift
+
+    fps = config.hardware.frame_grid.fps
+
+    if drift > 0:
+        if config.silent_output:
+            logger.error(
+                "Stage 2 timeline overshoots the master track by %.3fs (%.1f frames @%dfps): "
+                "the silent_output file this run assembles will be %.3fs long against a "
+                "%.3fs track, and the post-assembly duration check (tolerance=%.3fs) WILL "
+                "raise once the file is written. Not refusing the run -- the fix is a Stage-2 "
+                "decision (trim the final tile vs pad the click track) for whoever owns it "
+                "with a click track in hand; see CLAUDE.md's '-shortest' bullet and "
+                "docs/design-concert-mode.md.",
+                drift,
+                drift * fps,
+                fps,
+                track_duration + drift,
+                track_duration,
+                config.duration_tolerance_seconds,
+            )
+        else:
+            logger.warning(
+                "Stage 2 timeline overshoots the master track by %.3fs (%.1f frames @%dfps): "
+                "the mux's -shortest will silently discard that many rendered frames from the "
+                "final video. Harmless to watch, but it is GPU time spent rendering frames "
+                "nobody will see -- CLAUDE.md's '-shortest' bullet, issue #22.",
+                drift,
+                drift * fps,
+                fps,
+            )
+    else:
+        undershoot = -drift
+        if config.silent_output:
+            logger.error(
+                "Stage 2 timeline UNDERshoots the master track by %.3fs (%.1f frames @%dfps): "
+                "the silent_output file this run assembles will be SHORTER than the %.3fs "
+                "track, and the post-assembly duration check (tolerance=%.3fs) WILL raise "
+                "once the file is written. Not refusing the run; see the overshoot log line "
+                "for who owns the fix.",
+                undershoot,
+                undershoot * fps,
+                fps,
+                track_duration,
+                config.duration_tolerance_seconds,
+            )
+        else:
+            logger.error(
+                "Stage 2 timeline UNDERshoots the master track by %.3fs (%.1f frames @%dfps): "
+                "the mux's -shortest stops at the end of the video, so the last %.3fs of the "
+                "song will be cut out of the final video. This is the worse defect of the two. Not "
+                "refusing the run; a human should look at this before trusting the final cut.",
+                undershoot,
+                undershoot * fps,
+                fps,
+                undershoot,
+            )
+    return drift
+
+
 def run_pipeline(
     config: RunConfig,
     *,
@@ -581,6 +686,10 @@ def run_pipeline(
                 "aligned to audio?)"
             )
         logger.info("Stage 1-2 complete: %d chunk(s) to render", len(chunks))
+        # Issue #22: known before any GPU time is spent -- report it here,
+        # not after the render. See _log_timeline_track_drift's own
+        # docstring for why this never refuses the run.
+        _log_timeline_track_drift(chunks, alignment.track_duration, config)
 
         if config.vocal_stem:
             # Issue #25: condition H3 on the isolated vocal stem, cut at the
@@ -928,6 +1037,17 @@ def run_pipeline(
                 None if config.silent_output else config.master_audio,
                 config.final_video_dir,
                 runner=ffmpeg_runner,
+                # Issue #22: arms the measured-duration check that replaces
+                # -shortest, but ONLY on the silent path -- the music-video
+                # path gets no new probe and no new subprocess, byte-for-byte
+                # unchanged (expected_duration stays None). The master
+                # track's own duration stands in for the authoritative show
+                # duration here; design-concert-mode.md question 5 (is the
+                # rig's real click track ever a different length than the
+                # audio file?) is still open, so this is a stand-in, not the
+                # final answer.
+                expected_duration=alignment.track_duration if config.silent_output else None,
+                duration_tolerance_seconds=config.duration_tolerance_seconds,
             )
             output_video = assembly_result.output_video
 
@@ -1020,6 +1140,10 @@ def prepare_shot_plan(
             "lyric lines aligned to audio?)"
         )
     logger.info("Stage 1-2 complete: %d chunk(s) available to plan (issue #52)", len(chunks))
+    # Issue #22: the same no-GPU check run_pipeline does, available here too
+    # since --prepare is exactly the 50s check this project uses to catch a
+    # Stage-2 drift before spending GPU time.
+    _log_timeline_track_drift(chunks, alignment.track_duration, config)
 
     return write_shot_plan_skeleton(
         chunks, output_path, source=source, generated_at=generated_at, force=force
