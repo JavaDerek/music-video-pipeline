@@ -234,10 +234,10 @@ Stage 1-2 completes:
 * Silent-path overshoot: ERROR, because it predicts the post-assembly
   duration check above will raise, and an operator should learn that before
   committing GPU hours, not after.
-* Undershoot (either path): ERROR, always — the worse defect, since the
-  master audio (or, on the silent path, the file's own expected duration)
-  outlives the picture and `-shortest` cannot fix it. Coverage does **not**
-  guarantee this can't happen: `tests/test_slicing.py::test_short_trailing_gap_undershoots_the_track_silently`
+* Undershoot (either path): ERROR, always — the worse defect, since on the
+  music-video path `-shortest` ends the file with the picture and cuts the
+  song's ending off (and on the silent path the file is short of the track). Coverage does **not**
+  guarantee this can't happen: `tests/test_slicing.py::test_short_trailing_gap_is_covered_by_the_timeline`
   reproduces a real case where `instrumental_coverage`'s own trailing-gap
   filler silently drops a gap shorter than one trained-floor chunk (~5.167 s)
   rather than padding it — a genuine defect found while building this

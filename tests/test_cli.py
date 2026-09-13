@@ -1928,8 +1928,8 @@ def test_silent_output_overshoot_logs_an_error_naming_the_pending_raise(tmp_path
 def test_undershoot_is_reported_louder_than_overshoot_on_the_music_video_path(
     tmp_path: Path, caplog
 ):
-    """The worse defect for a music video: the master audio outlives the
-    picture and -shortest cannot fix it, so this is ERROR even on the
+    """The worse defect for a music video: -shortest ends the file with
+    the picture and cuts the song's ending off, so this is ERROR even on the
     ordinarily-harmless music-video path."""
     rig = Rig(tmp_path)
 
