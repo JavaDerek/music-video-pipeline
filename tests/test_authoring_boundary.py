@@ -22,8 +22,8 @@ because the literal rule would fail against legitimate, already-tested,
 pre-#54 code that has nothing to do with calling a model:
 
 * ``subprocess`` is banned everywhere outside ``authoring/`` *except* the
-  three modules that already, correctly, shell out for non-model reasons
-  (ffmpeg, host-sleep prevention) -- see :data:`SUBPROCESS_ALLOWLIST`.
+  modules that already, correctly, shell out for non-model reasons (ffmpeg,
+  host-sleep prevention, `tailscale ip -4`) -- see :data:`SUBPROCESS_ALLOWLIST`.
 * ``authoring/`` is allowed to import ``logging_setup`` in addition to the
   design's named list (``config``, ``contracts``, ``shot_plan``,
   ``alignment``, ``slicing``, ``lyrics``) -- it is a side-effect-free
@@ -49,6 +49,7 @@ SUBPROCESS_ALLOWLIST = frozenset(
         "alignment_quality.py",  # ffmpeg astats vocal-energy check (issue #71) -- no model
         "luminance.py",  # ffmpeg frame sampling for the darkness floor (issue #77) -- no model
         "scenecuts.py",  # ffmpeg scene-detection probe (issue #81) -- no model
+        "webui.py",  # `tailscale ip -4` bind discovery + ffmpeg thumbnails (issue #36) -- no model
     }
 )
 
