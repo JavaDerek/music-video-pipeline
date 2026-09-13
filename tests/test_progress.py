@@ -40,6 +40,9 @@ def _result(
     errors: tuple[str, ...] = (),
     render_seconds: float | None = None,
     video_file: Path | None = None,
+    free_vram_gb_before: float | None = None,
+    rerender_reason: str | None = None,
+    rerender_reason_fields: tuple[str, ...] = (),
 ) -> ChunkResult:
     return ChunkResult(
         chunk_id=chunk_id,
@@ -48,6 +51,9 @@ def _result(
         attempts=attempts,
         errors=errors,
         render_seconds=render_seconds,
+        free_vram_gb_before=free_vram_gb_before,
+        rerender_reason=rerender_reason,
+        rerender_reason_fields=rerender_reason_fields,
     )
 
 
@@ -73,6 +79,9 @@ def test_chunk_progress_to_dict_and_terminal_by_status():
         "errors": [],
         "render_seconds": 12.0,
         "video_file": "chunk_0001.mp4",
+        "free_vram_gb_before": None,
+        "rerender_reason": None,
+        "rerender_reason_fields": [],
     }
 
     cached = ChunkProgress(2, "cached", 1, (), 0.001, "chunk_0002.mp4")
@@ -440,6 +449,113 @@ def test_events_between_run_id_change_re_snapshots_and_logs_error(
 
 
 # --------------------------------------------------------------------------- #
+# Issue #36: free VRAM and the resume reason pass through unchanged
+# --------------------------------------------------------------------------- #
+
+
+def test_chunk_progress_carries_free_vram_and_rerender_reason():
+    run_state = RunState(
+        run_id="run-1",
+        results={
+            1: _result(
+                1,
+                ChunkStatus.RENDERED,
+                free_vram_gb_before=17.25,
+                rerender_reason="content_changed",
+                rerender_reason_fields=("prompt_hash", "noise_seed"),
+            ),
+        },
+    )
+    progress = RunProgress.from_run_state(run_state, [1])
+    chunk = progress.chunks[0]
+
+    assert chunk.free_vram_gb_before == pytest.approx(17.25)
+    assert chunk.rerender_reason == "content_changed"
+    assert chunk.rerender_reason_fields == ("prompt_hash", "noise_seed")
+    assert chunk.to_dict()["free_vram_gb_before"] == pytest.approx(17.25)
+    assert chunk.to_dict()["rerender_reason"] == "content_changed"
+    assert chunk.to_dict()["rerender_reason_fields"] == ["prompt_hash", "noise_seed"]
+
+
+def test_pending_chunk_has_no_free_vram_or_rerender_reason():
+    progress = RunProgress.from_run_state(RunState(run_id="run-1"), [1])
+    chunk = progress.chunks[0]
+
+    assert chunk.status == "pending"
+    assert chunk.free_vram_gb_before is None
+    assert chunk.rerender_reason is None
+    assert chunk.rerender_reason_fields == ()
+
+
+# --------------------------------------------------------------------------- #
+# Issue #23/#36: the run-level VRAM stop
+# --------------------------------------------------------------------------- #
+
+
+def test_run_progress_carries_vram_stop_from_run_state():
+    from music_video_maker.contracts import VramStopEvent
+
+    run_state = RunState(
+        run_id="run-1",
+        results={1: _result(1, ChunkStatus.RENDERED)},
+        vram_stop=VramStopEvent(chunk_id=2, free_vram_gb=4.5, floor_gb=16.0),
+    )
+    progress = RunProgress.from_run_state(run_state, [1, 2])
+
+    assert progress.vram_stop_chunk_id == 2
+    assert progress.vram_stop_free_vram_gb == pytest.approx(4.5)
+    assert progress.vram_stop_floor_gb == pytest.approx(16.0)
+    data = progress.to_dict()
+    assert data["vram_stop_chunk_id"] == 2
+    assert data["vram_stop_free_vram_gb"] == pytest.approx(4.5)
+    assert data["vram_stop_floor_gb"] == pytest.approx(16.0)
+    # Chunk 2 itself never rendered -- it is still "pending" in the chunk
+    # list, exactly as a UI would see for any other not-yet-attempted chunk.
+    assert next(c for c in progress.chunks if c.chunk_id == 2).status == "pending"
+
+
+def test_run_progress_vram_stop_is_none_when_run_state_never_set_it():
+    progress = RunProgress.from_run_state(RunState(run_id="run-1"), [1])
+    assert progress.vram_stop_chunk_id is None
+    assert progress.vram_stop_free_vram_gb is None
+    assert progress.vram_stop_floor_gb is None
+
+
+def test_events_between_emits_run_stopped_once_when_vram_stop_appears():
+    from music_video_maker.contracts import VramStopEvent
+
+    previous = RunProgress.from_run_state(
+        RunState(run_id="run-1", results={1: _result(1, ChunkStatus.RENDERED)}), [1, 2]
+    )
+    current_state = RunState(
+        run_id="run-1",
+        results={1: _result(1, ChunkStatus.RENDERED)},
+        vram_stop=VramStopEvent(chunk_id=2, free_vram_gb=3.0, floor_gb=16.0),
+    )
+    current = RunProgress.from_run_state(current_state, [1, 2])
+
+    events = events_between(previous, current)
+    event_types = [e.event for e in events]
+    assert event_types.count("run_stopped") == 1
+    stopped = next(e for e in events if e.event == "run_stopped")
+    assert stopped.data["vram_stop_chunk_id"] == 2
+    assert stopped.data["vram_stop_free_vram_gb"] == pytest.approx(3.0)
+
+    # Polling again against the already-stopped state must not re-emit.
+    events_again = events_between(current, current)
+    assert "run_stopped" not in [e.event for e in events_again]
+
+
+def test_events_between_no_vram_stop_emits_no_run_stopped_event():
+    previous = RunProgress.from_run_state(RunState(run_id="run-1"), [1])
+    current = RunProgress.from_run_state(
+        RunState(run_id="run-1", results={1: _result(1, ChunkStatus.RENDERED)}), [1]
+    )
+    events = events_between(previous, current)
+    assert "run_stopped" not in [e.event for e in events]
+
+
+# --------------------------------------------------------------------------- #
 # format_sse / to_json
 # --------------------------------------------------------------------------- #
 
@@ -500,7 +616,7 @@ def test_read_run_state_round_trips_a_file_written_by_resilience_serializer(tmp_
     )
     # Build the payload with resilience's own serializer so this test breaks
     # if the schema moves, rather than re-encoding the format by hand here.
-    payload = resilience_module._serialize_run_state(run_state)
+    payload = resilience_module.dump_run_state(run_state)
     path = tmp_path / "run_state.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
@@ -511,8 +627,79 @@ def test_read_run_state_round_trips_a_file_written_by_resilience_serializer(tmp_
     assert loaded.results[1].render_seconds == 12.5
 
 
+def test_read_run_state_round_trips_free_vram_rerender_reason_and_vram_stop(tmp_path: Path):
+    """Issue #36's three additions all survive the exact path a poller uses:
+    resilience serializes, this module reads it back through the public
+    loader."""
+    from music_video_maker.contracts import VramStopEvent
+
+    run_state = RunState(
+        run_id="run-1",
+        results={
+            1: _result(
+                1,
+                ChunkStatus.RENDERED,
+                free_vram_gb_before=18.0,
+                rerender_reason="timeline_changed",
+                rerender_reason_fields=("start", "end"),
+            ),
+        },
+        vram_stop=VramStopEvent(chunk_id=2, free_vram_gb=5.5, floor_gb=16.0),
+    )
+    payload = resilience_module.dump_run_state(run_state)
+    path = tmp_path / "run_state.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    loaded = read_run_state(path)
+
+    assert loaded.results[1].free_vram_gb_before == pytest.approx(18.0)
+    assert loaded.results[1].rerender_reason == "timeline_changed"
+    assert loaded.results[1].rerender_reason_fields == ("start", "end")
+    assert loaded.vram_stop == VramStopEvent(chunk_id=2, free_vram_gb=5.5, floor_gb=16.0)
+
+
+def test_read_run_state_loads_a_file_shaped_exactly_like_todays_code(tmp_path: Path):
+    """The hard constraint restated at this module's boundary: a real
+    in-flight run's run_state.json, written before issue #36, has none of
+    the new keys (``free_vram_gb_before``, ``rerender_reason``,
+    ``rerender_reason_fields``, ``vram_stop``) and must still be pollable."""
+    path = tmp_path / "run_state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": resilience_module.RUN_STATE_SCHEMA_VERSION,
+                "run_id": "pre-36-run",
+                "results": {
+                    "1": {
+                        "chunk_id": 1,
+                        "status": "rendered",
+                        "video_file": None,
+                        "prompt_id": "p",
+                        "attempts": 1,
+                        "errors": [],
+                        "render_seconds": 42.0,
+                        "fingerprint": None,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = read_run_state(path)
+
+    assert loaded.run_id == "pre-36-run"
+    assert loaded.results[1].free_vram_gb_before is None
+    assert loaded.results[1].rerender_reason is None
+    assert loaded.vram_stop is None
+
+    progress = RunProgress.from_run_state(loaded, [1])
+    assert progress.chunks[0].free_vram_gb_before is None
+    assert progress.vram_stop_chunk_id is None
+
+
 def test_read_run_state_accepts_a_string_path(tmp_path: Path):
-    payload = resilience_module._serialize_run_state(RunState(run_id="run-1"))
+    payload = resilience_module.dump_run_state(RunState(run_id="run-1"))
     path = tmp_path / "run_state.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
