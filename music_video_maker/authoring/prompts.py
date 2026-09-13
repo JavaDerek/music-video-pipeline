@@ -332,8 +332,8 @@ pronouns.
 want composed for an object crossing toward the lens -- flying at the \
 screen, not staying inside the frame it started in. Name the object itself \
 ("the printer"), not just that a pop is happening: later stages compose \
-toward that specific thing, and a lint checks that specific thing's \
-staging, so a flag with nothing named would leave both guessing. \
+toward that specific thing, so a flag with nothing named would leave them \
+guessing. \
 THE OBJECT MUST HAVE AN EARLIER `plant` IN ITS OWN `beat_group` -- the \
 objects that fly out are motifs the concept already established, not things \
 invented for the first time as they pop; a `pop_object` with no earlier \
