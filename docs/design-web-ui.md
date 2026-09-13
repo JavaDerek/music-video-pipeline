@@ -5,11 +5,14 @@ There is no UI. A run today is hand-edited TOML, a CLI, and `grep` over
 for anyone else — and it hides the two things that decide whether a run is
 worth starting.
 
-This document is the design. Two pieces of it are built:
-`music_video_maker/progress.py`, the layer underneath the server, and
-`music_video_maker/review.py`, the read-only pre-render review page (see
-"The next slice — built", below). **There is no server, and nothing in this
-repo binds a socket.**
+This document is the design. Three pieces of it are built:
+`music_video_maker/progress.py` (the reader-plus-differ underneath the server),
+`music_video_maker/review.py` (the read-only pre-render review page, `--review`;
+see "The next slice — built", below) and `music_video_maker/webui.py` (the
+server itself — a **read-only** HTTP monitor; see "What's built: the read-only
+monitor" below). **The start/configure half described in "What the page
+collects" is not built** — see "What is deliberately not here" for why, and
+read that section before assuming it was merely forgotten.
 
 ## What is built, and why that piece first
 
@@ -87,6 +90,169 @@ Non-negotiables for whoever writes the server:
    `master_audio=/etc/…`.
 4. Serving chunk thumbnails means serving files. Serve them from the run's own
    `chunks_dir` by chunk id, never by path.
+
+All four are now enforced code, not just this list — see "What's built: the
+read-only monitor" immediately below. One implementation note against #4: the
+server extracts a still frame with ffmpeg and caches *that*, rather than
+serving anything out of `chunks_dir` directly — see "Thumbnails" there for
+why (the cache must be writable, and `chunks_dir` is a live render's own
+directory, not this server's to write into).
+
+## What's built: the read-only monitor (issue #36)
+
+`music_video_maker/webui.py` — plus a console script and `python -m
+music_video_maker.webui`, following `pyproject.toml`'s existing
+`[project.scripts]` pattern — is the server the rest of this document used to
+say did not exist. It is read-only: see "What is deliberately not here"
+below for the boundary and why it stops there.
+
+Run it against a config already driving a render, or a finished one:
+
+```bash
+mvm-webui --config run.toml --bind 100.x.y.z
+```
+
+`100.x.y.z` above is a **placeholder** — this project's own rule is that a
+real Tailscale address never lands in a committed file (see CLAUDE.md,
+"Everything committed here is intended to become public"). You do not
+usually need `--bind` at all: `127.0.0.1` and the host's own Tailscale IPv4
+address (found via `tailscale ip -4`) are always included automatically;
+`--bind` only adds more validated addresses, e.g. for a second interface.
+
+### Bind addresses
+
+`resolve_bind_addresses` always includes `127.0.0.1`, adds this host's
+Tailscale IPv4 address if `tailscale ip -4` finds one (an injected subprocess
+seam; absence or failure is logged and falls back to loopback-only, never
+fatal — matching point 1 above), and validates every operator-supplied
+`--bind` address through the same `validate_bind_address`: loopback, or
+inside Tailscale's own ranges (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`), or
+refused outright — `0.0.0.0`, `::`, a LAN address like `192.168.x.x`, and any
+hostname (never resolved; an address must already be an IP literal) all
+raise `BindAddressError` and refuse to start the process. `tests/test_webui.py`
+checks this two ways, matching point 2 above: the pure function's output for
+a wide range of addresses, and that a real `ThreadingHTTPServer` built from
+it only ever reports `server_address` on the address it was given —
+including one build with `AF_INET6` for a Tailscale IPv6 address.
+
+### run_state.json and "the run's known chunks"
+
+The server is started with `--config run.toml`, the same file the render
+itself was started with. `config.load_config` already resolves
+`RunConfig.run_state_file` (defaulting to `chunks_dir/run_state.json`,
+overridable in the TOML directly) — that resolved path is what the monitor
+polls, through `progress.read_run_state`; nothing in `webui.py` re-derives
+or guesses the rule.
+
+**Deliberately not built: recomputing the chunk timeline.** The obvious way
+to answer "how many chunks will this run ever have" is to re-run Stage 1-2
+(`alignment.align` + `slicing.slice_audio`) the way `--prepare` does. That
+function is **not** read-only — its own docstring says it exports
+`chunk_NNN.wav` into `chunks_dir`, the *same* directory a live render is
+already reading and writing — so a monitor that called it would race an
+in-flight run for that directory and spend disk on a machine this project's
+own CLAUDE.md already flags as tight (doris and the driving Mac both). So
+`webui.py` never imports `alignment` or `slicing`, and "the run's known
+chunks" (`webui._known_chunk_ids`) means exactly the chunk ids that already
+have an entry in `run_state.json`, plus the one id `RunState.vram_stop` names
+if the run stopped below the VRAM floor before that chunk got a result of
+its own (it renders as a "pending" row instead of not existing). This is
+strictly a subset of the run's true plan until the last chunk lands — the
+rendered page says "chunks recorded in run_state.json so far", explicitly
+not "of N", and a run with zero results yet is never presented as finished
+even though `RunProgress.finished` is vacuously `True` over an empty set
+(`tests/test_webui.py::TestKnownChunks::test_a_run_with_no_results_yet_does_not_report_finished`
+is the regression guard). The pre-render review page below is the right
+place for the true chunk plan: it runs Stage 1-2 once, on demand, from the
+CLI — not from a long-lived poller that might be watching a live render.
+
+Point 3 above, concretely: chunk ids reaching the server in a request
+(`/chunks/<id>/thumbnail.png`) are matched by a digits-only route regex,
+parsed as `int`, and looked up as a dict key against `run_state.results` —
+never concatenated into a path. `tests/test_webui.py` fires several
+path-traversal shapes (`../../etc/passwd`, URL-encoded `..`, a decimal, a
+double slash) at that route and asserts a flat 404 for every one, the same
+404 an unrecognized route gets.
+
+### Routes
+
+* **`GET /`** — server-rendered HTML: recorded/rendered/cached/dead-lettered
+  counts, mean render time over rendered chunks only (matching
+  `progress.py`'s own exclusion of cached chunks' stale `render_seconds`), a
+  per-chunk table (status, attempts, free VRAM before, re-render reason,
+  errors, a thumbnail link), a prominent VRAM-stop notice when
+  `RunState.vram_stop` is set, and dead-lettered chunks with their full error
+  history. Renders a complete, correct snapshot with **no JavaScript
+  required**; a small inline script upgrades it to reload on new SSE events.
+  All run-derived text — errors, re-render-reason fields, the run id itself —
+  is HTML-escaped (`html.escape`, via one `_e` helper every piece of
+  run-derived text passes through); `tests/test_webui.py` proves a
+  `<script>` string arriving in a dead-letter error, and a run id containing
+  `<`/`>`, both survive unexecuted in the response body.
+* **`GET /events`** — SSE, a thin wrapper (`stream_progress_events`) around
+  `progress.events_between`/`format_sse`: one `run_snapshot` on connect,
+  diffs after, polling `run_state.json` at `--poll-interval-seconds`
+  (default 2.0). A missing or torn state file is silently "not ready yet",
+  never a 500 — the same contract `progress.read_run_state` already
+  documents — and a client disconnect is caught (`BrokenPipeError` /
+  `ConnectionResetError` / `OSError`) rather than logged as a server error.
+  `stream_progress_events` is itself a plain generator with an injectable
+  sleeper and a `max_polls` bound, so `tests/test_webui.py` drives several
+  polls of it with no real socket and no real `time.sleep` — a fake sleeper
+  rewrites `run_state.json` to the next fixture state when called, which is
+  what stands in for the passage of time.
+* **`GET /chunks/<id>/thumbnail.png`** — a frame extracted with ffmpeg
+  (`get_or_render_thumbnail`, an injected subprocess seam — never called
+  directly in a test) from the chunk's `video_file` in `run_state.json`, and
+  cached at `$TMPDIR/mvm-webui-thumbnails/<run_id>/<video-stem>-<mtime_ns>-<size>.png`
+  by default (`DEFAULT_THUMBNAIL_CACHE_DIR`, overridable with
+  `--thumbnail-cache-dir`) — **outside the repo and outside every run's
+  `chunks_dir`** on purpose (see the note under point 4 above), namespaced by
+  `run_id` so two runs whose chunk ids collide never serve each other's
+  frames, and keyed by the video file's own mtime and size so a chunk
+  re-rendered under `--resume` invalidates its cached frame automatically
+  without anything having to notice the rename didn't happen. 404 if the
+  chunk id is unknown to `run_state.json`, has no `video_file`, or the file
+  is missing on disk; 502 if ffmpeg itself fails.
+* **`GET /review`** — serves the file at `--review-html PATH` verbatim if the
+  operator passed one at startup (a fixed, operator-chosen path — never a
+  request parameter); 404 otherwise. The review page itself (see "The
+  pre-render half" below) is still unbuilt on another branch (`cli --review`)
+  — this route only ever serves whatever file is put there, never generates
+  one, and never imports that branch's code.
+* Everything else 404s. Only `GET` and `HEAD` are accepted; every other
+  method (`POST` included) gets a flat 405 with an `Allow: GET, HEAD` header.
+
+### What is deliberately not here
+
+No start, configure, resume, or reseed route exists anywhere in this
+server — no form, no POST handler, nothing that touches `run.toml` or calls
+into `cli.run_pipeline` / `resilience.ResilientRunner`. Two reasons, matching
+"Custody and resume" below:
+
+1. **GPU custody is exclusive** (`custody.py`'s module docstring; CLAUDE.md's
+   "GPU custody protocol"). Starting a render safely means refusing a second
+   one in flight, running the issue #19 pre-flight, and respecting that a
+   wedge under VRAM contention can strand the host. The CLI already has all
+   of this; how a *server* should gate it has not been reviewed by the owner,
+   and this work package is not the place to decide that unreviewed.
+2. Anything that can start a render can write files and load custom nodes
+   *by proxy through ComfyUI* — the same threat model as an open bind, one
+   layer up (see "The constraint that shapes everything else"). A read-only
+   monitor that only ever reads `run_state.json` and serves pre-existing,
+   operator-named files cannot become that regardless of what address it is
+   reachable from; a start/configure half would have to clear a materially
+   higher bar than this module does.
+
+This document's "Testing" section (below) names two tests that must exist on
+day one for a server like this: the bind-address assertion, and "starting a
+run while one is in flight is refused". The first is built and tested
+exhaustively above. The second **does not apply** to this server — there is
+no start route to refuse a second run from — and
+`tests/test_webui.py::test_starting_a_run_while_one_is_in_flight_is_refused_does_not_apply`
+says so explicitly, as an executable test with that reasoning in its own
+docstring, so a reader of the suite sees a decision rather than a gap nobody
+noticed.
 
 ## Open questions, and the answers this design assumes
 
@@ -224,11 +390,19 @@ makes every finding in this project checkable.
 
 ## Custody and resume, which must be visible rather than hidden
 
-* **GPU custody is exclusive.** The UI must refuse to start a second run while
-  one is in flight, and must not bypass the #19 pre-flight. The stopping of the
-  card's other tenants is deliberately manual and stays manual — see
-  `custody.py`'s module docstring. A UI button that stops the Ollama container
-  would be the exact automation this project decided never to build.
+The first two bullets below are requirements for a future *start/configure*
+half — not built here, see "What is deliberately not here" above — and are
+kept in this document unchanged so whoever eventually builds that half
+inherits them rather than rediscovering them. The last two are about
+*displaying* resume semantics, which the built read-only monitor already
+does.
+
+* **GPU custody is exclusive.** A UI that can start a render must refuse to
+  start a second one while one is in flight, and must not bypass the #19
+  pre-flight. The stopping of the card's other tenants is deliberately manual
+  and stays manual — see `custody.py`'s module docstring. A UI button that
+  stops the Ollama container would be the exact automation this project
+  decided never to build.
 * **Release is unconditional.** Any path that renders releases ComfyUI's VRAM
   in a `finally`. A direct-library test script that skipped it once left 17 GB
   held and starved every other tenant on the card.
@@ -245,10 +419,14 @@ makes every finding in this project checkable.
   every chunk after a whole-file `schema_version` rejection restarts the run
   from an empty `RunState` — deliberately: there is nothing to compare
   against in either case, and inventing a per-chunk reason for the second
-  would be less honest than `None`, not more. See "Closed" below.
-* **Dead-lettered chunks** are called out with their error history and offered
-  a resume. `ProgressEvent("chunk_dead_lettered")` carries the full `errors`
-  tuple for exactly this.
+  would be less honest than `None`, not more. See "Closed" below. **Built:**
+  the monitor's per-chunk table shows this column verbatim.
+* **Dead-lettered chunks** are called out with their error history. **Built,
+  with one adjustment:** the read-only monitor shows the errors
+  (`ProgressEvent("chunk_dead_lettered")` carries the full `errors` tuple)
+  but does not *offer* a resume button — resuming means starting a render,
+  which is the half this server does not do; `--resume` on the CLI is still
+  how a dead-lettered chunk actually gets retried.
 
 ## Closed since this document was first written (issue #36)
 
@@ -314,7 +492,20 @@ rediscover:
 
 ## Testing
 
-The existing mock ComfyUI harness (#16) should drive the UI's backend, exactly
-as it drives the pipeline: no GPU, no network, no live server in CI. For the
-server itself the two tests that must exist on day one are the bind-address
-assertion above and "starting a run while one is in flight is refused".
+The existing mock ComfyUI harness (#16) should drive a future start/configure
+half's backend, exactly as it drives the pipeline: no GPU, no network, no live
+server in CI — nothing about the read-only monitor built here needed it,
+since it never renders anything.
+
+For the server itself the two tests that must exist on day one are the
+bind-address assertion and "starting a run while one is in flight is
+refused". **Both are addressed in `tests/test_webui.py`:** the first is
+built and tested exhaustively (see "What's built: the read-only monitor" →
+"Bind addresses"); the second is a documented non-applicability (see "What is
+deliberately not here"), not a gap. Route dispatch, SSE diffing, thumbnail
+caching, and HTML escaping are tested the way this project tests everything
+else offline: pure functions directly where possible
+(`resolve_bind_addresses`, `stream_progress_events`, `render_index_html`),
+and a small number of real sockets on `127.0.0.1` with port 0, torn down in
+a fixture, where HTTP semantics (status codes, headers, method dispatch)
+are what's actually under test.
