@@ -5,9 +5,11 @@ There is no UI. A run today is hand-edited TOML, a CLI, and `grep` over
 for anyone else — and it hides the two things that decide whether a run is
 worth starting.
 
-This document is the design. One piece of it is built:
-`music_video_maker/progress.py`, the layer underneath the server. **There is
-no server, and nothing in this repo binds a socket.**
+This document is the design. Two pieces of it are built:
+`music_video_maker/progress.py`, the layer underneath the server, and
+`music_video_maker/review.py`, the read-only pre-render review page (see
+"The next slice — built", below). **There is no server, and nothing in this
+repo binds a socket.**
 
 ## What is built, and why that piece first
 
@@ -127,25 +129,85 @@ Suggested flow, unchanged from the issue: pick assets → align (cheap, CPU) →
 **review timeline + quality findings + shot plan** → confirm → render with live
 progress.
 
-### The next slice, specified
+### The next slice — built (issue #36)
 
-A read-only `review` command that renders one HTML page (and the same data as
-JSON) from a `--prepare` output. No server, no forms, no start button — a file
-you open. That keeps it honest: it can be built and tested offline today, it is
-useful from the CLI before any server exists, and it becomes the server's
-review page verbatim.
+`music_video_maker/review.py`: a read-only `--review` CLI flag that writes one
+self-contained HTML page plus the same data as JSON from a `--prepare`-style
+input. No server, no forms, no start button, no socket import (same discipline
+`progress.py` follows) — a file you open. `build_review` (inputs → a
+`ReviewData` tree) and `render_review_html`/`render_review_json` (that tree →
+a string) are two pure functions with nothing between them; `cli.main`'s own
+wiring is the only part of this that touches a filesystem.
 
-It needs, per chunk: `chunk_id`, span, duration, frame count, voiced /
-instrumental, the lyric text, the shot line, `camera`, `location`, `present`,
-`subject`, and every `alignment_quality` finding that touches the chunk's span,
-plus the run-level quality summary and the `lint_*` warnings
-`shot_plan.check`/`lint_shots_against_lyrics` raise. All of that already exists
-as return values; none of it needs new measurement.
+Per chunk: `chunk_id`, span, duration, frame count, voiced/instrumental, the
+lyric text, the shot line, `camera`, `location`, `present`, `subject`,
+`conditions`, every `alignment_quality` finding whose span touches the
+chunk's, and every shot-plan warning that named it. Run-level: the alignment
+quality summary, every shot-plan warning (including the ones that named no
+chunk), any structural plan failure (`plan_errors` — a plan that would not
+load, or that a raising lint refused, exactly as a real render would refuse,
+surfaced instead of a stack trace), and `would_refuse_render` (below).
 
-It was **not** built here on purpose. Its producers (`alignment_quality`,
-`shot_plan`'s lints) are owned by other work in flight, and a renderer written
-against them today is a merge conflict with no user. Build it after those
-settle, in one commit, with a golden-file test.
+**The timeline it describes is the one a real render produces, not a second
+approximation of it.** `run_pipeline` always slices with
+`shot_length_requests(plan)` read from `config.shot_plan` directly; there is
+no separate "from_plan" concept at render time. `build_review` defaults its
+own `from_plan` to `config.shot_plan` for exactly this reason — an explicit
+`--from-plan` (checking a *candidate* plan before it is wired into the
+config, the same case `--prepare --from-plan` exists for) still overrides
+it. A first cut of this page got this wrong: it ignored `config.shot_plan`'s
+own lengths, so any plan setting a `length_seconds` got reviewed against the
+*natural* (unmerged) timeline, and every chunk after the first long take
+reported as `ShotPlanDriftError` in `plan_errors` instead of the merged
+chunk the render actually produces.
+
+**`strict_alignment` must never crash the review.** `prepare_timeline` ->
+`align()` raises `AlignmentQualityError` once `strict_alignment` is set and a
+finding reaches CRITICAL — exactly the run a reviewer most needs to see, not
+a traceback for. The review's own call into `prepare_timeline` always aligns
+non-strict (`--prepare` itself is untouched); when the *original* config was
+strict and the report does have a CRITICAL-or-above finding,
+`would_refuse_render` names the count and is rendered at the top of the HTML
+page and included in the JSON, so "this run would in fact refuse" is not
+lost along with the crash it no longer causes.
+
+**Reused, not reimplemented**, on both axes this section originally flagged as
+in flux:
+
+* Stage 1-2 itself: `cli.prepare_timeline`, factored out of
+  `cli.prepare_shot_plan` (the two now share one Stage 1-2 run rather than
+  each describing their own), returns the chunk timeline *and* the
+  `AlignmentQualityReport` Stage 1 already computes and, before this issue,
+  only logged — `alignment.align()` grew one injectable seam
+  (`on_quality_report`) for this, the same shape as every other Stage 1/2 I/O
+  seam already takes.
+* The shot-plan lints: `cli.run_shot_plan_lints`, factored out of
+  `run_pipeline`'s own lint block, is the literal function a real render
+  calls — same lints, same order. The review runs it with a logging handler
+  attached, the identical technique `authoring/plan.check_plan` uses on the
+  authoring side ("checked by the render's own loaders, never a copy of
+  them"). `review.py` cannot import that collector directly —
+  `tests/test_authoring_boundary.py` forbids anything outside
+  `authoring/` from importing that package — so it carries its own
+  nine-line `logging.Handler`, not a second copy of any lint.
+
+Golden-file tests live in `tests/test_review.py` against
+`tests/fixtures/review/review_golden.{json,html}`, built from a hand-written
+`ReviewData` (not a real alignment/slicing run, so the fixture cannot drift
+when those change) covering one voiced chunk, one instrumental, one with an
+alignment finding, and one with a lint warning; `MVM_UPDATE_GOLDEN=1` on that
+test file regenerates them after a deliberate format change. Separate wiring
+tests exercise `build_review` through the same offline `Rig`
+`tests/test_cli.py` uses for `--prepare`, with a real `FakeAlignModel`
+injected.
+
+What it does not do: nothing here talks to ComfyUI, GPU custody, or Stage 4/5
+— a review is Stage 1-2 and nothing past it. It does not know within-chunk
+step progress, the per-chunk resume reason, or free VRAM (`progress.py`'s own
+"Gaps" section, below); those are run-time facts a finished run or an
+in-flight one has, and a review is neither. It is one snapshot of one
+`--prepare`-style input, not live — opening it twice after editing the shot
+plan means running `--review` again.
 
 ## What the page collects
 
