@@ -91,7 +91,7 @@ def _chunks(texts: list[str], width: float = 5.875):
 
 def _beat(
     chunk_id, *, group=1, role="transition", focus="subject", length=None, width=5.875,
-    location="the street", act="the story", subject=None,
+    location="the street", act="the story", subject=None, pop_object=None,
 ):
     start = (chunk_id - 1) * width
     return Beat(
@@ -106,6 +106,7 @@ def _beat(
         focus=focus,
         length_seconds=length,
         subject=subject,
+        pop_object=pop_object,
     )
 
 
@@ -255,6 +256,33 @@ def test_an_absent_act_is_omitted_from_the_comment_line(tmp_path):
     text = render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, camera=CAMERAS)
 
     assert "act" not in text.split("# beat:")[1].split("\n")[0]
+
+
+def test_pop_object_is_surfaced_in_the_beat_comment_line_only(tmp_path):
+    """Issue #68: `pop_object` rides in the `# beat: ...` comment beside
+    `act`, and -- unlike `subject`/`location` -- deliberately never becomes a
+    real TOML key: it is authoring-layer data (`.authoring/beats.json`'s
+    corpus), and the render path has nothing that reads it."""
+    chunks = _chunks(["a line", ""])
+    beats = (
+        _beat(1, role="plant", group=1, act="situation"),
+        _beat(2, role="contact", group=1, act="situation", pop_object="the printer"),
+    )
+
+    text = render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, camera=CAMERAS)
+
+    assert '[contact, group 1, act "situation", pop "the printer"]' in text
+    assert "pop_object" not in text
+    assert "pop =" not in text  # never a real TOML key, only a free-text comment
+
+
+def test_an_absent_pop_object_is_omitted_from_the_comment_line(tmp_path):
+    chunks = _chunks(["a line"])
+    beats = (_beat(1, role="plant", group=1),)
+
+    text = render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, camera=CAMERAS)
+
+    assert "pop" not in text.split("# beat:")[1].split("\n")[0]
 
 
 def test_subject_is_emitted_next_to_present(tmp_path):

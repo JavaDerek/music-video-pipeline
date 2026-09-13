@@ -77,7 +77,10 @@ def _chunks(n: int = 3, width: float = 6.0):
     )
 
 
-def _beat(chunk_id, *, group=1, role="transition", focus="subject", location="the room"):
+def _beat(
+    chunk_id, *, group=1, role="transition", focus="subject", location="the room",
+    pop_object=None,
+):
     start = (chunk_id - 1) * 6.0
     return Beat(
         chunk_id=chunk_id,
@@ -88,6 +91,7 @@ def _beat(chunk_id, *, group=1, role="transition", focus="subject", location="th
         beat_group=group,
         location=location,
         focus=focus,
+        pop_object=pop_object,
     )
 
 
@@ -245,6 +249,37 @@ def test_the_beat_table_tags_voiced_and_instrumental_chunks(tmp_path):
 
     assert "chunk_id=1 | 0.0-6.0s | voiced" in prompt
     assert "chunk_id=2 | 6.0-12.0s | instrumental" in prompt
+
+
+def test_the_beat_table_tags_a_pop_beats_object(tmp_path):
+    """Issue #68: `pop_object` has to reach this stage the same way
+    `beat_role`/`focus` already do -- design doc: "photography and prose
+    stages compose toward the lens" for a pop beat."""
+    beats = (_beat(1, pop_object="the printer"), _beat(2))
+
+    prompt = build_photography_prompt(_config(tmp_path), CONCEPT, beats, _chunks())
+
+    assert "chunk_id=1" in prompt and "POP: the printer" in prompt
+    lines = {line.split(" | ")[0]: line for line in prompt.splitlines() if "chunk_id=" in line}
+    assert "POP" in lines["chunk_id=1"]
+    assert "POP" not in lines["chunk_id=2"]
+
+
+def test_a_beat_with_no_pop_object_carries_no_pop_marker(tmp_path):
+    beats = (_beat(1),)
+
+    prompt = build_photography_prompt(_config(tmp_path), CONCEPT, beats, _chunks())
+
+    assert "POP" not in prompt
+
+
+def test_the_preamble_tells_the_model_to_compose_toward_a_pop(tmp_path):
+    from music_video_maker.authoring.prompts import PHOTOGRAPHY_PREAMBLE
+
+    lowered = PHOTOGRAPHY_PREAMBLE.lower()
+    assert "pop" in lowered and "lens" in lowered
+    assert "rare" in lowered
+    assert "#68" in PHOTOGRAPHY_PREAMBLE or "68" in PHOTOGRAPHY_PREAMBLE
 
 
 def test_a_fixed_cinematography_is_stated_as_fixed(tmp_path):

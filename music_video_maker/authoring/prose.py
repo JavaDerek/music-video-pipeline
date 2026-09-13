@@ -64,7 +64,7 @@ from music_video_maker.authoring.prompts import (
 )
 from music_video_maker.config import RunConfig
 from music_video_maker.contracts import AudioChunk
-from music_video_maker.shot_plan import _content_words, _singularish
+from music_video_maker.shot_plan import _content_words, _distant_staging_match, _singularish
 
 logger = logging.getLogger(__name__)
 
@@ -441,6 +441,74 @@ def plant_end_state_issues(
     return tuple(issues)
 
 
+def pop_distant_staging_issues(
+    shots: Mapping[int, str], beats: Sequence[Beat]
+) -> tuple[ProseIssue, ...]:
+    """Warn when a pop beat's own shot line trips the distant-staging
+    vocabulary (issue #68).
+
+    The design doc's own build order is the reason this exists rather than a
+    new keyword-based pop lint: scored against the only real corpus (80 shot
+    lines, 59 ``camera`` clauses of ``shot_plan_v12.toml``), every candidate
+    "toward the lens" keyword -- "toward the lens", "at the camera", "into
+    frame", "foreground", "closer" -- scores **zero**, because the corpus
+    contains no pop beats at all. A lint cannot be scored against a corpus
+    that contains none of what it detects, so #68 ships no new vocabulary.
+
+    What it ships instead is this: :func:`~music_video_maker.shot_plan.
+    _distant_staging_match` is *already measured* (issue #58, re-scored #76)
+    and already runs over every shot via ``load_shot_plan`` ->
+    ``_lint_distant_staging``, so a pop beat staged distant already produces
+    a generic "small or far away" warning through :func:`~music_video_maker.
+    authoring.plan.check_plan`. This function adds nothing to that
+    vocabulary; it re-runs the *same* predicate, scoped to beats the sheet
+    itself marked as a pop, and reports a sharper finding: for an ordinary
+    beat, distant staging costs the shot; for a pop beat, it costs the one
+    thing the beat was authored for, which is a worse outcome from the exact
+    same defect. "Already half the pop lint... reuse it rather than writing
+    a second vocabulary" (issue #68).
+
+    Warning tier, like every other finding in this module and like
+    ``_lint_distant_staging`` itself: a false positive on prose a human wrote
+    deliberately must never be able to block a run, and this is the same
+    heuristic with the same failure mode, not a new one with different
+    evidence behind it. ``revisable`` defaults to ``True`` (unlike issue
+    #83's world-state findings) because the defect named -- the shot line
+    stages the pop object as small or distant -- is exactly the kind of
+    thing a prose rewrite can fix: restage the same object near and large.
+
+    Pure and a function of the text alone, exactly like :func:`advisory_issues`
+    and :func:`plant_end_state_issues` and for the same reason: shot lines
+    move under a revision round, so this has to be recomputed against
+    whatever they say now rather than annotated once and left stale.
+    """
+    issues: list[ProseIssue] = []
+    for beat in sorted(beats, key=lambda b: b.start):
+        if beat.pop_object is None:
+            continue
+        shot = shots.get(beat.chunk_id)
+        if not shot:
+            continue
+        keyword = _distant_staging_match(shot)
+        if keyword is None:
+            continue
+        issues.append(
+            ProseIssue(
+                chunk_id=beat.chunk_id,
+                severity="warning",
+                message=(
+                    f"chunk_id={beat.chunk_id} is a pop beat for {beat.pop_object!r} but "
+                    f"stages it as {keyword!r}, which reads as small or far away (issue "
+                    "#58's distant-staging vocabulary, reused: issue #68). An ordinary shot "
+                    "staged this way loses the shot; a pop beat staged this way loses the "
+                    "whole reason this beat is marked pop -- restage the object in the near "
+                    "or mid ground, coming toward the lens, not behind or distant"
+                ),
+            )
+        )
+    return tuple(issues)
+
+
 def validate_prose(
     data: object,
     window: Sequence[Beat],
@@ -611,6 +679,11 @@ def _beat_line(beat: Beat, chunk: AudioChunk | None, camera: Mapping[int, str]) 
         parts.append("INSTRUMENTAL -- nothing sung here")
     if beat.chunk_id in camera:
         parts.append(f"camera (already decided, do not repeat): {camera[beat.chunk_id]}")
+    if beat.pop_object is not None:
+        # Issue #68: surfaced the same way `role`/`focus`/`camera` already
+        # are, so the model composes toward the lens for this specific
+        # object -- see PROSE_PREAMBLE rule 14.
+        parts.append(f"POP -- compose toward the lens: {beat.pop_object}")
     return " | ".join(parts)
 
 
@@ -900,6 +973,7 @@ __all__ = [
     "build_prose_prompt",
     "generate_prose",
     "plant_end_state_issues",
+    "pop_distant_staging_issues",
     "prose_input_hashes",
     "revise_prose",
     "validate_prose",

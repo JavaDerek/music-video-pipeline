@@ -1031,6 +1031,30 @@ shot = "She has come so far tonight, standing in a small office by the window"
     assert "small or far away" not in caplog.text
 
 
+def test_shot_plan_entry_has_no_pop_field():
+    """Issue #68, design doc step 5: `pop`/`pop_object` stays out of the
+    render path entirely -- the corpus for it lives in
+    `.authoring/beats.json`, never in a mono H3 render's `ShotPlanEntry` or
+    the prompts composed from it. A field appearing here would mean the
+    render loop started reading authoring-only data."""
+    import dataclasses
+
+    field_names = {f.name for f in dataclasses.fields(ShotPlanEntry)}
+    assert not any("pop" in name for name in field_names)
+
+
+def test_distant_staging_match_returns_the_matched_keyword_or_none():
+    """The pure predicate `_lint_distant_staging` is built on (issue #68:
+    factored out so the authoring layer's pop check can reuse it without a
+    second keyword list). Behaviour is otherwise unchanged -- see the tests
+    above and below, which exercise it indirectly via `load_shot_plan` and
+    still pass unmodified."""
+    assert shot_plan_module._distant_staging_match(
+        "The printer lies smashed in a snowbank far behind on the street"
+    ) in shot_plan_module._DISTANT_STAGING_KEYWORDS
+    assert shot_plan_module._distant_staging_match("She stands close beside it") is None
+
+
 def test_the_distant_staging_lint_never_raises_whatever_it_finds(tmp_path):
     path = _write_plan(
         tmp_path,

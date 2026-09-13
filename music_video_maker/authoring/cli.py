@@ -518,9 +518,10 @@ def _cmd_beats(args: argparse.Namespace) -> int:
     for beat in plan.beats:
         merged = f"  [merged {list(beat.merged_from)}]" if beat.merged_from else ""
         act_tag = f"<{beat.act}> " if beat.act else ""
+        pop_tag = f"  [POP: {beat.pop_object}]" if beat.pop_object is not None else ""
         print(
             f"{beat.chunk_id:>4}  {beat.start:>8.3f}  {beat.beat_role:<13}"
-            f"g{beat.beat_group:<3} [{beat.location}] {act_tag}{beat.beat}{merged}"
+            f"g{beat.beat_group:<3} [{beat.location}] {act_tag}{beat.beat}{merged}{pop_tag}"
         )
     _report_condition_findings(plan.beats)
     return EXIT_SUCCESS
@@ -1023,10 +1024,15 @@ def _cmd_write(args: argparse.Namespace) -> int:
         only the authoring layer has -- the render sees finished prose and a
         chunk timeline and could not tell a plant from a payoff without
         guessing, which is the thing this project keeps having to retire.
+
+        Issue #68's pop-distant-staging check joins them for the same reason:
+        it needs to know which beats are pop beats (``Beat.pop_object``),
+        which only the beat sheet carries.
         """
         return (
             prose_module.advisory_issues(current_shots, camera=camera)
             + prose_module.plant_end_state_issues(current_shots, beats)
+            + prose_module.pop_distant_staging_issues(current_shots, beats)
             + condition_issues
         )
 
