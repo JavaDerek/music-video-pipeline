@@ -93,18 +93,23 @@ is the same value as ``faces.py``'s own (private)
 ``_REFERENCE_FACE_SCORE_THRESHOLD``, applied to both sides of a pairwise
 comparison rather than only the reference-photo side."""
 
-DEFAULT_PORTRAIT_INSPECTION_FLOOR = 0.25
-"""Score floor for the *second*, inspection-only detector call this module
-makes on every image (issue #93's lesson: a bare zero from detection has
-never meant "no face", only "nothing cleared the primary floor"). Chosen as
-roughly half of :data:`DEFAULT_PORTRAIT_SCORE_THRESHOLD`, mirroring the
-~0.35x ratio between ``faces.DEFAULT_INSPECTION_FLOOR`` (0.70) and
-``faces.DEFAULT_SCORE_THRESHOLD`` (0.9) -- but that ratio is **not**
-independently calibrated the way both of those constants are. It is a
-placeholder proportioned from a real calibration elsewhere in this project,
-not a measurement of its own, and should be revisited once there is
-synthetic-image material to measure it against (the same caveat that applies
-to the similarity floor itself -- see the module docstring)."""
+DEFAULT_PORTRAIT_INSPECTION_FLOOR: float | None = None
+"""Score floor for an optional *second*, inspection-only detector call
+(issue #93: a bare zero from detection never meant "no face", only "nothing
+cleared the primary floor"). **Off by default**, so an undetected image's
+verdict is ``unexamined``.
+
+No inspection floor has been calibrated for portraits. ``faces.DEFAULT_
+INSPECTION_FLOOR`` (0.70) was calibrated on in-scene H3 frames against a 0.9
+gate, so it sits *above* this module's 0.5 detection floor and could never
+qualify anything here; and #93 measured that a low floor (0.15) fires on
+nearly every zero and its extra candidates are not faces -- the one cited to
+justify it was the back of a head. A guessed value between the two would be
+a preference, not a calibration. It also buys nothing yet: every image that
+is not ``detected`` is already excluded from pairing and makes the report
+``needs_review`` whatever its verdict says, which is the "look at this"
+outcome an inspection pass exists to trigger. Pass ``--inspection-floor``
+once synthetic material exists to calibrate one against."""
 
 _DETECTED = "detected"
 
@@ -525,7 +530,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--inspection-floor",
         type=float,
         default=DEFAULT_PORTRAIT_INSPECTION_FLOOR,
-        help="score floor for the second, inspection-only detector call",
+        help=(
+            "score floor for an optional second, inspection-only detector call "
+            "(default: off -- no portrait floor has been calibrated)"
+        ),
     )
     parser.add_argument(
         "--model-path", type=Path, default=None, help="override the YuNet model file location"
