@@ -522,7 +522,8 @@ def build_parser() -> argparse.ArgumentParser:
             "'out/review.json'). The timeline is sliced with --config's own shot_plan's "
             "editorial lengths, if it sets any -- the same lengths a real render with this "
             "config would use -- unless --from-plan names a different plan to check "
-            "instead."
+            "instead. Never raises on strict_alignment; if the config is strict and the "
+            "report would in fact make a render refuse, the page says so at the top."
         ),
     )
     parser.add_argument(
