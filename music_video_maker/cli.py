@@ -575,12 +575,9 @@ def _log_timeline_track_drift(
     An UNDERshoot -- the timeline finishing short of the track -- is
     reported too, and louder: it is the worse defect for a music video (the
     mux's ``-shortest`` stops at the end of the *video*, so the song's own
-    ending is cut out of the finished file with no error), and ``instrumental_coverage``
-    does not guarantee it can't happen -- see
-    :func:`~music_video_maker.slicing.timeline_track_drift_seconds`'s own
-    docstring and
-    ``tests/test_slicing.py::test_short_trailing_gap_is_covered_by_the_timeline``
-    for a real reproduction.
+    ending is cut out of the finished file with no error). ``instrumental_coverage``
+    now covers a short outro (see ``slicing._cover_instrumentals``), so this
+    line firing means something upstream of that broke the invariant.
 
     Silent below ``config.duration_tolerance_seconds`` (default one frame at
     24 fps): that is the same window the post-assembly check itself treats

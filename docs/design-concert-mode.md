@@ -236,13 +236,10 @@ Stage 1-2 completes:
   committing GPU hours, not after.
 * Undershoot (either path): ERROR, always — the worse defect, since on the
   music-video path `-shortest` ends the file with the picture and cuts the
-  song's ending off (and on the silent path the file is short of the track). Coverage does **not**
-  guarantee this can't happen: `tests/test_slicing.py::test_short_trailing_gap_is_covered_by_the_timeline`
-  reproduces a real case where `instrumental_coverage`'s own trailing-gap
-  filler silently drops a gap shorter than one trained-floor chunk (~5.167 s)
-  rather than padding it — a genuine defect found while building this
-  reporting, left unfixed here (see that test's docstring for why, and for
-  who owns the fix).
+  song's ending off (and on the silent path the file is short of the track). Building this
+  report found a real case — a trailing gap shorter than one trained-floor
+  chunk (~5.167 s) was dropped rather than covered — fixed the same day in
+  `slicing._cover_instrumentals`.
 
 Given the overshoot measured above, the honest expectation is that the first
 concert render **fails this check**, and now says so twice: once at Stage 2,

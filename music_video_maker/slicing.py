@@ -2114,12 +2114,14 @@ def _cover_instrumentals(
 
     boundaries: list[tuple[float, int, bool]] = []  # (start, frame_count, is_split_continuation)
     running = 0.0
+    last_is_filler = False
 
     def _emit_filler(gap: float) -> None:
-        nonlocal running
+        nonlocal running, last_is_filler
         for frame_count in _plan_filler_frames(gap, min_frames, filler_max_frames, grid):
             boundaries.append((running, frame_count, False))
             running += grid.frames_to_seconds(frame_count)
+            last_is_filler = True
 
     for piece in pieces:
         if piece.start - running > _EPS:
@@ -2127,9 +2129,36 @@ def _cover_instrumentals(
         assert piece.frame_count is not None  # pass 3 guarantees this
         boundaries.append((running, piece.frame_count, piece.is_split_continuation))
         running += grid.frames_to_seconds(piece.frame_count)
+        last_is_filler = False
 
     if track_duration - running > _EPS:
         _emit_filler(track_duration - running)
+
+    # Whatever tail is still uncovered here is shorter than one chunk: either a
+    # whole outro under the trained floor (which emits nothing above) or the
+    # grid-rounding residue of the filler that was emitted. Unlike a hole
+    # between chunks there is no later chunk to re-anchor over it, so the
+    # timeline ended short of the track and the mux's -shortest cut the song's
+    # own outro out of the video.
+    #
+    # If the last chunk is instrumental filler, grow it by grid steps: stretching
+    # instrumental time costs nothing and overshoots by under one step. If it is
+    # a sung chunk, never grow it -- the conditioning audio outranks the prompt
+    # (F26), so it would mouth over the outro -- and append a floor-length
+    # instrumental tile run past the end instead; that also covers a filler
+    # already at its maximum. The overshoot is frames -shortest discards, named
+    # before any GPU time by the Stage 2 drift report. Less than one frame of
+    # tail is not representable in any video, so it is not worth a render.
+    tail_frames = grid.seconds_to_frames(track_duration - running)
+    if tail_frames >= 1.0:
+        last_start, last_frames, last_continuation = boundaries[-1] if boundaries else (0, 0, False)
+        grown = grid.quantize_up(last_frames + int(math.ceil(tail_frames)))
+        if last_is_filler and grown <= filler_max_frames:
+            boundaries[-1] = (last_start, grown, last_continuation)
+            running = last_start + grid.frames_to_seconds(grown)
+        else:
+            boundaries.append((running, min_frames, False))
+            running += grid.frames_to_seconds(min_frames)
 
     if shot_lengths:
         boundaries, pinned_indices = _apply_shot_lengths(
@@ -2654,15 +2683,11 @@ def timeline_track_drift_seconds(
     less than that much track remains. Negative means the timeline
     **undershoots**: the mux's ``-shortest`` ends the file at the
     end of the video, which is the *worse* defect for a music video (the
-    song's own ending is cut out of the finished file), and it is not merely
-    theoretical -- ``instrumental_coverage``'s own trailing-gap filler
-    (``_cover_instrumentals``) calls :func:`_plan_frames_run`, which returns
-    ``()`` (emits nothing) whenever the gap is shorter than one trained-floor
-    chunk (~5.167s), so a trailing gap in ``(0, 5.167)`` seconds is silently
-    dropped rather than padded. See
-    ``tests/test_slicing.py::test_short_trailing_gap_is_covered_by_the_timeline``
-    for a reproduction -- coverage being on does *not* guarantee this can't
-    happen.
+    song's own ending is cut out of the finished file). It was real until
+    2026-09-13: a trailing gap under one trained-floor chunk (~5.167s) was
+    dropped rather than covered. ``_cover_instrumentals`` now grows the last
+    filler or appends a floor-length instrumental tile, so a negative value
+    here means the invariant broke somewhere new.
 
     Reads only ``chunks[-1].end``, deliberately, rather than summing
     durations or re-deriving coverage: a contiguous timeline's last chunk end

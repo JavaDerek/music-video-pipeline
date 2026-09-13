@@ -2596,51 +2596,93 @@ def test_drift_is_zero_for_no_chunks():
     assert timeline_track_drift_seconds((), 29.0) == 0.0
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known defect, not yet decided: a trailing instrumental gap shorter than "
-        "the trained floor is dropped, so the timeline ends short of the track "
-        "and -shortest trims the song's outro out of the final video. Measured "
-        "2026-09-13: gaps of 1/3/5 s after a segment ending at 26.0 s all leave "
-        "the timeline ending at 26.833 s; a 6 s gap is covered."
-    ),
-)
-def test_short_trailing_gap_is_covered_by_the_timeline(tmp_path):
-    """Asserts the invariant a real defect breaks, found while building issue #22's
-    duration-drift reporting: ``instrumental_coverage``'s own trailing-gap
-    filler (``_cover_instrumentals`` -> ``_plan_frames_run``) refuses to
-    emit ANY filler chunk for a gap shorter than one trained-floor chunk
-    (~5.167s) -- ``_plan_frames_run`` returns ``()`` rather than padding up,
-    the way pass 1-3's own minimum-duration handling does for a short
-    *segment*. So a lyric segment that ends a few seconds before the track's
-    own end (an ordinary instrumental outro shorter than 5.167s) leaves the
-    rendered timeline short of the master track, with instrumental_coverage
-    ON and nothing logging it before this issue's reporting existed.
-
-    This is worse than an unlogged number. On the music-video path the mux's
-    ``-shortest`` trims to the *video*, so the song's own outro is cut out of
-    the finished file -- "The chunk timeline must cover the whole track" is a
-    non-negotiable invariant, and this breaks it with coverage ON.
-
-    Strict xfail, asserting the correct behaviour, rather than a test that
-    asserts the defect: the fix (pad a floor-length tile past the end, the way
-    a short final *voiced* remainder already overshoots, or grow the previous
-    chunk by grid steps) moves chunk boundaries and is Stage 2's call. When it
-    lands this test XPASSes and fails, which is the prompt to drop the marker.
-    """
+def _slice_song_with_outro(tmp_path, gap):
     seg_start, seg_end = 20.0, 26.0  # 6s segment, already above the trained floor
-    gap = 3.0  # inside (0, 5.167s): too short for one filler chunk, not zero
     track_duration = seg_end + gap
     segment = make_aligned_segment(
         0, "walking through the empty halls tonight", seg_start, seg_end, "Dianne"
     )
     alignment = AlignmentResult(segments=(segment,), track_duration=track_duration)
     audio = write_silent_wav(tmp_path / "master.wav", track_duration)
+    chunks = slice_audio(
+        audio, alignment, DEFAULT_HARDWARE, tmp_path / "chunks", cover_instrumentals=True
+    )
+    return chunks, track_duration
+
+
+@pytest.mark.parametrize("gap", [0.5, 1.0, 3.0, 5.0])
+def test_an_outro_shorter_than_one_chunk_is_not_cut_off(tmp_path, gap):
+    """The chunk timeline must cover the whole track. A trailing gap shorter
+    than the trained floor used to be dropped: ``_plan_frames_run`` refuses a
+    sub-floor hole on the promise that a neighbour absorbs it, which holds
+    between chunks (the next one re-anchors earlier) and cannot hold at the end,
+    where there is no next chunk. The mux's ``-shortest`` then ended the file
+    with the video, so the song's own outro was cut out with no error --
+    measured: gaps of 1/3/5s after a segment ending at 26.0s all ended at
+    26.833s."""
+    chunks, track_duration = _slice_song_with_outro(tmp_path, gap)
+
+    assert timeline_track_drift_seconds(chunks, track_duration) >= 0.0
+
+
+def test_a_short_outro_is_its_own_instrumental_chunk_not_a_stretched_sung_one(tmp_path):
+    """The tail is covered by a floor-length instrumental tile run past the end
+    of the track, never by growing the last sung chunk into the outro: the
+    conditioning audio outranks the prompt (F26), so a sung shot stretched over
+    instrumental time mouths over the music. The overshoot is rendered frames
+    ``-shortest`` discards, which the Stage 2 drift report names before any GPU
+    time -- the same trade a short final voiced remainder already makes."""
+    chunks, track_duration = _slice_song_with_outro(tmp_path, 3.0)
+
+    # Before the fix this song tiled as exactly these three chunks and stopped
+    # at 26.833s: two lead-in fillers and the sung chunk at the 158 frames its
+    # 6s segment rounds up to. None of them may move or grow.
+    assert [(c.frame_count, c.is_instrumental) for c in chunks[:-1]] == [
+        (243, True), (243, True), (158, False)
+    ]
+    outro = chunks[-1]
+    assert outro.start == pytest.approx(chunks[-2].end)
+    assert outro.is_instrumental
+    assert outro.frame_count == GRID.clamp_to_trained(0)
+    assert outro.start < track_duration < outro.end
+
+
+def test_a_sub_frame_residue_at_the_end_adds_no_chunk(tmp_path):
+    """Less than one frame of tail cannot be shown by any video, so it is not a
+    reason to render a whole extra chunk."""
+    exact, track_duration = _slice_song_with_outro(tmp_path / "a", 0.0)
+    end = exact[-1].end
+    segment = make_aligned_segment(
+        0, "walking through the empty halls tonight", 20.0, 26.0, "Dianne"
+    )
+    sliver = end + GRID.frames_to_seconds(1) * 0.4
+    alignment = AlignmentResult(segments=(segment,), track_duration=sliver)
+    audio = write_silent_wav(tmp_path / "master.wav", sliver)
 
     chunks = slice_audio(
         audio, alignment, DEFAULT_HARDWARE, tmp_path / "chunks", cover_instrumentals=True
     )
 
-    drift = timeline_track_drift_seconds(chunks, track_duration)
-    assert drift >= 0.0, f"timeline ends {-drift:.3f}s before the track (gap={gap}s)"
+    assert len(chunks) == len(exact)
+
+
+def test_a_rounding_residue_after_outro_filler_grows_that_filler_not_a_new_chunk(tmp_path):
+    """An outro longer than one chunk is tiled as filler, but grid rounding can
+    leave a residue after it -- 0.292s here (a 192-frame filler ending at
+    24.708s of a 25.0s track), which -shortest used to clip. Stretching
+    instrumental filler costs nothing, so it grows by one grid step rather than
+    spending a whole 124-frame render on a third of a second."""
+    segment = make_aligned_segment(
+        0, "walking through the empty halls tonight", 10.0, 16.0, "Dianne"
+    )
+    alignment = AlignmentResult(segments=(segment,), track_duration=25.0)
+    audio = write_silent_wav(tmp_path / "master.wav", 25.0)
+
+    chunks = slice_audio(
+        audio, alignment, DEFAULT_HARDWARE, tmp_path / "chunks", cover_instrumentals=True
+    )
+
+    assert [(c.frame_count, c.is_instrumental) for c in chunks] == [
+        (243, True), (158, False), (209, True)
+    ]
+    assert 0.0 <= timeline_track_drift_seconds(chunks, 25.0) < GRID.frames_to_seconds(17)
