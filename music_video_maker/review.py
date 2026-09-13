@@ -362,11 +362,39 @@ def build_review(
     refuses, is recorded in :attr:`ReviewData.plan_errors` rather than
     raised: the review's whole purpose is to surface exactly this kind of
     problem without needing a stack trace to do it.
+
+    ``from_plan`` defaults to ``config.shot_plan`` when not given, not to
+    "no editorial lengths": ``run_pipeline`` always slices with
+    ``shot_length_requests(plan)`` from ``config.shot_plan`` directly, so a
+    review that ignored it for any plan setting ``length_seconds`` would
+    describe chunks the render never emits and report the resulting mismatch
+    as plan drift instead of the merged timeline the render actually
+    produces. An explicit ``from_plan`` (checking a *candidate* plan before
+    it is wired into the config, the same case ``--prepare --from-plan``
+    exists for) still overrides it, exactly as passing it explicitly always
+    has.
     """
-    timeline = cli.prepare_timeline(config, align_model=align_model, from_plan=from_plan)
+    effective_from_plan = from_plan if from_plan is not None else config.shot_plan
+
+    plan_errors: list[str] = []
+    try:
+        timeline = cli.prepare_timeline(
+            config, align_model=align_model, from_plan=effective_from_plan
+        )
+    except ShotPlanError as exc:
+        # A plan that cannot be read is a hard failure for --prepare (real
+        # work depends on it landing correctly) but not for a review: the
+        # whole point here is to surface a problem, never to crash instead
+        # of showing one. Fall back to the natural (no editorial lengths)
+        # timeline so the rest of the review still has something to show --
+        # ``config.shot_plan``'s own load a few lines down will hit the same
+        # error again and add it to ``plan_errors`` too if it names the same
+        # file; a caller reads two lines naming one root cause rather than a
+        # traceback naming none.
+        plan_errors.append(str(exc))
+        timeline = cli.prepare_timeline(config, align_model=align_model, from_plan=None)
 
     plan: Mapping[int, ShotPlanEntry] = {}
-    plan_errors: list[str] = []
     lint_records: tuple[logging.LogRecord, ...] = ()
 
     if config.shot_plan is not None:

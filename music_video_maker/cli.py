@@ -500,8 +500,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "With --prepare or --review, read an existing shot plan for its length_seconds "
             "only and re-anchor the timeline against the run that plan will actually "
-            "produce. Without this, a plan that sets any editorial shot length describes "
-            "chunks no render will ever emit, and drifts."
+            "produce. Without this, --prepare slices with no editorial lengths at all "
+            "(there is usually no plan yet to read them from), and --review slices with "
+            "--config's own shot_plan's lengths if it names one (matching what a real "
+            "render does) or none if it doesn't. Pass this to check a candidate plan "
+            "before it is wired into --config; it always overrides --config's own "
+            "shot_plan for the lengths, whichever mode is running."
         ),
     )
     parser.add_argument(
@@ -515,8 +519,10 @@ def build_parser() -> argparse.ArgumentParser:
             "(issue #36) -- one self-contained HTML page plus the same data as JSON, no "
             "server, no GPU. Writes PATH with its suffix replaced by '.html' and '.json' "
             "(so 'out/review' or 'out/review.html' both produce 'out/review.html' and "
-            "'out/review.json'). Reads --config's own shot_plan if it names one; "
-            "--from-plan re-anchors the timeline exactly as it does for --prepare."
+            "'out/review.json'). The timeline is sliced with --config's own shot_plan's "
+            "editorial lengths, if it sets any -- the same lengths a real render with this "
+            "config would use -- unless --from-plan names a different plan to check "
+            "instead."
         ),
     )
     parser.add_argument(
