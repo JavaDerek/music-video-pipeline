@@ -140,6 +140,19 @@ chunk), and any structural plan failure (`plan_errors` — a plan that would not
 load, or that a raising lint refused, exactly as a real render would refuse,
 surfaced instead of a stack trace).
 
+**The timeline it describes is the one a real render produces, not a second
+approximation of it.** `run_pipeline` always slices with
+`shot_length_requests(plan)` read from `config.shot_plan` directly; there is
+no separate "from_plan" concept at render time. `build_review` defaults its
+own `from_plan` to `config.shot_plan` for exactly this reason — an explicit
+`--from-plan` (checking a *candidate* plan before it is wired into the
+config, the same case `--prepare --from-plan` exists for) still overrides
+it. A first cut of this page got this wrong: it ignored `config.shot_plan`'s
+own lengths, so any plan setting a `length_seconds` got reviewed against the
+*natural* (unmerged) timeline, and every chunk after the first long take
+reported as `ShotPlanDriftError` in `plan_errors` instead of the merged
+chunk the render actually produces.
+
 **Reused, not reimplemented**, on both axes this section originally flagged as
 in flux:
 

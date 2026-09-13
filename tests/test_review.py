@@ -40,7 +40,7 @@ from music_video_maker.review import (
     render_review_html,
     render_review_json,
 )
-from tests.test_cli import Rig, _make_config_file
+from tests.test_cli import Rig, _anchors, _make_config_file, _prepare
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "review"
 GOLDEN_JSON = FIXTURES_DIR / "review_golden.json"
@@ -381,6 +381,124 @@ def test_build_review_touches_no_comfyui(tmp_path: Path):
     build_review(rig.config, align_model=rig.align_model)
 
     assert rig.session.requests == []
+
+
+# --------------------------------------------------------------------------- #
+# Bug: build_review ignored config.shot_plan's own editorial lengths, so a
+# plan with a `length_seconds` merging chunks got reviewed against the
+# NATURAL (unmerged) timeline -- describing chunks a real render never
+# emits, and reporting the resulting drift as plan_errors rather than the
+# merged timeline the render actually produces. `run_pipeline` always slices
+# with `shot_length_requests(plan)` from `config.shot_plan` directly; there
+# is no separate "from_plan" concept at render time -- that flag exists only
+# because `--prepare` typically runs *before* `config.shot_plan` exists, to
+# preview a re-anchor against some other candidate plan.
+# --------------------------------------------------------------------------- #
+
+
+def _merged_plan_fixture(rig: Rig, tmp_path: Path) -> tuple[Path, list[tuple[int, float]]]:
+    """A self-consistent shot plan -- anchored against the very timeline its
+    own `length_seconds` produces (the "round trips onto its own anchors"
+    property `test_prepare_from_plan_round_trips_onto_its_own_anchors` in
+    ``tests/test_cli.py`` proves) -- with a long take on chunk index 1 that
+    merges what would otherwise be two natural chunks into one.
+
+    Returns the plan path and the merged timeline's own ``(chunk_id, start)``
+    anchors, so a test can assert against them without re-deriving.
+    """
+    plain_anchors = _anchors(_prepare(rig, tmp_path / "plain.toml"))
+
+    draft_path = tmp_path / "draft.toml"
+    draft_path.write_text(
+        "\n".join(
+            f'[[shot]]\nchunk_id = {cid}\nstart = {start!r}\nshot = "beat {cid}"'
+            + ("\nlength_seconds = 12.0" if index == 1 else "")
+            for index, (cid, start) in enumerate(plain_anchors)
+        )
+    )
+    merged_anchors = _anchors(_prepare(rig, tmp_path / "reanchored.toml", from_plan=draft_path))
+    assert len(merged_anchors) < len(plain_anchors), "fixture must actually merge chunks"
+
+    final_path = tmp_path / "shot_plan.toml"
+    final_path.write_text(
+        "\n".join(
+            f'[[shot]]\nchunk_id = {cid}\nstart = {start!r}\nshot = "beat {cid} final"'
+            + ("\nlength_seconds = 12.0" if index == 1 else "")
+            for index, (cid, start) in enumerate(merged_anchors)
+        )
+    )
+    return final_path, merged_anchors
+
+
+def test_build_review_uses_config_shot_plan_lengths_with_no_from_plan(tmp_path: Path):
+    """The defect: without the fix, ``build_review`` slices with no
+    ``shot_lengths`` (natural timeline) while the plan is anchored against
+    the merged one, so every chunk after the long take drifts."""
+    rig = Rig(tmp_path, instrumental_coverage=True)
+    plan_path, merged_anchors = _merged_plan_fixture(rig, tmp_path)
+    config = dc_replace(rig.config, shot_plan=plan_path)
+
+    data = build_review(config, align_model=rig.align_model)
+
+    assert data.plan_errors == (), (
+        "config.shot_plan's own length_seconds must be used to slice the timeline "
+        "this review describes, the same way run_pipeline does"
+    )
+    assert len(data.chunks) == len(merged_anchors)
+    assert [c.chunk_id for c in data.chunks] == [cid for cid, _ in merged_anchors]
+    merged_chunk = data.chunks[1]
+    assert merged_chunk.shot == f"beat {merged_chunk.chunk_id} final"
+    assert merged_chunk.duration == pytest.approx(12.0, abs=0.5)
+
+
+def test_build_review_explicit_from_plan_still_wins(tmp_path: Path):
+    """An explicit ``--from-plan`` overrides ``config.shot_plan`` for the
+    *lengths* -- the same precedence ``--prepare --from-plan`` already
+    documents -- even though ``config.shot_plan`` is set to something else
+    entirely."""
+    rig = Rig(tmp_path, instrumental_coverage=True)
+    plan_path, merged_anchors = _merged_plan_fixture(rig, tmp_path)
+    natural_anchors = _anchors(_prepare(rig, tmp_path / "natural_source.toml"))
+    # A second, natural-length plan `config.shot_plan` points at -- distinct
+    # from `plan_path`, which is passed explicitly as `from_plan`.
+    unmerged_plan_path = tmp_path / "unmerged.toml"
+    unmerged_plan_path.write_text(
+        "\n".join(
+            f'[[shot]]\nchunk_id = {cid}\nstart = {start!r}\nshot = "natural {cid}"'
+            for cid, start in natural_anchors
+        )
+    )
+    config = dc_replace(rig.config, shot_plan=unmerged_plan_path)
+
+    data = build_review(config, align_model=rig.align_model, from_plan=plan_path)
+
+    # The timeline followed from_plan's lengths (merged), not
+    # config.shot_plan's (natural) -- so config.shot_plan's own entries
+    # (anchored at the natural timeline) now drift against it.
+    assert len(data.chunks) == len(merged_anchors)
+    assert data.plan_errors, (
+        "config.shot_plan is anchored against the natural timeline; slicing with "
+        "from_plan's merged lengths instead must surface that as drift, proving "
+        "from_plan -- not config.shot_plan -- decided the timeline"
+    )
+
+
+def test_build_review_reports_unreadable_config_shot_plan_instead_of_crashing(tmp_path: Path):
+    """``build_review`` now feeds ``config.shot_plan`` into
+    ``prepare_timeline``'s own ``from_plan`` (to read its lengths), and that
+    function does its own ``load_shot_plan`` call for them -- a malformed
+    ``config.shot_plan`` must not crash there, before this function's own
+    (already-tested) graceful load a few lines later ever gets a chance to
+    catch it."""
+    rig = Rig(tmp_path)
+    bad_plan = tmp_path / "shot_plan.toml"
+    bad_plan.write_text("this is not [valid toml\n")
+    config = dc_replace(rig.config, shot_plan=bad_plan)
+
+    data = build_review(config, align_model=rig.align_model)  # must not raise
+
+    assert data.plan_errors
+    assert len(data.chunks) == 3  # falls back to the natural timeline
 
 
 # --------------------------------------------------------------------------- #
