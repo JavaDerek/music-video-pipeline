@@ -2633,3 +2633,50 @@ def _log_unmeasured_chunks(chunks: Sequence[AudioChunk], grid: FrameGrid) -> Non
         longest.duration,
         MEASURED_MAX_FRAMES,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Timeline-vs-track drift (issue #22)
+# --------------------------------------------------------------------------- #
+
+
+def timeline_track_drift_seconds(
+    chunks: Sequence[AudioChunk], track_duration: float
+) -> float:
+    """How far the rendered chunk timeline's end sits from the master
+    track's own duration.
+
+    Positive means the timeline **overshoots** the track: rendered seconds
+    past the end of the song. This is exactly what a music-video mux's
+    ``-shortest`` throws away today with nothing logging it (CLAUDE.md's
+    "-shortest" invariant, issue #22) -- 1.837s / 47 frames on "Deathless",
+    because the final tile is padded up to H3's 124-frame trained floor when
+    less than that much track remains. Negative means the timeline
+    **undershoots**: the muxed master audio outlives the video, which is the
+    *worse* defect for a music video (a viewer watches the last frame frozen
+    or black while the song keeps playing), and it is not merely
+    theoretical -- ``instrumental_coverage``'s own trailing-gap filler
+    (``_cover_instrumentals``) calls :func:`_plan_frames_run`, which returns
+    ``()`` (emits nothing) whenever the gap is shorter than one trained-floor
+    chunk (~5.167s), so a trailing gap in ``(0, 5.167)`` seconds is silently
+    dropped rather than padded. See
+    ``tests/test_slicing.py::test_short_trailing_gap_undershoots_the_track_silently``
+    for a reproduction -- coverage being on does *not* guarantee this can't
+    happen.
+
+    Reads only ``chunks[-1].end``, deliberately, rather than summing
+    durations or re-deriving coverage: a contiguous timeline's last chunk end
+    already *is* the total rendered runtime a viewer experiences, the same
+    number :func:`_cover_instrumentals`'s own "tiling %.3fs of a %.3fs track"
+    log line reports, and this reads correctly whether or not
+    ``cover_instrumentals`` was on.
+
+    Pure arithmetic: no I/O, no subprocess, safe to call from ``--prepare``
+    (no GPU) as well as after a full render, at Stage 2's own boundary
+    before any GPU time is spent. Returns ``0.0`` for an empty ``chunks`` --
+    every caller here already refuses to proceed on zero chunks before this
+    could be reached, so there is nothing to compare.
+    """
+    if not chunks:
+        return 0.0
+    return chunks[-1].end - track_duration

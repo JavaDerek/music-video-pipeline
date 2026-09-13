@@ -18,6 +18,8 @@ the priority of the third piece.
 |---|---|
 | The `(time, label)` marker contract, reader, fixture | **built** — `music_video_maker/markers.py`, `tests/test_markers.py` |
 | Silent-output assembly + measured duration check | **built** — `assembly.assemble_final_video(master_audio=None, expected_duration=…)` |
+| The duration check armed end to end on the silent path | **built** — `run_pipeline` now passes `expected_duration=alignment.track_duration` whenever `silent_output = true`; see "The duration check" below |
+| Stage 2 timeline-drift reporting (before any GPU work) | **built** — `slicing.timeline_track_drift_seconds` + `cli._log_timeline_track_drift`, wired into both `run_pipeline` and `--prepare` |
 | What the click tracks actually are | **blocked on the owner / the band** |
 | t2v (or i2v) workflow template, projection aspect ratio | **blocked on the GPU** |
 | Wiring the marker reader as an alternate Stage 1 | **deliberately not done** — see "Why nothing is wired up" |
@@ -201,21 +203,61 @@ the drift exceeds `duration_tolerance_seconds`.
   on disk to inspect, and for a show the operator has to be told now, not find
   it in a log tomorrow.
 * The 0.05 s default is one frame at 24 fps rounded up. It is **not** a
-  measured figure. A real rig's tolerance should come from the playback system.
+  measured figure. A real rig's tolerance should come from the playback
+  system — `duration_tolerance_seconds` in `run.toml` overrides it, and is
+  only ever consulted when `silent_output = true`.
 * When `expected_duration` is not given, nothing new happens — no probe, no
   subprocess, no behaviour change for the music-video path.
 
+**Now armed end to end.** The gap this issue's own comment claimed closed and
+didn't: `run_pipeline` (`cli.py`) now passes
+`expected_duration=alignment.track_duration` whenever `config.silent_output`
+is true, and leaves it `None` otherwise — so `silent_output = true` in
+`run.toml` really does wire the check into a render, and the music-video path
+still never probes anything. The master track's own duration (already known
+from Stage 1, no second probe) stands in for the authoritative show duration
+here — design doc question 5 above is still open, and the call site names
+that explicitly rather than quietly answering it.
+
+**Reported before GPU time, not just after assembly.** A new pure function,
+`slicing.timeline_track_drift_seconds(chunks, track_duration)`, reads Stage
+2's own finished chunk timeline against the master track and returns the
+drift (positive = overshoot, negative = undershoot). `cli._log_timeline_track_drift`
+wraps it with the logging policy and runs from **both** `run_pipeline` and
+`--prepare` — the 50 s, no-GPU check this project already uses — right after
+Stage 1-2 completes:
+
+* Music-video overshoot: WARNING, naming the frame count `-shortest` will
+  discard. Chosen over INFO because it quantifies rendered-but-discarded GPU
+  time, and the entire reason this issue exists is that nothing surfaced this
+  number before.
+* Silent-path overshoot: ERROR, because it predicts the post-assembly
+  duration check above will raise, and an operator should learn that before
+  committing GPU hours, not after.
+* Undershoot (either path): ERROR, always — the worse defect, since the
+  master audio (or, on the silent path, the file's own expected duration)
+  outlives the picture and `-shortest` cannot fix it. Coverage does **not**
+  guarantee this can't happen: `tests/test_slicing.py::test_short_trailing_gap_undershoots_the_track_silently`
+  reproduces a real case where `instrumental_coverage`'s own trailing-gap
+  filler silently drops a gap shorter than one trained-floor chunk (~5.167 s)
+  rather than padding it — a genuine defect found while building this
+  reporting, left unfixed here (see that test's docstring for why, and for
+  who owns the fix).
+
 Given the overshoot measured above, the honest expectation is that the first
-concert render **fails this check** and that the fix is upstream: either the
-final tile is trimmed to the track (a Stage-2 change, and note H3's 124-frame
-floor means the last tile cannot simply be made shorter), or the click track
-is padded to a legal grid length. That is a decision for whoever owns Stage 2,
-and it should be made with the click track in hand.
+concert render **fails this check**, and now says so twice: once at Stage 2,
+before any GPU time is spent, and again — authoritatively, on the real
+assembled file — when `expected_duration` raises after assembly. The fix
+itself is still upstream: either the final tile is trimmed to the track (a
+Stage-2 change, and note H3's 124-frame floor means the last tile cannot
+simply be made shorter), or the click track is padded to a legal grid length.
+That is a decision for whoever owns Stage 2, and it should be made with the
+click track in hand — nothing built here makes that call.
 
 ## Why nothing is wired up
 
-There is no `concert = true`, no `marker_file` config key, and no CLI flag.
-Deliberately:
+There is still no `concert = true`, no `marker_file` config key, and no CLI
+flag for the mode itself. Deliberately:
 
 * The marker reader has no consumer until the t2v template exists, and the
   template needs the GPU.
@@ -223,9 +265,11 @@ Deliberately:
   switch: it invites a run that reads markers, then composes labels as lyrics
   into an r2v graph conditioned on cast photos, and produces something that
   looks *nearly* right.
-* Both built pieces are useful on their own today. Silent output is what you
-  hand a VJ; the duration check is worth having on a music video too — nothing
-  currently reports that 47 frames went in the bin.
+* Both built pieces are useful on their own today, and one of them is now
+  useful on both output paths: silent output is what you hand a VJ; the
+  duration check is what tells the operator before a show; and the Stage 2
+  drift report above means a music-video run finally logs that GPU-rendered
+  frames are being thrown away, which nothing did before this issue.
 
 The order to finish in is the issue's own: answer the questions, then the
 template + a cost measurement at the real aspect ratio, then the mode switch,

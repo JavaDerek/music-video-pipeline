@@ -35,6 +35,7 @@ against the *config file's* directory, not the process cwd)::
     render_height            = 480       # biggest lever on run time -- see RunConfig
     instrumental_coverage    = true      # render the unvoiced spans too
     silent_output            = false     # issue #22; no audio stream at all
+    duration_tolerance_seconds = 0.05    # issue #22; only consulted when silent_output=true
     i2v_continuity           = false     # issue #12
     i2v_workflow_template    = "workflow_i2v_api.json"          # issue #12
     resume_ignore_prompt_changes = false # issue #34; --ignore-prompt-changes overrides
@@ -81,6 +82,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import NoReturn
 from urllib.parse import urlparse
 
+from music_video_maker.assembly import DEFAULT_DURATION_TOLERANCE_SECONDS
 from music_video_maker.contracts import AlignmentOverride, CastMember, HardwareProfile
 from music_video_maker.faces import (
     DEFAULT_MIN_FACE_FRACTION,
@@ -722,6 +724,16 @@ class RunConfig:
     :func:`~music_video_maker.assembly.assemble_final_video` when that
     difference matters, i.e. whenever something else is playing to the same
     clock."""
+
+    duration_tolerance_seconds: float = DEFAULT_DURATION_TOLERANCE_SECONDS
+    """Issue #22: how far the finished file's measured duration may drift
+    from the master track's own duration before
+    :func:`~music_video_maker.assembly.assemble_final_video`'s
+    ``expected_duration`` check raises. Only consulted when ``silent_output``
+    is true -- the music-video path never probes duration at all. Defaults
+    to one frame at 24 fps rounded up, which is a starting point, not a
+    measured figure; a real playback rig's tolerance should come from the
+    show's actual frame rate and sync requirements."""
 
     instrumental_coverage: bool = True
     """Render the unvoiced spans too -- intro, outro, and every instrumental
@@ -1505,6 +1517,9 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
     values["render_width"], values["render_height"] = _render_dimensions(merged)
     values["instrumental_coverage"] = _flag(merged, "instrumental_coverage", True)
     values["silent_output"] = _flag(merged, "silent_output", False)
+    values["duration_tolerance_seconds"] = _positive_number(
+        merged, "duration_tolerance_seconds", DEFAULT_DURATION_TOLERANCE_SECONDS
+    )
     values["i2v_continuity"] = _flag(merged, "i2v_continuity", False)
     values["resume_ignore_prompt_changes"] = _flag(merged, "resume_ignore_prompt_changes", False)
     values["strict_alignment"] = _flag(merged, "strict_alignment", False)
