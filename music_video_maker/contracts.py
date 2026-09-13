@@ -814,6 +814,60 @@ class ChunkResult:
     ``None`` means unrecorded -- which is not evidence of a match, and the
     resilience layer treats it as un-reusable rather than assuming."""
 
+    free_vram_gb_before: float | None = None
+    """The between-chunk free-VRAM reading (issue #23) taken immediately
+    before this chunk was submitted, in GB. ``None`` when no ``vram_probe``
+    was injected, or the probe returned an unreadable ``None`` for this
+    chunk -- both are "no evidence", never "the card was empty".
+
+    Recorded **once per chunk, before its first attempt** --
+    ``ResilientRunner._check_vram_before_chunk`` runs outside the retry loop
+    in ``_render_chunk``, so a chunk that fails twice and succeeds on its
+    third attempt still carries exactly one reading, taken before attempt 1.
+    That is deliberate, not an approximation: the question this field answers
+    is "what did the card look like when this chunk *started*", the same
+    question the log line the probe already emits answers, and re-probing
+    per attempt would conflate a VRAM condition with a retry's own recovery
+    sequence (``interrupt`` -> ``free``), which itself changes free VRAM.
+
+    Never set on a ``CACHED`` result -- a reused chunk never touches the GPU,
+    so ``ResilientRunner`` never calls the probe for it (see
+    ``test_vram_probe_is_not_called_for_chunks_reused_from_resume``). Purely
+    an observation for a UI (issue #36) to plot alongside render time; it is
+    never compared by ``--resume`` and has no bearing on whether a cached
+    chunk is reused -- see :class:`ChunkFingerprint`, which this field is
+    deliberately not part of."""
+
+    rerender_reason: str | None = None
+    """Why a chunk with a prior cached result re-rendered instead of being
+    reused on ``--resume`` (issue #36): one of ``"explicit_selection"``,
+    ``"video_missing"``, ``"no_fingerprint"``, ``"chain_blocked"``,
+    ``"conditioning_changed"``, ``"timeline_changed"`` or
+    ``"content_changed"`` -- see ``resilience._reusable_cached_result``, which
+    is the only place that ever sets it. ``None`` covers two different
+    situations that this field deliberately does not distinguish: a chunk
+    rendered fresh with no prior entry at all (nothing to reject), and a
+    chunk rendered because the *whole* prior state file was discarded (a
+    ``schema_version`` mismatch or index-space guard failure) -- in the
+    second case ``ResilientRunner`` starts from an empty ``RunState``, so
+    every chunk genuinely has no prior entry to compare against by the time
+    this field is computed, and fabricating a per-chunk reason (as though
+    each chunk's own fingerprint had been compared and rejected) would be
+    less honest than ``None``, not more. There is nothing here for a UI to
+    misread: it can still tell the run started fresh, because *no* chunk in
+    it carries a fingerprint mismatch reason and the run's own history (a
+    missing ``run_state.json`` from before this run, or the log) is where
+    that fact belongs."""
+
+    rerender_reason_fields: tuple[str, ...] = ()
+    """The specific ``ChunkFingerprint`` field names behind ``rerender_reason``,
+    for the three reasons that come from a field comparison
+    (``"conditioning_changed"``, ``"timeline_changed"``, ``"content_changed"``)
+    -- the same tuple ``ChunkFingerprint.conditioning_differences`` /
+    ``.timeline_differences`` / ``.content_differences`` returned. Empty for
+    every other reason, including ``None``. Lets a UI say "re-rendered
+    because prompt_hash changed" instead of just naming the tier."""
+
     @property
     def succeeded(self) -> bool:
         return self.status in (ChunkStatus.RENDERED, ChunkStatus.CACHED)
@@ -920,12 +974,45 @@ class HardwareProfile:
     ``max_chunk_seconds``, but the grid itself is fixed by the model."""
 
 
+@dataclass(frozen=True)
+class VramStopEvent:
+    """Recorded on :class:`RunState` when the between-chunk VRAM re-check
+    (issue #23) stopped a run before it could submit the chunk that tripped
+    the floor -- see ``resilience.VramBelowFloorError``.
+
+    Run-level, not a :class:`ChunkResult` field, because it is not honest as
+    one: ``chunk_id`` never gets a ``ChunkResult`` at all on this path --
+    ``ResilientRunner`` persists the run state accumulated so far (everything
+    *before* this chunk) and raises, precisely so ``--resume`` picks up from
+    the last chunk that actually rendered rather than resuming into a
+    fabricated entry for a chunk that never ran. This is the one honest place
+    to write the reading down: what the card looked like when the run
+    refused to continue, and which chunk it refused to submit."""
+
+    chunk_id: int
+    """The chunk that was about to be submitted when the reading came in
+    under the floor. Never a chunk with a ``ChunkResult`` in the same
+    ``RunState`` -- see the class docstring."""
+    free_vram_gb: float
+    """The reading that tripped the stop, in GB."""
+    floor_gb: float
+    """``between_chunk_min_free_vram_gb`` at the time of the stop, so a UI
+    (or a human reading the file later) does not have to cross-reference the
+    run's config to know how close the margin was."""
+
+
 @dataclass
 class RunState:
     """Resumable per-run state persisted by the resilience layer (issue #10)."""
 
     run_id: str
     results: dict[int, ChunkResult] = field(default_factory=dict)
+
+    vram_stop: VramStopEvent | None = None
+    """Set exactly once, by ``ResilientRunner._check_vram_before_chunk``,
+    when a between-chunk reading (issue #23) stops the run -- see
+    :class:`VramStopEvent`. ``None`` for every run that never hit the floor,
+    which is every run before this field existed and most runs after it."""
 
     @property
     def dead_lettered(self) -> tuple[int, ...]:

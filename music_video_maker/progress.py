@@ -59,18 +59,33 @@ Design decisions (issue #36, settled before this module was written)
   not report it: a real server wanting that number needs to additionally
   listen on that WebSocket itself, which is a live per-render seam this
   offline, polling module cannot reach and should not fake.
+* **D5 -- free VRAM and the resume reason are recorded per chunk, so this
+  module just carries them.** Two of the three gaps this file used to list
+  below are closed: ``ChunkResult.free_vram_gb_before`` (issue #23) and
+  ``ChunkResult.rerender_reason`` / ``.rerender_reason_fields`` (issue #34's
+  fingerprint comparison, finally written down instead of only logged) are
+  now real fields on the ``run_state.json`` schema, and :class:`ChunkProgress`
+  exposes both unchanged -- this module does no interpretation of either, the
+  same "reader, not a measurement" stance as everything else here. The
+  between-chunk stop-below-floor path additionally gets one run-level field,
+  ``RunProgress.vram_stop_chunk_id`` / ``.vram_stop_free_vram_gb`` /
+  ``.vram_stop_floor_gb`` (from ``contracts.VramStopEvent``), because the
+  chunk that tripped the floor never gets a ``ChunkResult`` at all -- see
+  that class's docstring. :func:`events_between` emits a one-time
+  ``run_stopped`` event the first poll after ``vram_stop`` appears, mirroring
+  how ``run_finished`` fires once when :attr:`RunProgress.finished` flips.
+  Within-chunk step progress (D4) remains the one gap nothing here can close.
 
 Reuse, don't reimplement, the schema
 -------------------------------------
-``resilience._deserialize_run_state`` (and ``_serialize_run_state``) already
-own ``RUN_STATE_SCHEMA_VERSION`` and every backward-compatibility rule
-recorded beside it -- re-implementing that parsing here would be a second
-copy of the schema that silently drifts from the first. Both are currently
-private to that module; :func:`read_run_state` calls
-``resilience._deserialize_run_state`` directly with a comment noting that a
-public ``resilience.load_run_state`` has been proposed to that file's owner.
-Until it exists, this is the one sanctioned caller outside ``resilience.py``
-itself.
+``resilience.load_run_state`` (and ``dump_run_state``, its serialize
+counterpart) own ``RUN_STATE_SCHEMA_VERSION`` and every backward-compatibility
+rule recorded beside it -- re-implementing that parsing here would be a second
+copy of the schema that silently drifts from the first. Both are public
+(issue #36 closed the reach this docstring used to apologise for: it named
+``resilience._deserialize_run_state`` as a private function this module
+called directly, with a public loader "proposed to that file's owner").
+:func:`read_run_state` now calls :func:`resilience.load_run_state`.
 """
 
 from __future__ import annotations
@@ -148,6 +163,19 @@ class ChunkProgress:
     """A path string, not a ``Path`` -- this is a wire format, not an
     in-process value; ``None`` means the chunk has not produced a file
     (pending, failed, or dead-lettered with no output)."""
+    free_vram_gb_before: float | None = None
+    """Straight passthrough of ``ChunkResult.free_vram_gb_before`` (issue
+    #23). ``None`` for a pending chunk, a cached chunk (never probed), or any
+    chunk rendered without a ``vram_probe`` injected -- see that field's
+    docstring for the full list; this module draws no distinction between
+    them, the same way it never has for ``render_seconds``."""
+    rerender_reason: str | None = None
+    """Straight passthrough of ``ChunkResult.rerender_reason`` (issue #36).
+    ``None`` for a pending chunk, a reused (``"cached"``) chunk, or a chunk
+    rendered fresh with nothing to reject -- see that field's docstring for
+    why the last two are deliberately not distinguished."""
+    rerender_reason_fields: tuple[str, ...] = ()
+    """Straight passthrough of ``ChunkResult.rerender_reason_fields``."""
 
     @property
     def terminal(self) -> bool:
@@ -164,6 +192,9 @@ class ChunkProgress:
             "errors": list(self.errors),
             "render_seconds": self.render_seconds,
             "video_file": self.video_file,
+            "free_vram_gb_before": self.free_vram_gb_before,
+            "rerender_reason": self.rerender_reason,
+            "rerender_reason_fields": list(self.rerender_reason_fields),
         }
 
 
@@ -184,6 +215,9 @@ def _chunk_progress(chunk_id: int, result: ChunkResult | None) -> ChunkProgress:
         errors=tuple(result.errors),
         render_seconds=result.render_seconds,
         video_file=str(result.video_file) if result.video_file is not None else None,
+        free_vram_gb_before=result.free_vram_gb_before,
+        rerender_reason=result.rerender_reason,
+        rerender_reason_fields=tuple(result.rerender_reason_fields),
     )
 
 
@@ -194,6 +228,18 @@ class RunProgress:
 
     run_id: str
     chunks: tuple[ChunkProgress, ...]
+    vram_stop_chunk_id: int | None = None
+    """From ``RunState.vram_stop`` (issue #23/#36): the chunk id the run
+    refused to submit because a between-chunk VRAM reading dropped below the
+    floor. ``None`` for every run that never hit it. This is run-level, not a
+    per-chunk field, because that chunk id never got a ``ChunkResult`` at all
+    -- see ``contracts.VramStopEvent``'s docstring."""
+    vram_stop_free_vram_gb: float | None = None
+    """The reading that tripped the stop, in GB. ``None`` exactly when
+    :attr:`vram_stop_chunk_id` is ``None``."""
+    vram_stop_floor_gb: float | None = None
+    """The floor it dropped below. ``None`` exactly when
+    :attr:`vram_stop_chunk_id` is ``None``."""
 
     @property
     def total(self) -> int:
@@ -276,6 +322,9 @@ class RunProgress:
             "mean_render_seconds": self.mean_render_seconds,
             "projected_remaining_seconds": self.projected_remaining_seconds,
             "finished": self.finished,
+            "vram_stop_chunk_id": self.vram_stop_chunk_id,
+            "vram_stop_free_vram_gb": self.vram_stop_free_vram_gb,
+            "vram_stop_floor_gb": self.vram_stop_floor_gb,
         }
 
     @classmethod
@@ -305,7 +354,14 @@ class RunProgress:
             _chunk_progress(chunk_id, run_state.results.get(chunk_id))
             for chunk_id in sorted(expected)
         )
-        return cls(run_id=run_state.run_id, chunks=chunks)
+        vram_stop = run_state.vram_stop
+        return cls(
+            run_id=run_state.run_id,
+            chunks=chunks,
+            vram_stop_chunk_id=vram_stop.chunk_id if vram_stop is not None else None,
+            vram_stop_free_vram_gb=vram_stop.free_vram_gb if vram_stop is not None else None,
+            vram_stop_floor_gb=vram_stop.floor_gb if vram_stop is not None else None,
+        )
 
 
 @dataclass(frozen=True)
@@ -315,7 +371,7 @@ class ProgressEvent:
 
     event: str
     """``"run_snapshot" | "chunk_completed" | "chunk_dead_lettered" |
-    "chunk_retried" | "run_finished"``."""
+    "chunk_retried" | "run_stopped" | "run_finished"``."""
     data: Mapping[str, object]
 
     def to_json(self) -> str:
@@ -340,8 +396,13 @@ def events_between(previous: RunProgress | None, current: RunProgress) -> tuple[
     newly-completed chunk (``rendered``/``cached``), then every newly
     dead-lettered chunk (with its full error history), then every chunk
     whose ``attempts`` rose without reaching a terminal status this poll,
-    and finally at most one ``run_finished`` when ``current.finished``
-    flips from ``False`` to ``True``.
+    then at most one ``run_stopped`` when ``current.vram_stop_chunk_id``
+    appears where ``previous`` had none (issue #23/#36 -- the between-chunk
+    VRAM floor stopped the run; see ``RunProgress.vram_stop_chunk_id``), and
+    finally at most one ``run_finished`` when ``current.finished`` flips
+    from ``False`` to ``True``. The two are mutually exclusive in practice --
+    a stopped run has an unsubmitted chunk still pending, so ``finished`` is
+    ``False`` -- but nothing here assumes that; both checks are independent.
     """
     if previous is None:
         return (ProgressEvent(event="run_snapshot", data=current.to_dict()),)
@@ -387,6 +448,9 @@ def events_between(previous: RunProgress | None, current: RunProgress) -> tuple[
         if chunk.attempts > prior.attempts and not chunk.terminal:
             events.append(ProgressEvent(event="chunk_retried", data=chunk.to_dict()))
 
+    if current.vram_stop_chunk_id is not None and previous.vram_stop_chunk_id is None:
+        events.append(ProgressEvent(event="run_stopped", data=current.to_dict()))
+
     if current.finished and not previous.finished:
         events.append(ProgressEvent(event="run_finished", data=current.to_dict()))
 
@@ -407,14 +471,14 @@ def format_sse(event: ProgressEvent) -> str:
 def read_run_state(path: Path | str) -> RunState:
     """Read and deserialize a ``run_state.json``.
 
-    Delegates to ``resilience._deserialize_run_state`` rather than
+    Delegates to :func:`resilience.load_run_state` rather than
     re-implementing the schema -- that function (and
     ``RUN_STATE_SCHEMA_VERSION`` beside it) is the one place that knows
     every backward-compatibility rule for this file, and a second
-    implementation here would drift from it within a release. That function
-    is currently private to ``resilience.py``; a public
-    ``resilience.load_run_state`` has been proposed to that module's owner,
-    and this call site should switch to it once it exists.
+    implementation here would drift from it within a release. Issue #36
+    proposed exactly this public loader for exactly this call site, which
+    used to reach into ``resilience._deserialize_run_state`` directly; it now
+    does not.
 
     Every failure mode collapses to :class:`ProgressError` naming ``path``:
     a missing file (``OSError``), a half-written file caught mid atomic
@@ -427,8 +491,7 @@ def read_run_state(path: Path | str) -> RunState:
     """
     resolved = Path(path)
     try:
-        payload = json.loads(resolved.read_text(encoding="utf-8"))
-        return resilience._deserialize_run_state(payload)
+        return resilience.load_run_state(resolved)
     except (OSError, json.JSONDecodeError, resilience.ResilienceError) as exc:
         logger.exception("Could not read run state from %s", resolved)
         raise ProgressError(f"could not read run state from {resolved}: {exc}") from exc
