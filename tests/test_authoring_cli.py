@@ -1252,6 +1252,42 @@ def test_write_runs_the_plant_end_state_check_over_the_current_shots(
     assert "issue #85" in written
 
 
+def test_write_runs_the_pop_distant_staging_check_over_the_current_shots(
+    tmp_path, monkeypatch
+):
+    """Issue #68: reuses the same wiring #85's check does -- needs
+    `Beat.pop_object`, which only the authoring layer's beat sheet carries,
+    so it is re-derived on the *current* text inside `advisory()` rather
+    than living in `shot_plan.py`."""
+    from music_video_maker.authoring.prose import ProseIssue
+
+    config_path = _author_through_prose(tmp_path, monkeypatch)
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([]))
+
+    seen: list[tuple[dict, tuple]] = []
+
+    def spy(shots, beats):
+        seen.append((dict(shots), tuple(beats)))
+        return (
+            ProseIssue(
+                chunk_id=sorted(shots)[0],
+                severity="warning",
+                message="chunk_id=0 is a pop beat staged distant (issue #68)",
+            ),
+        )
+
+    monkeypatch.setattr(auth_cli.prose_module, "pop_distant_staging_issues", spy)
+
+    assert auth_cli.main(["--config", str(config_path), "write"]) == auth_cli.EXIT_SUCCESS
+
+    assert seen, "pop_distant_staging_issues was never called"
+    shots, beats = seen[-1]
+    assert shots, "the check must see the shot lines"
+    assert beats, "the check must see the beat sheet -- it is what knows which beats pop"
+    written = (config_path.parent / "shot_plan.toml").read_text(encoding="utf-8")
+    assert "issue #68" in written
+
+
 def test_write_records_the_runs_literalness_in_the_plans_provenance(tmp_path, monkeypatch):
     """Issue #67: a shot plan should be able to prove which brief it was
     written to. A plan authored `free` and later loaded by a run configured

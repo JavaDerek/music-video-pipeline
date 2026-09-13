@@ -29,6 +29,7 @@ from music_video_maker.authoring.prose import (
     build_prose_prompt,
     generate_prose,
     plant_end_state_issues,
+    pop_distant_staging_issues,
     prose_input_hashes,
     validate_prose,
 )
@@ -78,7 +79,8 @@ def _chunks(texts: list[str], width: float = 6.0):
 
 
 def _beat(
-    chunk_id, *, group=1, role="transition", start=None, focus="subject", location="the room"
+    chunk_id, *, group=1, role="transition", start=None, focus="subject", location="the room",
+    pop_object=None,
 ):
     start = (chunk_id - 1) * 6.0 if start is None else start
     return Beat(
@@ -90,6 +92,7 @@ def _beat(
         beat_group=group,
         location=location,
         focus=focus,
+        pop_object=pop_object,
     )
 
 
@@ -357,6 +360,27 @@ def test_the_prompt_marks_a_consequence_beats_focus(tmp_path):
 
     assert "consequence" in prompt
     assert "action" in prompt
+
+
+def test_the_prompt_marks_a_pop_beats_object(tmp_path):
+    """Issue #68: `pop_object` has to reach the model the same way
+    `beat_role`/`focus`/`camera` already do, via `_beat_line`."""
+    beats = (_beat(1, role="contact", pop_object="the printer"),)
+    prompt = build_prose_prompt(
+        _config(tmp_path), CONCEPT, beats, beats, _chunks([""]), camera={}, notes=None
+    )
+
+    assert "POP" in prompt
+    assert "the printer" in prompt
+
+
+def test_a_beat_with_no_pop_object_carries_no_pop_marker(tmp_path):
+    beats = (_beat(1, role="contact"),)
+    prompt = build_prose_prompt(
+        _config(tmp_path), CONCEPT, beats, beats, _chunks([""]), camera={}, notes=None
+    )
+
+    assert "POP" not in prompt
 
 
 def test_notes_reach_the_prompt(tmp_path):
@@ -944,6 +968,81 @@ def test_the_returned_severity_is_warning():
     assert all(issue.severity == "warning" for issue in issues)
 
 
+# --------------------------------------------------------------------------- #
+# pop_distant_staging_issues -- issue #68: a pop beat's own shot line trips
+# the render-side distant-staging vocabulary (issue #58, re-scored #76).
+# Reuses `shot_plan._distant_staging_match` rather than a second keyword
+# list -- the design doc's own build order: a pop-specific keyword lint
+# scores zero against the only real corpus, which has no pop beats in it.
+# --------------------------------------------------------------------------- #
+
+
+def test_fires_when_a_pop_beats_shot_stages_the_object_distant():
+    beats = (
+        _beat(1, group=1, role="plant"),
+        _beat(2, group=1, role="contact", pop_object="the printer"),
+    )
+    shots = {
+        1: "A beige printer sits blinking on the office windowsill beside her.",
+        2: "The printer hangs small against the tower far behind her, tumbling toward the lens.",
+    }
+
+    issues = pop_distant_staging_issues(shots, beats)
+
+    assert [i.chunk_id for i in issues] == [2]
+    assert issues[0].severity == "warning"
+    assert "printer" in issues[0].message
+    assert issues[0].revisable is True
+
+
+def test_silent_when_a_pop_beats_shot_stages_the_object_near():
+    beats = (
+        _beat(1, group=1, role="plant"),
+        _beat(2, group=1, role="contact", pop_object="the printer"),
+    )
+    shots = {
+        1: "A beige printer sits blinking on the office windowsill beside her.",
+        2: "The printer bursts toward the lens, filling the frame as it tumbles past her shoulder.",
+    }
+
+    assert pop_distant_staging_issues(shots, beats) == ()
+
+
+def test_silent_on_a_non_pop_beat_even_when_staged_distant():
+    """The same distant-staging text on an ordinary beat is not this
+    function's business -- `_lint_distant_staging` already covers every
+    beat via `load_shot_plan`; this one is scoped to pop beats only, per its
+    own docstring."""
+    beats = (_beat(1, group=1, role="transition"),)
+    shots = {1: "The printer sits tiny in the distance, far behind on the street."}
+
+    assert pop_distant_staging_issues(shots, beats) == ()
+
+
+def test_silent_when_the_pop_beat_has_no_shot_line_yet():
+    beats = (_beat(1, group=1, role="contact", pop_object="the printer"),)
+
+    assert pop_distant_staging_issues({}, beats) == ()
+
+
+def test_reuses_the_render_sides_own_vocabulary_not_a_copy(monkeypatch):
+    """Proof this is the SAME predicate, not a second keyword list: patching
+    the render-side function that `pop_distant_staging_issues` imports
+    changes this function's answer too."""
+    from music_video_maker.authoring import prose as prose_module
+
+    beats = (_beat(1, group=1, role="contact", pop_object="the printer"),)
+    shots = {1: "an ordinary sentence, staged near, with nothing flagged in it"}
+
+    assert pop_distant_staging_issues(shots, beats) == ()
+
+    monkeypatch.setattr(prose_module, "_distant_staging_match", lambda shot: "patched")
+    issues = pop_distant_staging_issues(shots, beats)
+
+    assert len(issues) == 1
+    assert "patched" in issues[0].message
+
+
 def test_the_preamble_tells_a_plant_to_show_the_before_state():
     """Issue #85: rule 5 ("describe the end state, not the motion") is right
     for a contact or a consequence and wrong for a plant, and nothing
@@ -956,6 +1055,19 @@ def test_the_preamble_tells_a_plant_to_show_the_before_state():
     assert "6:26" in PROSE_PREAMBLE
     assert "6:31" in PROSE_PREAMBLE
     assert "6:38" in PROSE_PREAMBLE
+
+
+def test_the_preamble_tells_the_model_to_compose_a_pop_toward_the_lens():
+    """Issue #68: near, large, held long enough to read, and clear of the
+    frame edges -- the design doc's own vocabulary for what makes an object
+    read as crossing the screen plane rather than clipped by a window
+    violation."""
+    from music_video_maker.authoring.prompts import PROSE_PREAMBLE
+
+    lowered = PROSE_PREAMBLE.lower()
+    assert "pop" in lowered and "lens" in lowered
+    assert "edge" in lowered  # the window-violation warning
+    assert "#68" in PROSE_PREAMBLE or "68" in PROSE_PREAMBLE
 
 
 # --------------------------------------------------------------------------- #

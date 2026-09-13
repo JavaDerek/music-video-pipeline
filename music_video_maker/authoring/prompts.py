@@ -328,6 +328,27 @@ morphed one into the other mid-shot; `subject` is the missing statement that \
 prevents that, and this stage is where it belongs because you already know \
 whose beat this is -- nothing downstream should have to guess it back from \
 pronouns.
+8. `pop_object` is OPTIONAL and RARE (issue #68). Set it only on a beat you \
+want composed for an object crossing toward the lens -- flying at the \
+screen, not staying inside the frame it started in. Name the object itself \
+("the printer"), not just that a pop is happening: later stages compose \
+toward that specific thing, and a lint checks that specific thing's \
+staging, so a flag with nothing named would leave both guessing. \
+THE OBJECT MUST HAVE AN EARLIER `plant` IN ITS OWN `beat_group` -- the \
+objects that fly out are motifs the concept already established, not things \
+invented for the first time as they pop; a `pop_object` with no earlier \
+plant in its group is rejected and sent back to you, the same way an \
+under-supported `consequence` is. Keep it RARE: the corpus this project has \
+measured contains zero shots composed at the lens at all, so even a handful \
+in one video is a large fraction of it -- a video where every beat pops is \
+not one where any of them reads as a moment. There is no fixed cap; use \
+judgement. Nothing here forbids `pop_object` on a chunk tagged LYRIC, but \
+weigh it the same way rule 4 asks you to weigh a `consequence` there: the \
+singer owns the frame on a voiced chunk (issues #58, #59, #60), and a large \
+object thrust at the lens over a sung line has the same shape as a \
+measured risk for `focus = "action"`, even though nobody has measured it \
+for a pop specifically. Prefer an instrumental chunk in the same group when \
+one is available.
 
 `beat` itself is one short clause -- what happens, not how it is shot. No \
 camera direction (a later stage owns that), no restating who the character \
@@ -469,6 +490,19 @@ What this model renders is the grammatical subject of the sentence, and your \
 clause is deliberately a trailing one so it cannot take that slot. Do not \
 write camera direction that is really staging ("she turns to face the door"), \
 and do not restate the beat -- another stage owns both.
+
+WHEN A CHUNK BELOW IS MARKED POP (issue #68), that beat is composed for an \
+object crossing toward the lens -- an object thrust at the screen, meant to \
+read as in front of the screen plane. Compose `camera` TOWARD that object \
+rather than away from it: push in, hold close, or frame so the object's \
+approach is what the shot is doing. Hold it -- a pop that only occupies the \
+first handful of frames of a chunk is a flicker, not a beat, so do not pair \
+it with a move that leaves it behind quickly. And do not compose a move that \
+would carry the object OUT A SIDE of the frame: an object popping toward the \
+lens and then clipped by the frame edge reads as a contradiction, not as \
+depth, and the illusion the beat exists for collapses. Pop beats are meant \
+to be rare -- most chunks in the table below will not carry one, and that is \
+correct.
 
 ON A CHUNK THAT CARRIES A LYRIC (marked below), try to keep her face \
 available to the lens rather than craning away and holding on something \
@@ -635,7 +669,22 @@ see it, because each was a complete, self-contained description and none \
 referred to any other. If the beat you were given is itself ambiguous about \
 tense -- "she looks out toward the sea where the island stood" reads equally as \
 "has always stood" and "used to stand" -- resolve it toward the before-state, \
-because that is what a plant is for.\
+because that is what a plant is for.
+14. A CHUNK BELOW MARKED POP (issue #68) IS COMPOSED FOR AN OBJECT CROSSING \
+TOWARD THE LENS. Stage that object coming AT the screen, NEAR and LARGE -- \
+this is the same "near or mid ground, never small, distant, or far behind" \
+rule 8 above already asks for, pushed to its far end for a beat whose whole \
+job is that one object reading as in front of the screen plane. HOLD IT long \
+enough to read: a pop that fills only a handful of frames is a flicker, not \
+a beat, so do not write it as something glimpsed or passing. KEEP IT CLEAR \
+OF THE FRAME EDGES -- describe it coming toward the centre of view, never \
+moving across the frame and out a side. An object popping toward the lens \
+and then cut off by the frame edge gives the eyes contradictory evidence (in \
+front of the screen, and occluded by it) and the illusion this beat exists \
+for collapses; it must come AT the lens, never past it. This does not \
+relax rule 12: every noun still renders literally, so name the object the \
+same concrete way you would anywhere else -- what changes is only where in \
+the frame and how close.\
 """
 
 
