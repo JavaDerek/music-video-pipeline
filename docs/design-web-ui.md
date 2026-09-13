@@ -25,7 +25,7 @@ run_state.json  ──read_run_state──▶  RunState
                                  format_sse(event)  ──▶  "event: …\ndata: {…}\n\n"
 ```
 
-Four decisions in it are load-bearing:
+Five decisions in it are load-bearing:
 
 * **The source of truth is `run_state.json`, polled.** `ResilientRunner` has
   no observer seam and adding one is a change to the most safety-critical file
@@ -53,6 +53,14 @@ Four decisions in it are load-bearing:
   consumed inside `execution.ComfyUIExecutionClient` and never reach
   `run_state.json`. A UI that wants a moving bar *inside* a chunk needs a seam
   there; everything else it needs already exists.
+* **Free VRAM and the resume reason are carried, not computed.** Issue #36's
+  "Gaps" section (below) used to name three things `run_state.json` did not
+  yet carry; two are now real fields on `ChunkResult` /
+  `RunState` — `free_vram_gb_before`, `rerender_reason` /
+  `rerender_reason_fields`, and the run-level `VramStopEvent` for the
+  stop-below-floor path — and `progress.py` does nothing but pass them
+  through onto `ChunkProgress` / `RunProgress`. Within-chunk step progress
+  is the one that remains open.
 
 `progress.py` imports no `http`, no `socket`, no `asyncio`. A module that
 cannot listen cannot get the security constraint below wrong.
@@ -166,31 +174,68 @@ makes every finding in this project checkable.
   re-rendered the page must say *why*: a `schema_version` rejection, or a
   fingerprint mismatch **naming the field that changed**. `ChunkFingerprint`
   already reports the field names through `timeline_differences` /
-  `content_differences`; today they go to a log. `progress.py` does not carry
-  them yet — see "Gaps" below.
+  `content_differences`; `resilience._reusable_cached_result` now records
+  the category and field names on the resulting `ChunkResult` (issue #36) as
+  `rerender_reason` / `rerender_reason_fields` — e.g. `"content_changed"` with
+  `("prompt_hash",)` — instead of only logging them, and `progress.py` carries
+  both through unchanged on every `ChunkProgress`. A freshly rendered chunk
+  with no prior entry to reject reports `rerender_reason=None`, and so does
+  every chunk after a whole-file `schema_version` rejection restarts the run
+  from an empty `RunState` — deliberately: there is nothing to compare
+  against in either case, and inventing a per-chunk reason for the second
+  would be less honest than `None`, not more. See "Closed" below.
 * **Dead-lettered chunks** are called out with their error history and offered
   a resume. `ProgressEvent("chunk_dead_lettered")` carries the full `errors`
   tuple for exactly this.
 
-## Gaps `progress.py` leaves for the server
+## Closed since this document was first written (issue #36)
 
-Three, all named rather than papered over:
+The three gaps below, plus the private-reach fix, all landed in one pass —
+each was "record what is already known", not new measurement, and all three
+went onto `contracts.ChunkResult` / `RunState` without a `schema_version`
+bump (every new field is optional on read, so a run_state.json written by
+code before this change still loads and resumes).
 
-1. **Within-chunk step progress** — lives on ComfyUI's WebSocket inside
-   `execution.py`, never persisted. Needs a seam there.
-2. **The resume reason per chunk** — computed in `resilience` when a cached
-   chunk is rejected, logged, and not recorded in `run_state.json`. A UI that
-   wants to show "re-rendering because `prompt_hash` changed" needs it
-   persisted on `ChunkResult`, or recomputed by the reader from the two
-   fingerprints.
-3. **Free VRAM between chunks** (#23) — probed and logged every chunk, not
-   persisted. This is the reading that distinguishes a healthy slow chunk from
-   the host wedging under contention (#23/#24), which is the failure the
-   progress display exists to make visible, so it is the most valuable of the
-   three.
+1. **Free VRAM between chunks** (#23) — the most valuable of the three, now
+   `ChunkResult.free_vram_gb_before`. Recorded **once per chunk, before its
+   first attempt**: `ResilientRunner._check_vram_before_chunk` sits outside
+   `_render_chunk`'s retry loop, so a chunk that fails twice before
+   succeeding still carries exactly one reading rather than an ambiguous
+   choice among several — re-probing per attempt would have conflated a VRAM
+   condition with the recovery sequence's (`interrupt` → `free`) own effect
+   on free VRAM. `None` when no `vram_probe` was injected or the probe
+   returned an unreadable `None`; never set on a `CACHED` chunk, which never
+   touches the GPU. The chunk that actually trips the floor and stops the
+   run is the one case with no `ChunkResult` to record it on at all — see
+   `contracts.VramStopEvent` below.
+2. **The resume reason per chunk** — `ChunkResult.rerender_reason` (a short
+   category: `"explicit_selection"`, `"video_missing"`, `"no_fingerprint"`,
+   `"chain_blocked"`, `"conditioning_changed"`, `"timeline_changed"`,
+   `"content_changed"`) plus `rerender_reason_fields` (the `ChunkFingerprint`
+   field names, for the three reasons that come from a field comparison).
+   `None` for a freshly rendered chunk with nothing to reject, including
+   every chunk after a schema-version rejection — see the "Custody and
+   resume" bullet above for why that collapse is deliberate rather than a
+   missing case.
+3. **Within-chunk step progress** — still open. Lives on ComfyUI's WebSocket
+   inside `execution.py`, never persisted. Needs a seam there; nothing in
+   this pass touched it, and it remains the one gap `run_state.json` cannot
+   close because it is not the kind of fact that file was ever going to
+   carry — see the module docstring's D4.
 
-All three are additions to `contracts.ChunkResult` / `resilience`, and all
-three are "record what is already known", not new measurement.
+**The stop-below-floor path gets a run-level field, not a per-chunk one.**
+`ResilientRunner._check_vram_before_chunk` persists the run state accumulated
+so far and raises `VramBelowFloorError` *before* the chunk that tripped the
+floor ever gets a `ChunkResult` — so there is no honest chunk to hang the
+reading on. `RunState.vram_stop` (a `contracts.VramStopEvent`: `chunk_id`,
+`free_vram_gb`, `floor_gb`) carries it instead, `RunProgress` surfaces it as
+`vram_stop_chunk_id` / `vram_stop_free_vram_gb` / `vram_stop_floor_gb`, and
+`events_between` emits a one-time `run_stopped` event the first poll after it
+appears — mirroring how `run_finished` fires once when `RunProgress.finished`
+flips. Because `VramBelowFloorError` propagates out of `render_run` rather
+than returning, the only way a caller sees this is by polling
+`run_state.json` after the process has stopped, exactly as issue #36
+intended: the file, not a callback, is the source of truth.
 
 Two smaller facts about `run_state.json` that a UI author will otherwise
 rediscover:
@@ -199,11 +244,11 @@ rediscover:
   persists — a pending chunk simply has no entry. `progress.py` therefore
   treats a `PENDING`-status result (a hand-edited file, a future build) as
   `"failed"`, distinct from a genuinely absent entry.
-* `resilience._serialize_run_state` / `_deserialize_run_state` are private.
-  `progress.read_run_state` calls the latter directly rather than
-  re-implementing the schema, which is the lesser evil but still a reach
-  across a module boundary. A public `resilience.load_run_state` is the fix,
-  and it is proposed to that file's owner rather than taken here.
+* `resilience._serialize_run_state` / `_deserialize_run_state` are now
+  implementation details behind public `resilience.load_run_state(path)` /
+  `dump_run_state(run_state)`. `progress.read_run_state` calls
+  `load_run_state` rather than reaching into the private function it used to
+  — the reach this section apologised for is closed.
 
 ## Testing
 

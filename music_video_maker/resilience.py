@@ -93,7 +93,7 @@ import time
 import uuid
 from collections.abc import Callable, Collection, Mapping, Sequence
 from collections.abc import Set as AbstractSet
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -105,6 +105,7 @@ from music_video_maker.contracts import (
     ChunkStatus,
     ExecutionClient,
     RunState,
+    VramStopEvent,
     Workflow,
 )
 from music_video_maker.custody import DEFAULT_MIN_FREE_VRAM_GB
@@ -268,6 +269,39 @@ def _classify_failure(exc: BaseException) -> _FailureClass:
 
 
 # --------------------------------------------------------------------------- #
+# Per-chunk resume reason (issue #36)
+# --------------------------------------------------------------------------- #
+
+# The ``ChunkResult.rerender_reason`` vocabulary. Plain string constants,
+# not an ``Enum``, deliberately -- ``ChunkResult.rerender_reason`` is a bare
+# ``str | None`` in ``contracts.py``, which must not import this module (see
+# contracts.py's own "append-mostly, dependency-free" rule), so there is
+# nowhere shared to put an enum both sides could import without a cycle.
+_REASON_EXPLICIT_SELECTION = "explicit_selection"
+_REASON_VIDEO_MISSING = "video_missing"
+_REASON_NO_FINGERPRINT = "no_fingerprint"
+_REASON_CHAIN_BLOCKED = "chain_blocked"
+_REASON_CONDITIONING_CHANGED = "conditioning_changed"
+_REASON_TIMELINE_CHANGED = "timeline_changed"
+_REASON_CONTENT_CHANGED = "content_changed"
+
+
+@dataclass(frozen=True)
+class _RerenderReason:
+    """Internal pairing of a :data:`_REASON_*` category with the
+    ``ChunkFingerprint`` field names behind it (empty for the three reasons
+    that are not a field comparison). ``_reusable_cached_result`` returns one
+    of these instead of ``None`` for every path that rejects a cached chunk;
+    ``render_run`` unpacks it onto the freshly rendered ``ChunkResult`` as
+    ``rerender_reason`` / ``rerender_reason_fields``. Not itself part of the
+    public contract -- ``ChunkResult`` stores the two fields it carries as
+    plain ``str`` / ``tuple[str, ...]``, per the module note above."""
+
+    category: str
+    fields: tuple[str, ...] = ()
+
+
+# --------------------------------------------------------------------------- #
 # RunState (de)serialization -- atomic persistence for --resume
 # --------------------------------------------------------------------------- #
 
@@ -381,6 +415,16 @@ def _serialize_result(result: ChunkResult) -> dict[str, Any]:
         "fingerprint": (
             _serialize_fingerprint(result.fingerprint) if result.fingerprint is not None else None
         ),
+        # Issue #36. Written unconditionally, `null` when unset, matching
+        # every other optional field above (`prompt_id`, `render_seconds`,
+        # `fingerprint`) rather than omitting the key -- a reader that does
+        # `raw.get(...)` cannot tell "absent because unset" from "absent
+        # because an older build never wrote this key" either way, so there
+        # is no information lost by always writing it, and the schema stays
+        # one shape instead of two.
+        "free_vram_gb_before": result.free_vram_gb_before,
+        "rerender_reason": result.rerender_reason,
+        "rerender_reason_fields": list(result.rerender_reason_fields),
     }
 
 
@@ -395,6 +439,36 @@ def _deserialize_result(raw: dict[str, Any]) -> ChunkResult:
         errors=tuple(raw.get("errors") or ()),
         render_seconds=raw.get("render_seconds"),
         fingerprint=_deserialize_fingerprint(raw.get("fingerprint")),
+        # Absent in a file written before issue #36: `.get(...)` -> `None` /
+        # `()`, which is exactly "unrecorded" for a field that did not exist
+        # yet -- no schema_version bump needed, same reasoning as
+        # `noise_seed` above. Neither field ever participates in a `--resume`
+        # comparison (see `ChunkResult.free_vram_gb_before` /
+        # `.rerender_reason`), so there is nothing here that could be
+        # *misread*, only something that is simply not there yet to read.
+        free_vram_gb_before=raw.get("free_vram_gb_before"),
+        rerender_reason=raw.get("rerender_reason"),
+        rerender_reason_fields=tuple(raw.get("rerender_reason_fields") or ()),
+    )
+
+
+def _serialize_vram_stop(event: VramStopEvent | None) -> dict[str, Any] | None:
+    if event is None:
+        return None
+    return {
+        "chunk_id": event.chunk_id,
+        "free_vram_gb": event.free_vram_gb,
+        "floor_gb": event.floor_gb,
+    }
+
+
+def _deserialize_vram_stop(raw: dict[str, Any] | None) -> VramStopEvent | None:
+    if not raw:
+        return None
+    return VramStopEvent(
+        chunk_id=int(raw["chunk_id"]),
+        free_vram_gb=float(raw["free_vram_gb"]),
+        floor_gb=float(raw["floor_gb"]),
     )
 
 
@@ -406,6 +480,11 @@ def _serialize_run_state(run_state: RunState) -> dict[str, Any]:
             str(chunk_id): _serialize_result(result)
             for chunk_id, result in run_state.results.items()
         },
+        # Issue #23/#36. Absent (None -> null) on every run that never hit
+        # the floor -- which is every run before this field existed and most
+        # runs after it -- so an old reader that has never heard of this key
+        # simply never sees it change shape.
+        "vram_stop": _serialize_vram_stop(run_state.vram_stop),
     }
 
 
@@ -435,7 +514,45 @@ def _deserialize_run_state(payload: dict[str, Any]) -> RunState:
     return RunState(
         run_id=payload["run_id"],
         results=results,
+        # Absent in a file written before issue #36: `.get(...)` -> `None`,
+        # the correct reading for "this run never hit the floor" and for
+        # "this build predates the field" alike -- see `_deserialize_result`.
+        vram_stop=_deserialize_vram_stop(payload.get("vram_stop")),
     )
+
+
+def load_run_state(path: Path | str) -> RunState:
+    """Read and deserialize a ``run_state.json`` from ``path``.
+
+    The public counterpart of ``ResilientRunner._read_run_state``, and the
+    fix for the reach ``progress.read_run_state`` used to make into this
+    module's private ``_deserialize_run_state`` (issue #36's "Gaps" section
+    named this directly: a public loader was "proposed to that file's owner
+    rather than taken", and this is that proposal taken). Raises
+    :class:`RunStateSchemaError` (via ``_deserialize_run_state``) on a
+    ``schema_version`` this build does not read, :class:`ChunkIdMismatchError`
+    on the index-space guard, ``OSError`` if ``path`` cannot be read, and
+    ``json.JSONDecodeError`` on a torn or malformed file -- deliberately not
+    collapsed into one exception type here, because the two sanctioned
+    callers want different things: ``ResilientRunner`` (via
+    ``_read_run_state``) lets ``RunStateSchemaError`` and
+    ``ChunkIdMismatchError`` fall through to its own fresh-run fallback,
+    while ``progress.read_run_state`` collapses all of the above into
+    :class:`~music_video_maker.progress.ProgressError` for a poller that only
+    ever wants "not ready yet, try again"."""
+    resolved = Path(path)
+    payload = json.loads(resolved.read_text(encoding="utf-8"))
+    return _deserialize_run_state(payload)
+
+
+def dump_run_state(run_state: RunState) -> dict[str, Any]:
+    """The JSON-able dict :func:`load_run_state` (and ``run_state.json``
+    itself) shapes ``RunState`` into -- the public counterpart of
+    ``_serialize_run_state``, for a caller that wants the schema (to build a
+    fixture, or write the file some way other than
+    ``ResilientRunner._persist``'s atomic temp-file-plus-``os.replace``)
+    without reaching into a private function."""
+    return _serialize_run_state(run_state)
 
 
 def _first_existing_ancestor(path: Path) -> Path:
@@ -613,7 +730,7 @@ class ResilientRunner:
 
         for chunk_id in chunk_ids:
             expected = fingerprints.get(chunk_id) if fingerprints is not None else None
-            cached = (
+            cached, rerender_reason = (
                 self._reusable_cached_result(
                     run_state,
                     chunk_id,
@@ -622,7 +739,7 @@ class ResilientRunner:
                     rerendered=rerendered,
                 )
                 if resume
-                else None
+                else (None, None)
             )
             if cached is not None:
                 _store_result(run_state, chunk_id, cached)
@@ -630,8 +747,13 @@ class ResilientRunner:
                     "Chunk %d reused from a previous run (resume): %s", chunk_id, cached.video_file
                 )
             else:
-                self._check_vram_before_chunk(chunk_id, run_state)
+                # Issue #23: one probe reading per chunk, taken before the
+                # first attempt -- see ChunkResult.free_vram_gb_before's
+                # docstring for why retries inside _render_chunk do not
+                # re-probe.
+                free_vram_gb_before = self._check_vram_before_chunk(chunk_id, run_state)
                 result = self._render_chunk(chunk_id, provider, run_state, output_dir)
+                result = replace(result, free_vram_gb_before=free_vram_gb_before)
                 if expected is not None:
                     recorded = (
                         fingerprint_amender(chunk_id, expected)
@@ -639,6 +761,12 @@ class ResilientRunner:
                         else expected
                     )
                     result = replace(result, fingerprint=recorded)
+                if rerender_reason is not None:
+                    result = replace(
+                        result,
+                        rerender_reason=rerender_reason.category,
+                        rerender_reason_fields=rerender_reason.fields,
+                    )
                 rerendered.add(chunk_id)
                 _store_result(run_state, chunk_id, result)
             self._persist(run_state)
@@ -809,7 +937,21 @@ class ResilientRunner:
         *,
         quiet: bool = False,
         rerendered: AbstractSet[int] = frozenset(),
-    ) -> ChunkResult | None:
+    ) -> tuple[ChunkResult | None, _RerenderReason | None]:
+        """Return ``(cached_result, None)`` when ``chunk_id`` can be reused as
+        ``CACHED``, or ``(None, reason)`` when it must re-render.
+
+        ``reason`` (issue #36) is ``None`` for two different situations that
+        this method deliberately does not distinguish -- see
+        ``ChunkResult.rerender_reason``'s docstring for why collapsing them is
+        the honest choice, not a missing case: a chunk with no reusable prior
+        entry at all (nothing was rejected, there was nothing to reject), and
+        the ``expected is None`` / content-tier-with-``ignore_prompt_changes``
+        paths, which return a cached result rather than a rejection. The
+        caller (``render_run``) attaches ``reason`` to the *freshly rendered*
+        ``ChunkResult`` only when this method actually returns one -- it is
+        never fabricated for a chunk that had nothing to compare against.
+        """
         if chunk_id in self._force_chunk_ids:
             # A validation slice (cli --only-chunks) re-renders its chunks on
             # purpose: the reason is usually something no fingerprint can see,
@@ -817,10 +959,13 @@ class ResilientRunner:
             # every other chunk's result, so the slice augments the run state
             # rather than replacing it.
             logger.info("Chunk %d: re-rendering because it was explicitly selected", chunk_id)
-            return None
+            return None, _RerenderReason(_REASON_EXPLICIT_SELECTION)
         existing = run_state.results.get(chunk_id)
         if existing is None or existing.status not in (ChunkStatus.RENDERED, ChunkStatus.CACHED):
-            return None
+            # No reusable prior entry -- a brand new chunk, or one that
+            # previously dead-lettered (always retried on resume). Neither is
+            # a rejection: there was no cached result to reject.
+            return None, None
         if existing.video_file is None or not Path(existing.video_file).exists():
             logger.warning(
                 "Chunk %d was %s in the prior run state but video_file %s is missing on "
@@ -829,12 +974,12 @@ class ResilientRunner:
                 existing.status.value,
                 existing.video_file,
             )
-            return None
+            return None, _RerenderReason(_REASON_VIDEO_MISSING)
 
         if expected is None:
             # No fingerprint to check against -- the caller was warned once, up
             # front, that identity cannot be verified this run.
-            return replace(existing, status=ChunkStatus.CACHED)
+            return replace(existing, status=ChunkStatus.CACHED), None
 
         stored = existing.fingerprint
         # ``quiet`` demotes the per-chunk detail to DEBUG when a single
@@ -850,7 +995,7 @@ class ResilientRunner:
                 chunk_id,
                 existing.video_file,
             )
-            return None
+            return None, _RerenderReason(_REASON_NO_FINGERPRINT)
 
         if chain_reuse_blocked(stored.chained_from, rerendered):
             # Issue #28: not escapable via ignore_prompt_changes -- this is
@@ -865,7 +1010,7 @@ class ResilientRunner:
                 stored.chained_from,
                 stored.chained_from,
             )
-            return None
+            return None, _RerenderReason(_REASON_CHAIN_BLOCKED, fields=("chained_from",))
 
         conditioning = expected.conditioning_differences(stored)
         if conditioning:
@@ -885,7 +1030,7 @@ class ResilientRunner:
                 chunk_id,
                 _describe_changes(stored, expected, conditioning),
             )
-            return None
+            return None, _RerenderReason(_REASON_CONDITIONING_CHANGED, fields=conditioning)
 
         moved = expected.timeline_differences(stored)
         if moved:
@@ -895,7 +1040,7 @@ class ResilientRunner:
                 chunk_id,
                 _describe_changes(stored, expected, moved),
             )
-            return None
+            return None, _RerenderReason(_REASON_TIMELINE_CHANGED, fields=moved)
 
         changed = expected.content_differences(stored)
         if changed:
@@ -911,7 +1056,7 @@ class ResilientRunner:
                 # Deliberately keeps ``existing.fingerprint``: the state file
                 # must keep recording what the video was really rendered from,
                 # or a later run without the flag would believe it matches.
-                return replace(existing, status=ChunkStatus.CACHED)
+                return replace(existing, status=ChunkStatus.CACHED), None
             log(
                 "Chunk %d covers the same span but no longer matches the configured prompt, "
                 "cast or noise seed (%s) -- re-rendering. Set resume_ignore_prompt_changes "
@@ -919,9 +1064,9 @@ class ResilientRunner:
                 chunk_id,
                 description,
             )
-            return None
+            return None, _RerenderReason(_REASON_CONTENT_CHANGED, fields=changed)
 
-        return replace(existing, status=ChunkStatus.CACHED)
+        return replace(existing, status=ChunkStatus.CACHED), None
 
     def _report_timeline_change(
         self,
@@ -1022,6 +1167,11 @@ class ResilientRunner:
                     self.run_state_file,
                     len(loaded.results),
                 )
+                # Issue #36: a VramStopEvent describes the invocation that
+                # stopped, not this one. Carried forward, it would be
+                # re-persisted by a healthy resume and a poller would report
+                # the run stopped while it renders.
+                loaded.vram_stop = None
                 return loaded
 
         if resume:
@@ -1035,15 +1185,19 @@ class ResilientRunner:
         return RunState(run_id=self.run_id or str(uuid.uuid4()))
 
     def _read_run_state(self, path: Path) -> RunState:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return _deserialize_run_state(payload)
+        # Thin wrapper over the public loader (issue #36) -- kept as its own
+        # method rather than inlined at the one call site because
+        # ``_load_or_init_run_state`` catches specific exceptions out of it
+        # by name, which reads better against a method than a bare module
+        # function call.
+        return load_run_state(path)
 
     def _persist(self, run_state: RunState) -> None:
         path = self.run_state_file
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-            payload = json.dumps(_serialize_run_state(run_state), indent=2)
+            payload = json.dumps(dump_run_state(run_state), indent=2)
             tmp_path.write_text(payload, encoding="utf-8")
             os.replace(tmp_path, path)
             logger.debug(
@@ -1062,18 +1216,28 @@ class ResilientRunner:
 
     # -- between-chunk VRAM re-check (issue #23) ---------------------------------- #
 
-    def _check_vram_before_chunk(self, chunk_id: int, run_state: RunState) -> None:
+    def _check_vram_before_chunk(self, chunk_id: int, run_state: RunState) -> float | None:
         """Re-read free VRAM immediately before submitting ``chunk_id``.
 
+        Returns the reading taken (or ``None`` when no probe is injected, or
+        the probe raised, or returned ``None`` itself) so the caller can
+        record it on that chunk's ``ChunkResult.free_vram_gb_before`` (issue
+        #36) -- this method's return value *is* that field, for the one
+        chunk it is called for.
+
         No-op when ``vram_probe`` is unset (default). Below the floor:
-        persist ``run_state`` (everything rendered so far) and raise
-        :class:`VramBelowFloorError` -- never return a partial ``RunState``
-        that looks complete, since Stage 5 would then assemble a truncated,
-        desynced video with no error anywhere. Unreadable: log and continue,
-        a best-effort check must not block a run over its own flakiness.
+        record :class:`~music_video_maker.contracts.VramStopEvent` on
+        ``run_state`` (issue #36 -- ``chunk_id`` never gets a ``ChunkResult``
+        on this path, so the reading that stopped the run has no per-chunk
+        home; see that class's docstring), persist ``run_state`` (everything
+        rendered so far) and raise :class:`VramBelowFloorError` -- never
+        return a partial ``RunState`` that looks complete, since Stage 5
+        would then assemble a truncated, desynced video with no error
+        anywhere. Unreadable: log and continue, a best-effort check must not
+        block a run over its own flakiness.
         """
         if self.vram_probe is None:
-            return
+            return None
 
         try:
             free_gb = self.vram_probe()
@@ -1085,7 +1249,7 @@ class ResilientRunner:
                 chunk_id,
                 type(exc).__name__,
             )
-            return
+            return None
 
         if free_gb is None:
             logger.info(
@@ -1093,7 +1257,7 @@ class ResilientRunner:
                 "blocking (a best-effort check must not fail the run over its own flakiness)",
                 chunk_id,
             )
-            return
+            return None
 
         floor = self.between_chunk_min_free_vram_gb
         logger.info(
@@ -1104,6 +1268,9 @@ class ResilientRunner:
         )
 
         if floor is not None and free_gb < floor:
+            run_state.vram_stop = VramStopEvent(
+                chunk_id=chunk_id, free_vram_gb=free_gb, floor_gb=floor
+            )
             self._persist(run_state)
             message = (
                 f"free VRAM dropped to {free_gb:.2f} GB before chunk {chunk_id} "
@@ -1115,6 +1282,8 @@ class ResilientRunner:
             )
             logger.error("%s", message)
             raise VramBelowFloorError(message)
+
+        return free_gb
 
     # -- pre-flight disk check --------------------------------------------------- #
 
@@ -1187,4 +1356,6 @@ __all__ = [
     "VramBelowFloorError",
     "VramProbe",
     "WorkflowProvider",
+    "dump_run_state",
+    "load_run_state",
 ]
