@@ -1167,6 +1167,11 @@ class ResilientRunner:
                     self.run_state_file,
                     len(loaded.results),
                 )
+                # Issue #36: a VramStopEvent describes the invocation that
+                # stopped, not this one. Carried forward, it would be
+                # re-persisted by a healthy resume and a poller would report
+                # the run stopped while it renders.
+                loaded.vram_stop = None
                 return loaded
 
         if resume:
