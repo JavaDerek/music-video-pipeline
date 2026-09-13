@@ -67,25 +67,54 @@ class SequencedWSFactory:
         return ws
 
 
+DEFAULT_MASTER_AUDIO_SECONDS = 25.0
+"""The Rig's master track duration (``write_silent_wav`` below) -- named so
+``FakeFfmpegRunner``'s issue #22 duration-probe default can match it without
+the two numbers drifting apart."""
+
+
 class FakeFfmpegRunner:
     """Stands in for continuity's ffprobe/ffmpeg frame extraction, Stage 5's
-    concat/mux ffmpeg calls, and issue #77's raw-frame luminance probe -- no
-    real binary anywhere.
+    concat/mux ffmpeg calls, issue #77's raw-frame luminance probe, and issue
+    #22's container-duration probe -- no real binary anywhere.
 
     ``luminance_level`` is the grey value every probed frame reports. The
     default sits well above ``luminance.DEFAULT_DARK_FLOOR`` so an ordinary
     pipeline test does not trip the darkness check; a test that wants the
-    check to fire sets it below the floor."""
+    check to fire sets it below the floor.
 
-    def __init__(self, frame_count: int = 124, luminance_level: int = 128) -> None:
+    ``duration_seconds`` is what the issue #22 ``format=duration`` probe
+    reports (:func:`~music_video_maker.assembly.probe_duration_seconds`) --
+    kept separate from ``frame_count`` (the *other* thing this rig's ffprobe
+    stands in for, continuity's frame-count probe) because conflating them
+    was exactly the bug that made the duration check spuriously fire in
+    every silent-output test the day it was wired up: the fake returned
+    ``frame_count`` (124) for *every* ffprobe call, including a duration
+    query, so a happy-path test measured "124.000s" against a 25s master and
+    every silent_output test failed on a check that had nothing wrong with
+    it. Defaults to :data:`DEFAULT_MASTER_AUDIO_SECONDS` so a happy-path
+    silent-output test passes the check by construction; a test that wants a
+    real mismatch sets it explicitly."""
+
+    def __init__(
+        self,
+        frame_count: int = 124,
+        luminance_level: int = 128,
+        duration_seconds: float = DEFAULT_MASTER_AUDIO_SECONDS,
+    ) -> None:
         self.frame_count = frame_count
         self.luminance_level = luminance_level
+        self.duration_seconds = duration_seconds
         self.calls: list[list[str]] = []
 
     def __call__(self, args: Any) -> subprocess.CompletedProcess:
         args = list(args)
         self.calls.append(args)
         if args[0] == "ffprobe":
+            if "format=duration" in args:
+                return subprocess.CompletedProcess(
+                    args, 0, stdout=f"{self.duration_seconds}\n".encode()
+                )
             return subprocess.CompletedProcess(args, 0, stdout=f"{self.frame_count}\n".encode())
         # "-" is ffmpeg's name for stdout, not a file. Writing it as a path
         # both litters the repo root with a file called "-" and hands the
@@ -201,7 +230,9 @@ class Rig:
         self.clock = FakeClock()
         self.align_model = FakeAlignModel(_raw_result(segment_specs or DEFAULT_SEGMENT_SPECS))
 
-        master_audio = write_silent_wav(tmp_path / "audio" / "master.wav", seconds=25.0)
+        master_audio = write_silent_wav(
+            tmp_path / "audio" / "master.wav", seconds=DEFAULT_MASTER_AUDIO_SECONDS
+        )
         lyrics_file = tmp_path / "lyrics.txt"
         lyrics_file.write_text(
             "Walking through the empty halls tonight\n"
@@ -1843,6 +1874,86 @@ def test_resolve_seed_face_gate_prefers_an_injected_gate_over_config(tmp_path: P
     assert cli._resolve_seed_face_gate(rig.config, injected) is injected
 
 
+# --------------------------------------------------------------------------- #
+# Issue #22: timeline-vs-track drift reporting (Stage 2, before any GPU work)
+# --------------------------------------------------------------------------- #
+
+
+def _drift_chunk(end: float) -> contracts.AudioChunk:
+    """Minimal chunk for :func:`cli._log_timeline_track_drift` -- only
+    ``end`` matters to it."""
+    return contracts.AudioChunk(chunk_id=0, audio_file=Path("x.wav"), start=0.0, end=end, text="")
+
+
+def test_drift_within_tolerance_logs_nothing(tmp_path: Path, caplog):
+    rig = Rig(tmp_path)
+    with caplog.at_level(logging.WARNING):
+        drift = cli._log_timeline_track_drift((_drift_chunk(25.0),), 25.0, rig.config)
+
+    assert drift == pytest.approx(0.0)
+    assert caplog.text == ""
+
+
+def test_music_video_overshoot_logs_a_warning_naming_shortest(tmp_path: Path, caplog):
+    """The default (silent_output=False) path: harmless to watch, so a
+    WARNING -- not an ERROR -- but it must name the wasted GPU seconds and
+    the mechanism (-shortest) that has hidden this until now."""
+    rig = Rig(tmp_path)
+    assert rig.config.silent_output is False
+
+    with caplog.at_level(logging.WARNING):
+        drift = cli._log_timeline_track_drift((_drift_chunk(26.0),), 25.0, rig.config)
+
+    assert drift == pytest.approx(1.0)
+    assert "overshoots" in caplog.text
+    assert "-shortest" in caplog.text
+    assert caplog.records[-1].levelname == "WARNING"
+
+
+def test_silent_output_overshoot_logs_an_error_naming_the_pending_raise(tmp_path: Path, caplog):
+    """The silent path has no mux to hide behind: the same overshoot is
+    reported at ERROR, and the message says the post-assembly check WILL
+    raise, before any GPU time is spent finding that out the hard way."""
+    rig = Rig(tmp_path)
+    rig.config = replace(rig.config, silent_output=True)
+
+    with caplog.at_level(logging.WARNING):
+        drift = cli._log_timeline_track_drift((_drift_chunk(26.0),), 25.0, rig.config)
+
+    assert drift == pytest.approx(1.0)
+    assert "WILL raise" in caplog.text
+    assert caplog.records[-1].levelname == "ERROR"
+
+
+def test_undershoot_is_reported_louder_than_overshoot_on_the_music_video_path(
+    tmp_path: Path, caplog
+):
+    """The worse defect for a music video: the master audio outlives the
+    picture and -shortest cannot fix it, so this is ERROR even on the
+    ordinarily-harmless music-video path."""
+    rig = Rig(tmp_path)
+
+    with caplog.at_level(logging.WARNING):
+        drift = cli._log_timeline_track_drift((_drift_chunk(24.0),), 25.0, rig.config)
+
+    assert drift == pytest.approx(-1.0)
+    assert "UNDERshoots" in caplog.text
+    assert "worse defect" in caplog.text
+    assert caplog.records[-1].levelname == "ERROR"
+
+
+def test_silent_output_undershoot_also_names_the_pending_raise(tmp_path: Path, caplog):
+    rig = Rig(tmp_path)
+    rig.config = replace(rig.config, silent_output=True)
+
+    with caplog.at_level(logging.WARNING):
+        drift = cli._log_timeline_track_drift((_drift_chunk(24.0),), 25.0, rig.config)
+
+    assert drift == pytest.approx(-1.0)
+    assert "WILL raise" in caplog.text
+    assert caplog.records[-1].levelname == "ERROR"
+
+
 def test_a_faceless_seed_frame_is_not_chained_from(tmp_path: Path):
     """Issue #47: the chained node has no ``ref_images``, so the seed frame is
     the whole identity conditioning. When the previous shot ends on the back of
@@ -2010,6 +2121,28 @@ def test_prepare_shot_plan_writes_a_skeleton_touching_no_comfyui(tmp_path: Path)
     assert text.count("[[shot]]") == 3
     assert text.count('shot = ""') == 3
     assert rig.session.requests == []
+
+
+def test_prepare_shot_plan_reports_timeline_drift_before_any_gpu_work(tmp_path: Path, caplog):
+    """Issue #22: ``--prepare`` is the 50s no-GPU check this project already
+    uses, so the Stage 2 drift report must fire from here too, not only from
+    a full ``run_pipeline``. The default rig's three segments end at 19.0s
+    against a 25.0s master with ``instrumental_coverage`` off -- a real
+    undershoot, not a constructed one."""
+    rig = Rig(tmp_path)
+    out_path = tmp_path / "shot_plan.toml"
+
+    with caplog.at_level(logging.WARNING):
+        cli.prepare_shot_plan(
+            rig.config,
+            out_path,
+            source="run.toml",
+            generated_at="2026-08-12",
+            align_model=rig.align_model,
+        )
+
+    assert "UNDERshoots" in caplog.text
+    assert rig.session.requests == [], "must still touch no ComfyUI"
 
 
 def test_prepare_shot_plan_refuses_to_overwrite_without_force(tmp_path: Path):

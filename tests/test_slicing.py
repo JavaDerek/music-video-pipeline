@@ -36,7 +36,7 @@ from music_video_maker.contracts import (
     WordTiming,
 )
 from music_video_maker.shot_plan import ShotLength
-from music_video_maker.slicing import slice_audio
+from music_video_maker.slicing import slice_audio, timeline_track_drift_seconds
 from tests.harness.factories import (
     make_aligned_segment,
     make_alignment_result_long_segment,
@@ -2557,3 +2557,80 @@ def test_no_untenable_phrase_warning_when_every_phrase_fits(tmp_path, caplog):
         slice_audio(audio, alignment, DEFAULT_HARDWARE, tmp_path / "chunks")
 
     assert "cannot be held whole by any chunk" not in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# Timeline-vs-track drift (issue #22)
+# --------------------------------------------------------------------------- #
+
+
+def _chunk(end: float) -> AudioChunk:
+    """Minimal chunk for :func:`timeline_track_drift_seconds` -- only ``end``
+    (and the fields the dataclass requires) matter to that function."""
+    return AudioChunk(chunk_id=0, audio_file=Path("x.wav"), start=0.0, end=end, text="")
+
+
+def test_drift_is_zero_when_the_timeline_lands_exactly_on_the_track():
+    assert timeline_track_drift_seconds((_chunk(29.0),), 29.0) == pytest.approx(0.0)
+
+
+def test_drift_is_positive_when_the_timeline_overshoots_the_track():
+    """The "Deathless" shape: the final tile pads past the end of the song."""
+    drift = timeline_track_drift_seconds((_chunk(513.917),), 512.080)
+    assert drift == pytest.approx(1.837, abs=1e-3)
+
+
+def test_drift_is_negative_when_the_timeline_undershoots_the_track():
+    """The worse defect for a music video: the muxed master audio outlives
+    the video."""
+    drift = timeline_track_drift_seconds((_chunk(26.0),), 29.0)
+    assert drift == pytest.approx(-3.0)
+
+
+def test_drift_reads_only_the_last_chunks_end_not_a_sum():
+    chunks = (_chunk(10.0), _chunk(20.0), _chunk(29.5))
+    assert timeline_track_drift_seconds(chunks, 29.0) == pytest.approx(0.5)
+
+
+def test_drift_is_zero_for_no_chunks():
+    assert timeline_track_drift_seconds((), 29.0) == 0.0
+
+
+def test_short_trailing_gap_undershoots_the_track_silently(tmp_path):
+    """Characterizes a real defect found while building issue #22's
+    duration-drift reporting: ``instrumental_coverage``'s own trailing-gap
+    filler (``_cover_instrumentals`` -> ``_plan_frames_run``) refuses to
+    emit ANY filler chunk for a gap shorter than one trained-floor chunk
+    (~5.167s) -- ``_plan_frames_run`` returns ``()`` rather than padding up,
+    the way pass 1-3's own minimum-duration handling does for a short
+    *segment*. So a lyric segment that ends a few seconds before the track's
+    own end (an ordinary instrumental outro shorter than 5.167s) leaves the
+    rendered timeline short of the master track, with instrumental_coverage
+    ON and nothing logging it before this issue's reporting existed.
+
+    This is a characterization test, not a fix -- the underlying gap-filling
+    behavior is unchanged; it exists so :func:`timeline_track_drift_seconds`
+    (and the run-path/--prepare logging built on it) has a real reproduction
+    to catch, and so this silent-undershoot shape doesn't regress into an
+    even-larger gap unnoticed. Whether to always pad a short trailing gap
+    (mirroring pass 1's "accept the shortfall" for a short *segment*) is a
+    Stage-2 design decision for whoever owns it, same as the overshoot fix
+    CLAUDE.md's "-shortest" bullet already defers.
+    """
+    seg_start, seg_end = 20.0, 26.0  # 6s segment, already above the trained floor
+    gap = 3.0  # inside (0, 5.167s): too short for one filler chunk, not zero
+    track_duration = seg_end + gap
+    segment = make_aligned_segment(
+        0, "walking through the empty halls tonight", seg_start, seg_end, "Dianne"
+    )
+    alignment = AlignmentResult(segments=(segment,), track_duration=track_duration)
+    audio = write_silent_wav(tmp_path / "master.wav", track_duration)
+
+    chunks = slice_audio(
+        audio, alignment, DEFAULT_HARDWARE, tmp_path / "chunks", cover_instrumentals=True
+    )
+
+    drift = timeline_track_drift_seconds(chunks, track_duration)
+    assert drift < -1.0, (
+        f"expected the trailing {gap}s gap to be silently dropped (undershoot), got drift={drift}"
+    )
