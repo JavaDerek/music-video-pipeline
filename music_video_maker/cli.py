@@ -47,7 +47,7 @@ import logging
 import shutil
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from dataclasses import replace as dc_replace
 from datetime import date
@@ -57,10 +57,12 @@ from typing import Any
 import requests
 
 from music_video_maker.alignment import align
+from music_video_maker.alignment_quality import AlignmentQualityReport, evaluate_alignment_quality
 from music_video_maker.assembly import assemble_final_video
 from music_video_maker.config import ConfigError, RunConfig, load_config
 from music_video_maker.continuity import ContinuityWorkflowProvider, planned_chain_source
 from music_video_maker.contracts import (
+    AlignmentResult,
     AudioChunk,
     ChunkFingerprint,
     ChunkStatus,
@@ -83,6 +85,7 @@ from music_video_maker.prompting import expand_prompt
 from music_video_maker.resilience import DiskUsage, ResilientRunner, Sleeper
 from music_video_maker.shot_plan import (
     ShotLength,
+    ShotPlanEntry,
     ShotPlanError,
     lint_camera_face_away_on_voiced_chunks,
     lint_instrumental_focus_mismatch,
@@ -182,6 +185,72 @@ def _resolve_seed_face_gate(
         min_fraction=config.i2v_min_seed_face_fraction,
         min_similarity=config.i2v_min_seed_face_similarity,
     )
+
+
+def run_shot_plan_lints(
+    plan: Mapping[int, ShotPlanEntry], chunks: Sequence[Any], config: RunConfig
+) -> None:
+    """Every shot-plan lint a real render runs against ``plan``, in the
+    render's own order (issue #36).
+
+    Factored out of :func:`run_pipeline` so the review page can run *this
+    exact function* -- not a copy of it -- with a logging handler attached,
+    the same "checked by the render's own loaders, never a copy of them"
+    rule ``authoring/plan.check_plan`` already follows on the authoring side
+    (see that module's docstring). See ``music_video_maker/review.py``.
+
+    Raises whatever the first raising lint raises (today, only
+    :func:`~music_video_maker.shot_plan.lint_subject_on_voiced_chunk`'s
+    :class:`~music_video_maker.shot_plan.ShotPlanError`) -- callers that want
+    to keep going past a structural plan error catch it themselves; this
+    function does not soften it, the same as when this code lived inline in
+    :func:`run_pipeline`.
+    """
+    # Issue #82: raises, so it goes first -- no point running
+    # advisory lints on a plan a raising lint will refuse outright.
+    # `subject` is legal only on an instrumental chunk; honouring it
+    # on a voiced one would reintroduce the desync it exists to fix.
+    lint_subject_on_voiced_chunk(plan, chunks)
+    # Issue #37: both strings are in hand here -- a lyric naming an
+    # object the plan stages only elsewhere is mechanically visible,
+    # for free, before any GPU time is spent on it. Issue #67: the
+    # run's own lyric_literalness decides how loudly this fires --
+    # silenced at "free", promoted to ERROR at "literal" -- but the
+    # render never refuses on it either way. "A false positive must
+    # never block a run" and "one chunk failing must not kill the
+    # run" both still apply here; the error tier only means
+    # something in the authoring layer's revision round.
+    lint_shots_against_lyrics(plan, chunks, literalness=config.lyric_literalness)
+    # Issue #58: a camera direction that turns her away from the
+    # lens on a voiced chunk costs that chunk's lip-sync.
+    lint_camera_face_away_on_voiced_chunks(plan, chunks)
+    # The mirror of the check above: an INSTRUMENTAL chunk whose own
+    # text asks for the mouth the render is telling H3 to keep still.
+    for finding in lint_mouth_direction_on_instrumental_chunks(plan, chunks):
+        logger.warning(
+            "Shot plan chunk_id=%d: this chunk is instrumental, so its prompt "
+            "says the character stays silent -- but its %s names %r (%r). H3 "
+            "renders the nouns it is given, so the prompt asks for the mouth it "
+            "also forbids, and a viewer sees someone mouthing words with no "
+            "audio. Describe what the shot shows without naming the mouth.",
+            finding.chunk_id, finding.field, finding.matched, finding.text,
+        )
+    # A sung chunk framed wide (or not framed at all) has no face big
+    # enough to read a mouth -- the one thing the whole pipeline is for.
+    lint_voiced_framing(plan, chunks)
+    # Issue #72: a pronoun with only one bound candidate but text
+    # that insists on a second, distinct person.
+    lint_unbound_companion_referent(plan, chunks)
+    # Issue #73: a role written as a prohibition, contradicted by
+    # the shot line actually describing the forbidden thing.
+    lint_role_prohibition_contradiction(plan, chunks, config.cast)
+    # Issue #78: `present` staging a companion at a location that
+    # contradicts where their own singing chunks place them.
+    lint_present_location_mismatch(plan, chunks)
+    # Issue #82: an instrumental chunk whose shot line reads as
+    # entirely about a `present` bystander, with no `subject` set to
+    # tell the render that -- the general shape of the chunk 29 bug.
+    lint_instrumental_focus_mismatch(plan, chunks, config.default_lead_vocalist)
 
 
 def _select_render_ids(chunks: Sequence[Any], only_chunks: Sequence[int] | None) -> list[int]:
@@ -430,10 +499,32 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help=(
-            "With --prepare, read an existing shot plan for its length_seconds only and "
-            "re-anchor the skeleton against the timeline a render with that plan will "
-            "actually produce. Without this, a plan that sets any editorial shot length "
-            "gets a skeleton describing chunks no render will ever emit, and drifts."
+            "With --prepare or --review, read an existing shot plan for its length_seconds "
+            "only and re-anchor the timeline against the run that plan will actually "
+            "produce. Without this, --prepare slices with no editorial lengths at all "
+            "(there is usually no plan yet to read them from), and --review slices with "
+            "--config's own shot_plan's lengths if it names one (matching what a real "
+            "render does) or none if it doesn't. Pass this to check a candidate plan "
+            "before it is wired into --config; it always overrides --config's own "
+            "shot_plan for the lengths, whichever mode is running."
+        ),
+    )
+    parser.add_argument(
+        "--review",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Run Stages 1-2 (like --prepare) and write a read-only review of the chunk "
+            "timeline, the alignment-quality findings, and the shot plan's own warnings "
+            "(issue #36) -- one self-contained HTML page plus the same data as JSON, no "
+            "server, no GPU. Writes PATH with its suffix replaced by '.html' and '.json' "
+            "(so 'out/review' or 'out/review.html' both produce 'out/review.html' and "
+            "'out/review.json'). The timeline is sliced with --config's own shot_plan's "
+            "editorial lengths, if it sets any -- the same lengths a real render with this "
+            "config would use -- unless --from-plan names a different plan to check "
+            "instead. Never raises on strict_alignment; if the config is strict and the "
+            "report would in fact make a render refuse, the page says so at the top."
         ),
     )
     parser.add_argument(
@@ -703,51 +794,7 @@ def run_pipeline(
             ).chunks
 
         if plan is not None:
-            # Issue #82: raises, so it goes first -- no point running
-            # advisory lints on a plan a raising lint will refuse outright.
-            # `subject` is legal only on an instrumental chunk; honouring it
-            # on a voiced one would reintroduce the desync it exists to fix.
-            lint_subject_on_voiced_chunk(plan, chunks)
-            # Issue #37: both strings are in hand here -- a lyric naming an
-            # object the plan stages only elsewhere is mechanically visible,
-            # for free, before any GPU time is spent on it. Issue #67: the
-            # run's own lyric_literalness decides how loudly this fires --
-            # silenced at "free", promoted to ERROR at "literal" -- but the
-            # render never refuses on it either way. "A false positive must
-            # never block a run" and "one chunk failing must not kill the
-            # run" both still apply here; the error tier only means
-            # something in the authoring layer's revision round.
-            lint_shots_against_lyrics(plan, chunks, literalness=config.lyric_literalness)
-            # Issue #58: a camera direction that turns her away from the
-            # lens on a voiced chunk costs that chunk's lip-sync.
-            lint_camera_face_away_on_voiced_chunks(plan, chunks)
-            # The mirror of the check above: an INSTRUMENTAL chunk whose own
-            # text asks for the mouth the render is telling H3 to keep still.
-            for finding in lint_mouth_direction_on_instrumental_chunks(plan, chunks):
-                logger.warning(
-                    "Shot plan chunk_id=%d: this chunk is instrumental, so its prompt "
-                    "says the character stays silent -- but its %s names %r (%r). H3 "
-                    "renders the nouns it is given, so the prompt asks for the mouth it "
-                    "also forbids, and a viewer sees someone mouthing words with no "
-                    "audio. Describe what the shot shows without naming the mouth.",
-                    finding.chunk_id, finding.field, finding.matched, finding.text,
-                )
-            # A sung chunk framed wide (or not framed at all) has no face big
-            # enough to read a mouth -- the one thing the whole pipeline is for.
-            lint_voiced_framing(plan, chunks)
-            # Issue #72: a pronoun with only one bound candidate but text
-            # that insists on a second, distinct person.
-            lint_unbound_companion_referent(plan, chunks)
-            # Issue #73: a role written as a prohibition, contradicted by
-            # the shot line actually describing the forbidden thing.
-            lint_role_prohibition_contradiction(plan, chunks, config.cast)
-            # Issue #78: `present` staging a companion at a location that
-            # contradicts where their own singing chunks place them.
-            lint_present_location_mismatch(plan, chunks)
-            # Issue #82: an instrumental chunk whose shot line reads as
-            # entirely about a `present` bystander, with no `subject` set to
-            # tell the render that -- the general shape of the chunk 29 bug.
-            lint_instrumental_focus_mismatch(plan, chunks, config.default_lead_vocalist)
+            run_shot_plan_lints(plan, chunks, config)
 
         prompts = {
             chunk.chunk_id: expand_prompt(
@@ -1059,6 +1106,115 @@ def run_pipeline(
     )
 
 
+@dataclass(frozen=True)
+class PreparedTimeline:
+    """Stages 1-2's output, plus the quality report Stage 1 already computes
+    internally (issue #36).
+
+    ``--prepare`` (issue #52) only ever needed ``chunks``, to write the
+    skeleton; ``alignment`` and ``quality_report`` are recorded here so a
+    second caller -- the review page -- can use the exact same Stage 1-2 run
+    rather than a second one, which is also what keeps the two honest about
+    describing the same timeline."""
+
+    alignment: AlignmentResult
+    chunks: tuple[Any, ...]
+    quality_report: AlignmentQualityReport
+
+
+def prepare_timeline(
+    config: RunConfig,
+    *,
+    align_model: object | None = None,
+    from_plan: str | Path | None = None,
+) -> PreparedTimeline:
+    """Run Stages 1-2 only -- alignment + slicing, no GPU, no ComfyUI, no
+    custody -- and return the chunk timeline, the raw alignment, and the
+    alignment-quality report (issue #36).
+
+    Shared by :func:`prepare_shot_plan` (issue #52, which only writes the
+    skeleton) and the review page (issue #36's next slice, which additionally
+    needs the quality report and the chunks themselves) -- both want exactly
+    the same Stage 1-2 run, and a second implementation would risk describing
+    a timeline the real one does not.
+
+    ``from_plan`` re-anchors the timeline against the run a render with
+    *that plan* will actually produce, by loading it **for its
+    ``length_seconds`` only** and re-slicing with them (issue #54 design
+    section 5). Without it this slices with no ``shot_lengths`` while
+    :func:`run_pipeline` passes ``shot_length_requests(plan)``, so the moment
+    a plan expresses one editorial length the timeline describes chunks no
+    render will ever produce and every chunk after that length raises
+    ``ShotPlanDriftError`` the moment something resolves against it. Nothing
+    else in the source plan is read -- not the shot text, not the camera
+    direction.
+
+    A plan that cannot be read is a hard failure, never a silent fall back to
+    a length-free timeline: that fallback would look exactly like success and
+    drift hours later, on the GPU.
+    """
+    lines = parse_lyrics(config.lyrics_file, config.cast, config.default_lead_vocalist)
+    quality_reports: list[AlignmentQualityReport] = []
+    alignment = align(
+        config.master_audio,
+        lines,
+        model=align_model,
+        # --prepare/review must align exactly as the render will, or the
+        # timeline describes chunks the render never emits (issue #52).
+        model_size=config.alignment_model_size,
+        strict_alignment=config.strict_alignment,
+        overrides=config.alignment_overrides,
+        # Issue #36: align() already computes this and only logs it -- this
+        # is the seam that hands the structured report back to a caller that
+        # needs more than a log line.
+        on_quality_report=quality_reports.append,
+    )
+    shot_lengths: tuple[ShotLength, ...] = ()
+    if from_plan is not None:
+        shot_lengths = shot_length_requests(
+            load_shot_plan(from_plan, setting=config.setting, cast_names=config.cast)
+        )
+        logger.info(
+            "Re-anchoring the timeline against %s: %d editorial shot length(s) applied "
+            "(issue #52 follow-up)",
+            from_plan,
+            len(shot_lengths),
+        )
+    chunks = slice_audio(
+        config.master_audio,
+        alignment,
+        config.hardware,
+        config.chunks_dir,
+        cover_instrumentals=config.instrumental_coverage,
+        instrumental_shot_seconds=config.instrumental_shot_seconds,
+        # Passed so a stem --prepare/review writes is the stem a render
+        # uses. It cannot move the timeline (level only), so the timeline is
+        # identical either way -- this is consistency, not correctness.
+        instrumental_audio_gain_db=config.instrumental_audio_gain_db,
+        shot_lengths=shot_lengths,
+    )
+    if not chunks:
+        raise PipelineError(
+            f"no chunks produced by slicing {config.master_audio} against "
+            f"{config.lyrics_file} -- nothing to prepare a timeline for (no non-empty "
+            "lyric lines aligned to audio?)"
+        )
+    logger.info("Stage 1-2 complete: %d chunk(s) available (issue #52/#36)", len(chunks))
+    # Issue #22: the same no-GPU check run_pipeline does. --prepare is exactly
+    # the 50s check this project uses to catch a Stage-2 drift before spending
+    # GPU time, and --review reads the same timeline.
+    _log_timeline_track_drift(chunks, alignment.track_duration, config)
+
+    # `align()` always calls the callback exactly once before returning (see
+    # its own docstring) -- this is defensive, not a real fallback path.
+    quality_report = (
+        quality_reports[0] if quality_reports else evaluate_alignment_quality(alignment)
+    )
+    return PreparedTimeline(
+        alignment=alignment, chunks=tuple(chunks), quality_report=quality_report
+    )
+
+
 def prepare_shot_plan(
     config: RunConfig,
     output_path: str | Path,
@@ -1083,70 +1239,12 @@ def prepare_shot_plan(
     skeleton's header comment -- see that function for why they are
     caller-supplied rather than read from the filesystem or the clock here.
 
-    ``from_plan`` re-anchors the skeleton against the timeline a render with
-    *that plan* will actually produce, by loading it **for its
-    ``length_seconds`` only** and re-slicing with them (issue #54 design
-    section 5). Without it this function slices with no ``shot_lengths`` while
-    :func:`run_pipeline` passes ``shot_length_requests(plan)``, so the moment a
-    plan expresses one editorial length the skeleton describes a timeline no
-    render will ever produce and every chunk after that length raises
-    ``ShotPlanDriftError``. Nothing else in the source plan is read -- not the
-    shot text, not the camera direction -- so this never launders an authored
-    line into a file that is meant to be a blank skeleton.
-
-    A plan that cannot be read is a hard failure, never a silent fall back to a
-    length-free skeleton: that fallback would look exactly like success and
-    drift hours later, on the GPU.
+    Stages 1-2 themselves live in :func:`prepare_timeline`, shared with the
+    review page (issue #36) -- this function's own job is just the skeleton.
     """
-    lines = parse_lyrics(config.lyrics_file, config.cast, config.default_lead_vocalist)
-    alignment = align(
-        config.master_audio,
-        lines,
-        model=align_model,
-        # --prepare must align exactly as the render will, or the skeleton
-        # describes chunks the render never emits (issue #52's whole point).
-        model_size=config.alignment_model_size,
-        strict_alignment=config.strict_alignment,
-        overrides=config.alignment_overrides,
-    )
-    shot_lengths: tuple[ShotLength, ...] = ()
-    if from_plan is not None:
-        shot_lengths = shot_length_requests(
-            load_shot_plan(from_plan, setting=config.setting, cast_names=config.cast)
-        )
-        logger.info(
-            "Re-anchoring the skeleton against %s: %d editorial shot length(s) applied "
-            "(issue #52 follow-up)",
-            from_plan,
-            len(shot_lengths),
-        )
-    chunks = slice_audio(
-        config.master_audio,
-        alignment,
-        config.hardware,
-        config.chunks_dir,
-        cover_instrumentals=config.instrumental_coverage,
-        instrumental_shot_seconds=config.instrumental_shot_seconds,
-        # Passed so a stem --prepare writes is the stem a render uses. It
-        # cannot move the timeline (level only), so the skeleton is identical
-        # either way -- this is consistency, not correctness.
-        instrumental_audio_gain_db=config.instrumental_audio_gain_db,
-        shot_lengths=shot_lengths,
-    )
-    if not chunks:
-        raise PipelineError(
-            f"no chunks produced by slicing {config.master_audio} against "
-            f"{config.lyrics_file} -- nothing to prepare a shot plan for (no non-empty "
-            "lyric lines aligned to audio?)"
-        )
-    logger.info("Stage 1-2 complete: %d chunk(s) available to plan (issue #52)", len(chunks))
-    # Issue #22: the same no-GPU check run_pipeline does, available here too
-    # since --prepare is exactly the 50s check this project uses to catch a
-    # Stage-2 drift before spending GPU time.
-    _log_timeline_track_drift(chunks, alignment.track_duration, config)
-
+    timeline = prepare_timeline(config, align_model=align_model, from_plan=from_plan)
     return write_shot_plan_skeleton(
-        chunks, output_path, source=source, generated_at=generated_at, force=force
+        timeline.chunks, output_path, source=source, generated_at=generated_at, force=force
     )
 
 
@@ -1178,6 +1276,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.strict_alignment:
         overrides["strict_alignment"] = True
 
+    if args.prepare and args.review:
+        logger.error("--prepare and --review are two different entry points; pass only one")
+        return EXIT_ERROR
+
     try:
         config = load_config(Path(args.config), **overrides)
     except ConfigError:
@@ -1208,6 +1310,28 @@ def main(argv: list[str] | None = None) -> int:
         except (PipelineError, ShotPlanError):
             logger.exception("Failed to prepare shot plan")
             return EXIT_ERROR
+        return EXIT_SUCCESS
+
+    if args.review:
+        # Local import: review.py imports this module (to reuse
+        # prepare_timeline/run_shot_plan_lints, issue #36's whole point), so
+        # importing it back at module scope here would be a cycle. Deferred
+        # to this branch, it never runs at import time and the cycle never
+        # forms.
+        from music_video_maker.review import build_review, render_review_html, render_review_json
+
+        try:
+            data = build_review(config, from_plan=args.from_plan)
+        except (PipelineError, ShotPlanError):
+            logger.exception("Failed to build review")
+            return EXIT_ERROR
+        stem = args.review.with_suffix("")
+        html_path = stem.with_suffix(".html")
+        json_path = stem.with_suffix(".json")
+        html_path.parent.mkdir(parents=True, exist_ok=True)
+        html_path.write_text(render_review_html(data), encoding="utf-8")
+        json_path.write_text(render_review_json(data), encoding="utf-8")
+        logger.info("Wrote review to %s and %s", html_path, json_path)
         return EXIT_SUCCESS
 
     try:

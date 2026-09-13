@@ -1,0 +1,107 @@
+{
+  "alignment_finding_counts": {
+    "CRITICAL": 1,
+    "INFO": 0,
+    "WARNING": 0
+  },
+  "alignment_summary": "Alignment quality: 4 segment(s), 1 critical, 0 warning finding(s)",
+  "chunks": [
+    {
+      "camera": "slow push in",
+      "chunk_id": 0,
+      "conditions": null,
+      "duration": 6.5,
+      "end": 6.5,
+      "findings": [],
+      "frame_count": 141,
+      "lint_warnings": [],
+      "location": "hallway",
+      "lyric": "walking through the empty halls tonight",
+      "present": [],
+      "shot": "wide shot of the corridor, her hand trailing the wall",
+      "start": 0.0,
+      "subject": null,
+      "voiced": true
+    },
+    {
+      "camera": null,
+      "chunk_id": 1,
+      "conditions": "dust settling",
+      "duration": 1.5,
+      "end": 8.0,
+      "findings": [],
+      "frame_count": 124,
+      "lint_warnings": [],
+      "location": null,
+      "lyric": "",
+      "present": [],
+      "shot": null,
+      "start": 6.5,
+      "subject": "Dianne",
+      "voiced": false
+    },
+    {
+      "camera": null,
+      "chunk_id": 2,
+      "conditions": null,
+      "duration": 0.02,
+      "end": 8.02,
+      "findings": [
+        {
+          "code": "zero_length_segment",
+          "end": 8.02,
+          "message": "segment 1 (8.000s -> 8.020s) is only 20ms long -- too short to contain real audio",
+          "segment_index": 1,
+          "severity": "CRITICAL",
+          "start": 8.0
+        }
+      ],
+      "frame_count": null,
+      "lint_warnings": [],
+      "location": "hallway",
+      "lyric": "gone",
+      "present": [],
+      "shot": "<script>alert(\"staged\")</script> she vanishes mid-step",
+      "start": 8.0,
+      "subject": null,
+      "voiced": true
+    },
+    {
+      "camera": null,
+      "chunk_id": 3,
+      "conditions": null,
+      "duration": 5.0,
+      "end": 19.0,
+      "findings": [],
+      "frame_count": 141,
+      "lint_warnings": [
+        {
+          "chunk_id": 3,
+          "message": "chunk_id=3: lyric names \"printer\", staged only in chunk(s) [5] -- consider staging it here too (or removing it from the lyric-vs-shot check)",
+          "severity": "warning"
+        }
+      ],
+      "location": "hallway",
+      "lyric": "the printer sparks and dies behind her",
+      "present": [],
+      "shot": "she walks on, not looking back",
+      "start": 14.0,
+      "subject": null,
+      "voiced": true
+    }
+  ],
+  "lint_warnings": [
+    {
+      "chunk_id": 3,
+      "message": "chunk_id=3: lyric names \"printer\", staged only in chunk(s) [5] -- consider staging it here too (or removing it from the lyric-vs-shot check)",
+      "severity": "warning"
+    },
+    {
+      "chunk_id": null,
+      "message": "shot plan has 1 chunk(s) with no camera direction set",
+      "severity": "warning"
+    }
+  ],
+  "plan_errors": [],
+  "would_refuse_render": null
+}

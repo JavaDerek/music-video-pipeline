@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Shot Plan Review</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 2rem; color: #1a1a1a; background: #fff; }
+  h1 { font-size: 1.4rem; }
+  h2 { font-size: 1.1rem; margin-top: 2rem; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+  th, td { border: 1px solid #ccc; padding: 0.35rem 0.5rem; text-align: left;
+            vertical-align: top; }
+  th { background: #f0f0f0; position: sticky; top: 0; }
+  tr.row-critical { background: #fde8e8; }
+  tr.row-warning { background: #fff6db; }
+  ul.findings { margin: 0; padding-left: 1.1rem; }
+  ul.findings li { margin: 0.15rem 0; }
+  .badge { display: inline-block; padding: 0.05rem 0.4rem; border-radius: 0.2rem;
+            font-size: 0.72rem; font-weight: 600; color: #fff; }
+  .sev-critical { background: #b42318; }
+  .sev-warning { background: #b7791f; }
+  .sev-info { background: #4a5568; }
+  .summary { background: #f7f7f7; border: 1px solid #ddd; padding: 0.75rem 1rem; }
+  .plan-errors { background: #fde8e8; border: 1px solid #b42318; padding: 0.75rem 1rem; }
+  .refusal { background: #b42318; color: #fff; border-radius: 0.25rem;
+              padding: 0.75rem 1rem; font-weight: 600; }
+  code { font-size: 0.85em; }
+</style>
+</head>
+<body>
+<h1>Shot Plan Review</h1>
+
+<div class="summary">
+  <p><strong>Alignment quality:</strong> Alignment quality: 4 segment(s), 1 critical, 0 warning finding(s)</p>
+  <p><strong>Findings by severity:</strong> CRITICAL: 1</p>
+</div>
+
+<h2>Run-level shot-plan warnings</h2>
+<ul class="findings"><li><span class="badge sev-warning">WARNING</span> shot plan has 1 chunk(s) with no camera direction set</li></ul>
+
+<h2>Chunks (4)</h2>
+<table>
+  <thead>
+    <tr>
+      <th>chunk_id</th><th>span</th><th>duration</th><th>frames</th><th>voicing</th>
+      <th>lyric</th><th>shot</th><th>camera</th><th>location</th><th>present</th>
+      <th>subject</th><th>conditions</th><th>alignment findings</th><th>lint warnings</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr class="">
+      <td>0</td>
+      <td>0.000s&ndash;6.500s</td>
+      <td>6.500s</td>
+      <td>141</td>
+      <td>voiced</td>
+      <td>walking through the empty halls tonight</td>
+      <td>wide shot of the corridor, her hand trailing the wall</td>
+      <td>slow push in</td>
+      <td>hallway</td>
+      <td>&mdash;</td>
+      <td>&mdash;</td>
+      <td>&mdash;</td>
+      <td>&mdash;</td>
+      <td>&mdash;</td>
+    </tr>
+    <tr class="">
+      <td>1</td>
+      <td>6.500s&ndash;8.000s</td>
+      <td>1.500s</td>
+      <td>124</td>
+      <td>instrumental</td>
+      <td>&mdash;</td>
+      <td>&mdash;</td>
+      <td>&mdash;</td>
+      <td>&mdash;</td>
+      <td>&mdash;</td>
+      <td>Dianne</td>
+      <td>dust settling</td>
+      <td>&mdash;</td>
+      <td>&mdash;</td>
+    </tr>
+    <tr class="row-critical">
+      <td>2</td>
+      <td>8.000s&ndash;8.020s</td>
+      <td>0.020s</td>
+      <td>&mdash;</td>
+      <td>voiced</td>
+      <td>gone</td>
+      <td>&lt;script&gt;alert(&quot;staged&quot;)&lt;/script&gt; she vanishes mid-step</td>
+      <td>&mdash;</td>
+      <td>hallway</td>
+      <td>&mdash;</td>
+      <td>&mdash;</td>
+      <td>&mdash;</td>
+      <td><ul class="findings"><li><span class="badge sev-critical">CRITICAL</span> <code>zero_length_segment</code> segment 1 (8.000s -&gt; 8.020s) is only 20ms long -- too short to contain real audio</li></ul></td>
+      <td>&mdash;</td>
+    </tr>
+    <tr class="row-warning">
+      <td>3</td>
+      <td>14.000s&ndash;19.000s</td>
+      <td>5.000s</td>
+      <td>141</td>
+      <td>voiced</td>
+      <td>the printer sparks and dies behind her</td>
+      <td>she walks on, not looking back</td>
+      <td>&mdash;</td>
+      <td>hallway</td>
+      <td>&mdash;</td>
+      <td>&mdash;</td>
+      <td>&mdash;</td>
+      <td>&mdash;</td>
+      <td><ul class="findings"><li><span class="badge sev-warning">WARNING</span> chunk_id=3: lyric names &quot;printer&quot;, staged only in chunk(s) [5] -- consider staging it here too (or removing it from the lyric-vs-shot check)</li></ul></td>
+    </tr>
+  </tbody>
+</table>
+</body>
+</html>

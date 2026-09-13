@@ -42,7 +42,7 @@ from __future__ import annotations
 import logging
 import warnings
 import wave
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -228,6 +228,7 @@ def align(
     strict_alignment: bool = False,
     counterpoint: Sequence[CounterpointStream] | None = None,
     overrides: Sequence[AlignmentOverride] = (),
+    on_quality_report: Callable[[alignment_quality.AlignmentQualityReport], None] | None = None,
 ) -> AlignmentResult:
     """Force-align ``audio_file`` against tag-stripped ``lyric_lines``.
 
@@ -258,6 +259,16 @@ def align(
     present the return value is a :class:`CounterpointAlignmentResult` (with
     an empty ``concurrent_segments`` if none could be timed -- always
     logged); with none it is a plain ``AlignmentResult``, exactly as before.
+
+    ``on_quality_report`` (issue #36) is handed the same
+    :class:`~music_video_maker.alignment_quality.AlignmentQualityReport` this
+    function already computes and logs, before returning -- an injectable
+    seam rather than a change to the return type, so every existing caller
+    (which reads the result as a plain ``AlignmentResult``) is unaffected.
+    The review page is the first caller: it needs the structured findings
+    (segment, severity, message), not the log lines :func:`log_report`
+    already writes. ``None`` (the default) matches every call site that
+    predates this and costs nothing.
     """
     audio_path = Path(audio_file)
     streams = _resolve_counterpoint(lyric_lines, counterpoint)
@@ -279,6 +290,8 @@ def align(
         empty_result = AlignmentResult(segments=(), track_duration=_probe_duration(audio_path))
         empty_report = alignment_quality.evaluate_alignment_quality(empty_result)
         alignment_quality.log_report(empty_report, context=str(audio_path))
+        if on_quality_report is not None:
+            on_quality_report(empty_report)
         return empty_result
 
     text_blob = "\n".join(line.text.strip() for line in non_empty)
@@ -379,6 +392,8 @@ def align(
         audio_path=audio_path,
     )
     alignment_quality.log_report(quality_report, context=str(audio_path))
+    if on_quality_report is not None:
+        on_quality_report(quality_report)
     alignment_quality.raise_if_blocking(quality_report, strict=strict_alignment)
 
     return result
