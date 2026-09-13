@@ -179,6 +179,31 @@ def test_load_profile_no_look_field(tmp_path: Path):
         load_profile(path)
 
 
+def test_cast_is_not_a_profile_field():
+    """Issue #56's own answer to the question #56 and #55 both raised: a
+    profile is *text* that resolves into config fields, a character is
+    *binary assets plus text*, and the two mechanisms are deliberately not
+    merged (see the design doc's "The trap to avoid"). Confirmed structurally
+    rather than remembered: cast/synthetic/origin are absent from every
+    closed field set a profile may touch."""
+    assert "cast" not in LOOK_FIELDS
+    assert "cast" not in TOP_LEVEL_KEYS
+    assert "synthetic" not in TOP_LEVEL_KEYS
+    assert "origin" not in TOP_LEVEL_KEYS
+
+
+def test_load_profile_cannot_set_cast(tmp_path: Path):
+    """The structural check above, exercised end-to-end: a profile file that
+    tries to set cast is refused at load, not silently ignored."""
+    path = _write(
+        tmp_path,
+        'version = 1\nname = "x"\ncinematography = "grainy"\n\n'
+        '[cast.Nobody]\nrole = "Lead Vocalist"\n',
+    )
+    with pytest.raises(ProfileError, match="unknown top-level"):
+        load_profile(path)
+
+
 def test_load_profile_unknown_top_level_key(tmp_path: Path):
     path = _write(
         tmp_path, 'version = 1\nname = "x"\ncinematography = "grainy"\ncamera = "wide"\n'

@@ -743,6 +743,536 @@ role = "Lead Vocalist, smiling constantly, oblivious"
 
 
 # --------------------------------------------------------------------------- #
+# synthetic / origin -- characters that are nobody (issue #56).
+# --------------------------------------------------------------------------- #
+
+def _origin_block(name: str = "Nobody") -> str:
+    """A ``[cast.<name>.origin]`` table -- a function, not a constant,
+    because TOML binds a bare table header to whichever cast member it
+    names: reusing a fixed ``[cast.Nobody.origin]`` string under a
+    differently-named cast entry silently creates a *second*, unrelated
+    ``Nobody`` entry instead of attaching the table to the entry under test
+    (this project's own TOML bare-key hazard, see ``profiles.py``'s D8)."""
+    return f"""
+[cast."{name}".origin]
+model = "hosted-api-v1"
+prompt = "a weathered lighthouse keeper, 60s, grey beard"
+seed = 12345
+created = "2026-08-23"
+"""
+
+
+_ORIGIN_BLOCK = _origin_block("Nobody")
+"""Convenience default for the (majority) tests whose synthetic entry is
+named ``Nobody``. Any test whose entry has a different name must call
+:func:`_origin_block` directly."""
+
+
+def test_synthetic_and_origin_are_known_cast_keys() -> None:
+    assert "synthetic" in config_module.CAST_KEYS
+    assert "origin" in config_module.CAST_KEYS
+
+
+def test_existing_config_loads_unchanged_with_synthetic_defaulted(tmp_path: Path) -> None:
+    """The whole point of defaulting synthetic=false: every config written
+    before this field existed keeps loading, and keeps meaning 'a real
+    person's photo is in this run' (issue #51's own question)."""
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path)  # DEFAULT_CAST_TOML, no synthetic/origin at all
+
+    cfg = load_config(config_path)
+
+    assert cfg.cast["Dianne"].synthetic is False
+    assert cfg.cast["Dianne"].origin is None
+    assert cfg.cast["Rex"].synthetic is False
+    assert cfg.cast["Rex"].origin is None
+
+
+def test_synthetic_true_with_no_origin_is_refused(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Nobody]
+role = "Lead Vocalist"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+synthetic = true
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Nobody")
+
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError, match="56"):
+        load_config(config_path)
+
+    assert "cast.Nobody" in caplog.text
+
+
+def test_origin_with_no_synthetic_true_is_refused(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An origin on a photo that is not declared synthetic is a
+    contradiction, not metadata -- refused rather than silently accepted."""
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Nobody]
+role = "Lead Vocalist"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+{_ORIGIN_BLOCK}
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Nobody")
+
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError, match="56"):
+        load_config(config_path)
+
+    assert "cast.Nobody.origin" in caplog.text
+
+
+def test_synthetic_true_with_full_origin_loads(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Nobody]
+role = "Lead Vocalist"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+synthetic = true
+{_ORIGIN_BLOCK}
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Nobody")
+
+    cfg = load_config(config_path)
+    member = cfg.cast["Nobody"]
+
+    assert member.synthetic is True
+    assert member.origin is not None
+    assert member.origin.model == "hosted-api-v1"
+    assert member.origin.prompt == "a weathered lighthouse keeper, 60s, grey beard"
+    assert member.origin.seed == 12345
+    assert member.origin.created == "2026-08-23"
+    assert member.origin.extra == ()
+
+
+def test_origin_created_accepts_a_bare_toml_date(tmp_path: Path) -> None:
+    """issue #56 says 'TOML date or ISO string -- pick, document': both are
+    accepted and normalized to the same ISO string."""
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Nobody]
+role = "Lead Vocalist"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+synthetic = true
+[cast.Nobody.origin]
+model = "hosted-api-v1"
+prompt = "a weathered lighthouse keeper"
+seed = 12345
+created = 2026-08-23
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Nobody")
+
+    cfg = load_config(config_path)
+
+    assert cfg.cast["Nobody"].origin.created == "2026-08-23"
+
+
+def test_origin_created_rejects_a_non_date_value(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Nobody]
+role = "Lead Vocalist"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+synthetic = true
+[cast.Nobody.origin]
+model = "hosted-api-v1"
+prompt = "a weathered lighthouse keeper"
+seed = 12345
+created = 42
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Nobody")
+
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError, match="created"):
+        load_config(config_path)
+
+
+def test_origin_created_rejects_a_malformed_date_string(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Nobody]
+role = "Lead Vocalist"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+synthetic = true
+[cast.Nobody.origin]
+model = "hosted-api-v1"
+prompt = "a weathered lighthouse keeper"
+seed = 12345
+created = "23rd of August"
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Nobody")
+
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError, match="created"):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize("missing_key", ["model", "prompt", "seed", "created"])
+def test_origin_missing_a_required_key_is_refused(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, missing_key: str
+) -> None:
+    _create_default_assets(tmp_path)
+    fields = {
+        "model": 'model = "hosted-api-v1"',
+        "prompt": 'prompt = "a weathered lighthouse keeper"',
+        "seed": "seed = 12345",
+        "created": 'created = "2026-08-23"',
+    }
+    del fields[missing_key]
+    cast_block = f"""
+[cast.Nobody]
+role = "Lead Vocalist"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+synthetic = true
+[cast.Nobody.origin]
+{chr(10).join(fields.values())}
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Nobody")
+
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError, match="56"):
+        load_config(config_path)
+
+    assert missing_key in caplog.text
+
+
+def test_origin_model_must_be_a_non_empty_string(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Nobody]
+role = "Lead Vocalist"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+synthetic = true
+[cast.Nobody.origin]
+model = "   "
+prompt = "a weathered lighthouse keeper"
+seed = 12345
+created = "2026-08-23"
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Nobody")
+
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError, match="model"):
+        load_config(config_path)
+
+
+def test_origin_seed_must_be_an_integer(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Nobody]
+role = "Lead Vocalist"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+synthetic = true
+[cast.Nobody.origin]
+model = "hosted-api-v1"
+prompt = "a weathered lighthouse keeper"
+seed = "12345"
+created = "2026-08-23"
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Nobody")
+
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError, match="seed"):
+        load_config(config_path)
+
+
+def test_origin_seed_rejects_a_boolean(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """bool is a subclass of int in Python -- guard against `seed = true`
+    silently passing an isinstance(int) check."""
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Nobody]
+role = "Lead Vocalist"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+synthetic = true
+[cast.Nobody.origin]
+model = "hosted-api-v1"
+prompt = "a weathered lighthouse keeper"
+seed = true
+created = "2026-08-23"
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Nobody")
+
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError, match="seed"):
+        load_config(config_path)
+
+
+def test_synthetic_must_be_a_boolean(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Nobody]
+role = "Lead Vocalist"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+synthetic = "true"
+{_ORIGIN_BLOCK}
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Nobody")
+
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError, match="synthetic"):
+        load_config(config_path)
+
+
+def test_origin_extra_scalar_keys_are_kept(tmp_path: Path) -> None:
+    """The design doc lists 'sampler settings' as provenance worth keeping;
+    this is a free-form table, not a second closed vocabulary."""
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Nobody]
+role = "Lead Vocalist"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+synthetic = true
+[cast.Nobody.origin]
+model = "hosted-api-v1"
+prompt = "a weathered lighthouse keeper"
+seed = 12345
+created = "2026-08-23"
+sampler = "dpmpp_2m"
+steps = 30
+cfg_scale = 7.5
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Nobody")
+
+    cfg = load_config(config_path)
+
+    assert dict(cfg.cast["Nobody"].origin.extra) == {
+        "sampler": "dpmpp_2m",
+        "steps": 30,
+        "cfg_scale": 7.5,
+    }
+
+
+def test_origin_extra_key_rejects_a_nested_table(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Nobody]
+role = "Lead Vocalist"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+synthetic = true
+[cast.Nobody.origin]
+model = "hosted-api-v1"
+prompt = "a weathered lighthouse keeper"
+seed = 12345
+created = "2026-08-23"
+[cast.Nobody.origin.nested]
+whatever = 1
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Nobody")
+
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError, match="nested"):
+        load_config(config_path)
+
+
+# --- voiced_by interaction (issue #56 x #89) -------------------------------- #
+
+
+def test_voiced_by_entry_without_own_image_cannot_set_synthetic(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A character with no photo of its own has nothing of its own to call
+    real or invented -- it is about to inherit the performer's photo, and
+    must inherit that photo's synthetic/origin facts with it, not restate
+    them."""
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Jan]
+role = "Kashay Besmertny the Deathless, an immortal watchman"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+
+[cast."The Dead"]
+voiced_by = "Jan"
+role = "the war's dead, speaking collectively"
+synthetic = true
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Jan")
+
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError, match="56"):
+        load_config(config_path)
+
+    assert "The Dead" in caplog.text
+
+
+def test_voiced_by_entry_without_own_image_cannot_set_origin_alone(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Jan]
+role = "Kashay Besmertny the Deathless, an immortal watchman"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+
+[cast."The Dead"]
+voiced_by = "Jan"
+role = "the war's dead, speaking collectively"
+{_origin_block("The Dead")}
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Jan")
+
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError, match="56"):
+        load_config(config_path)
+
+
+def test_voiced_by_entry_without_own_image_inherits_performers_synthetic_and_origin(
+    tmp_path: Path,
+) -> None:
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Nobody]
+role = "Kashay Besmertny the Deathless, an immortal watchman"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+synthetic = true
+{_ORIGIN_BLOCK}
+
+[cast."The Dead"]
+voiced_by = "Nobody"
+role = "the war's dead, speaking collectively"
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Nobody")
+
+    cfg = load_config(config_path)
+
+    assert cfg.cast["The Dead"].synthetic is True
+    assert cfg.cast["The Dead"].origin == cfg.cast["Nobody"].origin
+    assert cfg.cast["The Dead"].image == cfg.cast["Nobody"].image
+
+
+def test_voiced_by_entry_without_own_image_inherits_a_real_performers_non_synthetic_status(
+    tmp_path: Path,
+) -> None:
+    """The common case: a character borrowing a real performer's photo is
+    just as real a likeness as the performer, for #51's purposes."""
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Jan]
+role = "Kashay Besmertny the Deathless, an immortal watchman"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+
+[cast."The Dead"]
+voiced_by = "Jan"
+role = "the war's dead, speaking collectively"
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Jan")
+
+    cfg = load_config(config_path)
+
+    assert cfg.cast["The Dead"].synthetic is False
+    assert cfg.cast["The Dead"].origin is None
+
+
+def test_voiced_by_entry_with_its_own_image_sets_synthetic_independently(
+    tmp_path: Path,
+) -> None:
+    """An explicit image always wins over inheritance (already true for
+    `image` itself) -- and once a character owns its photo, it owns the
+    provenance question about that photo too, independent of its performer."""
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Jan]
+role = "Kashay Besmertny the Deathless, an immortal watchman"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+
+[cast."The Dead"]
+voiced_by = "Jan"
+role = "the war's dead, speaking collectively"
+image = "{tmp_path / "cast" / "rex_ref.jpg"}"
+synthetic = true
+{_origin_block("The Dead")}
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Jan")
+
+    cfg = load_config(config_path)
+
+    assert cfg.cast["Jan"].synthetic is False
+    assert cfg.cast["The Dead"].synthetic is True
+    assert cfg.cast["The Dead"].origin is not None
+
+
+# --- RunConfig.real_likenesses() -------------------------------------------- #
+
+
+def test_real_likenesses_lists_every_non_synthetic_member_by_default(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path)  # DEFAULT_CAST_TOML: Dianne, Rex, both real
+
+    cfg = load_config(config_path)
+
+    assert cfg.real_likenesses() == ("Dianne", "Rex")
+
+
+def test_real_likenesses_excludes_a_synthetic_member(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Dianne]
+role = "Lead Vocalist"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+
+[cast.Nobody]
+role = "Backing vocalist"
+image = "{tmp_path / "cast" / "rex_ref.jpg"}"
+synthetic = true
+{_ORIGIN_BLOCK}
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block)
+
+    cfg = load_config(config_path)
+
+    assert cfg.real_likenesses() == ("Dianne",)
+
+
+def test_real_likenesses_resolves_voiced_by_fallback_correctly(tmp_path: Path) -> None:
+    """A character voicing a synthetic performer is not a real likeness; a
+    character voicing a real performer is -- both resolved through the
+    fallback, not through the character's own (unset) field."""
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Jan]
+role = "a real performer"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+
+[cast.Nobody]
+role = "an invented performer"
+image = "{tmp_path / "cast" / "rex_ref.jpg"}"
+synthetic = true
+{_ORIGIN_BLOCK}
+
+[cast."Jan's Echo"]
+voiced_by = "Jan"
+role = "an echo"
+
+[cast."Nobody's Echo"]
+voiced_by = "Nobody"
+role = "an echo"
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Jan")
+
+    cfg = load_config(config_path)
+
+    assert cfg.real_likenesses() == ("Jan", "Jan's Echo")
+
+
+def test_real_likenesses_is_empty_for_an_all_synthetic_cast(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    cast_block = f"""
+[cast.Nobody]
+role = "Lead Vocalist"
+image = "{tmp_path / "cast" / "dianne_ref_01.jpg"}"
+synthetic = true
+{_ORIGIN_BLOCK}
+"""
+    config_path = _write_config(tmp_path, cast_block=cast_block, default_lead_vocalist="Nobody")
+
+    cfg = load_config(config_path)
+
+    assert cfg.real_likenesses() == ()
+
+
+# --------------------------------------------------------------------------- #
 # Demeanour (issue #74)
 # --------------------------------------------------------------------------- #
 

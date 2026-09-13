@@ -30,6 +30,62 @@ from typing import ClassVar, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True)
+class CastOrigin:
+    """How an invented cast member's reference photo was made (issue #56).
+
+    Required when :attr:`CastMember.synthetic` is ``True`` -- refused at
+    config load otherwise, the same shape as ``image`` being required for a
+    performer. Same reasoning as every other provenance decision this
+    project has made (#34's fingerprints, #38's seeds, #45's templates,
+    #54's authoring sessions): an input that decides the pixels needs its
+    origin written down, not remembered -- and here the pixels are the
+    reference photo itself, generated once and then treated exactly like a
+    photograph everywhere downstream.
+    """
+
+    model: str
+    """Which generator produced the image -- free text (an SDXL checkpoint
+    name, a hosted API and version, a LoRA). Required, non-empty. Issue #56
+    deliberately defers picking a model; this field is what lets that choice
+    be recorded per-character whenever it lands, or vary between characters."""
+
+    prompt: str
+    """The prompt that produced the image. Required, non-empty -- this is
+    the field that actually lets a character be regenerated or extended,
+    which is the whole point of recording provenance rather than merely
+    flagging synthetic=true."""
+
+    seed: int
+    """The generation seed. Required."""
+
+    created: str
+    """The date the image was generated, ISO-8601 (``YYYY-MM-DD``).
+
+    ``config.py`` accepts either a bare TOML date (``created = 2026-08-23``,
+    which ``tomllib`` parses as ``datetime.date``) or a quoted ISO string
+    (``created = "2026-08-23"``) and normalizes both to this string form, so
+    every consumer of a loaded config sees one type regardless of which
+    style the TOML file used."""
+
+    extra: tuple[tuple[str, object], ...] = ()
+    """Anything else the author recorded about how the image was made --
+    sampler settings, step count, method (img2img / IP-Adapter / LoRA), a
+    hosted API's job id. The design doc (``docs/design-synthetic-cast.md``)
+    lists "sampler settings" as provenance worth keeping, and issue #56
+    deliberately defers the model decision -- so this table is free-form
+    rather than a second closed vocabulary that would need to track whatever
+    generator eventually gets picked. Each value must be a TOML scalar
+    (string, integer, float or boolean); a nested table or array is refused
+    at config load, because this is a provenance record, not a place to
+    smuggle structured config past ``CAST_KEYS``.
+
+    Stored as a tuple of pairs rather than a ``dict`` so this (otherwise
+    all-frozen, all-hashable) contract stays that way -- the same reason
+    :attr:`ChunkFingerprint.present_cast` is a tuple rather than a set.
+    Read it with ``dict(origin.extra)``."""
+
+
+@dataclass(frozen=True)
 class CastMember:
     """One entry in the Cast Dictionary (issue #2)."""
 
@@ -110,6 +166,35 @@ class CastMember:
     would need one, so it is refused rather than reasoned about later. See
     :attr:`performer` for the one attribute this field exists to make
     derivable."""
+
+    synthetic: bool = False
+    """This member's reference photo depicts nobody real (issue #56) --
+    generated imagery, not a photograph of a consenting human.
+
+    Defaults to ``False``, the only meaning any cast entry has ever had:
+    every config written before this field existed keeps loading unchanged,
+    and ``False`` is also the fact #51's likeness question needs to be able
+    to query rather than remember (see ``RunConfig.real_likenesses``).
+
+    ``True`` requires :attr:`origin` -- refused at config load otherwise:
+    "this character is invented" with no record of how is the provenance
+    bug in a new place. :attr:`origin` set while this is ``False`` (or
+    defaulted) is refused too -- an origin on a real person's photo is a
+    contradiction, not metadata, so it is treated as a config error rather
+    than silently ignored.
+
+    A ``voiced_by`` entry with no ``image`` of its own cannot set this field
+    (or :attr:`origin`) explicitly -- it has no photo that is its own to
+    describe, real or invented, so it *inherits* both facts from whichever
+    cast entry actually owns the photo it falls back to (see
+    ``config._resolve_cast_voicing``). Setting it explicitly on such an
+    entry is refused at load, naming issue #56, rather than silently
+    accepting a claim about a photo the entry does not have -- the same
+    shape as issue #89's own "no chains" rule for :attr:`voiced_by` itself."""
+
+    origin: CastOrigin | None = None
+    """Required when :attr:`synthetic` is ``True``; must be ``None``
+    otherwise (issue #56). See :class:`CastOrigin`."""
 
     @property
     def performer(self) -> str:
