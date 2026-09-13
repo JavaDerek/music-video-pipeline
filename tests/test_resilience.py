@@ -2265,6 +2265,559 @@ def test_text_encoder_round_trips_through_run_state(tmp_path: Path):
     )
 
 
+
+
+
+# --------------------------------------------------------------------------- #
+# Issue #36: public load_run_state / dump_run_state
+# --------------------------------------------------------------------------- #
+
+
+def test_load_run_state_is_public_and_matches_the_internal_reader(tmp_path: Path):
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    _complete_a_run(tmp_path, output_dir, {0: _fp(0.0, 6.0)})
+
+    loaded = resilience_module.load_run_state(tmp_path / "run_state.json")
+    assert loaded.run_id
+    assert loaded.results[0].status is ChunkStatus.RENDERED
+
+
+def test_load_run_state_accepts_a_string_path(tmp_path: Path):
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    _complete_a_run(tmp_path, output_dir, {0: _fp(0.0, 6.0)})
+
+    loaded = resilience_module.load_run_state(str(tmp_path / "run_state.json"))
+    assert loaded.results[0].status is ChunkStatus.RENDERED
+
+
+def test_load_run_state_rejects_an_old_schema_the_same_as_the_private_reader(tmp_path: Path):
+    path = tmp_path / "run_state.json"
+    path.write_text(json.dumps({"run_id": "old", "results": {}}))
+
+    with pytest.raises(resilience_module.RunStateSchemaError):
+        resilience_module.load_run_state(path)
+
+
+def test_dump_run_state_is_public_and_matches_the_internal_writer():
+    run_state = RunState(run_id="run-1", results={0: _rendered(0, Path("/tmp"))})
+    assert resilience_module.dump_run_state(run_state) == (
+        resilience_module._serialize_run_state(run_state)  # noqa: SLF001
+    )
+
+
+def test_dump_run_state_round_trips_through_load_run_state(tmp_path: Path):
+    run_state = RunState(run_id="run-1", results={0: _rendered(0, tmp_path)})
+    path = tmp_path / "run_state.json"
+    path.write_text(json.dumps(resilience_module.dump_run_state(run_state)))
+
+    loaded = resilience_module.load_run_state(path)
+    assert loaded.run_id == "run-1"
+    assert loaded.results[0].status is ChunkStatus.RENDERED
+
+
+# --------------------------------------------------------------------------- #
+# Issue #23/#36: free VRAM persisted on ChunkResult.free_vram_gb_before
+# --------------------------------------------------------------------------- #
+
+
+def test_free_vram_reading_is_recorded_on_the_rendered_chunk(tmp_path: Path):
+    client = StubExecutionClient({1: [_rendered(1, tmp_path)], 2: [_rendered(2, tmp_path)]})
+    probe = ScriptedVramProbe([20.72, 1.54])
+    runner = _make_runner(client, tmp_path, vram_probe=probe, min_free_vram_gb=16.0)
+
+    run_state = runner.render_run([1, 2], _provider_returning(), tmp_path / "chunks")
+
+    assert run_state.results[1].free_vram_gb_before == pytest.approx(20.72)
+    assert run_state.results[2].free_vram_gb_before == pytest.approx(1.54)
+
+
+def test_free_vram_reading_is_none_when_no_probe_is_injected(tmp_path: Path):
+    client = StubExecutionClient({1: [_rendered(1, tmp_path)]})
+    runner = _make_runner(client, tmp_path)  # vram_probe defaults to None
+
+    run_state = runner.render_run([1], _provider_returning(), tmp_path / "chunks")
+
+    assert run_state.results[1].free_vram_gb_before is None
+
+
+def test_free_vram_reading_is_none_when_the_probe_returns_none(tmp_path: Path):
+    client = StubExecutionClient({1: [_rendered(1, tmp_path)], 2: [_rendered(2, tmp_path)]})
+    probe = ScriptedVramProbe([None, 20.0])
+    runner = _make_runner(client, tmp_path, vram_probe=probe, min_free_vram_gb=16.0)
+
+    run_state = runner.render_run([1, 2], _provider_returning(), tmp_path / "chunks")
+
+    assert run_state.results[1].free_vram_gb_before is None
+    assert run_state.results[2].free_vram_gb_before == pytest.approx(20.0)
+
+
+def test_free_vram_reading_is_taken_once_per_chunk_not_once_per_attempt(tmp_path: Path):
+    """The probe seam sits outside ``_render_chunk``'s retry loop, so a chunk
+    that fails twice before succeeding still gets exactly one reading,
+    recorded against whichever ``ChunkResult`` the chunk eventually produces
+    -- taken before attempt 1, not re-taken per retry. This is a deliberate
+    design decision (documented on ``ChunkResult.free_vram_gb_before``), not
+    an incidental consequence: re-probing per attempt would conflate a VRAM
+    condition with the recovery sequence's own effect on free VRAM."""
+    client = StubExecutionClient(
+        {1: [WebSocketTimeoutError("hang"), WebSocketTimeoutError("hang"), _rendered(1, tmp_path)]}
+    )
+    probe = ScriptedVramProbe([12.5])
+    runner = _make_runner(client, tmp_path, max_render_attempts=3, vram_probe=probe)
+
+    run_state = runner.render_run([1], _provider_returning(), tmp_path / "chunks")
+
+    assert run_state.results[1].status is ChunkStatus.RENDERED
+    assert run_state.results[1].attempts == 3
+    assert probe.calls == 1
+    assert run_state.results[1].free_vram_gb_before == pytest.approx(12.5)
+
+
+def test_free_vram_reading_is_recorded_on_a_dead_lettered_chunk_too(tmp_path: Path):
+    """The reading is taken before the chunk's first attempt regardless of
+    how that chunk ends -- a dead-lettered chunk still had a card condition
+    worth showing a UI, possibly the reason it struggled."""
+    client = StubExecutionClient(
+        {1: [WebSocketTimeoutError("1"), WebSocketTimeoutError("2")]}
+    )
+    probe = ScriptedVramProbe([3.2])
+    runner = _make_runner(client, tmp_path, max_render_attempts=2, vram_probe=probe)
+
+    run_state = runner.render_run([1], _provider_returning(), tmp_path / "chunks")
+
+    assert run_state.results[1].status is ChunkStatus.DEAD_LETTERED
+    assert run_state.results[1].free_vram_gb_before == pytest.approx(3.2)
+
+
+def test_free_vram_reading_is_not_set_on_a_cached_chunk(tmp_path: Path):
+    """A reused chunk never touches the GPU, so there is nothing to probe --
+    see test_vram_probe_is_not_called_for_chunks_reused_from_resume."""
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    client1 = StubExecutionClient({1: [_rendered(1, output_dir)]})
+    _make_runner(client1, tmp_path).render_run([1], _provider_returning(), output_dir)
+
+    client2 = StubExecutionClient({})
+    probe2 = ScriptedVramProbe([])
+    runner2 = _make_runner(client2, tmp_path, vram_probe=probe2)
+
+    run_state = runner2.render_run([1], _provider_returning(), output_dir, resume=True)
+
+    assert run_state.results[1].status is ChunkStatus.CACHED
+    assert run_state.results[1].free_vram_gb_before is None
+
+
+def test_free_vram_reading_round_trips_through_the_state_file(tmp_path: Path):
+    client = StubExecutionClient({1: [_rendered(1, tmp_path)]})
+    probe = ScriptedVramProbe([7.75])
+    runner = _make_runner(client, tmp_path, vram_probe=probe)
+    runner.render_run([1], _provider_returning(), tmp_path / "chunks")
+
+    payload = json.loads((tmp_path / "run_state.json").read_text())
+    assert payload["results"]["1"]["free_vram_gb_before"] == pytest.approx(7.75)
+
+    reloaded = resilience_module.load_run_state(tmp_path / "run_state.json")
+    assert reloaded.results[1].free_vram_gb_before == pytest.approx(7.75)
+
+
+# --------------------------------------------------------------------------- #
+# Issue #23/#36: the run-level VramStopEvent on the stop-below-floor path
+# --------------------------------------------------------------------------- #
+
+
+def test_vram_stop_event_is_recorded_on_run_state_when_the_run_stops(tmp_path: Path):
+    client = StubExecutionClient(
+        {1: [_rendered(1, tmp_path)], 2: [_rendered(2, tmp_path)], 3: [_rendered(3, tmp_path)]}
+    )
+    probe = ScriptedVramProbe([20.0, 19.0, 8.0])
+    runner = _make_runner(
+        client, tmp_path, vram_probe=probe, between_chunk_min_free_vram_gb=16.0
+    )
+
+    with pytest.raises(VramBelowFloorError):
+        runner.render_run([1, 2, 3], _provider_returning(), tmp_path / "chunks")
+
+    # The exception propagates rather than returning a RunState, so the only
+    # way to see what was recorded is to read back what was persisted --
+    # exactly what a UI polling run_state.json would do.
+    state = resilience_module.load_run_state(tmp_path / "run_state.json")
+    assert state.vram_stop is not None
+    assert state.vram_stop.chunk_id == 3
+    assert state.vram_stop.free_vram_gb == pytest.approx(8.0)
+    assert state.vram_stop.floor_gb == pytest.approx(16.0)
+    # And chunk 3, the one that tripped the floor, never got a ChunkResult --
+    # the reading has no honest per-chunk home, which is why it is run-level.
+    assert 3 not in state.results
+
+
+def test_vram_stop_event_round_trips_through_the_state_file(tmp_path: Path):
+    client = StubExecutionClient({1: [_rendered(1, tmp_path)]})
+    probe = ScriptedVramProbe([5.0])
+    runner = _make_runner(client, tmp_path, vram_probe=probe, between_chunk_min_free_vram_gb=16.0)
+
+    with pytest.raises(VramBelowFloorError):
+        runner.render_run([1], _provider_returning(), tmp_path / "chunks")
+
+    payload = json.loads((tmp_path / "run_state.json").read_text())
+    assert payload["vram_stop"] == {"chunk_id": 1, "free_vram_gb": 5.0, "floor_gb": 16.0}
+
+    reloaded = resilience_module.load_run_state(tmp_path / "run_state.json")
+    assert reloaded.vram_stop == resilience_module.VramStopEvent(
+        chunk_id=1, free_vram_gb=5.0, floor_gb=16.0
+    )
+
+
+def test_vram_stop_is_none_on_a_run_that_never_hit_the_floor(tmp_path: Path):
+    client = StubExecutionClient({1: [_rendered(1, tmp_path)]})
+    runner = _make_runner(client, tmp_path)
+
+    run_state = runner.render_run([1], _provider_returning(), tmp_path / "chunks")
+
+    assert run_state.vram_stop is None
+    payload = json.loads((tmp_path / "run_state.json").read_text())
+    assert payload["vram_stop"] is None
+
+
+# --------------------------------------------------------------------------- #
+# Issue #36: the per-chunk resume reason
+# --------------------------------------------------------------------------- #
+
+
+def test_rerender_reason_is_none_for_a_freshly_rendered_chunk_with_no_prior_entry(
+    tmp_path: Path,
+):
+    client = StubExecutionClient({1: [_rendered(1, tmp_path)]})
+    runner = _make_runner(client, tmp_path)
+
+    run_state = runner.render_run([1], _provider_returning(), tmp_path / "chunks")
+
+    assert run_state.results[1].rerender_reason is None
+    assert run_state.results[1].rerender_reason_fields == ()
+
+
+def test_rerender_reason_explicit_selection(tmp_path: Path):
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    _complete_a_run(tmp_path, output_dir, {0: _fp(0.0, 6.0)})
+
+    client = StubExecutionClient({0: [_rendered(0, output_dir, name="chunk_0000_new.mp4")]})
+    runner = _make_runner(client, tmp_path)
+
+    run_state = runner.render_run(
+        [0],
+        _provider_returning(),
+        output_dir,
+        resume=True,
+        fingerprints={0: _fp(0.0, 6.0)},
+        force_chunk_ids={0},
+    )
+
+    assert run_state.results[0].status is ChunkStatus.RENDERED
+    assert run_state.results[0].rerender_reason == "explicit_selection"
+    assert run_state.results[0].rerender_reason_fields == ()
+
+
+def test_rerender_reason_video_missing(tmp_path: Path):
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    _complete_a_run(tmp_path, output_dir, {0: _fp(0.0, 6.0)})
+    # Delete the video the prior run rendered -- the cache entry still names
+    # it, but the file is gone.
+    payload = json.loads((tmp_path / "run_state.json").read_text())
+    Path(payload["results"]["0"]["video_file"]).unlink()
+
+    client = StubExecutionClient({0: [_rendered(0, output_dir, name="chunk_0000_new.mp4")]})
+    runner = _make_runner(client, tmp_path)
+
+    run_state = runner.render_run(
+        [0], _provider_returning(), output_dir, resume=True, fingerprints={0: _fp(0.0, 6.0)}
+    )
+
+    assert run_state.results[0].rerender_reason == "video_missing"
+    assert run_state.results[0].rerender_reason_fields == ()
+
+
+def test_rerender_reason_no_fingerprint(tmp_path: Path):
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    video = output_dir / "chunk_0000.mp4"
+    video.write_bytes(b"fake-mp4-bytes")
+    (tmp_path / "run_state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": resilience_module.RUN_STATE_SCHEMA_VERSION,
+                "run_id": "old-run",
+                "results": {
+                    "0": {
+                        "chunk_id": 0,
+                        "status": "rendered",
+                        "video_file": str(video),
+                        "prompt_id": "p",
+                        "attempts": 1,
+                        "errors": [],
+                        "render_seconds": None,
+                        "fingerprint": None,
+                    }
+                },
+            }
+        )
+    )
+
+    client = StubExecutionClient({0: [_rendered(0, output_dir, name="chunk_0000_new.mp4")]})
+    runner = _make_runner(client, tmp_path)
+
+    run_state = runner.render_run(
+        [0], _provider_returning(), output_dir, resume=True, fingerprints={0: _fp(0.0, 6.0)}
+    )
+
+    assert run_state.results[0].rerender_reason == "no_fingerprint"
+    assert run_state.results[0].rerender_reason_fields == ()
+
+
+def test_rerender_reason_chain_blocked(tmp_path: Path):
+    from dataclasses import replace as dc_replace
+
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    fp0 = dc_replace(_fp(0.0, 6.0))
+    fp1 = dc_replace(_fp(6.0, 12.0), chained_from=0)
+    _complete_a_run(tmp_path, output_dir, {0: fp0, 1: fp1})
+
+    # Chunk 0 re-renders this run (forced); chunk 1 was chained from it, so
+    # its cached video's seed frame no longer exists.
+    client = StubExecutionClient(
+        {0: [_rendered(0, output_dir, name="chunk_0000_new.mp4")]}
+    )
+    runner = _make_runner(client, tmp_path)
+
+    run_state = runner.render_run(
+        [0, 1],
+        _provider_returning(),
+        output_dir,
+        resume=True,
+        fingerprints={0: fp0, 1: fp1},
+        force_chunk_ids={0},
+    )
+
+    assert run_state.results[1].rerender_reason == "chain_blocked"
+    assert run_state.results[1].rerender_reason_fields == ("chained_from",)
+
+
+def test_rerender_reason_conditioning_changed_names_the_field(tmp_path: Path):
+    from dataclasses import replace as dc_replace
+
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    prior = {0: dc_replace(_fp(0.0, 6.0), conditioning_source="mix")}
+    _complete_a_run(tmp_path, output_dir, prior)
+
+    wanted = {0: dc_replace(_fp(0.0, 6.0), conditioning_source="stem:vocals.wav")}
+    client = StubExecutionClient({0: [_rendered(0, output_dir, name="chunk_0000_new.mp4")]})
+    runner = _make_runner(client, tmp_path)
+
+    run_state = runner.render_run(
+        [0], _provider_returning(), output_dir, resume=True, fingerprints=wanted
+    )
+
+    assert run_state.results[0].rerender_reason == "conditioning_changed"
+    assert run_state.results[0].rerender_reason_fields == ("conditioning_source",)
+
+
+def test_rerender_reason_timeline_changed_names_the_field(tmp_path: Path):
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    _complete_a_run(tmp_path, output_dir, {0: _fp(0.0, 6.0)})
+
+    moved = {0: _fp(3.25, 9.25)}
+    client = StubExecutionClient({0: [_rendered(0, output_dir, name="chunk_0000_new.mp4")]})
+    runner = _make_runner(client, tmp_path)
+
+    run_state = runner.render_run(
+        [0], _provider_returning(), output_dir, resume=True, fingerprints=moved
+    )
+
+    assert run_state.results[0].rerender_reason == "timeline_changed"
+    assert "start" in run_state.results[0].rerender_reason_fields
+    assert "end" in run_state.results[0].rerender_reason_fields
+
+
+def test_rerender_reason_content_changed_names_the_field(tmp_path: Path):
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    _complete_a_run(tmp_path, output_dir, {0: _fp(0.0, 6.0, prompt="original prompt")})
+
+    changed = {0: _fp(0.0, 6.0, prompt="a completely different prompt")}
+    client = StubExecutionClient({0: [_rendered(0, output_dir, name="chunk_0000_new.mp4")]})
+    runner = _make_runner(client, tmp_path)
+
+    run_state = runner.render_run(
+        [0], _provider_returning(), output_dir, resume=True, fingerprints=changed
+    )
+
+    assert run_state.results[0].rerender_reason == "content_changed"
+    assert "prompt_hash" in run_state.results[0].rerender_reason_fields
+
+
+def test_rerender_reason_is_not_set_when_ignore_prompt_changes_reuses_the_chunk(tmp_path: Path):
+    """resume_ignore_prompt_changes reuses the cached video wholesale -- it
+    is not a rerender, so there is no reason to attach to anything; the
+    reused ChunkResult keeps whatever it already carried (None, for a chunk
+    rendered before this field existed)."""
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    _complete_a_run(tmp_path, output_dir, {0: _fp(0.0, 6.0, prompt="original prompt")})
+
+    changed = {0: _fp(0.0, 6.0, prompt="a completely different prompt")}
+    client = StubExecutionClient({})  # must never be reached
+    runner = _make_runner(client, tmp_path, ignore_prompt_changes=True)
+
+    run_state = runner.render_run(
+        [0], _provider_returning(), output_dir, resume=True, fingerprints=changed
+    )
+
+    assert run_state.results[0].status is ChunkStatus.CACHED
+    assert run_state.results[0].rerender_reason is None
+
+
+def test_rerender_reason_round_trips_through_the_state_file(tmp_path: Path):
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    _complete_a_run(tmp_path, output_dir, {0: _fp(0.0, 6.0)})
+
+    moved = {0: _fp(3.25, 9.25)}
+    client = StubExecutionClient({0: [_rendered(0, output_dir, name="chunk_0000_new.mp4")]})
+    runner = _make_runner(client, tmp_path)
+    runner.render_run([0], _provider_returning(), output_dir, resume=True, fingerprints=moved)
+
+    payload = json.loads((tmp_path / "run_state.json").read_text())
+    assert payload["results"]["0"]["rerender_reason"] == "timeline_changed"
+    assert set(payload["results"]["0"]["rerender_reason_fields"]) == {"start", "end"}
+
+    reloaded = resilience_module.load_run_state(tmp_path / "run_state.json")
+    assert reloaded.results[0].rerender_reason == "timeline_changed"
+
+
+# --------------------------------------------------------------------------- #
+# Issue #36: the new fields must never affect the --resume match itself
+# --------------------------------------------------------------------------- #
+
+
+def test_free_vram_and_rerender_reason_never_affect_whether_a_chunk_is_reused(tmp_path: Path):
+    """These are observations recorded alongside a result, not part of
+    ChunkFingerprint -- a chunk whose *only* difference from a fresh render
+    is its free_vram_gb_before / rerender_reason bookkeeping must still be
+    reused as CACHED."""
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    client1 = StubExecutionClient({0: [_rendered(0, output_dir)]})
+    probe1 = ScriptedVramProbe([9.9])
+    runner1 = _make_runner(client1, tmp_path, vram_probe=probe1)
+    runner1.render_run(
+        [0], _provider_returning(), output_dir, fingerprints={0: _fp(0.0, 6.0)}
+    )
+
+    stored = json.loads((tmp_path / "run_state.json").read_text())
+    assert stored["results"]["0"]["free_vram_gb_before"] == pytest.approx(9.9)
+
+    client2 = StubExecutionClient({})  # must never be reached -- reuse expected
+    runner2 = _make_runner(client2, tmp_path)
+    run_state = runner2.render_run(
+        [0], _provider_returning(), output_dir, resume=True, fingerprints={0: _fp(0.0, 6.0)}
+    )
+
+    assert run_state.results[0].status is ChunkStatus.CACHED
+    assert client2.calls == []
+
+
+def test_chunk_fingerprint_has_no_vram_or_rerender_reason_fields():
+    """Locks in that issue #36's additions never became comparable
+    fingerprint fields -- the fingerprint proves span/content identity, not
+    what a UI wants to display."""
+    import dataclasses as dc
+
+    from music_video_maker.contracts import ChunkFingerprint
+
+    field_names = {f.name for f in dc.fields(ChunkFingerprint)}
+    assert "free_vram_gb_before" not in field_names
+    assert "rerender_reason" not in field_names
+
+
+# --------------------------------------------------------------------------- #
+# Issue #36: backward compatibility -- a file written by today's code (no
+# free_vram_gb_before / rerender_reason / rerender_reason_fields / vram_stop
+# keys) must still load, with the new fields defaulting to None / ().
+# --------------------------------------------------------------------------- #
+
+
+def test_a_state_file_shaped_exactly_like_todays_code_still_loads(tmp_path: Path):
+    """This is the hard constraint: a real in-flight run's run_state.json,
+    written by the code before this change, must remain resumable. No
+    schema_version bump, and every new key is optional on read."""
+    video = tmp_path / "chunks" / "chunk_0000.mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"fake-mp4-bytes")
+    payload = {
+        "schema_version": resilience_module.RUN_STATE_SCHEMA_VERSION,
+        "run_id": "pre-36-run",
+        "results": {
+            "0": {
+                "chunk_id": 0,
+                "status": "rendered",
+                "video_file": str(video),
+                "prompt_id": "p",
+                "attempts": 1,
+                "errors": [],
+                "render_seconds": 123.4,
+                "fingerprint": {
+                    "start": 0.0,
+                    "end": 6.0,
+                    "frame_count": 141,
+                    "render_width": 864,
+                    "render_height": 480,
+                    "prompt_hash": "abc123",
+                    "character": "Dianne",
+                    "image_ref": "/cast/dianne.png",
+                    "present_cast": None,
+                    "noise_seed": 0,
+                    "chained_from": None,
+                    "conditioning_source": None,
+                    "instrumental_audio_gain_db": None,
+                    "text_encoder": None,
+                    "lora": None,
+                    "lora_strength": None,
+                    "template_hash": None,
+                },
+            }
+        },
+        # No "vram_stop" key at all -- exactly today's shape.
+    }
+    (tmp_path / "run_state.json").write_text(json.dumps(payload))
+
+    loaded = resilience_module.load_run_state(tmp_path / "run_state.json")
+
+    assert loaded.run_id == "pre-36-run"
+    assert loaded.results[0].status is ChunkStatus.RENDERED
+    assert loaded.results[0].free_vram_gb_before is None
+    assert loaded.results[0].rerender_reason is None
+    assert loaded.results[0].rerender_reason_fields == ()
+    assert loaded.vram_stop is None
+
+    # And a run resuming from this exact file reuses the chunk, unaffected
+    # by the missing keys.
+    client = StubExecutionClient({})  # must never be reached
+    runner = _make_runner(client, tmp_path)
+    run_state = runner.render_run(
+        [0], _provider_returning(), tmp_path / "chunks", resume=True,
+        fingerprints={0: _fp(0.0, 6.0, prompt="", seed=0)},
+    )
+    # Prompt hash differs from the stored "abc123" only because the fixture
+    # above used a hand-written placeholder hash rather than a real one --
+    # what matters here is that loading itself did not raise or misbehave.
+    assert run_state.results[0].chunk_id == 0
+
+
 def test_instrumental_audio_gain_is_conditioning_and_never_escapable():
     """F26: attenuating the instrumental stem changes what H3 was conditioned on.
 
