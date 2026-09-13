@@ -2469,6 +2469,31 @@ def test_vram_stop_event_round_trips_through_the_state_file(tmp_path: Path):
     )
 
 
+def test_resuming_after_a_vram_stop_clears_the_stop_once_the_run_completes(tmp_path: Path):
+    """A stop describes the invocation that stopped, not the run directory
+    forever. Without clearing it on resume, a healthy resumed run keeps
+    persisting the old stop, and a poller's first snapshot of it announces
+    ``run_stopped`` for a run that is rendering fine."""
+    client = StubExecutionClient({1: [_rendered(1, tmp_path)], 2: [_rendered(2, tmp_path)]})
+    stopped = _make_runner(
+        client, tmp_path, vram_probe=ScriptedVramProbe([20.0, 8.0]),
+        between_chunk_min_free_vram_gb=16.0,
+    )
+    with pytest.raises(VramBelowFloorError):
+        stopped.render_run([1, 2], _provider_returning(), tmp_path / "chunks")
+    assert resilience_module.load_run_state(tmp_path / "run_state.json").vram_stop is not None
+
+    client2 = StubExecutionClient({2: [_rendered(2, tmp_path)]})
+    resumed = _make_runner(
+        client2, tmp_path, vram_probe=ScriptedVramProbe([20.0]),
+        between_chunk_min_free_vram_gb=16.0,
+    )
+    run_state = resumed.render_run([1, 2], _provider_returning(), tmp_path / "chunks", resume=True)
+
+    assert run_state.vram_stop is None
+    assert resilience_module.load_run_state(tmp_path / "run_state.json").vram_stop is None
+
+
 def test_vram_stop_is_none_on_a_run_that_never_hit_the_floor(tmp_path: Path):
     client = StubExecutionClient({1: [_rendered(1, tmp_path)]})
     runner = _make_runner(client, tmp_path)
