@@ -1184,6 +1184,16 @@ def main(argv: list[str] | None = None) -> int:
         logger.exception("Failed to load run config from %s", args.config)
         return EXIT_ERROR
 
+    # Issue #56: #51's likeness question ("whose consent does this run
+    # depend on?") made askable at run start rather than left to be
+    # remembered. Only logged when the answer is non-empty -- a config with
+    # an entirely synthetic cast has nothing to disclose here.
+    real_likenesses = config.real_likenesses()
+    if real_likenesses:
+        logger.info(
+            "this run conditions on real likenesses: %s", ", ".join(real_likenesses)
+        )
+
     if args.prepare:
         output_path = args.shot_plan_out or (Path(args.config).resolve().parent / "shot_plan.toml")
         try:

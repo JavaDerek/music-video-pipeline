@@ -72,6 +72,7 @@ entry to be "used" as a vocalist.
 
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 import re
@@ -83,7 +84,7 @@ from typing import NoReturn
 from urllib.parse import urlparse
 
 from music_video_maker.assembly import DEFAULT_DURATION_TOLERANCE_SECONDS
-from music_video_maker.contracts import AlignmentOverride, CastMember, HardwareProfile
+from music_video_maker.contracts import AlignmentOverride, CastMember, CastOrigin, HardwareProfile
 from music_video_maker.faces import (
     DEFAULT_MIN_FACE_FRACTION,
     DEFAULT_MIN_FACE_SIMILARITY,
@@ -891,6 +892,23 @@ class RunConfig:
     is genuinely clear before a long run; stopping the one tenant you know
     about is not the same as freeing the card."""
 
+    def real_likenesses(self) -> tuple[str, ...]:
+        """Cast members whose reference photo depicts a real, identifiable
+        person (issue #56) -- so #51's likeness question ("whose consent does
+        this run depend on?") is something a run can be *asked*, not
+        something that has to be remembered.
+
+        Every cast entry not marked :attr:`~contracts.CastMember.synthetic`.
+        This needs no special case for a ``voiced_by`` entry with no image of
+        its own: :func:`_resolve_cast_voicing` already inherited the
+        performer's own ``synthetic``/``origin`` facts onto it, along with
+        the performer's photo, at load time -- so ``member.synthetic`` is
+        already the right answer for *this* entry's use of that photo.
+        Sorted, for a stable, diffable result (``cli.main`` logs this at INFO
+        for every run that has at least one)."""
+        return tuple(sorted(name for name, member in self.cast.items() if not member.synthetic))
+
+
 _ALLOWED_OVERRIDE_KEYS = {f.name for f in dc_fields(RunConfig)}
 
 
@@ -926,10 +944,94 @@ def _resolve_path(value: object, base_dir: Path) -> Path:
     return candidate if candidate.is_absolute() else base_dir / candidate
 
 
-CAST_KEYS = frozenset({"role", "image", "appearance", "demeanour", "voiced_by"})
+CAST_KEYS = frozenset(
+    {"role", "image", "appearance", "demeanour", "voiced_by", "synthetic", "origin"}
+)
 """Every key a ``[cast.<Name>]`` table may contain. Closed set, for the same
 reason :data:`HARDWARE_KEYS` is: a misspelled ``appearence`` that is silently
 ignored is config that reads as applied but never reaches a prompt."""
+
+ORIGIN_REQUIRED_KEYS = frozenset({"model", "prompt", "seed", "created"})
+"""Every ``[cast.<Name>.origin]`` key that is *required* (issue #56). Not a
+closed set the way :data:`CAST_KEYS` is -- an origin table may carry extra
+scalar keys (sampler settings, step count, a hosted API's job id; the design
+doc names "sampler settings" as provenance worth keeping) -- so this only
+names what :func:`_build_cast_origin` refuses to build without."""
+
+
+def _parse_origin_created(name: str, value: object) -> str:
+    """Normalize ``[cast.<name>.origin].created`` to an ISO-8601 string.
+
+    Two spellings are accepted on purpose (issue #56 says "pick, document"):
+    a bare TOML date (``created = 2026-08-23``, which ``tomllib`` parses as
+    ``datetime.date``) or a quoted ISO string (``created = "2026-08-23"``).
+    Both normalize to the same ``str`` here, so every downstream consumer of
+    a loaded config -- logging, the consistency report, a future regenerate
+    command -- sees one type regardless of which style the file used."""
+    if isinstance(value, datetime.datetime):
+        return value.date().isoformat()
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    if isinstance(value, str):
+        try:
+            return datetime.date.fromisoformat(value).isoformat()
+        except ValueError:
+            pass
+    _fail(
+        f"cast.{name}.origin.created",
+        f"must be a date (a bare TOML date, e.g. 2026-08-23, or a quoted ISO-8601 "
+        f"string 'YYYY-MM-DD'), got {value!r}",
+    )
+
+
+def _build_cast_origin(name: str, raw_origin: object) -> CastOrigin:
+    """Build and validate :class:`CastOrigin` from a ``[cast.<name>.origin]``
+    table (issue #56). Required keys are checked for presence and type;
+    everything else is carried through as :attr:`CastOrigin.extra`, scalars
+    only -- see that field's docstring for why the table is free-form rather
+    than a second closed vocabulary."""
+    if not isinstance(raw_origin, dict):
+        _fail(
+            f"cast.{name}.origin",
+            f"must be a table with {', '.join(sorted(ORIGIN_REQUIRED_KEYS))} keys, "
+            f"got {raw_origin!r}",
+        )
+    missing = sorted(ORIGIN_REQUIRED_KEYS - set(raw_origin))
+    if missing:
+        _fail(
+            f"cast.{name}.origin",
+            f"missing required key(s): {', '.join(missing)} (issue #56 -- an invented "
+            "character needs its provenance recorded to be regenerated or extended later)",
+        )
+
+    model = raw_origin["model"]
+    if not isinstance(model, str) or not model.strip():
+        _fail(f"cast.{name}.origin.model", f"must be a non-empty string, got {model!r}")
+
+    prompt = raw_origin["prompt"]
+    if not isinstance(prompt, str) or not prompt.strip():
+        _fail(f"cast.{name}.origin.prompt", f"must be a non-empty string, got {prompt!r}")
+
+    seed = raw_origin["seed"]
+    if not isinstance(seed, int) or isinstance(seed, bool):
+        _fail(f"cast.{name}.origin.seed", f"must be an integer, got {seed!r}")
+
+    created = _parse_origin_created(name, raw_origin["created"])
+
+    extra: list[tuple[str, object]] = []
+    for key in sorted(set(raw_origin) - ORIGIN_REQUIRED_KEYS):
+        value = raw_origin[key]
+        if isinstance(value, (dict, list)):
+            _fail(
+                f"cast.{name}.origin.{key}",
+                "must be a scalar value (string, integer, float or boolean) -- this is "
+                "a provenance record, not a place for structured config",
+            )
+        extra.append((key, value))
+
+    return CastOrigin(
+        model=model.strip(), prompt=prompt.strip(), seed=seed, created=created, extra=tuple(extra)
+    )
 
 _PROHIBITION_PATTERN = re.compile(r"\b(never|without|no)\b", re.IGNORECASE)
 """Issue #73's own list of prohibition markers, applied to ``role`` and
@@ -1077,12 +1179,55 @@ def _build_cast(raw_cast: object, base_dir: Path) -> dict[str, CastMember]:
         if member_demeanour:
             _warn_if_prohibition(f"cast.{name}", "demeanour", member_demeanour)
             _warn_if_displacement(f"cast.{name}", "demeanour", member_demeanour)
+
+        # Issue #56: synthetic/origin. A voiced_by entry with no image of its
+        # own has no photo that is its own to call real or invented -- it is
+        # about to inherit the performer's photo below, and it inherits that
+        # photo's synthetic/origin facts along with it (in
+        # _resolve_cast_voicing). Setting either explicitly here would be a
+        # claim about a photo this entry does not have, so it is refused now,
+        # before we even know who voiced_by names -- this check needs nothing
+        # but the entry's own fields, the same way the image-required check
+        # above does.
+        synthetic_present = "synthetic" in entry
+        origin_present = "origin" in entry
+        if voiced_by is not None and not image and (synthetic_present or origin_present):
+            _fail(
+                f"cast.{name}",
+                f"sets {'synthetic' if synthetic_present else 'origin'} but has no image "
+                f"of its own -- it falls back to {voiced_by!r}'s photo (issue #89), so it "
+                f"inherits that photo's synthetic/origin facts automatically and must not "
+                f"restate or contradict them (issue #56). Give cast.{name} its own image "
+                f"to describe a different photo, or remove synthetic/origin here.",
+            )
+
+        synthetic = entry.get("synthetic", False)
+        if synthetic_present and not isinstance(synthetic, bool):
+            _fail(f"cast.{name}.synthetic", f"must be a boolean (true/false), got {synthetic!r}")
+
+        origin = _build_cast_origin(name, entry["origin"]) if origin_present else None
+        if synthetic and origin is None:
+            _fail(
+                f"cast.{name}.synthetic",
+                f"is true but [cast.{name}.origin] is missing -- an invented character "
+                "needs its provenance recorded (issue #56): model, prompt, seed and created",
+            )
+        if origin is not None and not synthetic:
+            _fail(
+                f"cast.{name}.origin",
+                f"is set but cast.{name}.synthetic is not true -- an origin on a real "
+                f"person's photo is a contradiction (issue #56). Set synthetic = true, or "
+                f"remove [cast.{name}.origin].",
+            )
+
         raw_entries[name] = {
             "role": role,
             "image": image,
             "appearance": _optional_text(entry, "appearance"),
             "demeanour": member_demeanour,
             "voiced_by": voiced_by,
+            "synthetic": bool(synthetic),
+            "origin": origin,
         }
     return _resolve_cast_voicing(raw_entries, base_dir)
 
@@ -1107,11 +1252,24 @@ def _resolve_cast_voicing(
     first pass, so by the time a character's inheritance is resolved here,
     the performer it names is guaranteed to already have a real path -- this
     holds regardless of which of the two was written first in the file.
+
+    Issue #56: when an entry's ``image`` falls back to its performer's, its
+    ``synthetic``/``origin`` fall back with it -- the entry is now showing
+    exactly the performer's photo, so whatever is true of that photo (real
+    or invented, and by whom) is true of this entry's use of it too. Pass 1
+    already refused this entry setting either explicitly in that case, so
+    there is nothing to reconcile here, only to copy: the performer's own
+    raw ``synthetic``/``origin`` are self-contained (a performer cannot
+    itself set ``voiced_by``, so they were never subject to this same
+    inheritance), regardless of which of the two names came first in the
+    file.
     """
     cast: dict[str, CastMember] = {}
     for name, raw in raw_entries.items():
         voiced_by = raw["voiced_by"]
         image = raw["image"]
+        synthetic = raw["synthetic"]
+        origin = raw["origin"]
         if voiced_by is not None:
             if voiced_by == name:
                 _fail(
@@ -1135,6 +1293,8 @@ def _resolve_cast_voicing(
                 )
             if not image:
                 image = target["image"]
+                synthetic = target["synthetic"]
+                origin = target["origin"]
         cast[name] = CastMember(
             name=name,
             role=raw["role"],
@@ -1142,6 +1302,8 @@ def _resolve_cast_voicing(
             appearance=raw["appearance"],
             demeanour=raw["demeanour"],
             voiced_by=voiced_by,
+            synthetic=synthetic,
+            origin=origin,
         )
     return cast
 
