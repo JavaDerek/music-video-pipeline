@@ -120,6 +120,16 @@ BEATS_SCHEMA: dict[str, Any] = {
                     # whether a vocabulary was supplied -- this hint only
                     # covers "is this a string" for a model that does set it.
                     "conditions": {"type": "string", "minLength": 1},
+                    # Issue #68: this beat is composed for an object to come
+                    # at the lens / cross in front of the screen plane --
+                    # named as the motif that does it, not a bare boolean, so
+                    # the preamble can ask for its plant and a later lint can
+                    # know which noun to look for (see `Beat.pop_object`'s own
+                    # docstring for why a name beats a flag here). Optional --
+                    # most beats leave it out entirely -- and checked
+                    # structurally in `_parse_entries`/`check_beat_structure`,
+                    # never just "is this a string" the way this hint is.
+                    "pop_object": {"type": "string", "minLength": 1},
                 },
             },
         }
@@ -213,6 +223,59 @@ class Beat:
     :attr:`~music_video_maker.shot_plan.ShotPlanEntry.subject_is_focus`
     (issue #26): that is a boolean asking whether the focus member is the
     sentence's grammatical subject; this says WHO the focus member is."""
+    pop_object: str | None = None
+    """The motif this beat is composed to send at the lens / across the
+    screen plane (issue #68), e.g. ``"the printer"`` -- ``None`` (the default)
+    on every beat that is not a pop moment, which is almost all of them.
+
+    **Named, not a bare boolean.** A plain ``pop: bool`` would say only "this
+    is a pop moment" and leave the preamble to plant "it" against nothing in
+    particular. Naming the motif does two things a flag cannot: it gives
+    :func:`~music_video_maker.authoring.prompts.BEATS_PREAMBLE` a concrete
+    thing to ask the model to plant earlier in the same ``beat_group`` (the
+    same plant/payoff shape :func:`check_beat_structure` already enforces for
+    ``consequence``), and it gives a later per-object lint (design doc step 3,
+    NOT built here -- the only corpus that exists scores every proposed
+    keyword at zero, see issue #68's own comment) a specific noun to look for
+    instead of guessing from prose. The cost is one string instead of one
+    bool; the design doc's own worked example already names the object
+    ("this is a pop moment"), so a model that can mark the beat can name it.
+
+    **Structural check, reusing existing machinery.** A beat with
+    ``pop_object`` set must have an earlier ``plant`` in its own
+    ``beat_group`` -- exactly :func:`check_beat_structure`'s existing
+    consequence rule, applied to a second axis: "the objects that fly out are
+    motifs the concept established" (design doc), so a pop with nothing
+    planted for it is inventing the object as it flies at the lens. Checked
+    in :func:`check_beat_structure`, not here: this stage has the whole sheet
+    in scope, not just one entry.
+
+    **Deliberately NOT restricted by `beat_role` or voiced/instrumental
+    status.** Two candidates were considered and rejected for lack of
+    evidence: forbidding `pop_object` on `instrumental`/`transition` roles
+    (no measured reason a pop moment needs a particular role -- the object
+    still needs an earlier plant, whatever role carries it), and forbidding
+    it on a voiced chunk because the singer owns the frame there (#58/#59/
+    #60) and a large object thrust at the lens over a sung line could fight
+    lip-sync exactly the way `focus = "action"` does. That risk is real
+    enough to say in :data:`BEATS_PREAMBLE` -- prefer an instrumental chunk
+    when one is available in the group, the same advice rule 4 already gives
+    a `consequence` -- but nothing here has measured it, and this project's
+    own rule is not to forbid on a hypothesis (#60's lesson: "a lint that
+    guesses loses to a stage that knows", and nothing knows this yet).
+
+    **Rare, by convention rather than by cap.** The design doc says a pop
+    beat should be rare -- "a video with six of them is a different video"
+    -- but no number has been measured, so no cap is enforced here. Said in
+    :data:`BEATS_PREAMBLE` instead, the same way rarity is asked for rather
+    than counted.
+
+    **`to_dict` omits this key when unset** (unlike `subject`/`location`/
+    `act`/`conditions`, which are always present in the dict even at their
+    own "not authored" default) -- see `to_dict`'s own comment for why: a
+    beat sheet that never sets a pop must hash identically to one from before
+    this field existed, the same "key absent when empty" precedent #86's
+    `song_facts` set at the session level, applied here one level down."""
     focus: str = FOCUS_SUBJECT
     length_seconds: float | None = None
     merged_from: tuple[int, ...] = ()
@@ -221,7 +284,7 @@ class Beat:
     rule ``ShotLength.source_chunk_id`` follows."""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "chunk_id": self.chunk_id,
             "start": self.start,
             "end": self.end,
@@ -236,6 +299,20 @@ class Beat:
             "length_seconds": self.length_seconds,
             "merged_from": list(self.merged_from),
         }
+        if self.pop_object is not None:
+            # Issue #68: omitted entirely when unset, unlike `subject`/
+            # `location`/`act`/`conditions` above (which are always present,
+            # even at their own "not authored" default). This dict is what
+            # `prose_input_hashes`/`photography_input_hashes` hash as their
+            # "beats" input -- so a beat sheet that never sets a pop must
+            # serialise byte-identically to what this method produced before
+            # this field existed, or every pre-#68 session would be reported
+            # stale by a field nobody set. Same "key absent when empty"
+            # precedent as #86's `song_facts`, one level down: there it keeps
+            # a session's recorded input hashes stable, here it keeps a
+            # beat's own serialisation stable.
+            payload["pop_object"] = self.pop_object
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> Beat:
@@ -262,6 +339,12 @@ class Beat:
             # `None` -- not `""` -- is the correct "not stated" value here,
             # see the field's own docstring.
             subject=(None if payload.get("subject") is None else str(payload["subject"])),
+            # Pre-#68 persisted beat sheets have no `pop_object` key at all;
+            # `None` is the correct "not a pop beat" value -- same tolerant
+            # `.get` treatment `subject` gets above, for the same reason.
+            pop_object=(
+                None if payload.get("pop_object") is None else str(payload["pop_object"])
+            ),
             focus=str(payload.get("focus", FOCUS_SUBJECT)),
             length_seconds=(
                 None if payload.get("length_seconds") is None else float(payload["length_seconds"])
@@ -506,6 +589,23 @@ def _parse_entries(
                 )
                 continue
 
+        # Issue #68: which motif this beat sends at the lens, or omitted
+        # entirely on almost every beat. No vocabulary to check membership
+        # against -- unlike `location`/`act`/`conditions`, `motifs` in the
+        # concept is not a closed list anything downstream validates against
+        # (it is prompted as "a short list of recurring visual ideas", never
+        # enforced) -- so the only structural guarantee available is the one
+        # `check_beat_structure` adds: an earlier `plant` in the same group.
+        pop_object = entry.get("pop_object")
+        if pop_object is not None:
+            if not isinstance(pop_object, str) or not pop_object.strip():
+                problems.append(
+                    f"chunk_id={chunk_id} pop_object={pop_object!r} must be a non-blank "
+                    "string naming the object that comes at the lens, or omitted entirely"
+                )
+                continue
+            pop_object = pop_object.strip()
+
         beats.append(
             Beat(
                 chunk_id=chunk_id,
@@ -518,6 +618,7 @@ def _parse_entries(
                 act=act,
                 conditions=conditions_value,
                 subject=subject,
+                pop_object=pop_object,
                 focus=focus,
                 length_seconds=length,
             )
@@ -551,6 +652,28 @@ def check_beat_structure(
         group_sizes[beat.beat_group] = group_sizes.get(beat.beat_group, 0) + 1
 
     for position, beat in enumerate(ordered):
+        # Issue #68: a pop beat's object is "a motif the concept established"
+        # (design doc), so it needs an earlier plant in its own group -- the
+        # same causal shape `consequence` is held to below, applied to a
+        # second axis. Independent of `beat_role`: a pop can land on a
+        # consequence, a transition, or an instrumental beat, and all of them
+        # need the same earlier plant.
+        if beat.pop_object is not None:
+            earlier_roles = {
+                other.beat_role
+                for other in ordered[:position]
+                if other.beat_group == beat.beat_group
+            }
+            if "plant" not in earlier_roles:
+                problems.append(
+                    f"chunk_id={beat.chunk_id} pop_object={beat.pop_object!r} has no plant "
+                    f"earlier in beat_group={beat.beat_group}. A pop beat's object is a "
+                    "motif the concept established, not something invented for the first "
+                    "time as it flies at the lens -- give it an earlier plant in the same "
+                    "group (the same plant/payoff shape a consequence's plant/contact rule "
+                    "below already uses)"
+                )
+
         if beat.beat_role != "consequence":
             continue
 

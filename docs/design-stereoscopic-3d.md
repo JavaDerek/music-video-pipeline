@@ -133,6 +133,19 @@ the repo.
 
 ## Planning: the measurement that reorders the work
 
+**Status (2026-09-13): steps 1 and 2 below are built, step 3 is still not.**
+`Beat.pop_object` (not `pop = true`, and not `beat_role = "pop"` -- see the
+field's own docstring in `authoring/beats.py` for why a named motif beats a
+boolean: the preamble needs a concrete thing to plant, and a future lint
+needs a concrete noun to look for), `BEATS_PREAMBLE`/`PROSE_PREAMBLE`/
+`PHOTOGRAPHY_PREAMBLE`'s pop guidance, and the reuse of
+`_lint_distant_staging`'s own predicate for a sharper pop-scoped warning all
+shipped under issue #68. Step 3 -- a pop-specific keyword lint -- did not,
+for exactly the reason this section already gives: the only real corpus still
+contains zero pop beats, so there is still nothing to score a new vocabulary
+against. That does not change until a real plan exists with `pop_object` set
+on at least a few beats.
+
 The most useful finding this project has for 3D was found for an unrelated
 reason. #58: an object staged "small against the tower far behind her" did not
 render *at all*, twice; the same object staged near and large rendered
@@ -181,23 +194,38 @@ against 3.5x when it shipped).
 
 So the build order is the reverse of the issue's own list:
 
-1. **The field first.** `pop = true` (or `beat_role = "pop"`) on a beat,
-   emitted by the beats stage, which knows whose beat it is. Following this
-   project's own rule: a property that must hold across a video needs its own
-   field, and whole-video stereo parameters (convergence, baseline, format) are
-   a different thing again and belong next to `cinematography` in a locked
-   house-style profile (#55) — see `docs/design-cinematography-profiles.md`,
-   noting they would also need fingerprint evidence before being admitted
-   there.
-2. **The preamble second.** `BEATS_PREAMBLE` plants for it — the objects that
-   fly out are motifs the concept established, so the payoff has a cause; that
-   is the plant/payoff machinery the beats stage already enforces, aimed at a
-   new axis. `PROSE_PREAMBLE` composes toward the lens for it, holds it long
-   enough to read (a pop that lasts eight frames is a flicker) and keeps it
-   clear of the frame edges.
-3. **The lint last**, scored against a plan that actually contains pop beats.
-   Only then is there a corpus with a known outcome, and only then can the
-   excluded candidates be recorded with their reasons the way #60 requires.
+1. **The field first — BUILT.** `Beat.pop_object: str | None`, naming the
+   motif rather than a bare flag, emitted by the beats stage, which knows
+   whose beat it is. Structurally required to have an earlier `plant` in its
+   own `beat_group` — the same plant/payoff shape `check_beat_structure`
+   already enforces for a `consequence`, reused rather than reinvented — and
+   deliberately not restricted by `beat_role` or voiced/instrumental status:
+   neither restriction has evidence behind it (see the field's own docstring).
+   `to_dict` omits the key when unset, so a pre-#68 beat sheet hashes
+   byte-identically to before. Following this project's own rule — a property
+   that must hold across a video needs its own field — whole-video stereo
+   parameters (convergence, baseline, format) are a different thing again and
+   belong next to `cinematography` in a locked house-style profile (#55) —
+   see `docs/design-cinematography-profiles.md`, noting they would also need
+   fingerprint evidence before being admitted there. **Not built here.**
+2. **The preamble second — BUILT.** `BEATS_PREAMBLE` plants for it — the
+   objects that fly out are motifs the concept established, so the payoff has
+   a cause — and says to keep it rare, with no invented cap. `PROSE_PREAMBLE`
+   composes toward the lens for it, holds it long enough to read (a pop that
+   lasts eight frames is a flicker) and keeps it clear of the frame edges.
+   `PHOTOGRAPHY_PREAMBLE` gets the same "toward the lens" instruction, since a
+   pop beat's `camera` should push toward the object rather than away from it
+   — `pop_object` reaches all three stages' prompts the same way
+   `beat_role`/`focus`/`camera` already do.
+3. **The lint last — STILL NOT BUILT.** Scored against a plan that actually
+   contains pop beats. Only then is there a corpus with a known outcome, and
+   only then can the excluded candidates be recorded with their reasons the
+   way #60 requires. What *is* built in the meantime: `write`'s advisory
+   checks re-run `_lint_distant_staging`'s own predicate — imported, not
+   copied — scoped to beats the sheet marks `pop_object`, and report a
+   sharper warning when one trips it (`prose.pop_distant_staging_issues`).
+   That is not step 3; it is the "already half the pop lint" observation
+   below, wired up rather than only stated.
 
 ### Two things worth stating now
 
@@ -207,7 +235,10 @@ So the build order is the reverse of the issue's own list:
   them are is a different video.
 * The existing `_lint_distant_staging` is already half the pop lint. A pop beat
   whose prose stages its object distant is the same defect it catches, with a
-  higher cost. Reuse it rather than writing a second vocabulary.
+  higher cost. Reuse it rather than writing a second vocabulary — now wired up
+  (`prose.pop_distant_staging_issues`, factored out as
+  `shot_plan._distant_staging_match` so both call sites share one predicate),
+  not just stated as an intention.
 
 ## Open questions, and the answers this design assumes
 
