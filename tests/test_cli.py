@@ -736,6 +736,22 @@ def test_main_passes_resume_flag_through(tmp_path: Path, monkeypatch):
     assert captured["resume"] is True
 
 
+def test_main_logs_real_likenesses_at_startup(tmp_path: Path, monkeypatch, caplog):
+    """Issue #56: #51's likeness question ("whose consent does this run
+    depend on?") is asked at run start, not left to be remembered.
+    DEFAULT_CAST_TOML's Dianne and Rex are both ordinary (non-synthetic)
+    entries, so both are named."""
+    config_path = _make_config_file(tmp_path)
+    monkeypatch.setattr(cli, "run_pipeline", lambda config, *, resume, **_kwargs: _fake_report())
+
+    with caplog.at_level(logging.INFO):
+        cli.main(["--config", str(config_path)])
+
+    assert "conditions on real likenesses" in caplog.text
+    assert "Dianne" in caplog.text
+    assert "Rex" in caplog.text
+
+
 def test_main_ignore_prompt_changes_flag_overrides_the_config(tmp_path: Path, monkeypatch):
     config_path = _make_config_file(tmp_path)
     captured = {}

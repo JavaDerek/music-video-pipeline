@@ -113,6 +113,54 @@ def test_cast_member_performer_resolves_through_voiced_by():
 
 
 # --------------------------------------------------------------------------- #
+# CastMember.synthetic / CastOrigin -- invented characters (issue #56).
+# --------------------------------------------------------------------------- #
+
+
+def test_cast_member_synthetic_defaults_to_false():
+    """Every cast entry written before this field existed keeps meaning
+    exactly what it has always meant: a photograph of a real person."""
+    member = contracts.CastMember(name="Dianne", role="Lead Vocalist", image=Path("d.jpg"))
+    assert member.synthetic is False
+    assert member.origin is None
+
+
+def test_cast_origin_carries_provenance():
+    origin = contracts.CastOrigin(
+        model="hosted-api-v1", prompt="a weathered lighthouse keeper", seed=12345,
+        created="2026-08-23",
+    )
+    member = contracts.CastMember(
+        name="Nobody", role="Lead Vocalist", image=Path("nobody_ref_01.jpg"),
+        synthetic=True, origin=origin,
+    )
+    assert member.synthetic is True
+    assert member.origin is origin
+    assert member.origin.model == "hosted-api-v1"
+    assert member.origin.seed == 12345
+
+
+def test_cast_origin_extra_is_a_tuple_of_pairs_and_defaults_empty():
+    """Free-form provenance (sampler settings, step count, ...) without a
+    second closed vocabulary -- and stored as a tuple, not a dict, so the
+    contract stays hashable-safe like the rest of this module."""
+    origin = contracts.CastOrigin(model="m", prompt="p", seed=1, created="2026-08-23")
+    assert origin.extra == ()
+
+    with_extra = contracts.CastOrigin(
+        model="m", prompt="p", seed=1, created="2026-08-23",
+        extra=(("sampler", "dpmpp_2m"), ("steps", 30)),
+    )
+    assert dict(with_extra.extra) == {"sampler": "dpmpp_2m", "steps": 30}
+
+
+def test_cast_origin_is_frozen():
+    origin = contracts.CastOrigin(model="m", prompt="p", seed=1, created="2026-08-23")
+    with pytest.raises(AttributeError):
+        origin.model = "mutated"  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------- #
 # ChunkFingerprint -- what a cached chunk must prove about itself (issue #34).
 # --------------------------------------------------------------------------- #
 

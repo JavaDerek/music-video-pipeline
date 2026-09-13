@@ -5,10 +5,35 @@ prerequisite for using this project at all, it is why #51's likeness question
 exists, and it means every performer in every video must be someone who exists
 and consented.
 
-This is design only. It needs an image model, and that is a real decision with
-a disk cost, a licence question and an unsolved consistency problem. Nothing
-here has been built, deliberately — the wrong version of this feature is a
-one-off script that makes a pretty portrait and leaves the hard part untouched.
+This needs an image model, and that is a real decision with a disk cost, a
+licence question and an unsolved consistency problem — the wrong version of
+this feature is a one-off script that makes a pretty portrait and leaves the
+hard part untouched. That decision is still nobody's to make here.
+
+## Status (2026-09-13)
+
+Built, in the work package that does not depend on the model decision:
+
+* `synthetic`/`[cast.<name>.origin]` on `CastMember` (`contracts.py`,
+  `config.py`) — real/invented is queryable in config, exactly as proposed
+  below. `RunConfig.real_likenesses()` answers #51's own question; `cli.main`
+  logs it at run start when non-empty.
+* The consistency acceptance check this doc calls for (`music_video_maker/
+  castcheck.py`, `python -m music_video_maker.castcheck`) — pairwise SFace
+  similarity over a reference set, reusing `faces.recognize_face` exactly as
+  proposed, with the mode-collapse caveat printed in every report rather than
+  left to be remembered.
+
+Still open, exactly as this doc left them — nothing below changed by the
+above:
+
+* The model decision itself (SDXL+IP-Adapter / Flux / hosted API / reuse),
+  and its licence.
+* Actually generating a character, or committing any generated image.
+* Re-deriving the 0.34 floor on synthetic pairs (the check enforces the
+  caveat; it cannot do the re-derivation for you before synthetic material
+  exists to measure).
+* The cross-video / profile question in "What 'done' looks like" item 4.
 
 ## What it actually solves
 
@@ -50,6 +75,20 @@ That is an offline check, on a laptop, with weights this project already
 documents. It also gives the feature an honest failure mode: if a generator
 cannot clear that bar, the character is not ready, and you find out before a
 render rather than after.
+
+**Built:** the reference-set half — `music_video_maker/castcheck.py`
+(`python -m music_video_maker.castcheck <character> <img1> <img2> ...`).
+Scores every pair with `faces.recognize_face`, excludes and surfaces any
+image whose `FaceObservation.verdict` is not `detected` rather than averaging
+it in or scoring it as 0, refuses to pass vacuously on a set of one, and
+prints the mode-collapse caveat in every report. The second half — "frames
+rendered from it score ≥ the floor against the reference the render was
+conditioned on" — is **not** a new instrument: `facescan.py` already has a
+per-frame recognition-shaped path (it calls `faces.detect_faces` per sampled
+frame today; wiring a reference photo through to `faces.recognize_face` the
+way the #49 seed-face gate already does is the same shape of change, not a
+second tool) and is where that half belongs once there is a rendered chunk
+and a character to check it against.
 
 Two caveats to carry into any such measurement:
 
@@ -135,8 +174,10 @@ writing it down is this project's most-repeated bug.
 
 And answer #56's own open question **yes**: real and invented cast members must
 be distinguishable in config, so a #51-style likeness question can be *queried*
-rather than remembered. Proposed shape (this is `contracts.py`/`config.py`,
-owned elsewhere — proposed, not built):
+rather than remembered.
+
+**Built**, in `contracts.py` (`CastMember.synthetic`/`CastMember.origin`,
+`CastOrigin`) and `config.py` (`_build_cast_origin`, `CAST_KEYS`):
 
 ```toml
 [cast.Nobody]
@@ -147,18 +188,39 @@ synthetic = true                     # default false: every existing config is r
 model  = "…"
 prompt = "…"
 seed   = 12345
-created = "2026-08-23"
+created = "2026-08-23"               # bare TOML date or a quoted ISO string; both normalize
+# sampler = "…", steps = …           # free-form extra scalar keys, kept verbatim
 ```
 
-`synthetic = true` with no `[cast.<name>.origin]` should be refused at load:
-"this character is invented" with no record of how is the provenance bug in a
-new place. `synthetic = false` (the default) keeps every existing config
-loading unchanged, and it is the value that means "a real person's likeness is
-in this run" — which is the query #51 wants to be able to run.
+`synthetic = true` with no `[cast.<name>.origin]` is refused at load, exactly
+as proposed: "this character is invented" with no record of how is the
+provenance bug in a new place. The mirror image is refused too, which this
+doc left implicit — `[cast.<name>.origin]` present while `synthetic` is not
+`true` is a config error, because an origin on a real person's photo is a
+contradiction, not metadata. `synthetic = false` (the default) keeps every
+existing config loading unchanged, and it is the value that means "a real
+person's likeness is in this run" — which is the query #51 wants to be able
+to run: `RunConfig.real_likenesses()`, logged at INFO when non-empty by
+`cli.main` at run start.
+
+**One interaction this doc didn't anticipate: `voiced_by` (issue #89, landed
+after this doc was written).** A character with no `image` of its own borrows
+its performer's photo — so whose photo is it, for `synthetic` purposes? Two
+options were on the table: refuse `synthetic`/`origin` on such an entry
+outright, or let it inherit the performer's facts. Shipped: **both, by case**.
+An entry with no image of its own may not set `synthetic`/`origin`
+explicitly — refused at load, naming #56 — and instead inherits the
+performer's `synthetic`/`origin` automatically, along with the photo itself,
+so `real_likenesses()` and the CLI log line are correct for it with no special
+case. An entry that sets its *own* `image` (overriding the fallback, already
+legal per #89) may set its own `synthetic`/`origin` too, independent of its
+performer — it owns a different photo now, so it owns a different provenance
+question.
 
 The flag is also the natural place to hang a future consent field for the real
 case, mirroring `tests/test_repo_assets.py`'s `Asset(depicts_real_person=…,
-consent=…)`, which already refuses an unconsented likeness mechanically.
+consent=…)`, which already refuses an unconsented likeness mechanically. Not
+built here — `synthetic`/`origin` answer "real or invented", not "consented".
 
 ## Does an invented character still need `appearance`?
 
@@ -182,17 +244,24 @@ minutes of video.
 1. A character is defined in a small authored file (prompt, model, seed,
    which views), generated once, and its images committed as **run assets** in
    `~/mvm-runs/<song>/cast/` — not in the repo, exactly like every other run
-   asset.
+   asset. **Open** — depends on the model decision; nothing here generates
+   anything.
 2. The similarity check above passes over the set, and its numbers are
-   recorded next to the character.
+   recorded next to the character. **Built** (`castcheck.py`) for the
+   reference-set half; nothing to run it against yet.
 3. `synthetic = true` + `origin` in the run config; the render path is
    unchanged, because `ref_images` still just receives a photo — of nobody.
+   **Built** — and confirmed unchanged: `synthetic`/`origin` are not
+   fingerprinted (they don't move pixels; the image path/content already is
+   fingerprinted) and are not profile fields (confirmed by
+   `tests/test_profiles.py`), so neither `--resume` nor a cinematography
+   profile is affected.
 4. A cross-video story, since a character is a cross-video asset exactly like a
    locked house style (#55). Whether they share a mechanism is worth
    considering, but note the difference: a profile is *text* that resolves into
    config fields, while a character is *binary assets plus text*. The profile
    mechanism does not extend to that for free, and forcing it to would make the
-   simple half worse.
+   simple half worse. **Still open**, unchanged by this work package.
 
 ## The trap to avoid
 
