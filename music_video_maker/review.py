@@ -122,13 +122,24 @@ def _chunk_id_from(message: str) -> int | None:
 def _collecting_lint_records():
     collector = _LintCollector()
     loggers = [logging.getLogger(name) for name in _LINT_LOGGER_NAMES]
+    saved = [(one_logger.level, one_logger.propagate) for one_logger in loggers]
     for one_logger in loggers:
         one_logger.addHandler(collector)
+        # `--log-level` sets the root logger's level, and a logger's effective
+        # level gates a record before any handler sees it -- so at ERROR the
+        # page would silently lose every lint warning. The console's verbosity
+        # is the operator's choice; the page's contents are not. Where warnings
+        # would have been dropped, let them through to the collector only.
+        if not one_logger.isEnabledFor(logging.WARNING):
+            one_logger.setLevel(logging.WARNING)
+            one_logger.propagate = False
     try:
         yield collector
     finally:
-        for one_logger in loggers:
+        for one_logger, (level, propagate) in zip(loggers, saved, strict=True):
             one_logger.removeHandler(collector)
+            one_logger.setLevel(level)
+            one_logger.propagate = propagate
 
 
 # --------------------------------------------------------------------------- #
