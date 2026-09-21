@@ -71,7 +71,17 @@ already overrides whatever chose the frame's primary singer.
 The practical route is speaker diarization on an isolated vocal stem:
 `pyannote.audio` for diarization, plus a Demucs-separated vocal stem as its
 input (see [`docs/vocal-stem-workflow.md`](vocal-stem-workflow.md), issue
-#25, which this would share the stem-separation step with). Both are heavy,
+#25, which this would share the stem-separation step with).
+
+**Half of that is no longer hypothetical: #25 shipped.** `vocal_stem` is a
+real config field, `music_video_maker/stems.py` cuts the stem at the
+master's own chunk spans, and separation is already defined as an off-path,
+one-off, operator-run act (`python -m demucs --two-stems=vocals`) rather
+than something the pipeline calls. So a diarizer's *input* exists today and
+costs this project no new dependency — the operator produces the same file
+either way. What is left to decide is only the diarizer itself.
+
+`pyannote.audio` and Demucs are both heavy,
 optional-extra-shaped dependencies with their own model weights, and neither
 is being added by this document. Building the real thing means answering,
 up front, the same licensing/redistribution questions this project already
@@ -104,6 +114,16 @@ this project does not get to make an exception for its own next feature.
 - Someone has decided how a diarized speaker label ("SPEAKER_00") maps to a
   cast member name — by asking once per song, or by matching short reference
   clips — since diarization alone never produces a name, only a cluster.
+
+A fifth thing is a *decision*, not a measurement, and it is the one that
+actually blocks: **`pyannote.audio`'s pretrained pipelines are gated behind
+accepting their terms on Hugging Face, and this repo is a candidate for open
+sourcing.** That is a one-time human step nobody but the owner can take, it
+cannot be satisfied from inside the render path, and it has to be answered
+before any code is written — not discovered afterwards, the way CLAUDE.md's
+"Check redistribution before committing a third-party binary" rule says.
+Until it is answered, the honest status of this half is *blocked on a
+licence decision*, not *not got round to*.
 
 Until all four are true, hand-tagging with `[Name: Role]` remains the
 correct answer, and it is not a stopgap: it is fully specified, tested, and
