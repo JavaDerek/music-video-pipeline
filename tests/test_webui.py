@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+from music_video_maker import prepare_report as prepare_report_module
 from music_video_maker import resilience as resilience_module
 from music_video_maker import webui
 from music_video_maker.contracts import ChunkResult, ChunkStatus, RunState, VramStopEvent
@@ -702,6 +703,445 @@ class TestRouteDispatch:
 
 
 # --------------------------------------------------------------------------- #
+# /prepare -- the pre-render checks, READ from what --prepare wrote
+# --------------------------------------------------------------------------- #
+
+
+def _prepare_report(**overrides) -> prepare_report_module.PrepareReport:
+    base = prepare_report_module.PrepareReport(
+        generated_at="2026-09-21",
+        config_path="run.toml",
+        alignment_summary="Alignment quality: 57 segment(s), 2 critical, 5 warning finding(s)",
+        alignment_finding_counts={"CRITICAL": 2, "WARNING": 5, "INFO": 0},
+        alignment_findings=(
+            prepare_report_module.AlignmentFindingRow(
+                severity="CRITICAL",
+                code="zero_length_segment",
+                message="segment 0 is 20ms long",
+                start=0.0,
+                end=0.02,
+                segment_index=0,
+            ),
+        ),
+        chunk_count=80,
+        voiced_chunk_count=41,
+        instrumental_chunk_count=39,
+        timeline_start=0.0,
+        timeline_end=513.917,
+        track_duration_seconds=512.08,
+        timeline_drift_seconds=1.837,
+        timeline_drift_frames=44.1,
+        duration_tolerance_seconds=0.042,
+        notices=(
+            prepare_report_module.StageNotice(
+                logger="music_video_maker.slicing",
+                level="WARNING",
+                message="Final chunk boundary at 261.000s ... (issue #70).",
+                issue="70",
+            ),
+        ),
+    )
+    return type(base)(**{**base.__dict__, **overrides})
+
+
+class TestPrepareRoute:
+    def _serve(self, tmp_path: Path, report_path: Path | None):
+        ctx = webui.MonitorContext(
+            run_state_path=tmp_path / "chunks" / "run_state.json",
+            prepare_report_path=report_path,
+            thumbnail_cache_dir=tmp_path / "thumbcache",
+        )
+        server = webui.make_server("127.0.0.1", 0, ctx)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        host, port = server.server_address[0], server.server_address[1]
+        return f"http://{host}:{port}", server, thread
+
+    def test_a_run_nobody_has_prepared_says_so_and_names_the_command(
+        self, tmp_path: Path
+    ) -> None:
+        base_url, server, thread = self._serve(tmp_path, tmp_path / "prepare_report.json")
+        try:
+            resp = _get(base_url, "/prepare")
+            assert resp.status == 200  # an ordinary state, never a 500
+            body = resp.read_body.decode("utf-8")
+            assert "Nothing has been prepared for this run" in body
+            assert "--prepare" in body
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_the_page_never_offers_to_run_alignment_itself(self, tmp_path: Path) -> None:
+        """Alignment writes chunk audio into the live run's own directory and
+        costs ~6s of CPU: a step the operator invokes, not one a page performs
+        because somebody opened it. There is no control here at all -- this
+        route only ever reads a file."""
+        base_url, server, thread = self._serve(tmp_path, tmp_path / "prepare_report.json")
+        try:
+            body = _get(base_url, "/prepare").read_body.decode("utf-8")
+            assert "<form" not in body
+            assert "<button" not in body
+            assert _get(base_url, "/prepare", method="POST").status == 405
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_a_written_report_renders_its_findings_drift_and_notices(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "prepare_report.json"
+        prepare_report_module.write_prepare_report(_prepare_report(), path)
+        base_url, server, thread = self._serve(tmp_path, path)
+        try:
+            body = _get(base_url, "/prepare").read_body.decode("utf-8")
+            assert "2 critical" in body
+            assert "zero_length_segment" in body
+            assert "1.837s" in body  # the #22 timeline drift
+            assert "issue #70" in body  # notices grouped by the issue they name
+            assert "80" in body
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_a_report_whose_inputs_moved_renders_a_stale_banner(self, tmp_path: Path) -> None:
+        lyrics = tmp_path / "lyrics.txt"
+        lyrics.write_text("la la la\n", encoding="utf-8")
+        path = tmp_path / "prepare_report.json"
+        prepare_report_module.write_prepare_report(
+            _prepare_report(
+                inputs=(prepare_report_module.InputStamp.of("lyrics_file", lyrics),)
+            ),
+            path,
+        )
+        lyrics.write_text("an entirely different song\n", encoding="utf-8")
+        base_url, server, thread = self._serve(tmp_path, path)
+        try:
+            body = _get(base_url, "/prepare").read_body.decode("utf-8")
+            assert "Stale:" in body
+            assert "lyrics_file" in body
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_an_unreadable_report_reads_as_not_prepared_not_a_500(self, tmp_path: Path) -> None:
+        path = tmp_path / "prepare_report.json"
+        path.write_text("{not json", encoding="utf-8")
+        base_url, server, thread = self._serve(tmp_path, path)
+        try:
+            resp = _get(base_url, "/prepare")
+            assert resp.status == 200
+            assert b"Nothing has been prepared" in resp.read_body
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_no_configured_path_still_renders_the_not_prepared_page(
+        self, tmp_path: Path
+    ) -> None:
+        base_url, server, thread = self._serve(tmp_path, None)
+        try:
+            resp = _get(base_url, "/prepare")
+            assert resp.status == 200
+            assert b"no prepare-report path configured" in resp.read_body
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_the_index_links_to_it(self, tmp_path: Path) -> None:
+        run_state = RunState(run_id="run-1", results={0: _result(0, ChunkStatus.RENDERED)})
+        body = webui.render_index_html(webui.current_progress(run_state)).decode("utf-8")
+        assert 'href="/prepare"' in body
+
+
+class TestPrepareHtmlEscaping:
+    def test_every_report_derived_string_is_escaped(self) -> None:
+        """A shot-plan refusal quotes the plan's own text, a notice quotes a
+        lyric, and an input path is whatever the operator named: all three
+        reach this page as free text."""
+        report = _prepare_report(
+            plan_checked="<script>alert(1)</script>.toml",
+            plan_errors=('drift on <img src=x onerror="alert(2)">',),
+            notices=(
+                prepare_report_module.StageNotice(
+                    logger="music_video_maker.slicing",
+                    level="WARNING",
+                    message="<script>alert(3)</script>",
+                    issue=None,
+                ),
+            ),
+        )
+        body = webui.render_prepare_html(report).decode("utf-8")
+        assert "<script>alert(1)" not in body
+        assert "<script>alert(3)" not in body
+        # The tag that would have carried the handler is escaped, so
+        # `onerror=` survives only as inert text inside a <li>.
+        assert "<img" not in body
+        assert "&lt;img" in body
+        assert "&lt;script&gt;" in body
+
+    def test_a_plan_free_run_says_no_plan_was_checked_rather_than_passing(self) -> None:
+        body = webui.render_prepare_html(_prepare_report()).decode("utf-8")
+        assert "No shot plan was checked" in body
+
+    def test_a_plan_checked_without_its_lengths_says_the_comparison_is_not_real(self) -> None:
+        """CLAUDE.md: a plan that sets length_seconds has two timelines and
+        only one is real. A drift list produced against the other one has to
+        say so, or it reads as a defect in the plan."""
+        body = webui.render_prepare_html(
+            _prepare_report(
+                plan_checked="shot_plan.toml",
+                plan_lengths_applied=False,
+                plan_errors=("shot plan drift on chunk_id=7",),
+            )
+        ).decode("utf-8")
+        assert "NO editorial lengths" in body
+        assert "--from-plan" in body
+
+
+# --------------------------------------------------------------------------- #
+# Host header -- the DNS-rebinding defence (CLAUDE.md: "Not yet done: a
+# Host-header check against DNS rebinding")
+# --------------------------------------------------------------------------- #
+
+
+class TestHostHeaderAllowed:
+    """The pure predicate. A bound address plus a port stands in for one
+    running server; the socket-level proof is in TestHostHeaderOverHTTP."""
+
+    def _allowed(self, raw, *, address="127.0.0.1", port=8787, extra=frozenset()) -> bool:
+        return webui.host_header_allowed(
+            raw, bound_address=address, port=port, extra_allowed=extra
+        )
+
+    def test_absent_host_header_is_allowed(self) -> None:
+        """A rebinding attack's whole leverage is the name it puts in this
+        header, and a browser will not let script suppress it. Refusing an
+        absent header would refuse HTTP/1.0 clients and block no attack --
+        see webui.py's Host-header section."""
+        assert self._allowed(None) is True
+
+    @pytest.mark.parametrize("raw", ["127.0.0.1", "127.0.0.1:8787", "localhost", "localhost:8787"])
+    def test_accepts_its_own_bound_address_and_localhost(self, raw: str) -> None:
+        assert self._allowed(raw) is True
+
+    def test_accepts_localhost_with_a_trailing_root_dot(self) -> None:
+        assert self._allowed("LocalHost.") is True
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "evil.example",
+            "evil.example:8787",
+            "attacker.test.",
+            "192.168.1.5",
+            "192.168.1.5:8787",
+            "8.8.8.8",
+            "doris",  # a real name, but not one this server was told about
+        ],
+    )
+    def test_refuses_every_other_name_and_literal(self, raw: str) -> None:
+        assert self._allowed(raw) is False
+
+    def test_refuses_a_right_name_on_the_wrong_port(self) -> None:
+        assert self._allowed("127.0.0.1:9999") is False
+        assert self._allowed("localhost:9999") is False
+
+    @pytest.mark.parametrize(
+        "raw",
+        ["", "   ", "127.0.0.1:notaport", "http://127.0.0.1", "127.0.0.1/x", "a b", "u@127.0.0.1"],
+    )
+    def test_refuses_anything_that_is_not_a_plain_authority(self, raw: str) -> None:
+        assert self._allowed(raw) is False
+
+    def test_an_ipv6_bound_address_matches_its_bracketed_and_expanded_forms(self) -> None:
+        assert self._allowed("[::1]:8787", address="::1") is True
+        assert self._allowed("[0:0:0:0:0:0:0:1]", address="::1") is True
+        # ...and a v4 literal does not match a v6 bind, or vice versa.
+        assert self._allowed("[::1]", address="127.0.0.1") is False
+        assert self._allowed("127.0.0.1", address="::1") is False
+
+    def test_an_allowlisted_name_is_accepted_with_or_without_the_port(self) -> None:
+        extra = frozenset({"doris"})
+        assert self._allowed("doris", extra=extra) is True
+        assert self._allowed("doris:8787", extra=extra) is True
+        assert self._allowed("DORIS.", extra=extra) is True
+        assert self._allowed("doris:9999", extra=extra) is False
+        assert self._allowed("not-doris", extra=extra) is False
+
+    def test_a_name_is_never_resolved_to_decide_this(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Resolution is the mechanism the check exists to defeat: asking DNS
+        whether ``evil.example`` points here is asking the attacker."""
+
+        def _boom(*args, **kwargs):  # pragma: no cover - must never run
+            raise AssertionError("host_header_allowed resolved a name")
+
+        monkeypatch.setattr(socket, "gethostbyname", _boom)
+        monkeypatch.setattr(socket, "getaddrinfo", _boom)
+        assert self._allowed("evil.example") is False
+
+
+class TestNormaliseAllowedHost:
+    def test_casefolds_and_strips_a_trailing_root_dot(self) -> None:
+        assert webui.normalise_allowed_host("Doris.") == "doris"
+
+    def test_accepts_an_ip_literal_and_canonicalises_it(self) -> None:
+        assert webui.normalise_allowed_host("0:0:0:0:0:0:0:1") == "::1"
+
+    @pytest.mark.parametrize(
+        "raw", ["", "  ", "*", ".", "http://doris", "doris:8787", "doris/x", "a b", "-doris"]
+    )
+    def test_refuses_anything_that_is_not_a_bare_host_name(self, raw: str) -> None:
+        with pytest.raises(webui.HostAllowlistError):
+            webui.normalise_allowed_host(raw)
+
+
+def _request_with_host(
+    base_url: str, path: str, host: str | None, method: str = "GET"
+) -> http.client.HTTPResponse:
+    """One request over a real loopback socket with ``Host`` set to exactly
+    ``host`` -- or, for ``None``, with no ``Host`` header at all (what an
+    HTTP/1.0 client sends)."""
+    conn = http.client.HTTPConnection(base_url.split("://")[1], timeout=5)
+    try:
+        conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
+        if host is not None:
+            conn.putheader("Host", host)
+        conn.endheaders()
+        resp = conn.getresponse()
+        resp.read_body = resp.read()  # type: ignore[attr-defined]
+        return resp
+    finally:
+        conn.close()
+
+
+class TestHostHeaderOverHTTP:
+    """Real sockets, the way the bind-address tests above are real sockets:
+    a browser pointed at this server by a rebound name must get nothing."""
+
+    def _serve(self, tmp_path: Path, allowed_hosts=frozenset()):
+        run_state_path = tmp_path / "chunks" / "run_state.json"
+        _write_run_state(
+            run_state_path,
+            RunState(run_id="run-1", results={0: _result(0, ChunkStatus.RENDERED)}),
+        )
+        ctx = webui.MonitorContext(
+            run_state_path=run_state_path,
+            thumbnail_cache_dir=tmp_path / "thumbcache",
+            allowed_hosts=allowed_hosts,
+        )
+        server = webui.make_server("127.0.0.1", 0, ctx)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        host, port = server.server_address[0], server.server_address[1]
+        return f"http://{host}:{port}", server, thread
+
+    def test_a_rebound_name_gets_421_and_no_run_data(self, tmp_path: Path) -> None:
+        base_url, server, thread = self._serve(tmp_path)
+        try:
+            resp = _request_with_host(base_url, "/", "evil.example")
+            assert resp.status == 421
+            body = resp.read_body
+            # The page this would otherwise have served names the run.
+            assert b"run-1" not in body
+            # The refused value is logged, never echoed back into the body.
+            assert b"evil.example" not in body
+            assert resp.getheader("X-Content-Type-Options") == "nosniff"
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_the_servers_own_address_and_localhost_are_answered(self, tmp_path: Path) -> None:
+        base_url, server, thread = self._serve(tmp_path)
+        port = server.server_address[1]
+        try:
+            for host in (f"127.0.0.1:{port}", "127.0.0.1", f"localhost:{port}", None):
+                resp = _request_with_host(base_url, "/", host)
+                assert resp.status == 200, host
+                assert b"Run run-1" in resp.read_body
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_the_check_runs_before_every_route_including_405_and_404(
+        self, tmp_path: Path
+    ) -> None:
+        """"Before any handler runs" is the requirement: a rejected request
+        must not even learn which methods are allowed or which paths exist."""
+        base_url, server, thread = self._serve(tmp_path)
+        try:
+            for method, path in [
+                ("GET", "/events"),
+                ("GET", "/chunks/0/thumbnail.png"),
+                ("GET", "/review"),
+                ("GET", "/no-such-route"),
+                ("POST", "/"),
+                ("HEAD", "/"),
+            ]:
+                resp = _request_with_host(base_url, path, "evil.example", method=method)
+                assert resp.status == 421, (method, path)
+                assert resp.getheader("Allow") is None
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_head_rejection_sends_no_body(self, tmp_path: Path) -> None:
+        base_url, server, thread = self._serve(tmp_path)
+        try:
+            resp = _request_with_host(base_url, "/", "evil.example", method="HEAD")
+            assert resp.status == 421
+            assert resp.read_body == b""
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_two_host_headers_are_refused(self, tmp_path: Path) -> None:
+        base_url, server, thread = self._serve(tmp_path)
+        port = server.server_address[1]
+        try:
+            conn = http.client.HTTPConnection(base_url.split("://")[1], timeout=5)
+            try:
+                conn.putrequest("GET", "/", skip_host=True, skip_accept_encoding=True)
+                conn.putheader("Host", f"127.0.0.1:{port}")
+                conn.putheader("Host", "evil.example")
+                conn.endheaders()
+                resp = conn.getresponse()
+                assert resp.status == 421
+                assert b"run-1" not in resp.read()
+            finally:
+                conn.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_an_allow_host_name_is_answered(self, tmp_path: Path) -> None:
+        base_url, server, thread = self._serve(tmp_path, allowed_hosts=frozenset({"doris"}))
+        port = server.server_address[1]
+        try:
+            resp = _request_with_host(base_url, "/", f"doris:{port}")
+            assert resp.status == 200
+            assert b"Run run-1" in resp.read_body
+            # ...and only that name; the allowlist is not a wildcard.
+            assert _request_with_host(base_url, "/", "evil.example").status == 421
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+
+# --------------------------------------------------------------------------- #
 # The design doc's second day-one test does not apply here
 # --------------------------------------------------------------------------- #
 
@@ -803,8 +1243,31 @@ class TestCliMain:
         assert args.port == 9000
         assert args.review_html == Path("review.html")
 
+    def test_build_parser_collects_repeated_allow_host_values(self) -> None:
+        args = webui.build_parser().parse_args(
+            ["--config", "run.toml", "--allow-host", "doris", "--allow-host", "mac-mini"]
+        )
+        assert args.allow_host == ["doris", "mac-mini"]
+
     def test_main_returns_error_for_a_missing_config_file(self, tmp_path: Path) -> None:
         exit_code = webui.main(["--config", str(tmp_path / "does_not_exist.toml")])
+        assert exit_code == 1
+
+    def test_main_refuses_an_invalid_allow_host_without_binding_anything(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A silently-ignored allowlist entry is the failure mode where an
+        operator believes the check is looser than it is, so a value this
+        server cannot honour stops the process instead."""
+
+        def _no_tailscale(args):
+            raise FileNotFoundError("tailscale not installed in this sandbox")
+
+        monkeypatch.setattr(webui, "_default_subprocess_runner", _no_tailscale)
+        config_path = _write_minimal_run_config(tmp_path)
+        exit_code = webui.main(
+            ["--config", str(config_path), "--allow-host", "*", "--port", "0"]
+        )
         assert exit_code == 1
 
     def test_main_refuses_an_invalid_bind_address_without_binding_anything(

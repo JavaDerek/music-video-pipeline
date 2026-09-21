@@ -81,6 +81,13 @@ from music_video_maker.faces import build_seed_face_gate
 from music_video_maker.hardware import scan_workflow_for_missing_optimizations
 from music_video_maker.logging_setup import configure_logging
 from music_video_maker.lyrics import parse_lyrics
+from music_video_maker.prepare_report import (
+    InputStamp,
+    build_prepare_report,
+    collect_stage_notices,
+    plan_resolution_errors,
+    write_prepare_report,
+)
 from music_video_maker.profiles import LOOK_FIELDS as PROFILE_LOOK_FIELDS
 from music_video_maker.profiles import PROFILE_RECORD_FILENAME, write_profile_record
 from music_video_maker.prompting import expand_prompt
@@ -1258,6 +1265,7 @@ def prepare_shot_plan(
     align_model: object | None = None,
     force: bool = False,
     from_plan: str | Path | None = None,
+    report_path: str | Path | None = None,
 ) -> Path:
     """Issue #52: run Stages 1-2 only and write a ``shot_plan.toml`` skeleton.
 
@@ -1275,11 +1283,108 @@ def prepare_shot_plan(
 
     Stages 1-2 themselves live in :func:`prepare_timeline`, shared with the
     review page (issue #36) -- this function's own job is just the skeleton.
+
+    ``report_path`` (issue #36) additionally writes a JSON *report* of what
+    this prepare found -- the #35 alignment summary, every Stage-2 warning,
+    the #22 timeline drift, and any shot-plan drift -- so the read-only
+    monitor can show it without running Stage 1-2 itself (alignment is a
+    step an operator invokes; a page opening must not be). It is ``None`` by
+    default, so a library caller's behaviour is unchanged and only
+    ``--prepare`` writes one.
+
+    Order: Stage 1-2, then the skeleton, then the report. A prepare that
+    refuses (``strict_alignment`` tripping on a CRITICAL finding, or a
+    skeleton that would clobber an authored plan without ``--force``) writes
+    no report at all, and that is deliberate -- a report is a description of
+    a prepare that *happened*, and one left behind by a refused prepare is
+    the ``face_presence_v12.csv`` failure over again: an artefact describing
+    something other than what its reader assumes.
     """
-    timeline = prepare_timeline(config, align_model=align_model, from_plan=from_plan)
-    return write_shot_plan_skeleton(
+    notices: list[logging.LogRecord] = []
+    if report_path is None:
+        timeline = prepare_timeline(config, align_model=align_model, from_plan=from_plan)
+    else:
+        # Capture what Stage 1-2 warns about while it warns -- see
+        # prepare_report.collect_stage_notices. The console is unaffected.
+        with collect_stage_notices() as notices:
+            timeline = prepare_timeline(config, align_model=align_model, from_plan=from_plan)
+
+    written = write_shot_plan_skeleton(
         timeline.chunks, output_path, source=source, generated_at=generated_at, force=force
     )
+    if report_path is not None:
+        _write_prepare_report(
+            config,
+            report_path,
+            config_path=source,
+            generated_at=generated_at,
+            timeline=timeline,
+            notices=notices,
+            from_plan=from_plan,
+        )
+    return written
+
+
+def _write_prepare_report(
+    config: RunConfig,
+    report_path: str | Path,
+    *,
+    config_path: str,
+    generated_at: str,
+    timeline: PreparedTimeline,
+    notices: Sequence[logging.LogRecord],
+    from_plan: str | Path | None,
+) -> None:
+    """Assemble and write the issue #36 pre-render report.
+
+    Never raises: the report is a description of work that already
+    succeeded, so a full disk or an unwritable path must not turn a good
+    prepare (whose skeleton is already on disk) into a failed one. It is
+    logged loudly instead, because a report nobody can write is still worth
+    knowing about."""
+    plan_path = from_plan if from_plan is not None else config.shot_plan
+    plan_errors = (
+        plan_resolution_errors(
+            plan_path,
+            timeline.chunks,
+            setting=config.setting,
+            cast_names=tuple(config.cast),
+        )
+        if plan_path is not None
+        else ()
+    )
+    drift = timeline_track_drift_seconds(timeline.chunks, timeline.alignment.track_duration)
+    report = build_prepare_report(
+        generated_at=generated_at,
+        config_path=config_path,
+        inputs=[
+            InputStamp.of("master_audio", config.master_audio),
+            InputStamp.of("lyrics_file", config.lyrics_file),
+            InputStamp.of("shot_plan", config.shot_plan),
+            InputStamp.of("from_plan", from_plan),
+            InputStamp.of("vocal_stem", config.vocal_stem),
+        ],
+        alignment_model_size=config.alignment_model_size,
+        strict_alignment=config.strict_alignment,
+        chunks=timeline.chunks,
+        quality_report=timeline.quality_report,
+        track_duration_seconds=timeline.alignment.track_duration,
+        timeline_drift_seconds=drift,
+        fps=config.hardware.frame_grid.fps,
+        duration_tolerance_seconds=config.duration_tolerance_seconds,
+        notice_records=notices,
+        plan_errors=plan_errors,
+        plan_checked=plan_path,
+        plan_lengths_applied=from_plan is not None,
+    )
+    try:
+        write_prepare_report(report, report_path)
+    except OSError:
+        logger.exception(
+            "Stages 1-2 completed and the skeleton was written, but the pre-render report "
+            "could not be written to %s -- mvm-webui will report this run as not prepared",
+            report_path,
+        )
 
 
 def _log_final_report(report: RunReport) -> None:
@@ -1340,6 +1445,9 @@ def main(argv: list[str] | None = None) -> int:
                 generated_at=date.today().isoformat(),
                 force=args.force,
                 from_plan=args.from_plan,
+                # Issue #36: also write down what this prepare found, so
+                # mvm-webui can show it without re-running Stage 1-2.
+                report_path=config.prepare_report_file,
             )
         except (PipelineError, ShotPlanError):
             logger.exception("Failed to prepare shot plan")
