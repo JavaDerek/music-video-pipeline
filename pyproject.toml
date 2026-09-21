@@ -86,6 +86,13 @@ select = [
 # mangle the table/prompt dump. Diagnostics in this file still go through
 # `logger`; only the two direct user-facing prints are exempted here.
 "music_video_maker/authoring/cli.py" = ["T20"]
+# Issue #96: calibrate_voicing's table IS the product -- an operator reads it
+# in a terminal to decide a threshold, the way they read `git status`. Routing
+# it through logger.info() would stamp a timestamp and a level on every row and
+# make the columns unreadable, which is the same reason authoring/cli.py is
+# exempted above. Its diagnostics still go through `logger`; only the table and
+# its provenance header are printed.
+"music_video_maker/calibrate_voicing.py" = ["T20"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

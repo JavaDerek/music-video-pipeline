@@ -127,7 +127,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -2224,6 +2224,57 @@ def _cover_instrumentals(
 # --------------------------------------------------------------------------- #
 
 
+def _log_suspect_segment_chunks(
+    chunks_on_suspect_prompt: Sequence[tuple[int, list[int]]],
+    merges_on_suspect_drop: Sequence[tuple[int, list[int]]],
+    suspects: frozenset[int],
+) -> None:
+    """Map the alignment-quality report's doubted segments onto chunk ids
+    (issues #96, #92).
+
+    Nothing else in the pipeline does this: the report names *segments* and a
+    render names *chunks*, and the translation between them is exactly the
+    slicing pass. Two aggregated WARNING lines rather than one per chunk --
+    #96 can fire on many segments at once on a badly-aligned track, and a
+    per-chunk line would bury the merge case, which is the one a human has to
+    adjudicate.
+
+    Reports only. Slicing does not treat a doubted segment differently, and
+    deliberately: whether a dropped phrase is a phantom or a real second
+    singer, dropping it from the attributed singer's prompt is the same right
+    answer (#92), and refusing or re-attributing on a WARNING-grade acoustic
+    finding would let a false positive move a timeline.
+    """
+    if not suspects:
+        return
+    if chunks_on_suspect_prompt:
+        logger.warning(
+            "%d voiced chunk(s) are prompted with words from aligned segment(s) the "
+            "alignment-quality report doubts there is a voice under: %s. The timeline, the "
+            "attribution and the text are unchanged -- this is the segment-to-chunk mapping "
+            "nothing else produces, so a #96 finding can be checked against what actually "
+            "renders. Listen to each span before treating its lyric as sung (issue #96).",
+            len(chunks_on_suspect_prompt),
+            ", ".join(
+                f"chunk {chunk_id} <- segment(s) {indices}"
+                for chunk_id, indices in chunks_on_suspect_prompt
+            ),
+        )
+    if merges_on_suspect_drop:
+        logger.warning(
+            "%d cross-character merge(s) drop words belonging to a DOUBTED segment: %s. On "
+            "\"Deathless\" two of the three chunks issue #92's fix acted on were this case -- "
+            "the \"other singer's words\" were phantoms nobody sings (#96), so the chunk was "
+            "never a merge and the leading-offset cost recorded against it was measured "
+            "against words that are not there. Check these before quoting a cost for them.",
+            len(merges_on_suspect_drop),
+            ", ".join(
+                f"chunk {chunk_id} <- dropped segment(s) {indices}"
+                for chunk_id, indices in merges_on_suspect_drop
+            ),
+        )
+
+
 def slice_audio(
     audio_path: Path,
     alignment: AlignmentResult,
@@ -2234,6 +2285,7 @@ def slice_audio(
     shot_lengths: Sequence[ShotLength] = (),
     instrumental_shot_seconds: float | None = None,
     instrumental_audio_gain_db: float | None = None,
+    suspect_segment_indices: Collection[int] = (),
 ) -> tuple[AudioChunk, ...]:
     """Slice ``audio_path`` per ``alignment`` into ``AudioChunk``s honoring
     ``hardware``'s min/max chunk-duration window (clamped into H3's trained
@@ -2268,6 +2320,19 @@ def slice_audio(
     Both need the contiguous timeline ``cover_instrumentals`` builds -- there
     is no coherent way to retile a covering that has holes in it -- so they
     are ignored (loudly) when it is off.
+
+    ``suspect_segment_indices`` (issues #96, #92) are aligned segments the
+    alignment-quality report doubts the existence of a voice under -- build it
+    with ``alignment_quality.suspect_segment_indices(report)``. Slicing has
+    always read ``alignment.segments`` as ground truth; on "Deathless" two of
+    the three chunks the #92 cross-character fix acted on were not merges at
+    all, because the "other singer's words" it dropped were phantoms nobody
+    sings. This parameter changes **nothing** about the timeline, the
+    attribution or the text -- dropping a phantom's words from a prompt is
+    right whether or not it is a phantom. What it changes is that the run log
+    can say which chunks rest on a doubted segment, which is the re-check
+    issue #92's own follow-up asked for. Empty by default, so every existing
+    caller behaves byte-identically.
     """
     if not alignment.segments and not cover_instrumentals:
         # With cover_instrumentals on, zero segments is not "nothing to
@@ -2340,6 +2405,12 @@ def slice_audio(
     master = AudioSegment.from_file(str(audio_path))
 
     chunks: list[AudioChunk] = []
+    # Issues #96/#92. Kept as two separate registers because they answer two
+    # different questions: "this chunk sings a lyric the report doubts" and
+    # "this chunk's cross-character merge may not be a merge at all".
+    suspects = frozenset(suspect_segment_indices)
+    chunks_on_suspect_prompt: list[tuple[int, list[int]]] = []
+    merges_on_suspect_drop: list[tuple[int, list[int]]] = []
     prev_end = 0.0
     for idx, piece in enumerate(pieces):
         if piece.start < prev_end - _EPS:
@@ -2416,6 +2487,12 @@ def slice_audio(
         prompted = _prompted_members(piece.members, piece.start, piece.end)
         text = _text_within(prompted, piece.start, piece.end)
         is_instrumental = not piece.members or not text
+
+        # Issues #96/#92: record, never act. See slice_audio's docstring.
+        if suspects and not is_instrumental:
+            prompted_suspects = sorted(m.index for m in prompted if m.index in suspects)
+            if prompted_suspects:
+                chunks_on_suspect_prompt.append((idx, prompted_suspects))
 
         # Issue #73 follow-up, measured on the v8 "Deathless" render (F26).
         # H3 is an audio-driven lip-sync model and this stem is its
@@ -2497,6 +2574,9 @@ def slice_audio(
                 m for m in piece.members if m.character != dominant.character
             )
             dropped_text = _text_within(dropped_members, piece.start, piece.end)
+            dropped_suspects = sorted(m.index for m in dropped_members if m.index in suspects)
+            if dropped_suspects:
+                merges_on_suspect_drop.append((idx, dropped_suspects))
             dominant_onset = _first_prompted_word_onset(prompted, piece.start, piece.end)
             dominant_offset_text = (
                 f" {dominant_onset - piece.start:.3f}s" if dominant_onset is not None else ""
@@ -2504,7 +2584,8 @@ def slice_audio(
             logger.warning(
                 "Chunk %d (%.3f-%.3fs) merges segments with differing characters %s -- "
                 "in-chunk voiced time: %s. Attributing to %r, which contributes %.3fs of "
-                "the chunk's %.3fs total in-chunk voiced duration. Prompted with %r; %r is "
+                "the chunk's %.3fs total in-chunk voiced duration. Prompted with %r; %r "
+                "(aligned segment(s) %s) is "
                 "audible in this chunk's stem but deliberately dropped from the prompt "
                 "because it belongs to the other singer, not %r -- naming both risks #82's "
                 "morphing defect. H3 starts the mouth at frame 0 regardless of where in the "
@@ -2520,6 +2601,7 @@ def slice_audio(
                 total_voiced_in_chunk,
                 text,
                 dropped_text,
+                sorted(m.index for m in dropped_members),
                 dominant.character,
                 dominant.character,
                 dominant_offset_text,
@@ -2550,6 +2632,8 @@ def slice_audio(
             )
         )
         prev_end = piece.end
+
+    _log_suspect_segment_chunks(chunks_on_suspect_prompt, merges_on_suspect_drop, suspects)
 
     logger.info(
         "Sliced %d chunk(s) from %d aligned segment(s) into %s (frame-grid quantized, "

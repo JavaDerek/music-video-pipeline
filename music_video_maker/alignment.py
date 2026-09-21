@@ -3,10 +3,27 @@
 Uses ``stable-ts`` **forced alignment** (``model.align()``) -- never
 ``model.transcribe()``. The lyrics file is immutable truth (see project
 CLAUDE.md); ASR transcription of sung vocals buried in an instrumental mix
-hallucinates words that were never sung. ``suppress_silence=True`` enables
-stable-ts's integrated Silero VAD so timestamps get clamped instead of
-stretching a word across a guitar solo, and ``regroup=True`` lets stable-ts
-restructure the forced words into logical segments.
+hallucinates words that were never sung. ``suppress_silence=True`` clamps
+timestamps to detected silence instead of stretching a word across a guitar
+solo, and ``regroup=True`` lets stable-ts restructure the forced words into
+logical segments.
+
+**Correction (issue #96, read from the stable-ts 2.19.1 source, not from
+memory):** this docstring used to say ``suppress_silence=True`` "enables
+stable-ts's integrated Silero VAD". It does not. In
+``stable_whisper/options.py`` the ``vad`` option defaults to ``False``, and
+``stabilization/__init__.py`` branches on it: ``predict_with_vad`` runs Silero,
+``predict_with_nonvad`` runs ``wav2mask`` -- a **volume-quantization** mask
+(``q_levels=20``, ``k_size=5``) that marks quiet audio as silent. So what this
+call has always used is a loudness threshold, not a speech detector. That
+matters for exactly the failure #96 documents: a guitar note is not quiet, so
+nothing in the silence mask can suppress a lyric placed on top of one. The
+levers that would -- ``vad=True`` (+ ``vad_threshold``, default 0.35),
+``only_voice_freq=True`` (200-5000Hz), ``denoiser="demucs"``, and
+``failure_threshold`` -- are inventoried in ``docs/voicing-corpus.md`` with the
+one-command experiment for each. None is enabled here: every one of them
+re-cuts the timeline for every song, which re-anchors every authored shot plan,
+and that is a decision to take on measured evidence rather than a correction.
 
 ``stable-ts`` (and the ``torch`` it depends on) is an optional, heavy
 ``[align]`` extra -- it must never be imported at module load time, or every
