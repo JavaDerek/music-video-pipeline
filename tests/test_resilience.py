@@ -167,6 +167,8 @@ def _make_runner(
     vram_probe=None,
     min_free_vram_gb: float | None = None,
     between_chunk_min_free_vram_gb: float | None = None,
+    vram_releaser=None,
+    release_wait_seconds: float | None = None,
 ) -> ResilientRunner:
     sleeper = sleeper if sleeper is not None else RecordingSleeper()
     disk_usage = disk_usage if disk_usage is not None else _abundant_disk_usage
@@ -175,6 +177,10 @@ def _make_runner(
         kwargs["min_free_vram_gb"] = min_free_vram_gb
     if between_chunk_min_free_vram_gb is not None:
         kwargs["between_chunk_min_free_vram_gb"] = between_chunk_min_free_vram_gb
+    if vram_releaser is not None:
+        kwargs["vram_releaser"] = vram_releaser
+    if release_wait_seconds is not None:
+        kwargs["release_wait_seconds"] = release_wait_seconds
     return ResilientRunner(
         execution_client,
         run_state_file=tmp_path / "run_state.json",
@@ -1757,6 +1763,134 @@ def test_vram_probe_is_not_called_for_chunks_reused_from_resume(tmp_path: Path):
     assert run_state.results[1].status is ChunkStatus.CACHED
     assert run_state.results[2].status is ChunkStatus.CACHED
     assert probe2.calls == 0
+
+
+class RecordingReleaser:
+    """Stands in for ``custody.build_vram_releaser`` (``POST /free``)."""
+
+    def __init__(self, *, raises: Exception | None = None) -> None:
+        self.calls = 0
+        self.raises = raises
+
+    def __call__(self) -> None:
+        self.calls += 1
+        if self.raises is not None:
+            raise self.raises
+
+
+def test_the_below_floor_message_does_not_assert_contention_it_never_checked(tmp_path: Path):
+    """Measured 2026-09-20: with NOTHING but ComfyUI on the card, H3 resident
+    between chunks read 0.82 GB on ComfyUI 0.35.1 / torch 2.14. The guard only
+    knows the number, so it must not tell the operator another process took
+    the card -- on 2026-09-16 that sentence sent the diagnosis the wrong way."""
+    client = StubExecutionClient({1: [_rendered(1, tmp_path)], 2: [_rendered(2, tmp_path)]})
+    probe = ScriptedVramProbe([23.12, 0.82])
+    runner = _make_runner(client, tmp_path, vram_probe=probe, between_chunk_min_free_vram_gb=1.0)
+
+    with pytest.raises(VramBelowFloorError) as excinfo:
+        runner.render_run([1, 2], _provider_returning(), tmp_path / "chunks")
+
+    message = str(excinfo.value)
+    assert "likely claimed" not in message
+    assert "release_vram_between_chunks" in message
+
+
+def test_release_between_chunks_frees_the_card_before_every_chunk_after_the_first(
+    tmp_path: Path,
+):
+    client = StubExecutionClient(
+        {1: [_rendered(1, tmp_path)], 2: [_rendered(2, tmp_path)], 3: [_rendered(3, tmp_path)]}
+    )
+    # 1: cold card. 2: released at once. 3: first read still shows the old
+    # weights (POST /free returns before the memory does), then recovers.
+    probe = ScriptedVramProbe([23.1, 22.9, 0.84, 22.9])
+    releaser = RecordingReleaser()
+    sleeper = RecordingSleeper()
+    runner = _make_runner(
+        client,
+        tmp_path,
+        vram_probe=probe,
+        min_free_vram_gb=20.0,
+        between_chunk_min_free_vram_gb=1.0,
+        vram_releaser=releaser,
+        sleeper=sleeper,
+    )
+
+    run_state = runner.render_run([1, 2, 3], _provider_returning(), tmp_path / "chunks")
+
+    assert [c.chunk_id for c in client.calls] == [1, 2, 3]
+    assert releaser.calls == 2, "never before the first chunk: the pre-flight just read it cold"
+    assert run_state.results[3].free_vram_gb_before == pytest.approx(22.9)
+    assert len(sleeper.delays) == 1, "one wait, for the one read that came back too early"
+
+
+def test_release_between_chunks_gates_on_the_cold_card_floor_not_the_resident_one(
+    tmp_path: Path,
+):
+    """After our own models are released the card should read like a cold one,
+    so the pre-flight floor is the right bar -- and 5 GB is not enough of it."""
+    client = StubExecutionClient({1: [_rendered(1, tmp_path)], 2: [_rendered(2, tmp_path)]})
+    probe = ScriptedVramProbe([23.1] + [5.0] * 100)
+    runner = _make_runner(
+        client,
+        tmp_path,
+        vram_probe=probe,
+        min_free_vram_gb=20.0,
+        between_chunk_min_free_vram_gb=1.0,
+        vram_releaser=RecordingReleaser(),
+        release_wait_seconds=10.0,
+    )
+
+    with pytest.raises(VramBelowFloorError) as excinfo:
+        runner.render_run([1, 2], _provider_returning(), tmp_path / "chunks")
+
+    assert [c.chunk_id for c in client.calls] == [1]
+    message = str(excinfo.value)
+    assert "5.00 GB" in message and "20.00 GB" in message
+    # Now, and only now, the guard has earned the claim: our weights are gone.
+    assert "another process" in message
+    stop = json.loads((tmp_path / "run_state.json").read_text())["vram_stop"]
+    assert stop == {"chunk_id": 2, "free_vram_gb": 5.0, "floor_gb": 20.0}
+
+
+def test_release_between_chunks_skips_the_release_after_a_cached_chunk(tmp_path: Path):
+    """Nothing was staged since the last release, so there is nothing to free."""
+    first = StubExecutionClient({1: [_rendered(1, tmp_path)], 2: [_rendered(2, tmp_path)]})
+    _make_runner(first, tmp_path).render_run([1, 2], _provider_returning(), tmp_path / "chunks")
+
+    client = StubExecutionClient({3: [_rendered(3, tmp_path)]})
+    releaser = RecordingReleaser()
+    runner = _make_runner(
+        client,
+        tmp_path,
+        vram_probe=ScriptedVramProbe([23.0]),
+        min_free_vram_gb=20.0,
+        vram_releaser=releaser,
+    )
+
+    runner.render_run([1, 2, 3], _provider_returning(), tmp_path / "chunks", resume=True)
+
+    assert releaser.calls == 0
+
+
+def test_a_release_that_raises_still_waits_for_the_reading(tmp_path: Path, caplog):
+    """The reading is the evidence, not the POST: a /free that errored but
+    freed the card anyway must not stop the run, and one that did nothing
+    will be caught by the wait."""
+    client = StubExecutionClient({1: [_rendered(1, tmp_path)], 2: [_rendered(2, tmp_path)]})
+    runner = _make_runner(
+        client,
+        tmp_path,
+        vram_probe=ScriptedVramProbe([23.0, 22.9]),
+        min_free_vram_gb=20.0,
+        vram_releaser=RecordingReleaser(raises=OSError("connection reset")),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        run_state = runner.render_run([1, 2], _provider_returning(), tmp_path / "chunks")
+
+    assert run_state.results[2].status is ChunkStatus.RENDERED
+    assert any("connection reset" in r.getMessage() for r in caplog.records)
 
 
 def test_vram_below_floor_error_is_a_resilience_error(tmp_path: Path):

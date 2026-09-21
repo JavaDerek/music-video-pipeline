@@ -614,7 +614,9 @@ def test_custody_preflight_and_teardown_both_run(tmp_path: Path):
     rig.run(sequences)
 
     assert any(r.method == "GET" and r.url.endswith("/system_stats") for r in rig.session.requests)
-    assert rig.session.free_calls == [{"unload_models": True, "free_memory": True}]
+    # Teardown's release, after the two between-chunk ones that
+    # release_vram_between_chunks (default on) adds before chunks 1 and 2.
+    assert rig.session.free_calls == [{"unload_models": True, "free_memory": True}] * 3
 
 
 def test_free_vram_is_re_read_before_every_chunk_not_just_at_run_start(tmp_path: Path):
@@ -2111,6 +2113,81 @@ def test_only_chunks_re_renders_its_chunks_even_when_they_are_cached(tmp_path: P
     # rather than report.rendered, because the preserved chunks keep the
     # RENDERED status they earned in the first run.
     assert len(rig.submitted) == submitted_before + 1
+
+
+def test_only_chunks_with_resume_reuses_a_slice_chunk_whose_fingerprint_matches(tmp_path: Path):
+    """``--resume --only-chunks`` narrows WHICH chunks are considered, and
+    ``--resume`` decides whether each one renders -- the same fingerprint
+    comparison a full resume makes. Before 2026-09-21 the slice forced every
+    named chunk regardless, so an edit-and-resume on a three-chunk slice could
+    not be observed without rendering all 80 (it took a harness shim on the
+    2026-09-20 acceptance run)."""
+    rig = Rig(tmp_path)
+    rig.run([build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)])
+    submitted_before = len(rig.submitted)
+
+    report = rig.run([], resume=True, only_chunks=(0, 1))
+
+    assert len(rig.submitted) == submitted_before, "nothing changed, so nothing renders"
+    assert report.cached == 2
+
+
+def test_only_chunks_with_resume_re_renders_only_the_slice_chunk_whose_prompt_changed(
+    tmp_path: Path,
+):
+    rig = Rig(tmp_path)
+    rig.run([build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)])
+    state_file = rig.config.run_state_file
+    state = json.loads(state_file.read_text())
+    state["results"]["1"]["fingerprint"]["prompt_hash"] = "stale-prompt"
+    state_file.write_text(json.dumps(state))
+    submitted_before = len(rig.submitted)
+
+    rig.run([build_success_sequence(rig.seed_success(4, 1))], resume=True, only_chunks=(0, 1))
+
+    assert len(rig.submitted) == submitted_before + 1
+    after = json.loads(state_file.read_text())["results"]
+    assert after["1"]["rerender_reason"] == "content_changed"
+    assert after["1"]["rerender_reason_fields"] == ["prompt_hash"]
+    assert after["0"]["status"] == "cached"
+    assert set(after) == {"0", "1", "2"}, "chunk 2 is outside the slice and keeps its record"
+
+
+def test_reseed_still_forces_its_chunk_under_resume_and_only_chunks(tmp_path: Path):
+    """--reseed changes the seed, which IS in the fingerprint, but it must not
+    depend on that: a reseed is an explicit request for a new take."""
+    rig = Rig(tmp_path)
+    rig.run([build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)])
+    submitted_before = len(rig.submitted)
+
+    rig.run(
+        [build_success_sequence(rig.seed_success(4, 1))],
+        resume=True,
+        only_chunks=(0, 1),
+        reseed_chunk_ids=(1,),
+    )
+
+    assert len(rig.submitted) == submitted_before + 1
+
+
+def test_a_multi_chunk_run_releases_the_card_between_chunks_by_default(tmp_path: Path):
+    """release_vram_between_chunks (default on, 2026-09-21): a /free before
+    every chunk after the first, plus the custody release at the end."""
+    rig = Rig(tmp_path)
+    assert rig.config.release_vram_between_chunks is True
+
+    rig.run([build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)])
+
+    assert len(rig.session.free_calls) == 2 + 1
+
+
+def test_turning_release_off_leaves_only_the_end_of_run_release(tmp_path: Path):
+    rig = Rig(tmp_path)
+    rig.config = replace(rig.config, release_vram_between_chunks=False)
+
+    rig.run([build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)])
+
+    assert len(rig.session.free_calls) == 1
 
 
 # --------------------------------------------------------------------------- #

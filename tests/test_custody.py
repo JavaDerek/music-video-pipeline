@@ -23,6 +23,7 @@ from music_video_maker.custody import (
     VramCustodyManager,
     build_custody_manager,
     build_vram_probe,
+    build_vram_releaser,
 )
 from tests.harness.comfyui_mock import FakeComfyUISession
 
@@ -447,3 +448,13 @@ def test_a_failed_sleep_assertion_degrades_loudly_but_does_not_fail_the_run(capl
         pass
 
     assert any("sleep" in r.message.lower() for r in caplog.records)
+
+
+def test_build_vram_releaser_posts_free_with_unload_every_call():
+    session = FakeComfyUISession()
+    release = build_vram_releaser(session, session.base_url + "/")
+
+    release()
+    release()
+
+    assert session.free_calls == [{"unload_models": True, "free_memory": True}] * 2

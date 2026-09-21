@@ -643,6 +643,20 @@ class RunConfig:
     several GB between sampling and VAE decode, so a threshold tight enough to
     catch a 2 GB intruder will fire on us instead."""
 
+    release_vram_between_chunks: bool = True
+    """Release ComfyUI's models (``POST /free``) before every chunk after one
+    that rendered, and wait for the card to read back ``min_free_vram_gb``
+    before submitting the next (2026-09-21).
+
+    On ComfyUI 0.35.1 / torch 2.14, H3 resident between chunks leaves under
+    1 GB free with no other tenant on the card (0.82 GB measured 2026-09-20),
+    so ``between_chunk_min_free_vram_gb`` could not tell this run's own weights
+    from an intruder and no multi-chunk run could pass it. After a release the
+    card should read cold, so the cold floor is a real test again, and a
+    failure to come back genuinely means something else holds the memory.
+    Costs one re-stage of H3 per chunk. Turn it off only on a stack where you
+    have watched the resident figure clear your between-chunk floor."""
+
     alignment_model_size: str = DEFAULT_ALIGNMENT_MODEL_SIZE
     """Which whisper model Stage 1's forced alignment loads.
 
@@ -1694,6 +1708,7 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
             "inside stable-ts after the weights download, minutes into Stage 1"
         )
     values["alignment_model_size"] = model_size
+    values["release_vram_between_chunks"] = _flag(merged, "release_vram_between_chunks", True)
     between_chunk_floor = merged.get("between_chunk_min_free_vram_gb")
     values["between_chunk_min_free_vram_gb"] = (
         _positive_number(merged, "between_chunk_min_free_vram_gb", 0.0)

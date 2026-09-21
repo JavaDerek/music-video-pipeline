@@ -72,6 +72,7 @@ from music_video_maker.contracts import (
 from music_video_maker.custody import (
     build_custody_manager,
     build_vram_probe,
+    build_vram_releaser,
     prevent_host_sleep,
 )
 from music_video_maker.execution import ComfyUIExecutionClient
@@ -436,7 +437,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Stage 5 assembly. Stages 1-2 still run over the whole track, so each chunk "
             "gets exactly the span, prompt and frame count a full run would give it. This "
             "is the validation slice: prove a prompt-shape or gate change on a few chunks "
-            "before committing hours of exclusive GPU custody to a full render."
+            "before committing hours of exclusive GPU custody to a full render. Without "
+            "--resume the named chunks always re-render; with it they re-render only if "
+            "their fingerprint changed, exactly as a full --resume would decide."
         ),
     )
     parser.add_argument(
@@ -940,6 +943,11 @@ def run_pipeline(
             sleeper=sleeper,
             disk_usage=disk_usage,
             vram_probe=build_vram_probe(session, config.comfyui_url),
+            vram_releaser=(
+                build_vram_releaser(session, config.comfyui_url)
+                if config.release_vram_between_chunks
+                else None
+            ),
         )
         # Issue #34: what each chunk is being rendered *for*, composed from what
         # Stages 1-2 just produced. A resumed run compares this against what
@@ -1024,20 +1032,22 @@ def run_pipeline(
 
         render_ids = _select_render_ids(chunks, only_chunks)
         # --reseed forces its chunks to render even when only_chunks narrows
-        # the render list to something else entirely; --only-chunks already
-        # forces its own. Union, deduplicated, order-preserved -- neither flag
-        # needs to know the other exists.
-        force_chunk_ids = tuple(
-            dict.fromkeys((*(only_chunks or ()), *(reseed_chunk_ids or ())))
-        )
+        # the render list to something else entirely. A bare --only-chunks
+        # forces its own too (the validation slice: what changed is often
+        # something no fingerprint can see); with --resume it does not, and
+        # the slice's chunks get the same fingerprint comparison a full resume
+        # gives them -- so an edit-and-resume can be tried on three chunks
+        # instead of eighty. Union, deduplicated, order-preserved.
+        slice_forced = () if resume else (only_chunks or ())
+        force_chunk_ids = tuple(dict.fromkeys((*slice_forced, *(reseed_chunk_ids or ()))))
 
         run_state = runner.render_run(
             render_ids,
             provider,
             config.chunks_dir,
             # A slice or a reseed always loads prior state so it augments the
-            # run rather than replacing it, and always re-renders its own
-            # chunks -- see force_chunk_ids. Writing a state file containing
+            # run rather than replacing it; which of its own chunks it
+            # re-renders is force_chunk_ids' business. Writing a state file containing
             # only those chunks destroyed the record of every other chunk in
             # the run.
             resume=resume or bool(only_chunks) or bool(reseed_chunk_ids),

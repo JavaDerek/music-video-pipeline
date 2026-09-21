@@ -266,6 +266,16 @@ min_free_vram_gb = 16.0
 # rebuilding this config from the docs alone as a clean-room check.
 between_chunk_min_free_vram_gb = 1.0
 
+# Release ComfyUI's models before every chunk after the first and wait for the
+# card to read back min_free_vram_gb (the COLD floor) before submitting the
+# next. Default on since 2026-09-21: on ComfyUI 0.35.1 / torch 2.14, H3
+# resident between chunks left 0.82 GB free with NOTHING else on the card, so
+# the tripwire above could no longer tell our own weights from an intruder.
+# With it on, the tripwire above is consulted only before the first chunk and
+# any chunk after a cached one. Costs one H3 re-stage per chunk; turn it off
+# only on a stack where you have watched the resident figure clear the tripwire.
+release_vram_between_chunks = true
+
 # Which whisper model Stage 1 aligns with. Defaults to "base", which is what
 # every config written before this key existed used.
 #
