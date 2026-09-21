@@ -230,6 +230,7 @@ else:
     import tomli as tomllib
 
 from music_video_maker.contracts import H3_FRAME_GRID, AudioChunk, CastMember
+from music_video_maker.prompting import FRAMING_LEVELS
 
 logger = logging.getLogger(__name__)
 
@@ -526,6 +527,43 @@ class ShotPlanEntry:
     plan that does not use it. Unlike ``location``, there is no whole-video
     fallback field for it to substitute for: an unset ``conditions``
     composes nothing at all, via :func:`~music_video_maker.prompting._conditions_clause`."""
+
+    framing: str | None = None
+    """How much of the frame this shot's focus member should fill (issue
+    #97) -- one of ``prompting.FRAMING_LEVELS``: ``"face"``, ``"close"``,
+    ``"medium"`` or ``"wide"``, tightest first.
+
+    The field exists because nothing else in the plan controls delivered
+    face size, and #97 measured that face size is what decides whether a
+    #79 leading-vocal-offset desync is *visible*: across the seven "Deathless"
+    chunks with more than 1.0 s of offset, the four a viewer noticed carry
+    faces of 0.0778-0.2101 of frame and the three nobody has ever reported
+    carry 0.0120-0.0474, with no overlap. ``camera`` cannot do this job --
+    of 39 voiced chunks authored ``close``/``medium close`` there, the
+    delivered face fraction runs 0.0000 to 0.3561, and two chunks both
+    reading "close on her face" rendered at 0.0120 and 0.0460.
+
+    An **ordinal from a closed vocabulary**, not free text and not a number.
+    Free text in this exact role is what ``camera`` already is; a float
+    ("0.12 of frame") would claim a precision nothing in the render can
+    honour. Same choice, for the same reason, as ``lyric_literalness``
+    (#67). A value outside the vocabulary is an error at load time, not a
+    silently-dropped key: a typo'd ordinal would render the wrong frame with
+    nothing to show for the direction that was written, the rule ``subject``
+    and ``present`` already follow.
+
+    ``None`` (the default) is "not authored" -- every entry written before
+    this field existed, and every hand-written plan that does not use it --
+    and composes byte-identically to before it existed. Nothing fabricates a
+    default level: a run that does not use this field gets exactly the
+    framing behaviour it had, which is H3's own, uncontrolled.
+
+    **Not emitted by the authoring layer yet, deliberately.** The prompt
+    mechanism is measured only indirectly (#74's demeanour arms), and
+    generating a framing intent onto all 80 chunks would re-frame shots the
+    photography stage already authored, at a cost nobody has measured. #97's
+    A/B is three hand-set chunks at identical seeds; the generating stage
+    comes after it, not before."""
 
 
 def load_shot_plan(
@@ -2470,7 +2508,7 @@ def lint_instrumental_focus_mismatch(
 ENTRY_KEYS = frozenset(
     {
         "chunk_id", "start", "shot", "focus", "length_seconds", "camera", "present",
-        "location", "subject", "conditions",
+        "location", "subject", "conditions", "framing",
     }
 )
 """Every key this module actually reads out of a ``[[shot]]`` table."""
@@ -2555,6 +2593,7 @@ def _parse_entry(
         location=_parse_location(raw, chunk_id, path),
         subject=_parse_subject(raw, chunk_id, path, cast_names),
         conditions=_parse_conditions(raw, chunk_id, path),
+        framing=_parse_framing(raw, chunk_id, path),
     )
 
 
@@ -2693,6 +2732,56 @@ def _parse_location(raw: dict, chunk_id: object, path: Path) -> str | None:
             "a string"
         )
     return location.strip() or None
+
+
+def _parse_framing(raw: dict, chunk_id: object, path: Path) -> str | None:
+    """Read the optional ``framing`` field (issue #97) and validate it
+    against ``prompting.FRAMING_LEVELS``.
+
+    Unlike ``location``/``conditions``, whose vocabularies are song-specific
+    and defined by the concept stage this module never sees, ``framing``'s
+    vocabulary is fixed in code -- there are four framings and they are the
+    same for every song -- so the closed-set check belongs here, where the
+    plan is actually read, rather than only in the authoring layer.
+
+    An unknown value **raises**. Dropping it would be the worst of both
+    worlds: the plan says the shot is a close-up, the render silently
+    composes nothing, and the only evidence is a face that came out the size
+    H3 felt like. Matching is case-insensitive and whitespace-tolerant
+    (``"Close"`` and ``" close "`` are the same instruction); anything else
+    is a typo and is named as one, with the vocabulary in the message.
+    """
+    framing = raw.get("framing")
+    if framing is None:
+        return None
+    if not isinstance(framing, str) or not framing.strip():
+        logger.error(
+            "Shot plan %s: chunk_id=%s has framing=%r, which must be one of %s",
+            path,
+            chunk_id,
+            framing,
+            list(FRAMING_LEVELS),
+        )
+        raise ShotPlanError(
+            f"shot plan {path}: chunk_id={chunk_id} has framing={framing!r}; it must be "
+            f"one of {list(FRAMING_LEVELS)} (an ordinal, not free text -- issue #97)"
+        )
+    level = framing.strip().lower()
+    if level not in FRAMING_LEVELS:
+        logger.error(
+            "Shot plan %s: chunk_id=%s has framing=%r, which is not one of %s",
+            path,
+            chunk_id,
+            framing,
+            list(FRAMING_LEVELS),
+        )
+        raise ShotPlanError(
+            f"shot plan {path}: chunk_id={chunk_id} has framing={framing!r}, which is not "
+            f"one of {list(FRAMING_LEVELS)}. Framing is an ordinal from a closed "
+            "vocabulary (issue #97) -- free text is what `camera` already is, and #97 "
+            "measured that it does not control delivered face size."
+        )
+    return level
 
 
 def _parse_conditions(raw: dict, chunk_id: object, path: Path) -> str | None:
@@ -2959,6 +3048,29 @@ def resolve_conditions(
     has no plan."""
     entry = _resolve_entry(plan, chunk)
     return entry.conditions if entry is not None else None
+
+
+def resolve_framing(
+    plan: Mapping[int, ShotPlanEntry] | None, chunk: AudioChunk
+) -> str | None:
+    """This chunk's authored framing intent (issue #97), or ``None`` when the
+    plan has no entry for it, the entry never set ``framing``, or (via
+    :func:`_resolve_entry`) the plan itself is absent.
+
+    Shares :func:`_resolve_entry`'s drift check for the same reason every
+    other per-chunk resolver does: a stale plan must refuse every field the
+    same way. ``framing`` in particular is a claim about a *span* -- how
+    much of the frame a face fills over these seconds -- so honouring one
+    authored against a boundary that has since moved is exactly the class of
+    silent mismatch the drift check exists for.
+
+    ``cli.py`` passes this into ``expand_prompt(..., framing=...)``, which
+    composes it as its own sentence (``prompting._framing_clause``). ``None``
+    composes nothing -- there is no whole-video fallback field it substitutes
+    for, the same as ``conditions`` and unlike ``location``.
+    """
+    entry = _resolve_entry(plan, chunk)
+    return entry.framing if entry is not None else None
 
 
 # --------------------------------------------------------------------------- #
