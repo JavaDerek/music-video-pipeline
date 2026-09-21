@@ -35,7 +35,7 @@ from typing import Any
 
 import requests
 
-from music_video_maker import config
+from music_video_maker import config, execution
 from music_video_maker.contracts import AudioChunk, ExpandedPrompt, StagedAssets
 
 logger = logging.getLogger(__name__)
@@ -122,11 +122,20 @@ class ComfyUIAssetStager:
         *,
         max_upload_bytes: int = DEFAULT_MAX_UPLOAD_BYTES,
         max_megapixels: float = DEFAULT_MAX_MEGAPIXELS,
+        http_timeout: float | None = execution.DEFAULT_HTTP_TIMEOUT_SECONDS,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.session = session if session is not None else requests.Session()
         self.max_upload_bytes = max_upload_bytes
         self.max_megapixels = max_megapixels
+        self.http_timeout = http_timeout
+        """Issue #24: ``requests`` waits forever by default. Staging runs
+        *before* the card is loaded, so it is not the wedge path itself -- but
+        it talks to the same ComfyUI, and one left wedged by a previous run
+        would hang the upload with no timeout on it. Bounded for the same
+        reason and with the same number as the execution client's: a
+        half-bounded client is a trap, because the unbounded call is always
+        the one nobody thought about."""
         self._cache: dict[str, str] = {}
 
     @property
@@ -219,6 +228,7 @@ class ComfyUIAssetStager:
                 self.endpoint,
                 files={"image": (path.name, content)},
                 data={"type": "input", "subfolder": "", "overwrite": "false"},
+                timeout=self.http_timeout,
             )
         except requests.RequestException as exc:
             logger.exception(

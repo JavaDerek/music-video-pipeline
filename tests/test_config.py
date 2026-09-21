@@ -2546,3 +2546,14 @@ def test_resume_require_same_stack_rejects_a_non_boolean(tmp_path: Path) -> None
 
     with pytest.raises(ConfigError, match="resume_require_same_stack"):
         load_config(config_path)
+def test_acknowledge_unproven_envelope_defaults_off(tmp_path):
+    """Issues #24/#98: off means the run is *refused* when a chunk is bigger
+    than anything measured on this card. Every config written before the key
+    existed means false, which is what every one of them already did on any
+    run whose chunks are inside the envelope."""
+    assert _load_with(tmp_path).acknowledge_unproven_envelope is False
+
+
+def test_acknowledge_unproven_envelope_can_be_set_for_an_attended_proof(tmp_path):
+    config = _load_with(tmp_path, acknowledge_unproven_envelope="true")
+    assert config.acknowledge_unproven_envelope is True

@@ -1474,6 +1474,40 @@ def test_recovery_sequence_exceptions_are_logged_and_do_not_crash_the_run(tmp_pa
     assert any("free()" in r.message for r in caplog.records)
 
 
+class _WedgedInterruptClient(StubExecutionClient):
+    """``interrupt()`` never comes back.
+
+    A process cannot be blocked forever inside a test, so this stands in for
+    the real thing by ending the process's story at the same point: whatever
+    reached disk before ``interrupt()`` was called is everything that
+    survives. Issue #24's 2026-08-07 incident needed a power cycle, so that is
+    the honest model of it.
+    """
+
+    def interrupt(self) -> None:
+        self.interrupt_calls += 1
+        raise KeyboardInterrupt("the host wedged inside POST /interrupt")
+
+
+def test_state_is_on_disk_before_the_interrupt_that_may_never_return(tmp_path: Path):
+    """Issue #24: the normal per-chunk persist happens *after* ``_render_chunk``
+    returns, which is exactly the point a watchdog-then-wedge path never
+    reaches. Chunk 1 rendered over real minutes and must not be lost because
+    chunk 2 hung the recovery call that follows it."""
+    client = _WedgedInterruptClient(
+        {1: [_rendered(1, tmp_path)], 2: [WebSocketTimeoutError("silent H3 stage")]}
+    )
+    runner = _make_runner(client, tmp_path, max_render_attempts=3)
+
+    with pytest.raises(KeyboardInterrupt):
+        runner.render_run([1, 2], _provider_returning(), tmp_path / "chunks")
+
+    persisted = resilience_module.load_run_state(tmp_path / "run_state.json")
+    assert persisted.results[1].status is ChunkStatus.RENDERED
+    assert 2 not in persisted.results  # never got a result; --resume re-renders it
+    assert client.interrupt_calls == 1
+
+
 # --------------------------------------------------------------------------- #
 # Disk stat failure during pre-flight
 # --------------------------------------------------------------------------- #

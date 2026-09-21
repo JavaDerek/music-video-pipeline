@@ -276,6 +276,26 @@ between_chunk_min_free_vram_gb = 1.0
 # only on a stack where you have watched the resident figure clear the tripwire.
 release_vram_between_chunks = true
 
+# The two floors above ask what ELSE is on the card. This asks how big the
+# thing being submitted is, which is the axis nothing checked (issues #24,
+# #98): the run is REFUSED, before any GPU time, if a chunk's frame count or
+# resolution is larger than anything in envelope.PROVEN_ENVELOPES for this
+# run's [hardware] name. On doris that is 192 frames at 864x480 and 141 frames
+# at 1344x768 -- and nothing interpolates between them, because temporal VAE
+# decode memory scales non-linearly with frame count.
+#
+# A card with no recorded measurements gets NO gate at all: unmeasured is not
+# forbidden, and refusing someone else's GPU on the strength of doris's
+# numbers would be inventing a measurement.
+#
+# Setting this true says a human is at the keyboard for this run. It is what
+# docs/runbook-288-frame-proof.md has you set for the attended one-chunk proof
+# that EXTENDS the envelope -- and the proof's result then goes into
+# envelope.py, so the next run passes on evidence instead of on an
+# acknowledgement. Leaving it true afterwards is the same mistake as leaving
+# an assertion disabled.
+# acknowledge_unproven_envelope = true
+
 # Which whisper model Stage 1 aligns with. Defaults to "base", which is what
 # every config written before this key existed used.
 #
