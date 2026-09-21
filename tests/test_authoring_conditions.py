@@ -158,6 +158,36 @@ def test_a_deliberate_return_authored_on_its_own_consequence_still_reports():
     assert [f.kind for f in findings] == [REGRESSION]
 
 
+def test_a_second_regression_after_the_first_is_still_reported():
+    """The regression check is the ``worldstate`` write choke point, and a
+    rejected write raises. This pins that a caught
+    ``IrreversibleFactViolation`` leaves the log usable rather than
+    poisoned -- the scan keeps going, a *later* independent regression is
+    still found, and its ``against`` names the consequence that actually
+    ended that state (the second one, at 300.0s, not the first).
+
+    Worth a test of its own because the failure it guards against is
+    silent-and-partial rather than loud: a sheet with two regressions would
+    report only the earliest, and a human fixing that one would re-run and
+    get told the sheet is now clean.
+    """
+    findings = check_conditions(
+        _spans(
+            (10, 0.0, "green valley", False),
+            (20, 100.0, "burnt ground", True),
+            (25, 150.0, "burnt ground", False),
+            (30, 200.0, "green valley", False),
+            (35, 250.0, "green valley", False),
+            (40, 300.0, "drifting ash", True),
+            (45, 350.0, "drifting ash", False),
+            (50, 400.0, "green valley", False),
+        )
+    )
+    assert [f.kind for f in findings] == [REGRESSION, REGRESSION]
+    assert [f.ref for f in findings] == [30, 50]
+    assert [f.against for f in findings] == [20, 40]
+
+
 def test_both_lints_can_fire_on_one_sheet_and_are_reported_together():
     findings = check_conditions(
         _spans(

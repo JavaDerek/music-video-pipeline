@@ -168,7 +168,15 @@ Three deeper capabilities build on that base:
 - **Character tags** (`lyrics.py`) — `[Name: Role]` tags in the lyrics file
   switch which cast member is "active" (and therefore whose reference photo
   and role text drive the prompt) for that line and every line after it,
-  until the next tag. See [`docs/lyrics-format.md`](docs/lyrics-format.md).
+  until the next tag. **If a song has more than one vocalist, these tags are
+  the only supported way to say so** — nothing in this project listens to the
+  audio and guesses a singer (issue #29). The failure mode is silent: an
+  untagged or mis-tagged handoff does not raise, it *inherits whoever was
+  tagged last*, so that line renders with the wrong face and no error
+  anywhere. Tag every handoff, not just the first one. See
+  [`docs/lyrics-format.md`](docs/lyrics-format.md) for the full format (and
+  [`docs/design-multi-vocalist.md`](docs/design-multi-vocalist.md) for the
+  automatic-detection design, which is not built).
 - **I2V latent continuity** (`continuity.py`) — optionally bridges chunk
   *N-1*'s rendered last frame into chunk *N*'s render as a seed image, so
   consecutive shots don't visually re-layout themselves on every lyric line.
@@ -389,6 +397,67 @@ folded into the location one, because a condition holds whether or not the
 place is identifiable, and the authoring layer checks two things about it
 mechanically: a state that flips for one chunk and comes straight back, and a
 state that regresses after the `consequence` beat that ended it.
+
+#### Real people and invented ones
+
+Every `[cast.<Name>]` entry means **a real person's likeness is in this run**
+unless it says otherwise. A rendered H3 frame derived from a cast photo
+depicts a real, identifiable person, and publishing it is that person's
+decision — so whether a run depends on someone's likeness has to be a query,
+not something you remember (issue #56):
+
+```toml
+[cast.Kashay]
+role = "The deathless king, empty-handed, hands at his sides"
+image = "cast/kashay_ref_01.png"
+synthetic = true                       # this character is invented
+
+[cast.Kashay.origin]                   # required whenever synthetic = true
+model = "<checkpoint or hosted API and version>"
+prompt = "<the prompt that produced the image>"
+seed = 12345
+created = 2026-08-23                   # a bare TOML date or a quoted ISO string
+# any further scalar keys (sampler, steps, method, job id) are kept as-is
+```
+
+The loader refuses both halves of the contradiction: `synthetic = true` with
+no `[cast.<Name>.origin]` ("this character is invented" with no record of
+how is the provenance bug in a new place), and an `origin` on an entry that
+is not `synthetic`. A `voiced_by` character with no `image` of its own
+inherits its performer's photo *and* that photo's `synthetic`/`origin`
+facts, and may not restate them. `RunConfig.real_likenesses()` — every cast
+entry not marked synthetic — is logged at the start of every run.
+
+Nothing in this project generates a reference photo; issue #56 defers that
+decision (see [`docs/design-synthetic-cast.md`](docs/design-synthetic-cast.md)
+— a licence question, not just a model choice). What *is* built is the
+offline acceptance check for a generated character's reference set, because
+the hard part is not one portrait, it is a character who reads as the same
+person across eighty shots:
+
+```bash
+python -m music_video_maker.castcheck Kashay cast/kashay_*.png
+```
+
+It scores every pair with SFace cosine similarity
+(`music_video_maker/castcheck.py`, reusing `faces.recognize_face`) against
+the 0.34 floor from [`docs/seed-face-recognition.md`](docs/seed-face-recognition.md),
+excludes any image whose face could not actually be detected rather than
+scoring it as a failing 0.0, and stamps the source path, size and mtime of
+every image plus the model sha256s into the report. **That floor was
+calibrated on photographs of real people**; generated faces can sit closer
+to each other than two photographs of one person do, so re-derive it on
+synthetic pairs before trusting it on them. The report says so every time.
+
+It is a module CLI rather than a fourth console script, the same pattern
+`python -m music_video_maker.facescan` follows — neither is load-bearing for
+a run. It does need the SFace weights on disk, which are deliberately **not**
+committed here (38.7 MB against YuNet's 232 KB); `faces.py` records the
+source and sha256. Without them every pair comes back *unscored* with the
+reason printed beside it and the report's status is `insufficient` — exit
+code 1, never a quiet pass. Only `pass` exits 0; `fail`, `needs_review` and
+`insufficient` all mean this reference set is not ready to condition a
+render on.
 
 #### Chunk duration window
 
