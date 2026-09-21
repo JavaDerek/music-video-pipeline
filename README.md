@@ -337,6 +337,53 @@ docstring at the top of
 [`music_video_maker/config.py`](music_video_maker/config.py); treat that as
 the source of truth if this README ever drifts from it.
 
+#### A spoken prologue, or an epilogue (`[[segment]]`)
+
+A prologue is not a special kind of chunk; it is a **second timeline** — its
+own recording, its own text, its own chunks — rendered by the same five
+stages and concatenated ahead of the song
+([#66](https://github.com/JavaDerek/music-video-pipeline/issues/66)). H3
+conditions on audio and does not care that the audio is speech, so a script
+plus a recorded dialogue take is exactly the (text, audio) pair Stage 1
+already consumes.
+
+```toml
+# The song stays exactly where it is: master_audio / lyrics_file above.
+# NOTE: in TOML a bare key belongs to whichever table precedes it, so every
+# top-level setting must be written ABOVE this table. The key set here is
+# closed, so a misplaced one fails loudly naming the key.
+[[segment]]
+name      = "prologue"                  # becomes chunks_dir/prologue/
+position  = "before"                    # optional; "before" (default) or "after"
+audio     = "audio/prologue.wav"        # the recorded dialogue
+script    = "prologue.txt"              # lyrics-format text for that recording
+shot_plan = "prologue_shot_plan.toml"   # optional, authored against THIS timeline
+```
+
+Three things follow, and they are the whole feature:
+
+* **Chunk ids are a separate space per timeline**, with a chunks directory
+  and a `run_state.json` each. Prologue chunk 3 and song chunk 3 are
+  different shots. One shared id space would renumber every authored shot
+  plan the moment a prologue's length changed, silently, and `chunk_id` is
+  the anchor a plan is authored against. `ChunkFingerprint.timeline` is what
+  stops `--resume` handing one timeline's clip to another; `--only-chunks`
+  and `--reseed` take `--timeline NAME` to say which id space they mean.
+* **`--prepare` writes a skeleton per timeline** (`shot_plan.toml` and
+  `shot_plan__prologue.toml`) and reports the seam before any GPU time.
+* **The seam is reconciled by padding audio, measured with ffprobe.** The
+  chunk timeline overshoots its own track by up to one trained-floor chunk
+  (1.837 s on the render this was measured against). For one timeline the
+  mux's `-shortest` silently discards that; at a seam it would instead push
+  the entire song out of sync while both halves still looked correct alone.
+  So each timeline's audio is padded to its own *measured* video duration and
+  the padding is probed back, rather than computed and trusted.
+
+**Nothing has been rendered with this yet.** It is built and tested offline
+end to end against the mock ComfyUI; whether H3 lip-syncs spoken dialogue as
+well as it syncs singing is reasoning, not a measurement. Budget for it as a
+whole second song: a four-minute prologue at ~6 s/chunk is ~40 chunks.
+
 #### Properties that must hold across the whole video
 
 `setting`, `global_appearance` and a cast member's `appearance` exist because

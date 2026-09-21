@@ -846,7 +846,6 @@ def _align_and_slice_timeline(
 def _render_one_timeline(
     config: RunConfig,
     timeline: Timeline,
-    alignment: AlignmentResult,
     chunks: tuple[AudioChunk, ...],
     plan: Mapping[int, ShotPlanEntry] | None,
     *,
@@ -1247,7 +1246,6 @@ def run_pipeline(
             run_state = _render_one_timeline(
                 config,
                 timeline,
-                alignment,
                 chunks,
                 plan,
                 base_template=base_template,
