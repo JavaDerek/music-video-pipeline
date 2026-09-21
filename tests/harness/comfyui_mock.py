@@ -176,15 +176,29 @@ def _extract_file(value: Any) -> tuple[str, bytes]:
 
 
 def default_system_stats(
-    *, vram_total: int = 25_757_220_864, vram_free: int = 24_000_000_000
+    *,
+    vram_total: int = 25_757_220_864,
+    vram_free: int = 24_000_000_000,
+    comfyui_version: str | None = "0.30.2",
+    pytorch_version: str | None = "2.13.0+cu130",
 ) -> dict[str, Any]:
-    """A realistic ``/system_stats`` body for an RTX 4090 (~24 GB VRAM)."""
+    """A realistic ``/system_stats`` body for an RTX 4090 (~24 GB VRAM).
+
+    ``comfyui_version``/``pytorch_version`` are the render stack issue #95
+    fingerprints; passing ``None`` for either **omits the key**, which is how
+    a server that will not say is faked -- writing ``null`` would be a
+    different response shape from the one the real gap produces.
+    """
+    system: dict[str, Any] = {
+        "os": "posix",
+        "python_version": "3.12.8",
+    }
+    if comfyui_version is not None:
+        system["comfyui_version"] = comfyui_version
+    if pytorch_version is not None:
+        system["pytorch_version"] = pytorch_version
     return {
-        "system": {
-            "os": "posix",
-            "python_version": "3.12.8",
-            "comfyui_version": "0.30.2",
-        },
+        "system": system,
         "devices": [
             {
                 "name": "cuda:0 NVIDIA GeForce RTX 4090",

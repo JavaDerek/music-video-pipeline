@@ -292,6 +292,11 @@ _REASON_CHAIN_BLOCKED = "chain_blocked"
 _REASON_CONDITIONING_CHANGED = "conditioning_changed"
 _REASON_TIMELINE_CHANGED = "timeline_changed"
 _REASON_CONTENT_CHANGED = "content_changed"
+_REASON_STACK_CHANGED = "stack_changed"
+"""Issue #95, and the only reason here an operator has to ask for: a cached
+chunk rendered by a different ComfyUI/torch build than this run's. Never set
+unless ``resume_require_same_stack`` is on -- the default is to reuse the
+chunk and report the split once, at the end of the run."""
 
 
 @dataclass(frozen=True)
@@ -332,7 +337,17 @@ against a run that names a seed, for the precise reason logged, and stays
 reusable for one that does not; nothing is misread either way. Bumping instead
 would have thrown away a whole file's worth of still-valid timeline evidence,
 unescapably, to re-derive a conclusion the field comparison already reaches --
-and ``resume_ignore_prompt_changes`` would have had nothing to forgive."""
+and ``resume_ignore_prompt_changes`` would have had nothing to forgive.
+
+Issue #95 added ``fingerprint.comfyui_version`` / ``fingerprint.torch_version``
+without a bump for a *stronger* reason than #38's. The rule for bumping is "a
+field whose absence could be misread as agreement", and these two cannot be
+misread in either direction: ``ChunkFingerprint.stack_differences`` skips a
+field either side leaves ``None``, so a pre-#95 file neither claims to match
+this run's stack nor claims to differ from it -- it is counted and reported as
+unknown. A bump would make every in-flight render un-resumable in order to
+record which build produced chunks that are, in every other respect, provably
+the right ones."""
 
 
 def _serialize_fingerprint(fingerprint: ChunkFingerprint) -> dict[str, Any]:
@@ -356,6 +371,8 @@ def _serialize_fingerprint(fingerprint: ChunkFingerprint) -> dict[str, Any]:
         "lora": fingerprint.lora,
         "lora_strength": fingerprint.lora_strength,
         "template_hash": fingerprint.template_hash,
+        "comfyui_version": fingerprint.comfyui_version,
+        "torch_version": fingerprint.torch_version,
     }
 
 
@@ -408,6 +425,14 @@ def _deserialize_fingerprint(raw: dict[str, Any] | None) -> ChunkFingerprint | N
         # the graph was hashed cannot prove its chunks predate a template edit,
         # so it must not claim to.
         template_hash=raw.get("template_hash"),
+        # Absent in a file written before issue #95: None = unrecorded, and
+        # unrecorded is *unknown* rather than "a different stack". These two
+        # are the only fingerprint fields where None is neither a value nor a
+        # reason to re-render -- ChunkFingerprint.stack_differences skips a
+        # field either side leaves None, so an old file reports as "stack
+        # unknown for N chunk(s)" and reuses exactly as it always did.
+        comfyui_version=raw.get("comfyui_version"),
+        torch_version=raw.get("torch_version"),
     )
 
 
@@ -591,6 +616,7 @@ class ResilientRunner:
         sleeper: Sleeper = time.sleep,
         disk_usage: DiskUsage = shutil.disk_usage,
         ignore_prompt_changes: bool = False,
+        require_same_stack: bool = False,
         vram_probe: VramProbe | None = None,
         min_free_vram_gb: float = DEFAULT_MIN_FREE_VRAM_GB,
         between_chunk_min_free_vram_gb: float | None = None,
@@ -611,6 +637,24 @@ class ResilientRunner:
         """Issue #34: reuse a cached chunk whose span is unchanged but whose
         *prompt* changed. Covers the content tier only -- a moved span or a
         changed resolution is never reusable, by flag or otherwise."""
+        self.require_same_stack = require_same_stack
+        """Issue #95: re-render any cached chunk whose recorded ComfyUI/torch
+        build differs from this run's. **Off by default**, which is the whole
+        design -- the stack tier reports and the operator decides, because the
+        only remedy is re-rendering the video and the run does not get to
+        spend those hours on the operator's behalf.
+
+        Deliberately *not* a ``ChunkFingerprint`` field, unlike the stack
+        versions it acts on. It is a resume policy, like
+        :attr:`ignore_prompt_changes`: it changes which cached chunks are
+        reused, never what a rendered chunk is. Fingerprinting a policy would
+        make every chunk rendered under it compare unequal to the same pixels
+        rendered without it.
+
+        Not escapable via ``ignore_prompt_changes`` either, and not because it
+        outranks it -- the two answer different questions. That flag forgives
+        an edit to *this run's* config; a stack difference is not something
+        this run's config said."""
         self.vram_probe = vram_probe
         """Issue #23: zero-arg seam re-read immediately before submitting
         each chunk that actually needs to render. ``None`` (the default)
@@ -699,6 +743,7 @@ class ResilientRunner:
             sleeper=sleeper,
             disk_usage=disk_usage,
             ignore_prompt_changes=config.resume_ignore_prompt_changes,
+            require_same_stack=config.resume_require_same_stack,
             vram_probe=vram_probe,
             min_free_vram_gb=config.min_free_vram_gb,
             between_chunk_min_free_vram_gb=config.between_chunk_min_free_vram_gb,
@@ -802,6 +847,8 @@ class ResilientRunner:
                 rerendered.add(chunk_id)
                 _store_result(run_state, chunk_id, result)
             self._persist(run_state)
+
+        self._report_stack_census(run_state)
 
         dead = run_state.dead_lettered
         if dead:
@@ -1074,6 +1121,23 @@ class ResilientRunner:
             )
             return None, _RerenderReason(_REASON_TIMELINE_CHANGED, fields=moved)
 
+        # Issue #95. Checked here, between the tiers that always force and the
+        # tier a flag can forgive, because it is neither: it forces only when
+        # the operator asked. Ahead of the content tier so that
+        # ``ignore_prompt_changes`` -- which returns a reused chunk -- cannot
+        # forgive a stack difference the operator explicitly asked to refuse;
+        # behind timeline and conditioning so a chunk that is wrong for a
+        # second reason is still reported by the more actionable one.
+        if self.require_same_stack and (stack := expected.stack_differences(stored)):
+            log(
+                "Chunk %d was rendered by a different stack (%s) and "
+                "resume_require_same_stack is set -- re-rendering. Unset it to reuse it and "
+                "have the run report the mix instead (issue #95)",
+                chunk_id,
+                _describe_changes(stored, expected, stack),
+            )
+            return None, _RerenderReason(_REASON_STACK_CHANGED, fields=stack)
+
         changed = expected.content_differences(stored)
         if changed:
             description = _describe_changes(stored, expected, changed)
@@ -1099,6 +1163,74 @@ class ResilientRunner:
             return None, _RerenderReason(_REASON_CONTENT_CHANGED, fields=changed)
 
         return replace(existing, status=ChunkStatus.CACHED), None
+
+    def _report_stack_census(self, run_state: RunState) -> None:
+        """Say which render stack(s) the chunks in ``run_state`` came from
+        (issue #95) -- the reportable tier's entire mechanism.
+
+        Counted over **every** succeeded result in the state file, not just
+        the chunk ids this invocation rendered. The state file is what Stage 5
+        assembles from, so a slice or a ``--resume`` that touched three chunks
+        still has to account for the other seventy-seven; reporting only what
+        this invocation looked at would report a mixed video as single-stack
+        precisely on the run that mixed it.
+
+        Three outcomes and each is said differently, because they are not
+        degrees of one thing: one known stack is a fact worth one INFO line
+        (a run's own provenance, in the log beside its chunks); more than one
+        is a WARNING naming each stack and its chunk count, because a
+        2026-09-20 A/B measured the same chunk re-rendering to different
+        pixels across an upgrade; and chunks whose stack was never recorded
+        are counted and named as unknown in either case, never folded into
+        "the same as this run" and never counted as a second stack.
+        """
+        counts: dict[str, int] = {}
+        unknown = 0
+        for result in run_state.results.values():
+            if not result.succeeded:
+                continue
+            label = result.fingerprint.stack_label if result.fingerprint is not None else None
+            if label is None:
+                unknown += 1
+            else:
+                counts[label] = counts.get(label, 0) + 1
+
+        if not counts and not unknown:
+            return
+
+        unknown_clause = (
+            f"; stack unknown for {unknown} chunk(s) (rendered before the stack was recorded, "
+            "or by a server that would not say)"
+            if unknown
+            else ""
+        )
+        if len(counts) > 1:
+            logger.warning(
+                "THIS RUN'S CHUNKS COME FROM %d DIFFERENT RENDER STACKS: %s%s. The same chunk "
+                "re-rendered across a ComfyUI/torch upgrade at an identical config and seed "
+                "produced a different take (measured 2026-09-20), so the finished video mixes "
+                "them. Nothing is re-rendered for this -- set resume_require_same_stack to "
+                "re-render the chunks from the other stack(s), or accept the mix (issue #95)",
+                len(counts),
+                ", ".join(
+                    f"{label}: {count} chunk(s)" for label, count in sorted(counts.items())
+                ),
+                unknown_clause,
+            )
+            return
+        if counts:
+            label, count = next(iter(counts.items()))
+            logger.info(
+                "Render stack for this run's chunks: %s (%d chunk(s))%s",
+                label,
+                count,
+                unknown_clause,
+            )
+            return
+        logger.info(
+            "Render stack unrecorded for all %d chunk(s) in this run's state file (issue #95)",
+            unknown,
+        )
 
     def _report_timeline_change(
         self,

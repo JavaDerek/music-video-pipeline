@@ -2499,3 +2499,28 @@ def test_release_vram_between_chunks_defaults_on(tmp_path):
 def test_release_vram_between_chunks_can_be_turned_off(tmp_path):
     config = _load_with(tmp_path, release_vram_between_chunks="false")
     assert config.release_vram_between_chunks is False
+
+
+def test_resume_require_same_stack_defaults_off(tmp_path: Path) -> None:
+    """Issue #95's operator lever. Off is the finding, not a convenience: the
+    only remedy for a stack mix is re-rendering the whole video, so the run
+    reports the split and the operator decides."""
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path)
+
+    assert load_config(config_path).resume_require_same_stack is False
+
+
+def test_resume_require_same_stack_is_readable_from_the_file(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path, extra_toml="resume_require_same_stack = true")
+
+    assert load_config(config_path).resume_require_same_stack is True
+
+
+def test_resume_require_same_stack_rejects_a_non_boolean(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path, extra_toml='resume_require_same_stack = "yes"')
+
+    with pytest.raises(ConfigError, match="resume_require_same_stack"):
+        load_config(config_path)

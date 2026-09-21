@@ -451,8 +451,11 @@ code before this change still loads and resumes).
 2. **The resume reason per chunk** — `ChunkResult.rerender_reason` (a short
    category: `"explicit_selection"`, `"video_missing"`, `"no_fingerprint"`,
    `"chain_blocked"`, `"conditioning_changed"`, `"timeline_changed"`,
-   `"content_changed"`) plus `rerender_reason_fields` (the `ChunkFingerprint`
-   field names, for the three reasons that come from a field comparison).
+   `"content_changed"`, `"stack_changed"`) plus `rerender_reason_fields` (the
+   `ChunkFingerprint` field names, for the four reasons that come from a
+   field comparison). `"stack_changed"` (issue #95) only ever appears when
+   the operator set `resume_require_same_stack`; by default a chunk from
+   another ComfyUI/torch build is reused and the *run* reports the split.
    `None` for a freshly rendered chunk with nothing to reject, including
    every chunk after a schema-version rejection — see the "Custody and
    resume" bullet above for why that collapse is deliberate rather than a
