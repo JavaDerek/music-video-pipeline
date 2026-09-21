@@ -570,3 +570,43 @@ def test_prepare_on_a_segment_free_config_reports_no_seam(tmp_path: Path, caplog
         prepared = cli.prepare_timelines(rig.config, align_model=rig.align_model)
     assert len(prepared) == 1
     assert "Seam total" not in caplog.text
+
+
+def test_prepare_writes_nothing_at_all_if_any_skeleton_would_be_clobbered(tmp_path: Path):
+    """Per-file refusal alone would write the prologue's skeleton and then
+    abort on the song's, leaving one timeline's anchors from this run beside
+    another's from an older one."""
+    from music_video_maker.shot_plan import ShotPlanError
+
+    rig = PrologueRig(tmp_path)
+    out = tmp_path / "shot_plan.toml"
+    out.write_text("# hand-authored, do not clobber\n")
+
+    with pytest.raises(ShotPlanError, match="Nothing was written"):
+        cli.prepare_shot_plan(
+            rig.config,
+            out,
+            source="run.toml",
+            generated_at="2026-09-21",
+            align_model=rig.align_model,
+        )
+    assert out.read_text() == "# hand-authored, do not clobber\n"
+    assert not (tmp_path / "shot_plan__prologue.toml").exists()
+
+
+def test_prepare_force_overwrites_every_timelines_skeleton(tmp_path: Path):
+    rig = PrologueRig(tmp_path)
+    out = tmp_path / "shot_plan.toml"
+    out.write_text("# stale\n")
+    (tmp_path / "shot_plan__prologue.toml").write_text("# stale\n")
+
+    cli.prepare_shot_plan(
+        rig.config,
+        out,
+        source="run.toml",
+        generated_at="2026-09-21",
+        align_model=rig.align_model,
+        force=True,
+    )
+    assert "chunk_id" in out.read_text()
+    assert "chunk_id" in (tmp_path / "shot_plan__prologue.toml").read_text()

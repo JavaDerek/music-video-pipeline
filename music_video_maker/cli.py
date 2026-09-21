@@ -1591,15 +1591,39 @@ def prepare_shot_plan(
     prepared = prepare_timelines(config, align_model=align_model, from_plan=from_plan)
 
     song_path = Path(output_path)
+
+    def _destination(timeline: Timeline) -> Path:
+        if timeline.is_song:
+            return song_path
+        return song_path.with_name(f"{song_path.stem}__{timeline.name}{song_path.suffix}")
+
+    # Every destination is checked before any of them is written. Per-file
+    # refusal alone would write the prologue's skeleton and then abort on the
+    # song's, leaving one timeline's anchors from this run beside another's
+    # from an older one -- and two skeletons that disagree about the same run
+    # is exactly the drift anchors exist to prevent.
+    if not force:
+        clashes = [
+            path for path in (_destination(timeline) for timeline, _ in prepared)
+            if path.exists()
+        ]
+        if clashes:
+            names = ", ".join(str(path) for path in clashes)
+            logger.error(
+                "Refusing to write any shot-plan skeleton: %s already exist(s). An authored "
+                "shot plan is real work; pass --force to overwrite. Nothing was written.",
+                names,
+            )
+            raise ShotPlanError(
+                f"{names} already exist(s) -- an authored shot plan is real work; pass "
+                "--force to overwrite. Nothing was written, so no run can leave one "
+                "timeline's anchors beside another run's."
+            )
+
     written: list[Path] = []
     song_result = song_path
     for timeline, timeline_data in prepared:
-        if timeline.is_song:
-            destination = song_path
-        else:
-            destination = song_path.with_name(
-                f"{song_path.stem}__{timeline.name}{song_path.suffix}"
-            )
+        destination = _destination(timeline)
         written_path = write_shot_plan_skeleton(
             timeline_data.chunks,
             destination,
