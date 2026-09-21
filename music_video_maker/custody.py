@@ -37,6 +37,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import requests
@@ -145,6 +146,109 @@ def _extract_free_vram_gb(payload: object) -> float | None:
     except (KeyError, TypeError, ValueError):
         return None
     return free_bytes / (1024**3)
+
+
+@dataclass(frozen=True)
+class RenderStack:
+    """Which build of ComfyUI, on which torch, is about to render (issue #95).
+
+    Read from the same ``GET /system_stats`` body the VRAM check above already
+    fetches, and recorded on every ``ChunkFingerprint`` so a resumed run can
+    say which of its chunks came from which stack. Either half may be ``None``
+    when the response does not carry it -- unknown, never "the same as
+    yours"; see ``ChunkFingerprint.stack_differences``.
+    """
+
+    comfyui_version: str | None = None
+    torch_version: str | None = None
+
+    @property
+    def known(self) -> bool:
+        return self.comfyui_version is not None or self.torch_version is not None
+
+
+_COMFYUI_VERSION_KEY = "comfyui_version"
+_TORCH_VERSION_KEYS = ("pytorch_version", "torch_version")
+"""What ``/system_stats``' ``system`` object calls the torch build.
+
+ComfyUI's own server reports ``pytorch_version`` (its value is
+``comfy.model_management.torch_version``); ``torch_version`` is accepted as
+a second spelling so a build that exposes the underlying name is read rather
+than recorded as unknown. First key present wins, so the primary spelling is
+never shadowed."""
+
+
+def read_render_stack(session: Any, base_url: str) -> RenderStack:
+    """``GET {base_url}/system_stats`` and extract the render stack.
+
+    Best-effort, exactly like :func:`_fetch_free_vram_gb` and for the same
+    reason: this is evidence recorded *about* a run, not a precondition of
+    one, so an unreachable or unfamiliar server logs a warning and yields an
+    empty :class:`RenderStack` rather than refusing to render. An empty one
+    deserializes and compares as "unknown", which is the honest reading of a
+    server that would not say.
+    """
+    base_url = base_url.rstrip("/")
+    url = f"{base_url}{SYSTEM_STATS_PATH}"
+    try:
+        response = session.get(url)
+    except requests.RequestException as exc:
+        logger.warning("Render-stack check could not reach %s (%s)", url, exc)
+        return RenderStack()
+
+    if response.status_code != 200:
+        logger.warning("Render-stack check: %s returned status=%s", url, response.status_code)
+        return RenderStack()
+
+    try:
+        payload = response.json()
+    except ValueError:
+        logger.warning("Render-stack check: %s returned a non-JSON body", url)
+        return RenderStack()
+
+    stack = _extract_render_stack(payload)
+    if not stack.known:
+        logger.warning(
+            "Render-stack check: %s named neither %r nor %s under 'system' -- this run's "
+            "chunks will be fingerprinted with an unrecorded stack, so a later --resume "
+            "cannot say whether they came from this ComfyUI or an older one (issue #95)",
+            url,
+            _COMFYUI_VERSION_KEY,
+            " nor ".join(repr(key) for key in _TORCH_VERSION_KEYS),
+        )
+    return stack
+
+
+def _extract_render_stack(payload: object) -> RenderStack:
+    if not isinstance(payload, dict):
+        return RenderStack()
+    system = payload.get("system")
+    if not isinstance(system, dict):
+        return RenderStack()
+    return RenderStack(
+        comfyui_version=_version_string(system.get(_COMFYUI_VERSION_KEY)),
+        torch_version=next(
+            (
+                version
+                for key in _TORCH_VERSION_KEYS
+                if (version := _version_string(system.get(key))) is not None
+            ),
+            None,
+        ),
+    )
+
+
+def _version_string(value: object) -> str | None:
+    """A non-empty version string, or ``None``.
+
+    ``str()`` on whatever arrives would turn a ``null`` into ``"None"`` and an
+    empty string into a recorded value, both of which would compare unequal to
+    a real version and manufacture the stack split this field exists to
+    report."""
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
 
 
 VramProbe = Callable[[], "float | None"]
@@ -405,6 +509,7 @@ def prevent_host_sleep(
 __all__ = [
     "CustodyError",
     "DEFAULT_MIN_FREE_VRAM_GB",
+    "RenderStack",
     "SLEEP_ASSERTION_ARGV",
     "VramCustodyManager",
     "VramProbe",
@@ -412,4 +517,5 @@ __all__ = [
     "build_vram_probe",
     "build_vram_releaser",
     "prevent_host_sleep",
+    "read_render_stack",
 ]
