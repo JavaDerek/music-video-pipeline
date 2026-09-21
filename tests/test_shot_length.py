@@ -40,6 +40,7 @@ from music_video_maker.contracts import (
     HardwareProfile,
     WordTiming,
 )
+from music_video_maker.envelope import MeasuredCeiling
 from music_video_maker.shot_plan import (
     MEASURED_MAX_FRAMES,
     ShotLength,
@@ -410,6 +411,92 @@ def test_long_chunks_are_reported_even_when_nobody_asked_for_them(tmp_path, capl
     assert any((c.frame_count or 0) > MEASURED_MAX_FRAMES for c in chunks)
     assert f"exceed {MEASURED_MAX_FRAMES} frames" in caplog.text
     assert "unmeasured" in caplog.text.lower()
+
+
+@pytest.mark.parametrize(
+    ("max_chunk_seconds", "expected_frames"),
+    [
+        (12.0, 277),  # NOT 288: 12.0 * 24 is not on H3's 5+17k grid at all
+        (10.833, 243),  # one decimal short of 260/24 -- silently the previous grid point
+        (10.834, 260),
+        (15.083, 345),  # one decimal short of H3's own trained ceiling
+    ],
+)
+def test_the_run_reports_which_frame_ceiling_its_duration_actually_bought(
+    tmp_path, caplog, max_chunk_seconds, expected_frames
+):
+    """Issue #98. A duration is not a frame count, and nothing said which grid
+    point a ``max_chunk_seconds`` resolved to -- which is how the issue itself
+    came to be titled "288 frames" for a setting that produces 277."""
+    profile = HardwareProfile(
+        name="ceiling", vram_gb=24.0, min_chunk_seconds=5.167, max_chunk_seconds=max_chunk_seconds
+    )
+    with caplog.at_level(logging.INFO):
+        _slice(tmp_path, _gap_song(), f"ceiling{expected_frames}", profile=profile)
+
+    assert f"{expected_frames} frames" in caplog.text
+    assert "one decimal short" in caplog.text
+
+
+def test_the_report_no_longer_claims_141_is_the_longest_anything_ever_rendered(
+    tmp_path, caplog
+):
+    """Issue #98. For months this warning asserted that 141 frames was "the
+    longest anything ever rendered on this card" while the finished "Deathless"
+    v13 render held 45 of 80 chunks above it, 15 of them at 192. The number is
+    a calibrated constant that nothing updates; the sentence has to say so."""
+    alignment = _gap_song()
+
+    with caplog.at_level(logging.WARNING):
+        _slice(tmp_path, alignment, "claim", profile=DEFAULT_HARDWARE)
+
+    assert f"exceed {MEASURED_MAX_FRAMES} frames" in caplog.text
+    assert "longest anything ever rendered" not in caplog.text
+    assert "calibrated constant, not a live reading" in caplog.text
+
+
+def test_a_supplied_ceiling_replaces_the_constant_and_names_its_own_evidence(
+    tmp_path, caplog
+):
+    """The point of threading a ``MeasuredCeiling`` through: a caller holding a
+    ``run_state.json`` can make the number evidence instead of a memory."""
+    alignment = _gap_song()
+    ceiling = MeasuredCeiling(frames=192, provenance="chunk 3 of the run I actually rendered")
+
+    with caplog.at_level(logging.WARNING):
+        chunks = _slice(
+            tmp_path, alignment, "evidence", profile=DEFAULT_HARDWARE, measured_ceiling=ceiling
+        )
+
+    assert any((c.frame_count or 0) > 192 for c in chunks)
+    assert "exceed 192 frames" in caplog.text
+    assert "chunk 3 of the run I actually rendered" in caplog.text
+    assert f"exceed {MEASURED_MAX_FRAMES} frames" not in caplog.text
+
+
+def test_a_higher_supplied_ceiling_silences_chunks_the_constant_would_have_flagged(
+    tmp_path, caplog
+):
+    alignment = _gap_song()
+    baseline = _slice(tmp_path, alignment, "base0")
+    anchor = next(c.start for c in baseline if c.is_instrumental and c.start > 10.0)
+    lengths = (ShotLength(start=anchor, length_seconds=6.5),)  # 158 frames: over 141, under 192
+
+    caplog.clear()  # the anchor slice above logged its own report
+    with caplog.at_level(logging.WARNING):
+        _slice(
+            tmp_path,
+            alignment,
+            "quiet",
+            shot_lengths=lengths,
+            measured_ceiling=MeasuredCeiling(frames=192, provenance="a real render"),
+        )
+    assert "exceed" not in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        _slice(tmp_path, alignment, "loud", shot_lengths=lengths)
+    assert f"exceed {MEASURED_MAX_FRAMES} frames" in caplog.text
 
 
 def test_the_unmeasured_report_is_silent_when_every_chunk_is_measured(tmp_path, caplog):

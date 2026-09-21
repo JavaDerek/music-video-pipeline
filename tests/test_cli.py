@@ -35,6 +35,7 @@ else:
 from music_video_maker import cli, contracts, resilience
 from music_video_maker.assembly import DEFAULT_OUTPUT_FILENAME
 from music_video_maker.contracts import ChunkFingerprint
+from music_video_maker.envelope import UnprovenEnvelopeError
 from music_video_maker.workflow_graph import (
     CLASS_TYPE_H3_IMAGE_TO_VIDEO,
     CLASS_TYPE_H3_REFERENCE_TO_VIDEO,
@@ -289,6 +290,17 @@ class Rig:
             # WebSocket sequence per chunk. The shipping default (on) is
             # exercised end to end by its own test at the bottom of the file.
             instrumental_coverage=instrumental_coverage,
+            # Issues #24/#98: the rig names doris's own hardware profile (so the
+            # VRAM-floor tests read the real profile) and renders at the
+            # template's 1344x768 with chunks up to 158 frames -- a combination
+            # nothing has ever measured, which check_render_envelope correctly
+            # refuses. Acknowledged here rather than sidestepped by renaming the
+            # profile: this rig submits to a mock, so the gate's premise (a real
+            # card that can wedge) does not hold, and leaving the refusal live
+            # for every other test would mean the one test that exercises the
+            # gate is the only honest one. test_envelope.py covers the gate
+            # itself, and a dedicated test below pins that the default refuses.
+            acknowledge_unproven_envelope=True,
         )
 
     def run(
@@ -2649,3 +2661,36 @@ def test_a_resume_across_a_stack_upgrade_reuses_and_reports(tmp_path: Path, capl
         "Render stack for this run's chunks: comfyui 0.30.2 / torch 2.13.0+cu130 (3 chunk(s))"
         in caplog.text
     )
+# Issues #24/#98: the render-envelope refusal, end to end
+# --------------------------------------------------------------------------- #
+
+
+def test_a_chunk_bigger_than_anything_proven_is_refused_before_any_submission(tmp_path):
+    """#24's own conclusion is that a wedge cannot be recovered from, only
+    avoided -- so the size of the thing being submitted has to be refused
+    rather than warned about. Refused before the first POST /prompt, which is
+    what makes the refusal free."""
+    rig = Rig(tmp_path)
+    rig.config = replace(rig.config, acknowledge_unproven_envelope=False)
+
+    with pytest.raises(UnprovenEnvelopeError, match="158 frames"):
+        rig.run([rig.seed_success(1, 0), rig.seed_success(2, 1), rig.seed_success(3, 2)])
+
+    assert rig.submitted == []
+
+
+def test_a_slice_of_small_chunks_is_not_refused_for_a_long_chunk_elsewhere(tmp_path):
+    """The gate runs over the chunks this invocation would actually render.
+    That is not a nicety: the sanctioned way to *extend* the envelope is an
+    --only-chunks slice, so a whole-song refusal would refuse the proof."""
+    rig = Rig(tmp_path)
+    rig.config = replace(rig.config, acknowledge_unproven_envelope=False)
+
+    # Chunk 0 is the 158-frame one the test above is refused for; chunks 1 and
+    # 2 sit at the 124-frame floor. Verified from the state file below rather
+    # than asserted from memory.
+    rig.run([build_success_sequence(rig.seed_success(1, 1))], only_chunks=(1,))
+
+    assert len(rig.submitted) == 1
+    state = resilience.load_run_state(rig.config.run_state_file)
+    assert state.results[1].fingerprint.frame_count <= 192

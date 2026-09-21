@@ -68,6 +68,10 @@ SUBPROCESS_ALLOWLIST = frozenset(
         # ffmpeg decode of a master for the #96 voicing calibration table -- no model.
         # It is a diagnostic an operator runs by hand; nothing imports it at render time.
         "calibrate_voicing.py",
+        # `nvidia-smi` polling for the attended 277-frame VRAM proof (issue #98).
+        # No model, and not in the render path at all: nothing imports it, it is
+        # run by hand from its own terminal (`python -m ...`) beside a render.
+        "vramsample.py",
     }
 )
 

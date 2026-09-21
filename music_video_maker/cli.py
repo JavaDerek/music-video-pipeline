@@ -80,6 +80,7 @@ from music_video_maker.custody import (
     prevent_host_sleep,
     read_render_stack,
 )
+from music_video_maker.envelope import check_render_envelope, measured_ceiling
 from music_video_maker.execution import ComfyUIExecutionClient
 from music_video_maker.faces import build_seed_face_gate
 from music_video_maker.hardware import scan_workflow_for_missing_optimizations
@@ -128,6 +129,7 @@ from music_video_maker.workflow_graph import (
     WorkflowGraphMutator,
     graph_fingerprint,
     load_workflow_template,
+    read_render_dimensions,
     read_text_encoder,
     resolve_chunk_seed,
 )
@@ -793,6 +795,11 @@ def run_pipeline(
                 if render_quality_reports
                 else ()
             ),
+            # Issue #98: the "nothing longer has rendered here" warning gets
+            # its number from what this song's own previous run actually
+            # rendered, when there is one to read, instead of from a constant
+            # that has been overtaken twice.
+            measured_ceiling=measured_ceiling(config.run_state_file),
         )
         if not chunks:
             raise PipelineError(
@@ -1090,6 +1097,30 @@ def run_pipeline(
         slice_forced = () if resume else (only_chunks or ())
         force_chunk_ids = tuple(dict.fromkeys((*slice_forced, *(reseed_chunk_ids or ()))))
 
+        # Issues #24, #98: the last of the three refusals, and the only one
+        # that looks at the size of what is being submitted rather than at
+        # what else holds the card. Run over the chunks this invocation would
+        # actually render -- an --only-chunks slice of short chunks must not
+        # be refused because some other chunk in the song is long, which is
+        # precisely how the attended proof gets run. Resolution is taken from
+        # the config when it sets one and from the template when it does not,
+        # because "unset" means 1344x768 here, not "no resolution".
+        #
+        # Here rather than immediately after slicing, which would save this
+        # run's asset uploads: the selection has exactly one implementation
+        # (_select_render_ids, which also validates the ids and logs the
+        # slice), and a second copy of it to gate one HTTP upload earlier is
+        # the trade this project has lost before. No GPU work has happened at
+        # this point either way -- staging is an upload.
+        template_width, template_height = read_render_dimensions(base_template)
+        check_render_envelope(
+            [chunk for chunk in chunks if chunk.chunk_id in set(render_ids)],
+            hardware_name=config.hardware.name,
+            width=config.render_width if config.render_width is not None else template_width,
+            height=config.render_height if config.render_height is not None else template_height,
+            acknowledged=config.acknowledge_unproven_envelope,
+        )
+
         run_state = runner.render_run(
             render_ids,
             provider,
@@ -1251,6 +1282,7 @@ def prepare_timeline(
         suspect_segment_indices=(
             suspect_segment_indices(quality_reports[0]) if quality_reports else ()
         ),
+        measured_ceiling=measured_ceiling(config.run_state_file),
     )
     if not chunks:
         raise PipelineError(

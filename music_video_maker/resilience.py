@@ -934,6 +934,16 @@ class ResilientRunner:
                 )
                 return self._dead_letter(chunk_id, attempt, errors)
 
+            # Issue #24: persist everything that has already rendered BEFORE
+            # touching a ComfyUI that has just failed to answer. The recovery
+            # sequence below is two HTTP calls to a server that may be wedged
+            # -- they are bounded now (``execution.DEFAULT_HTTP_TIMEOUT_SECONDS``),
+            # but a host in the 2026-08-07 state can also take the whole
+            # process down with it, and every chunk rendered in the hours
+            # before this one must already be on disk when it does. The
+            # normal per-chunk persist happens after ``_render_chunk``
+            # returns, which is exactly the point this path may never reach.
+            self._persist(run_state)
             self._recover(chunk_id, attempt)
 
             if attempt >= self.max_render_attempts:
@@ -1005,6 +1015,25 @@ class ResilientRunner:
             return result, None
 
     def _recover(self, chunk_id: int, attempt: int) -> None:
+        """``POST /interrupt`` then ``POST /free``, both best-effort.
+
+        **This is the path issue #24 breaks, and the reason both calls must be
+        bounded.** The watchdog fires correctly on a silent H3 stage; what it
+        hands control to is this method, whose two HTTP calls go to a ComfyUI
+        whose worker is blocked inside a driver call. ``requests`` has no
+        default timeout, so before
+        :data:`~music_video_maker.execution.DEFAULT_HTTP_TIMEOUT_SECONDS`
+        existed the ``interrupt()`` here could block for as long as the wedge
+        lasted -- turning "one chunk failed, retry it" into a runner that
+        never retried, never dead-lettered and never released the card.
+
+        Neither call is expected to *work* on that path. ComfyUI cannot
+        interrupt a thread stuck below Python, and no application-level
+        recovery can: the only defence against the wedge itself is refusing to
+        enter the over-committed state, which is what ``custody``'s floor,
+        this class's between-chunk re-check and ``envelope`` do. What this
+        method owes the run is to come back, fast, either way.
+        """
         logger.warning(
             "Chunk %d attempt %d/%d: running recovery sequence (interrupt -> free)",
             chunk_id,
