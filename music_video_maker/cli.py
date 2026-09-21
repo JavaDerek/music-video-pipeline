@@ -58,7 +58,11 @@ import requests
 
 from music_video_maker.alignment import align
 from music_video_maker.alignment_quality import AlignmentQualityReport, evaluate_alignment_quality
-from music_video_maker.assembly import assemble_final_video
+from music_video_maker.assembly import (
+    TimelineAssembly,
+    assemble_final_video,
+    assemble_timelines,
+)
 from music_video_maker.config import ConfigError, RunConfig, load_config
 from music_video_maker.continuity import ContinuityWorkflowProvider, planned_chain_source
 from music_video_maker.contracts import (
@@ -110,6 +114,15 @@ from music_video_maker.shot_plan import (
 from music_video_maker.slicing import slice_audio, timeline_track_drift_seconds
 from music_video_maker.staging import ComfyUIAssetStager
 from music_video_maker.stems import slice_stem_for_chunks
+from music_video_maker.timelines import (
+    SONG_TIMELINE_NAME,
+    SeamOverrunError,
+    Timeline,
+    log_placements,
+    place_timelines,
+    plan_timelines,
+    predicted_measurements,
+)
 from music_video_maker.workflow_graph import (
     PerChunkSeedMutator,
     WorkflowGraphMutator,
@@ -384,21 +397,69 @@ class RunReport:
     wall time, and the output path."""
 
     run_state: RunState
+    """The **song's** run state. Still the song's with a prologue configured,
+    because that is what every existing caller means by it and because chunk
+    ids are a separate space per timeline -- merging two states into one dict
+    would collide ids that are not the same chunk (issue #66)."""
     total_chunks: int
     wall_seconds: float
     output_video: Path | None
 
+    timeline_states: tuple[tuple[str, RunState], ...] = ()
+    """``(timeline name, state)`` for every timeline this run rendered, in
+    playback order, including the song (issue #66). An optional field: a
+    hand-built report (or one from before segments existed) leaves it empty
+    and every property below falls back to ``run_state`` alone, so nothing
+    that reads this class changed meaning."""
+
+    def _states(self) -> tuple[RunState, ...]:
+        if self.timeline_states:
+            return tuple(state for _name, state in self.timeline_states)
+        return (self.run_state,)
+
     @property
     def rendered(self) -> int:
-        return sum(1 for r in self.run_state.results.values() if r.status is ChunkStatus.RENDERED)
+        return sum(
+            1
+            for state in self._states()
+            for r in state.results.values()
+            if r.status is ChunkStatus.RENDERED
+        )
 
     @property
     def cached(self) -> int:
-        return sum(1 for r in self.run_state.results.values() if r.status is ChunkStatus.CACHED)
+        return sum(
+            1
+            for state in self._states()
+            for r in state.results.values()
+            if r.status is ChunkStatus.CACHED
+        )
 
     @property
     def dead_lettered(self) -> tuple[int, ...]:
-        return self.run_state.dead_lettered
+        """Every dead-lettered chunk id across every timeline, deduplicated.
+
+        Aggregated rather than song-only because this is what decides the
+        process exit code: a prologue chunk that never rendered is a run that
+        did not finish, and reporting success for it would be the same class
+        of silence this project keeps finding. Which timeline each id came
+        from is :attr:`dead_lettered_by_timeline` -- ids alone are ambiguous
+        across id spaces, and that ambiguity is why both exist."""
+        ids: set[int] = set()
+        for state in self._states():
+            ids.update(state.dead_lettered)
+        return tuple(sorted(ids))
+
+    @property
+    def dead_lettered_by_timeline(self) -> tuple[tuple[str, tuple[int, ...]], ...]:
+        """Dead-lettered ids attributed to the timeline they belong to."""
+        if not self.timeline_states:
+            return ((SONG_TIMELINE_NAME, self.run_state.dead_lettered),)
+        return tuple(
+            (name, state.dead_lettered)
+            for name, state in self.timeline_states
+            if state.dead_lettered
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -531,6 +592,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--timeline",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Which timeline --only-chunks/--reseed name chunk ids in (issue #66): "
+            "'song' (the default) or a [[segment]] name. Chunk ids are a separate space "
+            "per timeline -- prologue chunk 3 and song chunk 3 are different shots -- so "
+            "a bare id is ambiguous the moment a config has segments, and this is how you "
+            "say which one you mean. With --only-chunks, only the named timeline renders "
+            "at all; the others are left alone, since a slice assembles nothing anyway."
+        ),
+    )
+    parser.add_argument(
         "--log-level", default="INFO", help="Root log level (default: INFO)."
     )
     return parser
@@ -651,6 +725,368 @@ def _log_timeline_track_drift(
     return drift
 
 
+@dataclass(frozen=True)
+class TimelineRender:
+    """One timeline's Stages 1-4 output (issue #66).
+
+    Held rather than folded together because every consumer downstream needs
+    it kept apart: Stage 5 concatenates the timelines in order and reconciles
+    a seam between them, the run report attributes dead-lettered ids to the
+    timeline whose id space they belong to, and a chunk's ``start`` is only
+    meaningful against its own alignment."""
+
+    timeline: Timeline
+    alignment: AlignmentResult
+    chunks: tuple[AudioChunk, ...]
+    run_state: RunState
+
+
+def _align_and_slice_timeline(
+    config: RunConfig,
+    timeline: Timeline,
+    *,
+    align_model: object | None,
+    from_plan: str | Path | None = None,
+    load_plan: bool = True,
+    on_quality_report: Callable[[AlignmentQualityReport], None] | None = None,
+) -> tuple[AlignmentResult, tuple[AudioChunk, ...], Mapping[int, ShotPlanEntry] | None]:
+    """Stages 1-2 for one timeline (issue #66).
+
+    The whole point of the second-timeline design is that this is the *same*
+    Stage 1 and Stage 2 the song gets: ``stable-ts``'s ``align()`` does not
+    know or care that the audio is speech rather than singing (it is better
+    at speech), and slicing is arithmetic over an ``AlignmentResult``. So a
+    segment reuses both verbatim, with three deliberate exceptions:
+
+    * ``alignment_overrides`` are **song-only**. An override names a
+      ``segment_index`` in the song's own alignment (issue #42); applying the
+      same indices to a prologue's alignment would pin arbitrary, unrelated
+      segments to times someone measured against a different recording.
+    * the **shot plan is the timeline's own**. The song's plan anchors
+      ``chunk_id``s in the song's id space, and resolving them against a
+      segment would attach the song's shot 3 to the prologue's shot 3 with
+      nothing raising.
+    * the **vocal stem is song-only** -- it is an isolated vocal cut from the
+      master (issue #25), and there is no such thing for a dialogue take.
+
+    ``from_plan`` is ``--prepare --from-plan``'s re-anchoring, applied to the
+    timeline whose plan it is. ``load_plan=False`` is what
+    :func:`prepare_timeline` passes: ``--prepare`` does not read the config's
+    own shot plan at all -- not for its lengths and not for its lints --
+    because there is usually no plan yet to read, and because a review whose
+    job is to *surface* an unreadable plan must not crash on one. That
+    asymmetry predates issue #66's refactor and is preserved by it rather
+    than tidied away; see :func:`prepare_timeline` and ``--from-plan``'s help
+    text.
+    """
+    lines = parse_lyrics(timeline.script, config.cast, config.default_lead_vocalist)
+    alignment = align(
+        timeline.audio,
+        lines,
+        model=align_model,
+        model_size=config.alignment_model_size,
+        strict_alignment=config.strict_alignment,
+        overrides=config.alignment_overrides if timeline.is_song else (),
+        # Issue #36: align() computes this internally and only logs it; this
+        # is the seam that hands the structured report to a caller (the
+        # review page) that needs more than a log line.
+        **({} if on_quality_report is None else {"on_quality_report": on_quality_report}),
+    )
+    if not timeline.is_song and config.alignment_overrides:
+        logger.info(
+            "Timeline %r: the run's %d alignment override(s) are NOT applied here -- they "
+            "name segment indices in the song's own alignment (issue #42), which is a "
+            "different recording with a different segmentation.",
+            timeline.name,
+            len(config.alignment_overrides),
+        )
+
+    plan = (
+        load_shot_plan(timeline.shot_plan, setting=config.setting, cast_names=config.cast)
+        if timeline.shot_plan and load_plan
+        else None
+    )
+    shot_lengths: tuple[ShotLength, ...] = shot_length_requests(plan)
+    if from_plan is not None:
+        shot_lengths = shot_length_requests(
+            load_shot_plan(from_plan, setting=config.setting, cast_names=config.cast)
+        )
+
+    chunks = slice_audio(
+        timeline.audio,
+        alignment,
+        config.hardware,
+        timeline.chunks_dir,
+        cover_instrumentals=config.instrumental_coverage,
+        shot_lengths=shot_lengths,
+        instrumental_shot_seconds=config.instrumental_shot_seconds,
+        instrumental_audio_gain_db=config.instrumental_audio_gain_db,
+        # Issue #66: stamped on every chunk, and from there onto every
+        # ChunkFingerprint, so --resume can never hand one timeline's mp4 to
+        # another. None for the song, which is what every pre-#66 state file
+        # already records.
+        timeline=timeline.fingerprint_name,
+    )
+    if not chunks:
+        raise PipelineError(
+            f"no chunks produced by slicing {timeline.audio} against {timeline.script} "
+            f"(timeline {timeline.name!r}) -- nothing to render (no non-empty lines "
+            "aligned to audio?)"
+        )
+    logger.info(
+        "Stage 1-2 complete for timeline %r: %d chunk(s), %.3fs of track",
+        timeline.name,
+        len(chunks),
+        alignment.track_duration,
+    )
+    _log_timeline_track_drift(chunks, alignment.track_duration, config)
+    return alignment, tuple(chunks), plan
+
+
+def _render_one_timeline(
+    config: RunConfig,
+    timeline: Timeline,
+    alignment: AlignmentResult,
+    chunks: tuple[AudioChunk, ...],
+    plan: Mapping[int, ShotPlanEntry] | None,
+    *,
+    base_template: Workflow,
+    i2v_template: Workflow | None,
+    text_encoder: str | None,
+    stager: ComfyUIAssetStager,
+    execution_client: ComfyUIExecutionClient,
+    session: Any,
+    resume: bool,
+    only_chunks: Sequence[int] | None,
+    reseed_chunk_ids: Sequence[int] | None,
+    reseed_generation: int,
+    ffmpeg_runner: Callable[[Sequence[str]], Any] | None,
+    sleeper: Sleeper,
+    disk_usage: DiskUsage,
+    seed_face_gate: Callable[[Path, Path], bool] | None,
+) -> RunState:
+    """Stages 2b-4 for one timeline: prompts, staging, and the resilient
+    render (issue #66).
+
+    Lifted verbatim out of :func:`run_pipeline` rather than reimplemented --
+    a prologue that renders through a *copy* of the render path is a prologue
+    whose chunks stop matching the song's the first time one of them is
+    edited, which is the whole class of defect ``ChunkFingerprint`` exists
+    for.
+
+    ``timeline.chunks_dir`` is per timeline, so chunk ids may (and do)
+    collide across timelines without their files colliding, and
+    ``timeline.run_state_file`` is per timeline for the same reason:
+    ``RunState.results`` is keyed by chunk id, and merging two id spaces into
+    one dict would silently overwrite.
+    """
+    if plan is not None:
+        run_shot_plan_lints(plan, chunks, config)
+
+    prompts = {
+        chunk.chunk_id: expand_prompt(
+            config,
+            chunk,
+            shot=resolve_shot(plan, chunk),
+            subject_is_focus=(
+                plan[chunk.chunk_id].subject_is_focus
+                if plan is not None and chunk.chunk_id in plan
+                else True
+            ),
+            camera=resolve_camera(plan, chunk),
+            present=resolve_present(plan, chunk),
+            subject=resolve_subject(plan, chunk),
+            location=resolve_location(plan, chunk),
+            conditions=resolve_conditions(plan, chunk),
+            # Issue #66: a segment's audio is dialogue, so its prompt says
+            # "speaking the line" rather than "singing the lyric". Taken from
+            # the timeline, never inferred from the text -- a segment whose
+            # script happens to be sung is still a segment.
+            spoken=not timeline.is_song,
+        )
+        for chunk in chunks
+    }
+
+    reseed_generations: dict[int, int] = {}
+    if reseed_chunk_ids:
+        if reseed_generation < 1:
+            raise PipelineError(
+                f"--reseed-generation must be >= 1 (0 is the seed every chunk already "
+                f"has without --reseed, not a re-roll of it), got {reseed_generation}"
+            )
+        available = [chunk.chunk_id for chunk in chunks]
+        unknown = sorted(set(reseed_chunk_ids) - set(available))
+        if unknown:
+            logger.error(
+                "--reseed names chunk id(s) %s that timeline %r does not have; it has %d "
+                "chunk(s), %s..%s",
+                unknown,
+                timeline.name,
+                len(available),
+                available[0],
+                available[-1],
+            )
+            raise PipelineError(
+                f"--reseed names unknown chunk id(s) {unknown} on timeline "
+                f"{timeline.name!r}; it has {len(available)} chunk(s), "
+                f"{available[0]}..{available[-1]}"
+            )
+        reseed_generations = {chunk_id: reseed_generation for chunk_id in reseed_chunk_ids}
+        logger.info(
+            "Re-seeding chunk(s) %s of timeline %r at generation %d -- every other chunk "
+            "keeps its existing seed and stays a cache hit under --resume",
+            sorted(reseed_generations),
+            timeline.name,
+            reseed_generation,
+        )
+
+    assets = {
+        chunk.chunk_id: stager.stage_chunk(prompts[chunk.chunk_id], chunk) for chunk in chunks
+    }
+    logger.info(
+        "Stage 3 complete for timeline %r: %d chunk(s) staged to %s",
+        timeline.name,
+        len(assets),
+        config.comfyui_url,
+    )
+
+    seeded_mutator = PerChunkSeedMutator(
+        WorkflowGraphMutator(),
+        base_seed=config.noise_seed,
+        reseed_generations=reseed_generations,
+    )
+
+    provider = ContinuityWorkflowProvider(
+        base_template=base_template,
+        i2v_template=i2v_template,
+        chunk_prompts=prompts,
+        chunk_assets=assets,
+        asset_stager=stager,
+        # Per timeline, like the chunks themselves: a seed frame is named by
+        # chunk id, and two timelines' chunk 3 would otherwise write to one
+        # path -- handing one timeline's last frame to the other's chain.
+        frames_dir=timeline.chunks_dir / "frames",
+        continuity_enabled=config.i2v_continuity,
+        mutator=seeded_mutator,
+        subprocess_runner=ffmpeg_runner,
+        chunk_frame_counts={c.chunk_id: c.frame_count for c in chunks},
+        render_width=config.render_width,
+        render_height=config.render_height,
+        noise_seed=config.noise_seed,
+        reanchor_interval=config.i2v_reanchor_interval,
+        chainable_chunk_ids=chain_scope_ids(config.i2v_chain_scope, chunks),
+        text_encoder=config.text_encoder,
+        lora=config.lora,
+        lora_strength=config.lora_strength,
+        graph_hasher=graph_fingerprint,
+        seed_face_gate=_resolve_seed_face_gate(config, seed_face_gate),
+    )
+
+    runner = ResilientRunner.from_config(
+        # Issue #66: one run state file per timeline. RunState.results is keyed
+        # by chunk id and the id spaces are separate, so one shared file would
+        # have the prologue's chunk 3 overwrite the song's -- the same
+        # collision the per-timeline chunks directory prevents on disk.
+        dc_replace(config, run_state_file=timeline.run_state_file),
+        execution_client,
+        sleeper=sleeper,
+        disk_usage=disk_usage,
+        vram_probe=build_vram_probe(session, config.comfyui_url),
+        vram_releaser=(
+            build_vram_releaser(session, config.comfyui_url)
+            if config.release_vram_between_chunks
+            else None
+        ),
+    )
+
+    fingerprints = {
+        chunk.chunk_id: ChunkFingerprint.of(
+            chunk,
+            prompts[chunk.chunk_id],
+            render_width=config.render_width,
+            render_height=config.render_height,
+            noise_seed=resolve_chunk_seed(
+                config.noise_seed,
+                chunk.chunk_id,
+                reseed_generation=reseed_generations.get(chunk.chunk_id, 0),
+            ),
+            conditioning_source=(
+                f"stem:{config.vocal_stem.name}"
+                if config.vocal_stem and timeline.is_song
+                else "mix"
+            ),
+            instrumental_audio_gain_db=config.instrumental_audio_gain_db,
+            text_encoder=text_encoder,
+            lora=config.lora,
+            lora_strength=config.lora_strength if config.lora else None,
+        )
+        for chunk in chunks
+    }
+    planned_chain = {
+        chunk.chunk_id: planned_chain_source(
+            chunk.chunk_id,
+            continuity_enabled=config.i2v_continuity,
+            reanchor_interval=config.i2v_reanchor_interval,
+            chainable_chunk_ids=chain_scope_ids(config.i2v_chain_scope, chunks),
+        )
+        for chunk in chunks
+    }
+    fingerprints = {
+        chunk_id: dc_replace(
+            fp,
+            chained_from=planned_chain[chunk_id],
+            prompt_hash=ChunkFingerprint.hash_prompt(
+                prompts[chunk_id].text_for(chained=planned_chain[chunk_id] is not None)
+            ),
+            template_hash=provider.planned_template_hash(
+                chained=planned_chain[chunk_id] is not None
+            ),
+            fallback_template_hash=provider.planned_template_hash(chained=False),
+        )
+        for chunk_id, fp in fingerprints.items()
+    }
+
+    render_ids = _select_render_ids(chunks, only_chunks)
+    slice_forced = () if resume else (only_chunks or ())
+    force_chunk_ids = tuple(dict.fromkeys((*slice_forced, *(reseed_chunk_ids or ()))))
+
+    return runner.render_run(
+        render_ids,
+        provider,
+        timeline.chunks_dir,
+        resume=resume or bool(only_chunks) or bool(reseed_chunk_ids),
+        force_chunk_ids=force_chunk_ids,
+        fingerprints=fingerprints,
+        fingerprint_amender=lambda chunk_id, fp: _amend_from_render(provider, chunk_id, fp),
+    )
+
+
+def _resolve_flag_timeline(
+    timelines: Sequence[Timeline], name: str | None, *, flag: str
+) -> Timeline:
+    """Which timeline ``--only-chunks``/``--reseed`` name ids in (issue #66).
+
+    Defaults to the song, which is what those flags have always meant and
+    what every config without segments still means. An unknown name is an
+    error rather than a silent fall back to the song: rendering the wrong
+    timeline's chunk 3 is exactly the confusion the separate id spaces exist
+    to make impossible, and doing it because of a typo would be worse than
+    doing it by accident."""
+    if name is None:
+        return next(t for t in timelines if t.is_song)
+    matches = [t for t in timelines if t.name == name]
+    if not matches:
+        known = ", ".join(t.name for t in timelines)
+        logger.error(
+            "--timeline %r is not a timeline in this run; it has: %s", name, known
+        )
+        raise PipelineError(
+            f"--timeline {name!r} is not a timeline in this run (used by {flag}); "
+            f"this run has: {known}"
+        )
+    return matches[0]
+
+
 def run_pipeline(
     config: RunConfig,
     *,
@@ -666,6 +1102,7 @@ def run_pipeline(
     reseed_chunk_ids: Sequence[int] | None = None,
     reseed_generation: int = DEFAULT_RESEED_GENERATION,
     seed_face_gate: Callable[[Path, Path], bool] | None = None,
+    flag_timeline: str | None = None,
 ) -> RunReport:
     """Run Stages 1-5 end-to-end against an already-loaded, validated config.
 
@@ -692,6 +1129,20 @@ def run_pipeline(
     (like ``only_chunks`` already does): a reseed with nothing to resume from
     just renders every chunk once, the named ones at their alternate
     generation.
+
+    **Timelines (issue #66).** A config with ``[[segment]]`` tables renders
+    more than one timeline -- a spoken prologue, an epilogue, or both -- each
+    through the identical Stages 1-4 with its own audio, text, chunks
+    directory, chunk id space and run state, and Stage 5 then concatenates
+    them and reconciles the seam between them. A config with no segments
+    renders exactly one timeline and takes the same Stage 5 path it always
+    did, down to the same two ffmpeg calls.
+
+    ``flag_timeline`` says which timeline ``only_chunks``/``reseed_chunk_ids``
+    name ids in (default: the song). With ``only_chunks`` it also narrows the
+    run to that one timeline -- a slice assembles nothing, so rendering the
+    other timelines would be hours of GPU time for an artefact the run then
+    deliberately does not produce.
     """
     start = clock()
     session = comfyui_session if comfyui_session is not None else requests.Session()
@@ -728,148 +1179,40 @@ def run_pipeline(
                 config.cinematography_profile.path,
             )
 
+    timelines = plan_timelines(config)
+    flagged = _resolve_flag_timeline(
+        timelines, flag_timeline, flag="--only-chunks/--reseed"
+    )
+    if only_chunks:
+        # A slice renders named chunks and assembles nothing, so the other
+        # timelines have no deliverable to contribute to -- rendering them
+        # would be hours of exclusive GPU custody spent on an artefact this
+        # run deliberately does not produce.
+        rendered_timelines = [flagged]
+        if len(timelines) > 1:
+            logger.info(
+                "Validation slice on timeline %r: the other %d timeline(s) are not "
+                "rendered at all (a slice skips Stage 5, so they would contribute to "
+                "nothing) -- %s",
+                flagged.name,
+                len(timelines) - 1,
+                ", ".join(t.name for t in timelines if t is not flagged),
+            )
+    else:
+        rendered_timelines = list(timelines)
+
+    if len(timelines) > 1:
+        logger.info(
+            "This run has %d timelines (issue #66), in playback order: %s",
+            len(timelines),
+            ", ".join(f"{t.name} [{t.position}]" for t in timelines),
+        )
+
     # Issue #43: outside the GPU custody block on purpose. Custody is about the
     # card; this is about the machine driving it staying awake long enough to
     # hear the card finish -- and it must cover Stage 1 too, since alignment
     # runs before custody is ever taken.
     with prevent_host_sleep(), custody:
-        lines = parse_lyrics(config.lyrics_file, config.cast, config.default_lead_vocalist)
-        alignment = align(
-            config.master_audio,
-            lines,
-            model=align_model,
-            # Ignored when `model` is injected (the test rigs), and the only
-            # thing that decides the timeline when it is not. Unpassed until
-            # now, which pinned every run to "base" however the config read.
-            model_size=config.alignment_model_size,
-            strict_alignment=config.strict_alignment,
-            # Issue #42: authored corrections for provably mis-placed
-            # segments; applied inside align(), before quality evaluation.
-            overrides=config.alignment_overrides,
-        )
-        # setting + cast names feed the shot plan's geography lint (issue #32):
-        # a shot naming Central Park while the run is set in London is an
-        # authoring slip worth catching here, before any GPU time is spent on it.
-        # Loaded BEFORE slicing (issue #27): the plan's length_seconds entries
-        # are requests slicing must honor while it derives the chunk timeline;
-        # loading it after the chunks exist made the whole mechanism inert.
-        plan = (
-            load_shot_plan(config.shot_plan, setting=config.setting, cast_names=config.cast)
-            if config.shot_plan
-            else None
-        )
-        chunks = slice_audio(
-            config.master_audio,
-            alignment,
-            config.hardware,
-            config.chunks_dir,
-            cover_instrumentals=config.instrumental_coverage,
-            shot_lengths=shot_length_requests(plan),
-            instrumental_shot_seconds=config.instrumental_shot_seconds,
-            # F26: H3 lip-syncs whatever audio it is handed, so an
-            # instrumental chunk fed full-level music grows a mouth.
-            instrumental_audio_gain_db=config.instrumental_audio_gain_db,
-        )
-        if not chunks:
-            raise PipelineError(
-                f"no chunks produced by slicing {config.master_audio} against "
-                f"{config.lyrics_file} -- nothing to render (no non-empty lyric lines "
-                "aligned to audio?)"
-            )
-        logger.info("Stage 1-2 complete: %d chunk(s) to render", len(chunks))
-        # Issue #22: known before any GPU time is spent -- report it here,
-        # not after the render. See _log_timeline_track_drift's own
-        # docstring for why this never refuses the run.
-        _log_timeline_track_drift(chunks, alignment.track_duration, config)
-
-        if config.vocal_stem:
-            # Issue #25: condition H3 on the isolated vocal stem, cut at the
-            # very spans slicing just computed from the master. Conditioning
-            # only -- Stage 5 still muxes the pristine master over the video.
-            chunks = slice_stem_for_chunks(
-                config.vocal_stem,
-                chunks,
-                config.chunks_dir / "stem",
-                master_path=config.master_audio,
-            ).chunks
-
-        if plan is not None:
-            run_shot_plan_lints(plan, chunks, config)
-
-        prompts = {
-            chunk.chunk_id: expand_prompt(
-                config,
-                chunk,
-                shot=resolve_shot(plan, chunk),
-                # Issue #26: a consequence beat can hand the shot's subject to
-                # the action, so the burning printer stops competing with an
-                # assertion that the performer is the focus.
-                subject_is_focus=(
-                    plan[chunk.chunk_id].subject_is_focus
-                    if plan is not None and chunk.chunk_id in plan
-                    else True
-                ),
-                # Issue #53: this chunk's own camera framing/movement,
-                # independent of whether `shot` itself is filled in.
-                camera=resolve_camera(plan, chunk),
-                # Issue #59: who is on screen, as opposed to who is singing.
-                # Without this a shot line's "him" reaches H3 with no role,
-                # appearance or reference photo behind it, and the model
-                # invents a different person every chunk.
-                present=resolve_present(plan, chunk),
-                # Issue #82: whose shot this is, on an instrumental chunk --
-                # replaces the default_lead_vocalist fallback with the
-                # actually-authored focus member.
-                subject=resolve_subject(plan, chunk),
-                # Issue #78: this chunk's own authored place, substituted for
-                # config.setting in the "Location continuity" sentence when
-                # set -- narrows a whole-video setting string for a song
-                # whose world changes over its own runtime (the "Deathless"
-                # nuclear-glow finding).
-                location=resolve_location(plan, chunk),
-                # Issue #83: what the world looks like right now (weather,
-                # light, the aftermath of an event already shown) -- a third
-                # axis alongside location, composed as its own sentence.
-                conditions=resolve_conditions(plan, chunk),
-            )
-            for chunk in chunks
-        }
-
-        # Issue #38 CLI: --reseed names which chunks render at an alternate
-        # generation (see workflow_graph.resolve_chunk_seed). Validated here,
-        # against the real chunk timeline, rather than left to fail as an
-        # unknown key deep inside the mutator -- same reasoning as
-        # _select_render_ids' --only-chunks check just above.
-        reseed_generations: dict[int, int] = {}
-        if reseed_chunk_ids:
-            if reseed_generation < 1:
-                raise PipelineError(
-                    f"--reseed-generation must be >= 1 (0 is the seed every chunk already "
-                    f"has without --reseed, not a re-roll of it), got {reseed_generation}"
-                )
-            available = [chunk.chunk_id for chunk in chunks]
-            unknown = sorted(set(reseed_chunk_ids) - set(available))
-            if unknown:
-                logger.error(
-                    "--reseed names chunk id(s) %s that this song does not have; it has %d "
-                    "chunk(s), %s..%s",
-                    unknown,
-                    len(available),
-                    available[0],
-                    available[-1],
-                )
-                raise PipelineError(
-                    f"--reseed names unknown chunk id(s) {unknown}; this run has "
-                    f"{len(available)} chunk(s), {available[0]}..{available[-1]}"
-                )
-            reseed_generations = {chunk_id: reseed_generation for chunk_id in reseed_chunk_ids}
-            logger.info(
-                "Re-seeding chunk(s) %s at generation %d -- every other chunk keeps its "
-                "existing seed and stays a cache hit under --resume",
-                sorted(reseed_generations),
-                reseed_generation,
-            )
-
         base_template = load_workflow_template(config.workflow_template)
         i2v_template = (
             load_workflow_template(config.i2v_workflow_template)
@@ -880,237 +1223,165 @@ def run_pipeline(
         text_encoder = _resolve_text_encoder(config, base_template, i2v_template)
 
         stager = ComfyUIAssetStager(base_url=config.comfyui_url, session=session)
-        assets = {
-            chunk.chunk_id: stager.stage_chunk(prompts[chunk.chunk_id], chunk) for chunk in chunks
-        }
-        logger.info("Stage 3 complete: %d chunk(s) staged to %s", len(assets), config.comfyui_url)
-
-        # Issue #38 (variation half): ContinuityWorkflowProvider passes one
-        # flat noise_seed to every mutate() call, by design -- see its own
-        # docstring. Per-chunk variation happens here instead, at the
-        # mutator seam the provider already exposes: PerChunkSeedMutator
-        # wraps the ordinary WorkflowGraphMutator and substitutes
-        # resolve_chunk_seed's per-chunk answer for whatever flat seed the
-        # provider hands it, so every chunk still renders through the same
-        # class_type-based node lookups, just under a different number.
-        seeded_mutator = PerChunkSeedMutator(
-            WorkflowGraphMutator(),
-            base_seed=config.noise_seed,
-            reseed_generations=reseed_generations,
-        )
-
-        provider = ContinuityWorkflowProvider(
-            base_template=base_template,
-            i2v_template=i2v_template,
-            chunk_prompts=prompts,
-            chunk_assets=assets,
-            asset_stager=stager,
-            frames_dir=config.chunks_dir / "frames",
-            continuity_enabled=config.i2v_continuity,
-            mutator=seeded_mutator,
-            subprocess_runner=ffmpeg_runner,
-            chunk_frame_counts={c.chunk_id: c.frame_count for c in chunks},
-            render_width=config.render_width,
-            render_height=config.render_height,
-            noise_seed=config.noise_seed,
-            reanchor_interval=config.i2v_reanchor_interval,
-            chainable_chunk_ids=chain_scope_ids(config.i2v_chain_scope, chunks),
-            text_encoder=config.text_encoder,
-            lora=config.lora,
-            lora_strength=config.lora_strength,
-            # Issue #45: hash the graph on its way out, per chunk, because a
-            # run holds two templates and a chunk renders through exactly one.
-            # Passed in rather than imported inside the provider so a test can
-            # substitute it, and so the provider owes nothing to this module.
-            graph_hasher=graph_fingerprint,
-            # Issue #47: a seed frame with no face in it carries no identity at
-            # all on the chained path, which has no ref_images. Built here so
-            # the provider never imports OpenCV and a test can pass a lambda.
-            seed_face_gate=_resolve_seed_face_gate(config, seed_face_gate),
-        )
-
         execution_client = ComfyUIExecutionClient(
             base_url=config.comfyui_url, session=session, ws_factory=ws_factory
         )
-        # Issue #23: the custody pre-flight checks free VRAM once, before the
-        # run starts, and cannot see another process claiming the card two
-        # hours in -- which is exactly how the 2026-08-07 wedge happened. The
-        # runner re-reads the same /system_stats path before every chunk it is
-        # about to submit, over the session custody already uses.
-        runner = ResilientRunner.from_config(
-            config,
-            execution_client,
-            sleeper=sleeper,
-            disk_usage=disk_usage,
-            vram_probe=build_vram_probe(session, config.comfyui_url),
-            vram_releaser=(
-                build_vram_releaser(session, config.comfyui_url)
-                if config.release_vram_between_chunks
-                else None
-            ),
-        )
-        # Issue #34: what each chunk is being rendered *for*, composed from what
-        # Stages 1-2 just produced. A resumed run compares this against what
-        # each cached chunk was actually rendered for, so an edited lyrics file
-        # (or shot plan, or resolution) re-renders the affected chunks instead
-        # of assembling a silently desynced video from the old timeline.
-        fingerprints = {
-            chunk.chunk_id: ChunkFingerprint.of(
-                chunk,
-                prompts[chunk.chunk_id],
-                render_width=config.render_width,
-                render_height=config.render_height,
-                # Issue #38: the same per-chunk value PerChunkSeedMutator
-                # injects into RandomNoise for this chunk_id -- two paths, one
-                # derivation (workflow_graph.resolve_chunk_seed), pinned by
-                # test. Not config.noise_seed directly: that is the run-wide
-                # base every chunk derives from, and reseed_generations may
-                # shift this particular chunk_id's derivation off generation 0.
-                noise_seed=resolve_chunk_seed(
-                    config.noise_seed,
-                    chunk.chunk_id,
-                    reseed_generation=reseed_generations.get(chunk.chunk_id, 0),
-                ),
-                # Issue #25: which audio drove the mouth. Never escapable on
-                # resume -- it is the stem A/B's experiment variable.
-                conditioning_source=(
-                    f"stem:{config.vocal_stem.name}" if config.vocal_stem else "mix"
-                ),
-                # F26: same tier, because conditioning_source is blind to level
-                # and reusing a full-level chunk inside a silenced run hands
-                # the comparison its control twice.
-                instrumental_audio_gain_db=config.instrumental_audio_gain_db,
-                # Issue #39: which encoder read the sentence -- the pinned one
-                # if this run pins one, otherwise whatever the template names.
-                # Recorded either way, because the encoder is the one
-                # pixel-deciding input that a canvas edit can change with
-                # nothing else in the fingerprint moving.
-                text_encoder=text_encoder,
-                # Issue #62: which adapter, at what strength. Conditioning tier --
-                # template_hash cannot see it, because the node is spliced in
-                # during mutation rather than authored into the template.
-                lora=config.lora,
-                lora_strength=config.lora_strength if config.lora else None,
-            )
-            for chunk in chunks
-        }
-        # Issue #28: plan the chain up front (what config alone predicts)...
-        #
-        # ...and with it, issue #45's graph and #46's prompt variant, because
-        # all three answer the same question -- which of the two templates is
-        # this chunk expected to take. ``--resume`` compares a cached chunk
-        # against these *predictions*, so they have to be computable before
-        # anything renders; the amender then corrects whichever ones the run
-        # actually decided differently.
-        planned_chain = {
-            chunk.chunk_id: planned_chain_source(
-                chunk.chunk_id,
-                continuity_enabled=config.i2v_continuity,
-                reanchor_interval=config.i2v_reanchor_interval,
-                chainable_chunk_ids=chain_scope_ids(config.i2v_chain_scope, chunks),
-            )
-            for chunk in chunks
-        }
-        fingerprints = {
-            chunk_id: dc_replace(
-                fp,
-                chained_from=planned_chain[chunk_id],
-                prompt_hash=ChunkFingerprint.hash_prompt(
-                    prompts[chunk_id].text_for(chained=planned_chain[chunk_id] is not None)
-                ),
-                template_hash=provider.planned_template_hash(
-                    chained=planned_chain[chunk_id] is not None
-                ),
-                # What this chunk would carry if the render declines to chain
-                # -- a dead-lettered predecessor, an unextractable frame, or
-                # #47's face gate. Lets the comparison tell a degradation from
-                # an edited template instead of re-rendering it every resume.
-                fallback_template_hash=provider.planned_template_hash(chained=False),
-            )
-            for chunk_id, fp in fingerprints.items()
-        }
 
-        render_ids = _select_render_ids(chunks, only_chunks)
-        # --reseed forces its chunks to render even when only_chunks narrows
-        # the render list to something else entirely. A bare --only-chunks
-        # forces its own too (the validation slice: what changed is often
-        # something no fingerprint can see); with --resume it does not, and
-        # the slice's chunks get the same fingerprint comparison a full resume
-        # gives them -- so an edit-and-resume can be tried on three chunks
-        # instead of eighty. Union, deduplicated, order-preserved.
-        slice_forced = () if resume else (only_chunks or ())
-        force_chunk_ids = tuple(dict.fromkeys((*slice_forced, *(reseed_chunk_ids or ()))))
-
-        run_state = runner.render_run(
-            render_ids,
-            provider,
-            config.chunks_dir,
-            # A slice or a reseed always loads prior state so it augments the
-            # run rather than replacing it; which of its own chunks it
-            # re-renders is force_chunk_ids' business. Writing a state file containing
-            # only those chunks destroyed the record of every other chunk in
-            # the run.
-            resume=resume or bool(only_chunks) or bool(reseed_chunk_ids),
-            force_chunk_ids=force_chunk_ids,
-            fingerprints=fingerprints,
-            # ...and record what actually happened, degradations included: a
-            # chunk whose predecessor dead-lettered fell back to unchained,
-            # and its fingerprint must say so or --resume compares against a
-            # chain the render never had.
-            fingerprint_amender=lambda chunk_id, fp: _amend_from_render(provider, chunk_id, fp),
-        )
-
-        output_video: Path | None = None
-        if only_chunks:
-            # Deliberately no Stage 5. Concatenating a subset would write a
-            # file that looks like the finished song and is not -- the same
-            # silently-desynced artifact the chunk timeline and the
-            # fingerprints both exist to prevent. A slice's deliverable is
-            # chunks to watch.
-            logger.info(
-                "Rendered a %d-chunk slice (%s) -- skipping Stage 5 assembly. The clips are "
-                "in %s; a partial concat would claim to be the whole song.",
-                len(render_ids),
-                ", ".join(str(i) for i in render_ids),
-                config.chunks_dir,
+        renders: list[TimelineRender] = []
+        for timeline in rendered_timelines:
+            alignment, chunks, plan = _align_and_slice_timeline(
+                config, timeline, align_model=align_model
             )
-        elif run_state.dead_lettered:
-            logger.error(
-                "Skipping Stage 5 assembly: %d chunk(s) dead-lettered: %s",
-                len(run_state.dead_lettered),
-                run_state.dead_lettered,
-            )
-        else:
-            assembly_result = assemble_final_video(
+            if timeline.is_song and config.vocal_stem:
+                # Issue #25: condition H3 on the isolated vocal stem, cut at
+                # the very spans slicing just computed from the master.
+                # Conditioning only -- Stage 5 still muxes the pristine master
+                # over the video. Song-only: a dialogue take has no vocal stem
+                # to isolate, and the field names one file.
+                chunks = slice_stem_for_chunks(
+                    config.vocal_stem,
+                    chunks,
+                    timeline.chunks_dir / "stem",
+                    master_path=timeline.audio,
+                ).chunks
+            run_state = _render_one_timeline(
+                config,
+                timeline,
+                alignment,
                 chunks,
-                run_state,
-                # Issue #22: None means no audio stream at all, for a concert
-                # backdrop where the band is the audio. See the field's own
-                # docstring for which invariant that suspends and which it
-                # leaves alone.
-                None if config.silent_output else config.master_audio,
-                config.final_video_dir,
-                runner=ffmpeg_runner,
-                # Issue #22: arms the measured-duration check that replaces
-                # -shortest, but ONLY on the silent path -- the music-video
-                # path gets no new probe and no new subprocess, byte-for-byte
-                # unchanged (expected_duration stays None). The master
-                # track's own duration stands in for the authoritative show
-                # duration here; design-concert-mode.md question 5 (is the
-                # rig's real click track ever a different length than the
-                # audio file?) is still open, so this is a stand-in, not the
-                # final answer.
-                expected_duration=alignment.track_duration if config.silent_output else None,
-                duration_tolerance_seconds=config.duration_tolerance_seconds,
+                plan,
+                base_template=base_template,
+                i2v_template=i2v_template,
+                text_encoder=text_encoder,
+                stager=stager,
+                execution_client=execution_client,
+                session=session,
+                resume=resume,
+                only_chunks=only_chunks if timeline is flagged else None,
+                reseed_chunk_ids=reseed_chunk_ids if timeline is flagged else None,
+                reseed_generation=reseed_generation,
+                ffmpeg_runner=ffmpeg_runner,
+                sleeper=sleeper,
+                disk_usage=disk_usage,
+                seed_face_gate=seed_face_gate,
             )
-            output_video = assembly_result.output_video
+            renders.append(
+                TimelineRender(
+                    timeline=timeline,
+                    alignment=alignment,
+                    chunks=tuple(chunks),
+                    run_state=run_state,
+                )
+            )
 
+        output_video = _assemble_run(
+            config,
+            renders,
+            only_chunks=only_chunks,
+            ffmpeg_runner=ffmpeg_runner,
+        )
+
+    song_render = next(
+        (r for r in renders if r.timeline.is_song), renders[0] if renders else None
+    )
     return RunReport(
-        run_state=run_state,
-        total_chunks=len(chunks),
+        run_state=song_render.run_state if song_render is not None else RunState(run_id=""),
+        total_chunks=sum(len(r.chunks) for r in renders),
         wall_seconds=clock() - start,
         output_video=output_video,
+        timeline_states=tuple((r.timeline.name, r.run_state) for r in renders),
     )
+
+
+def _assemble_run(
+    config: RunConfig,
+    renders: Sequence[TimelineRender],
+    *,
+    only_chunks: Sequence[int] | None,
+    ffmpeg_runner: Callable[[Sequence[str]], Any] | None,
+) -> Path | None:
+    """Stage 5 for however many timelines this run produced (issue #66).
+
+    One timeline takes the path it always took -- :func:`assemble_final_video`
+    with the same two ffmpeg calls, the same ``-shortest``, the same opt-in
+    duration check -- so adding this branch changed no existing run's output.
+
+    More than one takes :func:`~music_video_maker.assembly.assemble_timelines`,
+    which concats each timeline separately, *measures* what it produced with
+    ffprobe, pads each timeline's audio up to its own video, asserts that
+    padding on a second probe, and only then joins them. The seam is where
+    the ``-shortest`` safety net stops existing: it trims the end of a file,
+    and a seam is in the middle of one.
+    """
+    if only_chunks:
+        # Deliberately no Stage 5. Concatenating a subset would write a file
+        # that looks like the finished song and is not -- the same silently
+        # desynced artifact the chunk timeline and the fingerprints both
+        # exist to prevent. A slice's deliverable is chunks to watch.
+        render = renders[0]
+        logger.info(
+            "Rendered a %d-chunk slice of timeline %r -- skipping Stage 5 assembly. The "
+            "clips are in %s; a partial concat would claim to be the whole song.",
+            len(render.run_state.results),
+            render.timeline.name,
+            render.timeline.chunks_dir,
+        )
+        return None
+
+    dead = [
+        (r.timeline.name, r.run_state.dead_lettered)
+        for r in renders
+        if r.run_state.dead_lettered
+    ]
+    if dead:
+        logger.error(
+            "Skipping Stage 5 assembly: dead-lettered chunk(s) %s",
+            dead,
+        )
+        return None
+
+    if len(renders) == 1:
+        render = renders[0]
+        assembly_result = assemble_final_video(
+            render.chunks,
+            render.run_state,
+            # Issue #22: None means no audio stream at all, for a concert
+            # backdrop where the band is the audio. See the field's own
+            # docstring for which invariant that suspends and which it
+            # leaves alone.
+            None if config.silent_output else config.master_audio,
+            config.final_video_dir,
+            runner=ffmpeg_runner,
+            # Issue #22: arms the measured-duration check that replaces
+            # -shortest, but ONLY on the silent path -- the music-video
+            # path gets no new probe and no new subprocess, byte-for-byte
+            # unchanged (expected_duration stays None). The master track's
+            # own duration stands in for the authoritative show duration
+            # here; design-concert-mode.md question 5 is still open, so
+            # this is a stand-in, not the final answer.
+            expected_duration=(
+                render.alignment.track_duration if config.silent_output else None
+            ),
+            duration_tolerance_seconds=config.duration_tolerance_seconds,
+        )
+        return assembly_result.output_video
+
+    multi = assemble_timelines(
+        [
+            TimelineAssembly(
+                name=r.timeline.name,
+                chunks=r.chunks,
+                results=r.run_state,
+                audio=None if config.silent_output else r.timeline.audio,
+                fingerprint_name=r.timeline.fingerprint_name,
+            )
+            for r in renders
+        ],
+        config.final_video_dir,
+        runner=ffmpeg_runner,
+        duration_tolerance_seconds=config.duration_tolerance_seconds,
+    )
+    return multi.output_video
 
 
 @dataclass(frozen=True)
@@ -1135,15 +1406,17 @@ def prepare_timeline(
     align_model: object | None = None,
     from_plan: str | Path | None = None,
 ) -> PreparedTimeline:
-    """Run Stages 1-2 only -- alignment + slicing, no GPU, no ComfyUI, no
-    custody -- and return the chunk timeline, the raw alignment, and the
-    alignment-quality report (issue #36).
+    """Run Stages 1-2 only for the **song** -- alignment + slicing, no GPU, no
+    ComfyUI, no custody -- and return the chunk timeline, the raw alignment,
+    and the alignment-quality report (issue #36).
 
     Shared by :func:`prepare_shot_plan` (issue #52, which only writes the
     skeleton) and the review page (issue #36's next slice, which additionally
     needs the quality report and the chunks themselves) -- both want exactly
     the same Stage 1-2 run, and a second implementation would risk describing
-    a timeline the real one does not.
+    a timeline the real one does not. Since issue #66 that sharing goes one
+    level deeper: this runs ``_align_and_slice_timeline``, the same function
+    ``run_pipeline`` renders through, rather than a parallel copy of it.
 
     ``from_plan`` re-anchors the timeline against the run a render with
     *that plan* will actually produce, by loading it **for its
@@ -1159,59 +1432,41 @@ def prepare_timeline(
     A plan that cannot be read is a hard failure, never a silent fall back to
     a length-free timeline: that fallback would look exactly like success and
     drift hours later, on the GPU.
+
+    A run with ``[[segment]]`` tables has more than one timeline;
+    :func:`prepare_timelines` is the one that returns all of them. This
+    function stays the song's, because that is what the review page means and
+    what it has always returned.
     """
-    lines = parse_lyrics(config.lyrics_file, config.cast, config.default_lead_vocalist)
+    song = next(t for t in plan_timelines(config) if t.is_song)
+    return _prepare_one_timeline(config, song, align_model=align_model, from_plan=from_plan)
+
+
+def _prepare_one_timeline(
+    config: RunConfig,
+    timeline: Timeline,
+    *,
+    align_model: object | None = None,
+    from_plan: str | Path | None = None,
+) -> PreparedTimeline:
     quality_reports: list[AlignmentQualityReport] = []
-    alignment = align(
-        config.master_audio,
-        lines,
-        model=align_model,
-        # --prepare/review must align exactly as the render will, or the
-        # timeline describes chunks the render never emits (issue #52).
-        model_size=config.alignment_model_size,
-        strict_alignment=config.strict_alignment,
-        overrides=config.alignment_overrides,
-        # Issue #36: align() already computes this and only logs it -- this
-        # is the seam that hands the structured report back to a caller that
-        # needs more than a log line.
+    alignment, chunks, _plan = _align_and_slice_timeline(
+        config,
+        timeline,
+        align_model=align_model,
+        from_plan=from_plan,
+        # --prepare deliberately does not read the config's own shot plan at
+        # all; only --from-plan names one. Preserved from before issue #66's
+        # refactor -- see _align_and_slice_timeline for why.
+        load_plan=False,
         on_quality_report=quality_reports.append,
     )
-    shot_lengths: tuple[ShotLength, ...] = ()
     if from_plan is not None:
-        shot_lengths = shot_length_requests(
-            load_shot_plan(from_plan, setting=config.setting, cast_names=config.cast)
-        )
         logger.info(
-            "Re-anchoring the timeline against %s: %d editorial shot length(s) applied "
-            "(issue #52 follow-up)",
+            "Re-anchoring timeline %r against %s (issue #52 follow-up)",
+            timeline.name,
             from_plan,
-            len(shot_lengths),
         )
-    chunks = slice_audio(
-        config.master_audio,
-        alignment,
-        config.hardware,
-        config.chunks_dir,
-        cover_instrumentals=config.instrumental_coverage,
-        instrumental_shot_seconds=config.instrumental_shot_seconds,
-        # Passed so a stem --prepare/review writes is the stem a render
-        # uses. It cannot move the timeline (level only), so the timeline is
-        # identical either way -- this is consistency, not correctness.
-        instrumental_audio_gain_db=config.instrumental_audio_gain_db,
-        shot_lengths=shot_lengths,
-    )
-    if not chunks:
-        raise PipelineError(
-            f"no chunks produced by slicing {config.master_audio} against "
-            f"{config.lyrics_file} -- nothing to prepare a timeline for (no non-empty "
-            "lyric lines aligned to audio?)"
-        )
-    logger.info("Stage 1-2 complete: %d chunk(s) available (issue #52/#36)", len(chunks))
-    # Issue #22: the same no-GPU check run_pipeline does. --prepare is exactly
-    # the 50s check this project uses to catch a Stage-2 drift before spending
-    # GPU time, and --review reads the same timeline.
-    _log_timeline_track_drift(chunks, alignment.track_duration, config)
-
     # `align()` always calls the callback exactly once before returning (see
     # its own docstring) -- this is defensive, not a real fallback path.
     quality_report = (
@@ -1220,6 +1475,77 @@ def prepare_timeline(
     return PreparedTimeline(
         alignment=alignment, chunks=tuple(chunks), quality_report=quality_report
     )
+
+
+def prepare_timelines(
+    config: RunConfig,
+    *,
+    align_model: object | None = None,
+    from_plan: str | Path | None = None,
+) -> tuple[tuple[Timeline, PreparedTimeline], ...]:
+    """Stages 1-2 for **every** timeline this run would render, in playback
+    order, plus the seam report (issue #66).
+
+    ``--prepare`` is this project's 50-second, no-GPU check, and with a
+    prologue there are two things to check rather than one: each timeline's
+    own chunk timeline against its own track (the issue #22 drift report,
+    which ``_align_and_slice_timeline`` already emits per timeline), and the
+    **seam** -- where each timeline starts in the finished video and how much
+    silence its audio needs to match its own picture.
+
+    The seam numbers here are *predicted* from Stage 2's chunk timeline;
+    assembly re-derives them from ffprobe readings of the rendered files and
+    raises if they disagree. Both are worth having and they are not the same
+    claim, which is why the log line says which one it is.
+
+    ``from_plan`` applies to the song, matching ``--prepare --from-plan``'s
+    existing meaning: a segment's lengths come from its own ``shot_plan``.
+    """
+    timelines = plan_timelines(config)
+    prepared: list[tuple[Timeline, PreparedTimeline]] = []
+    for timeline in timelines:
+        prepared.append(
+            (
+                timeline,
+                _prepare_one_timeline(
+                    config,
+                    timeline,
+                    align_model=align_model,
+                    from_plan=from_plan if timeline.is_song else None,
+                ),
+            )
+        )
+
+    if len(prepared) > 1:
+        _report_predicted_seam(prepared)
+    return tuple(prepared)
+
+
+def _report_predicted_seam(prepared: Sequence[tuple[Timeline, PreparedTimeline]]) -> None:
+    """Log where each timeline will start and what its seam costs, from Stage
+    2's own numbers (issue #66).
+
+    Reports; never refuses. The same arithmetic *does* refuse inside
+    assembly, where it is measured against real files -- here it is a preview
+    of a decision nobody has spent GPU time on yet, and a preview that raises
+    is a preview nobody runs.
+    """
+    timelines = tuple(t for t, _ in prepared)
+    chunk_timeline_seconds = {
+        t.name: (p.chunks[-1].end if p.chunks else 0.0) for t, p in prepared
+    }
+    track_seconds = {t.name: p.alignment.track_duration for t, p in prepared}
+    try:
+        placements = place_timelines(
+            predicted_measurements(timelines, chunk_timeline_seconds, track_seconds)
+        )
+    except SeamOverrunError:
+        logger.exception(
+            "Predicted seam is unreconcilable -- reporting it rather than refusing, "
+            "because --prepare is a report. Assembly WILL refuse this run."
+        )
+        return
+    log_placements(placements, measured=False)
 
 
 def prepare_shot_plan(
@@ -1248,15 +1574,71 @@ def prepare_shot_plan(
 
     Stages 1-2 themselves live in :func:`prepare_timeline`, shared with the
     review page (issue #36) -- this function's own job is just the skeleton.
+
+    **A run with ``[[segment]]`` tables gets a skeleton per timeline**
+    (issue #66). ``--prepare`` emitting one for a prologue is not a
+    convenience: the whole point of #52 is that a plan's anchors are never
+    transcribed by hand, and a segment's anchors come from its own alignment
+    exactly like the song's. Segment skeletons are written beside the song's
+    as ``<stem>__<segment><suffix>`` -- one path in, one path per timeline
+    out, derived rather than asked for, so nobody has to remember to pass a
+    second ``--shot-plan-out``. The song's path is returned, unchanged, which
+    is what every existing caller expects.
+
+    Also reports the **seam** -- where each timeline starts in the finished
+    video, and how much silence its audio needs to match its own picture.
+    That is the number a prologue can get wrong in a way no per-timeline
+    check can see, and it costs no GPU to learn here.
     """
-    timeline = prepare_timeline(config, align_model=align_model, from_plan=from_plan)
-    return write_shot_plan_skeleton(
-        timeline.chunks, output_path, source=source, generated_at=generated_at, force=force
-    )
+    prepared = prepare_timelines(config, align_model=align_model, from_plan=from_plan)
+
+    song_path = Path(output_path)
+    written: list[Path] = []
+    song_result = song_path
+    for timeline, timeline_data in prepared:
+        if timeline.is_song:
+            destination = song_path
+        else:
+            destination = song_path.with_name(
+                f"{song_path.stem}__{timeline.name}{song_path.suffix}"
+            )
+        written_path = write_shot_plan_skeleton(
+            timeline_data.chunks,
+            destination,
+            source=source,
+            generated_at=generated_at,
+            force=force,
+        )
+        written.append(written_path)
+        if timeline.is_song:
+            song_result = written_path
+
+    if len(written) > 1:
+        logger.info(
+            "Wrote %d shot-plan skeleton(s), one per timeline (issue #66): %s. Each is "
+            "authored against ITS OWN chunk ids -- the id spaces are separate, so the "
+            "song's shot 3 and the prologue's shot 3 are different shots.",
+            len(written),
+            ", ".join(str(p) for p in written),
+        )
+    return song_result
 
 
 def _log_final_report(report: RunReport) -> None:
     dead = report.dead_lettered
+    if len(report.timeline_states) > 1:
+        logger.info(
+            "Timelines rendered (issue #66): %s%s",
+            ", ".join(
+                f"{name} ({len(state.results)} chunk(s))"
+                for name, state in report.timeline_states
+            ),
+            (
+                f"; dead-lettered by timeline: {report.dead_lettered_by_timeline}"
+                if dead
+                else ""
+            ),
+        )
     logger.info(
         "Run finished in %.1fs: %d/%d chunk(s) rendered, %d cached, %d dead-lettered%s -- "
         "output: %s",
@@ -1348,6 +1730,7 @@ def main(argv: list[str] | None = None) -> int:
             only_chunks=args.only_chunks,
             reseed_chunk_ids=args.reseed,
             reseed_generation=args.reseed_generation,
+            flag_timeline=args.timeline,
         )
     except Exception:
         logger.exception("Pipeline run failed")

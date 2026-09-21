@@ -379,6 +379,31 @@ class AudioChunk:
     exists so later stages and run reports can distinguish "no lyric here by
     design" from "a lyric chunk that somehow lost its text"."""
 
+    timeline: str | None = None
+    """Which timeline this chunk belongs to (issue #66). ``None`` is the song
+    -- so every chunk that existed before segments did says "the song" without
+    anything being rewritten, and a run with no ``[[segment]]`` table produces
+    exactly the chunks it always did.
+
+    A named value is a prologue/epilogue segment's ``name``. Chunk ids are a
+    **separate space per timeline** (see ``docs/design-prologue-timelines.md``):
+    prologue chunk 3 and song chunk 3 both exist, can share a span, a frame
+    count and a resolution, and are different renders. This field is what makes
+    them distinguishable -- in :class:`ChunkFingerprint`, in a log line, and in
+    a run report -- and the per-timeline chunks directory is what keeps their
+    files apart.
+
+    Deliberately **not** an offset. ``start``/``end`` stay seconds from the
+    start of *this chunk's own* track, because every anchor in the project is
+    measured that way: a shot plan's ``chunk_id``/``start``, the alignment
+    segments they came from, ``ShotPlanDriftError``'s comparison, and the
+    stem slicing. Folding a whole-video offset into them would move every
+    authored anchor in the song the moment a prologue's length changed --
+    silently, which is the same renumbering failure the separate id space
+    exists to avoid. Where a timeline sits in the finished video is a property
+    of the *timeline*, held once (``timelines.Timeline.offset_seconds``), and
+    measured from rendered video rather than computed (issue #22)."""
+
     @property
     def character(self) -> str | None:
         """Primary vocalist. Migration seam -- see ``LyricLine.character``."""
@@ -530,6 +555,23 @@ class ChunkFingerprint:
 
     start: float
     end: float
+    timeline: str | None = None
+    """Which timeline this chunk was rendered for (issue #66); ``None`` is the
+    song.
+
+    **Timeline tier**, and that is the whole point. Chunk ids are a separate
+    space per timeline, so prologue chunk 3 and song chunk 3 can trivially
+    agree on span, frame count and resolution -- every field this class had
+    before -- while being two different shots. Without this discriminator a
+    resumed run could hand a prologue's mp4 to the song and report a clean
+    match, which is issue #34's failure reintroduced along a new axis. Being
+    in the wrong *place* is never escapable via ``resume_ignore_prompt_changes``:
+    the clip is not merely stale, it is somebody else's.
+
+    ``None`` means the song for a run that has segments, and *also* means "a
+    state file written before segments existed" -- which is the same thing, so
+    an old file and a song chunk compare equal and nothing re-renders. That
+    coincidence is why this needed no ``schema_version`` bump."""
     frame_count: int | None = None
     render_width: int | None = None
     render_height: int | None = None
@@ -712,6 +754,7 @@ class ChunkFingerprint:
     chunk."""
 
     TIMELINE_FIELDS: ClassVar[tuple[str, ...]] = (
+        "timeline",
         "start",
         "end",
         "frame_count",
@@ -788,6 +831,10 @@ class ChunkFingerprint:
         return cls(
             start=chunk.start,
             end=chunk.end,
+            # Issue #66: read off the chunk, never passed in -- the chunk is
+            # what Stage 2 stamped, and a caller that could name a different
+            # timeline here is a caller that could mislabel one.
+            timeline=chunk.timeline,
             frame_count=chunk.frame_count,
             render_width=render_width,
             render_height=render_height,
