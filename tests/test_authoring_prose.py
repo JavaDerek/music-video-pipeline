@@ -14,6 +14,7 @@ a judgement call that a later reader will otherwise assume was an oversight.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from music_video_maker.authoring.prose import (
     generate_prose,
     plant_end_state_issues,
     pop_distant_staging_issues,
+    pop_object_named_in_shot_issues,
     prose_input_hashes,
     validate_prose,
 )
@@ -1141,3 +1143,121 @@ def test_a_prose_issue_can_be_marked_not_revisable():
     )
 
     assert issue.revisable is False
+
+
+# --------------------------------------------------------------------------- #
+# pop_object_named_in_shot_issues -- issue #68 step 3, the structural half.
+# `pop_object` is composed into NO prompt (it rides in the plan's `# beat:`
+# comment like `act`), so a pop beat whose shot line never names its object
+# is marked for something the render is never told about. No vocabulary, so
+# nothing to be scored wrong -- see docs/pop-beat-corpus.md for what n=3 can
+# and cannot claim.
+# --------------------------------------------------------------------------- #
+
+
+def test_fires_when_a_pop_beats_shot_line_never_names_its_object():
+    beats = (
+        _beat(1, group=1, role="plant"),
+        _beat(2, group=1, role="contact", pop_object="the printer"),
+    )
+    shots = {
+        1: "A beige printer sits blinking on the office windowsill beside her.",
+        2: "Paper bursts toward the lens in a torn white sheet, filling the frame.",
+    }
+
+    issues = pop_object_named_in_shot_issues(shots, beats)
+
+    assert [i.chunk_id for i in issues] == [2]
+    assert issues[0].severity == "warning"
+    assert "printer" in issues[0].message
+    assert issues[0].revisable is True
+
+
+def test_silent_when_the_shot_line_names_the_pop_object():
+    beats = (_beat(1, group=1, role="contact", pop_object="the printer"),)
+    shots = {1: "The printer tumbles at the lens, filling the frame as it comes."}
+
+    assert pop_object_named_in_shot_issues(shots, beats) == ()
+
+
+def test_a_plural_in_the_line_still_matches_a_singular_pop_object():
+    """Same `stageable_noun_stems` normalisation `lint_shots_against_lyrics`
+    uses -- never a second copy of it, which would disagree within a month."""
+    beats = (_beat(1, group=1, role="contact", pop_object="the printer"),)
+    shots = {1: "Two printers tumble at the lens, filling the frame as they come."}
+
+    assert pop_object_named_in_shot_issues(shots, beats) == ()
+
+
+def test_one_word_of_a_multi_word_pop_object_is_enough():
+    """Fires only when NONE of the object's stems appears. "mushroom cap"
+    staged as "the mushroom" is authored, not a defect, and a rule demanding
+    every word would fire on it."""
+    beats = (_beat(1, group=1, role="contact", pop_object="the mushroom cap"),)
+    shots = {1: "The mushroom swells at the lens, its underside filling the near frame."}
+
+    assert pop_object_named_in_shot_issues(shots, beats) == ()
+
+
+def test_silent_on_a_beat_with_no_pop_object_at_all():
+    beats = (_beat(1, group=1, role="transition"),)
+    shots = {1: "She walks the ridge line with nothing in her hands."}
+
+    assert pop_object_named_in_shot_issues(shots, beats) == ()
+
+
+def test_silent_when_the_pop_beat_has_no_shot_line_written_yet():
+    beats = (_beat(1, group=1, role="contact", pop_object="the printer"),)
+
+    assert pop_object_named_in_shot_issues({}, beats) == ()
+
+
+def test_an_unmatchable_pop_object_is_unexamined_not_passed(caplog):
+    """#93: a zero from a detector is not evidence of absence unless
+    something asked the second question. "the axe" normalises to no stems at
+    all (every word is a stopword or under the lint's minimum length), so the
+    beat is UNEXAMINED and the log says so -- it does not silently pass."""
+    beats = (_beat(1, group=1, role="contact", pop_object="the axe"),)
+    shots = {1: "Something swings at the lens, filling the near frame."}
+
+    with caplog.at_level(logging.INFO, logger="music_video_maker.authoring.prose"):
+        assert pop_object_named_in_shot_issues(shots, beats) == ()
+
+    assert "UNEXAMINED" in caplog.text
+
+
+def test_the_three_rendered_pop_lines_do_not_fire():
+    """The corpus, such as it is (docs/pop-beat-corpus.md): the three
+    hand-written pop lines that rendered as intended on 2026-09-20 -- chunk
+    45 the needle, 46 the ember, 66 the mushroom cap.
+
+    The lines themselves live in a run directory that is not part of this
+    repo, so these are reconstructions from the phrases issue #68's own
+    comment publishes, NOT the rendered text. They can prove one thing and
+    only one: a line that names its object does not fire. 0 of 3, at n=3."""
+    beats = (
+        _beat(45, group=1, role="contact", pop_object="the needle"),
+        _beat(46, group=1, role="contact", pop_object="the ember"),
+        _beat(66, group=2, role="contact", pop_object="the mushroom cap"),
+    )
+    shots = {
+        45: "The needle comes at the lens, held large and steady in the near frame.",
+        46: "An ember blooms out of the black straight toward the lens, filling the centre.",
+        66: "The mushroom cap fills the foreground, swelling toward the lens.",
+    }
+
+    assert pop_object_named_in_shot_issues(shots, beats) == ()
+
+
+def test_the_two_pop_checks_are_independent():
+    """A line can name its object and still stage it distant, and it can
+    stage something near and never name the object: the two #68 checks
+    answer different questions and neither subsumes the other."""
+    beats = (_beat(1, group=1, role="contact", pop_object="the printer"),)
+    distant_but_named = {1: "The printer sits far behind her on the street."}
+    near_but_unnamed = {1: "A white sheet of paper tumbles at the lens, filling the frame."}
+
+    assert len(pop_distant_staging_issues(distant_but_named, beats)) == 1
+    assert pop_object_named_in_shot_issues(distant_but_named, beats) == ()
+    assert pop_distant_staging_issues(near_but_unnamed, beats) == ()
+    assert len(pop_object_named_in_shot_issues(near_but_unnamed, beats)) == 1
