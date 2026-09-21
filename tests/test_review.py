@@ -84,6 +84,7 @@ def _golden_review_data() -> ReviewData:
         present=(),
         subject="Dianne",
         conditions="dust settling",
+        framing="wide",
     )
     finding_chunk = ChunkReview(
         chunk_id=2,
@@ -325,6 +326,29 @@ def test_build_review_surfaces_shot_plan_lint_warnings(tmp_path: Path):
     assert data.lint_warnings, "every entry in the skeleton has a blank shot line"
     assert any(chunk.lint_warnings for chunk in data.chunks)
     assert all(chunk.shot is None for chunk in data.chunks)  # blank -> falls back
+
+
+def test_build_review_shows_the_authored_framing(tmp_path: Path):
+    """Issue #97's field has to reach the pre-render review, not only the
+    prompt. #55 is the record of an approved 631-character look that reached
+    no prompt and nothing said so; a field that reaches the prompt but no
+    review is the same gap read from the other end -- a reviewer checking a
+    plan before hours of GPU time cannot see what they approved."""
+    rig = Rig(tmp_path)
+    plan_path = tmp_path / "shot_plan.toml"
+    plan_path.write_text(
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She reaches the ridge"\n'
+        'framing = "wide"\n'
+    )
+    config = dc_replace(rig.config, shot_plan=plan_path)
+
+    data = build_review(config, align_model=rig.align_model)
+
+    by_id = {chunk.chunk_id: chunk for chunk in data.chunks}
+    assert by_id[0].framing == "wide"
+    assert all(chunk.framing is None for cid, chunk in by_id.items() if cid != 0)
+    assert "wide" in render_review_html(data)
+    assert '"framing": "wide"' in render_review_json(data)
 
 
 def test_build_review_reports_a_plan_that_fails_to_load(tmp_path: Path):

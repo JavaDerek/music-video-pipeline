@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from music_video_maker import contracts
+from music_video_maker import prompting as prompting_module
 from music_video_maker.config import RunConfig
 from music_video_maker.prompting import (
     SubjectOnVoicedChunkError,
@@ -592,6 +593,169 @@ def test_two_prompts_differing_only_in_conditions_differ_in_text(config: RunConf
     clear = expand_prompt(config, chunk, shot="They cross the ridge", conditions="clear")
 
     assert snow.prompt != clear.prompt
+
+
+# --------------------------------------------------------------------------- #
+# Framing (issue #97) -- the only field that says anything about delivered
+# face size. `camera` is free text in a trailing subordinate clause and #97
+# measured "close" there delivering 0.0000-0.3561 of frame across 39 chunks;
+# this composes like `demeanour` (its own sentence, concrete nouns, adjacent
+# to the member it qualifies), which is the mechanism #74 actually measured.
+# --------------------------------------------------------------------------- #
+
+
+def test_framing_face_names_the_eyes_and_mouth_of_the_focus_member(config: RunConfig, cast):
+    """#74's measured mechanism, used deliberately: H3 renders the nouns it
+    is given, so the tight levels name the anatomy they want in frame and
+    put the member's own name in the subject slot."""
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+
+    prompt = expand_prompt(config, chunk, shot="She reaches the ridge", framing="face").prompt
+
+    assert "Dianne's face fills the frame, eyes and mouth large and sharp" in prompt
+
+
+def test_framing_wide_names_no_facial_anatomy_at_all(config: RunConfig, cast):
+    """The mirror of the same mechanism. "The face too far away to read"
+    would name exactly the nouns the level exists to keep out of frame, and
+    #73 measured that a prohibition adds its nouns rather than subtracting
+    them -- there is no negative-conditioning channel for it to land in."""
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+
+    prompt = expand_prompt(config, chunk, shot="She reaches the ridge", framing="wide").prompt
+
+    assert "Dianne is a small figure far from camera in a wide frame" in prompt
+    tail = prompt.split("is a small figure")[1]
+    for anatomy in ("face", "eyes", "mouth"):
+        assert anatomy not in tail.split(".")[0]
+
+
+def test_framing_none_is_byte_identical_to_the_prompt_built_without_the_parameter(
+    config: RunConfig, cast
+):
+    """Every pre-#97 caller, and every chunk of every plan authored before
+    this field existed, never passes `framing` at all."""
+    cfg = dataclasses.replace(config, setting=SETTING)
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+
+    without_param = expand_prompt(cfg, chunk, shot="She reaches the ridge")
+    with_explicit_none = expand_prompt(cfg, chunk, shot="She reaches the ridge", framing=None)
+
+    assert with_explicit_none.prompt == without_param.prompt
+    assert with_explicit_none.chained_prompt == without_param.chained_prompt
+    assert "fills the frame" not in without_param.prompt
+
+
+def test_framing_blank_string_composes_nothing(config: RunConfig, cast):
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+
+    assert (
+        expand_prompt(config, chunk, shot="She reaches the ridge", framing="   ").prompt
+        == expand_prompt(config, chunk, shot="She reaches the ridge").prompt
+    )
+
+
+def test_framing_survives_on_the_chained_variant(config: RunConfig, cast):
+    """Framing is about the frame, not identity, so -- unlike appearance,
+    which #46 strips because the seed frame is already its output -- it stays
+    on the chained variant exactly like camera/location/conditions. Asked of
+    its fifth chained application: every level states an endpoint, so nothing
+    accumulates."""
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+
+    result = expand_prompt(config, chunk, shot="She reaches the ridge", framing="close")
+
+    assert "framed head and shoulders" in result.prompt
+    assert "framed head and shoulders" in result.chained_prompt
+
+
+def test_framing_lands_immediately_after_the_character_clause(config: RunConfig, cast):
+    """The sentence's subject is the member's own name, so it has to sit
+    next to the clause that introduced that name -- the same adjacency
+    `demeanour` gets inside the character clause itself."""
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+
+    prompt = expand_prompt(config, chunk, shot="She reaches the ridge", framing="medium").prompt
+
+    assert "is the focus of this shot. Dianne is framed from the waist up" in prompt
+
+
+def test_framing_is_plural_when_two_members_are_active(config: RunConfig, cast):
+    """Two vocalists on one chunk get one shared clause with a plain name
+    list -- not `_join_member_list`'s serial comma, which exists for
+    descriptors that carry their own internal commas."""
+    chunk = _chunk(text="together now", characters=("Dianne", "Marcus"))
+
+    prompt = expand_prompt(config, chunk, shot="They reach the ridge", framing="face").prompt
+
+    assert "Dianne and Marcus's faces fill the frame, eyes and mouths large and sharp" in prompt
+
+
+def test_framing_follows_the_subject_member_on_an_instrumental_chunk(config: RunConfig, cast):
+    """`subject` (#82) reassigns who the focus member is, so the framing
+    sentence has to follow it -- framing the singer who is not in this shot
+    would be the #82 contradiction again, one field over."""
+    chunk = _chunk(text="", character=None)
+
+    prompt = expand_prompt(
+        config, chunk, shot="The tower burns", subject="Marcus", framing="close"
+    ).prompt
+
+    assert "Marcus is framed head and shoulders" in prompt
+    assert "Dianne is framed" not in prompt
+
+
+def test_framing_is_case_and_whitespace_insensitive(config: RunConfig, cast):
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+
+    assert (
+        expand_prompt(config, chunk, shot="She reaches the ridge", framing=" Close ").prompt
+        == expand_prompt(config, chunk, shot="She reaches the ridge", framing="close").prompt
+    )
+
+
+def test_framing_outside_the_vocabulary_raises_rather_than_composing_nothing(
+    config: RunConfig, cast
+):
+    """Defence in depth behind the shot-plan loader, for the same reason
+    `SubjectOnVoicedChunkError` is: `expand_prompt` is a public function and
+    a typo'd ordinal must never quietly render the wrong frame."""
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+
+    with pytest.raises(ValueError, match="extreme close"):
+        expand_prompt(config, chunk, shot="She reaches the ridge", framing="extreme close")
+
+
+def test_framing_moves_the_fingerprints_prompt_hash(config: RunConfig, cast):
+    """The resume guarantee, asserted against the hash itself rather than
+    inferred from the text: `framing` is a shot-plan field, so
+    `ChunkFingerprint.prompt_hash` is the fingerprint evidence for it (the
+    same tier `camera`/`location`/`conditions` rely on). Without this, a plan
+    edited to frame a shot close would reuse the wide render and report a
+    clean match -- #34's failure arriving down a new road."""
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+    wide = expand_prompt(config, chunk, shot="She reaches the ridge", framing="wide")
+    close = expand_prompt(config, chunk, shot="She reaches the ridge", framing="face")
+    unset = expand_prompt(config, chunk, shot="She reaches the ridge")
+
+    hashes = {
+        contracts.ChunkFingerprint.hash_prompt(result.prompt)
+        for result in (wide, close, unset)
+    }
+    assert len(hashes) == 3
+
+
+def test_every_framing_level_composes_a_distinct_prompt(config: RunConfig, cast):
+    """`ChunkFingerprint.prompt_hash` is computed over this text, so two
+    framings must never hash the same -- otherwise `--resume` would reuse a
+    wide shot's mp4 for a close-up and report a clean match."""
+    chunk = _chunk(text="the lucky ones", character="Dianne")
+    prompts = {
+        level: expand_prompt(config, chunk, shot="She reaches the ridge", framing=level).prompt
+        for level in prompting_module.FRAMING_LEVELS
+    }
+
+    assert len(set(prompts.values())) == len(prompting_module.FRAMING_LEVELS)
 
 
 # --------------------------------------------------------------------------- #

@@ -806,6 +806,67 @@ re-propose it as a literal keyword without a different operationalisation.
 Full numbers, per-chunk detail, and the excluded candidates for every one of
 these decisions: `docs/deathless-render-corpus.md`.
 
+## Delivered face size is a field, not a camera phrase (issue #97)
+
+`camera` cannot set how much of the frame a face fills, and this was measured
+rather than assumed. Of the 39 voiced "Deathless" chunks authored `close` or
+`medium close` in `camera`, the delivered largest-face fraction runs from
+**0.0000 to 0.3561**; chunks 20 and 58 both read "close on her face" and
+rendered at 0.0120 and 0.0460. Three explanations were tested and ruled out:
+the camera word itself (it spans the entire range), camera movement
+(confounded with character at n=3), and the cast reference photos (0.0921 and
+0.0964 of frame, within 5% of each other).
+
+Why it matters beyond composition: across the seven chunks with more than
+1.0 s of #79 leading vocal offset, the four a viewer noticed carry faces of
+0.0778-0.2101 and the three nobody has ever reported carry 0.0120-0.0474 —
+no overlap, and running *backwards* against offset (the two largest offsets
+in the song are the two least-noticed chunks). Face size is what decides
+whether a desync is visible, so "frame it wide" is a real remedy and needed a
+real lever.
+
+**Use `framing`**, an ordinal with four values, tightest first:
+
+```toml
+[[shot]]
+chunk_id = 38
+start = 241.083
+shot = "..."
+framing = "face"     # face | close | medium | wide
+```
+
+Each value composes a fixed sentence of its own, naming the focus member and
+— for the tight levels — the anatomy it wants in frame ("Dianne's face fills
+the frame, eyes and mouth large and sharp"). That is #74's measured mechanism
+used on purpose: naming a mouth and eyes put three chunks at identical seeds
+to 100% face presence against 83/0/33% for manner-only phrasing, and doubled
+face presence across a whole render as a *side effect* of a `demeanour`
+string. `wide` deliberately names no face, no eyes and no mouth — "the face
+too far away to read" would name exactly the nouns it exists to keep out of
+frame, which is #73's finding (there is no negative-conditioning channel for
+a prohibition to subtract in).
+
+Three things to know before using it:
+
+- **The field is a mechanism, not yet a measured result.** That it composes
+  correctly is not evidence H3 honours it; the A/B that settles it is in
+  issue #97. Until then, treat `framing` the way this guide treats any
+  unverified lever: use it where you have a reason to, and check the pixels.
+- **It is not emitted by the authoring layer.** Set it by hand, on the chunks
+  where it matters. A generating stage that re-framed all 80 shots would be
+  paying an unmeasured cost across a whole video to fix a handful of them.
+- **It is an endpoint, not a displacement.** "Framed head and shoulders" is a
+  state; the chained I2V path applies every per-chunk instruction to its own
+  previous output, and anything that displaces rather than specifies drifts.
+
+Do not re-propose "name the face in `camera`" as the cheaper version of this:
+tested at n=41 on the full render, chunks whose `camera` names the face
+averaged 50.8% face presence against 59.8% for those that don't — backwards
+(see the section above and `docs/deathless-render-corpus.md`). The difference
+is not the words, it is that `camera` composes as a trailing subordinate
+clause on the shot sentence while `framing` composes a sentence whose subject
+is the performer's own name.
+
 ## Never refer to another shot (issue #61)
 
 Each chunk is rendered on its own, from its own prompt, by a model that has

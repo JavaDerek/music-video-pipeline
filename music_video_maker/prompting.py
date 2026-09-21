@@ -64,14 +64,22 @@ additive concatenation of, in order:
    what is supposed to read as a transcript. How multiple active characters
    are actually framed together is the shot line's job, already composed
    in part 3.
-6. **The literal lyric line** -- phrased for lip-sync/contextual meaning, or
+6. **Framing intent** (issue #97) -- ``ShotPlanEntry.framing``, an ordinal
+   from :data:`FRAMING_LEVELS`, composed as its own short sentence
+   immediately after part 5 and naming the same member(s). Nothing else in
+   the prompt says how large the face should be: ``camera`` (part 3) is free
+   text in a trailing subordinate clause, and #97 measured the word "close"
+   there delivering face fractions from 0.0000 to 0.3561 across 39 chunks
+   authored with it. ``None`` composes nothing, which is every chunk of
+   every run authored before this field existed.
+7. **The literal lyric line** -- phrased for lip-sync/contextual meaning, or
    an instrumental-passage clause when the chunk carries no lyric text.
    Grammatical number agrees with how many characters are active (singular
    "the character is..." for one, plural "the characters are..." for more
    than one) -- this is the only change multiple active characters make to
-   part 6, which otherwise stays exactly what it always was: the sole
+   part 7, which otherwise stays exactly what it always was: the sole
    authority on whether anyone is singing (see the rule below).
-7. **The avoid list** (issue #73) -- ``config.avoid`` is *not* composed
+8. **The avoid list** (issue #73) -- ``config.avoid`` is *not* composed
    into a prompt. It was for exactly one render, and it put a climbing
    harness on a character who had none. H3 has one prompt input and no
    negative-conditioning channel, so a prohibition can only add its own
@@ -130,6 +138,92 @@ instrumental chunks a viewer named (30, 66, 78) and check whether the mouth
 moves. Record the result here either way."""
 
 
+FRAMING_LEVELS: tuple[str, ...] = ("face", "close", "medium", "wide")
+"""``ShotPlanEntry.framing``'s closed, **ordinal** vocabulary (issue #97),
+tightest first. An ordinal, never a free-text phrase and never a number --
+the same choice ``lyric_literalness`` (#67) made, and for the reason #97
+measured: free text is what the existing ``camera`` field already is, and
+it does not control this.
+
+Issue #97's measurement: of 39 voiced "Deathless" chunks authored ``close``
+or ``medium close`` in ``camera``, the delivered largest-face fraction runs
+from **0.0000 to 0.3561**. Chunks 20 and 58 both say "close on her face" and
+render at 0.0120 and 0.0460. The camera word spans the entire range, so the
+authoring layer has no lever on delivered face size at all -- and #97's own
+finding is that face size, interacting with #79's leading vocal offset, is
+what decides whether a desync is *visible* (n=7, no overlap: the noticed
+group's faces are 0.0778-0.2101, the unnoticed group's 0.0120-0.0474).
+
+Why an ordinal with fixed clause text rather than a better ``camera``
+phrase: ``camera`` composes as a *trailing subordinate clause* on the shot
+sentence (:func:`_apply_camera_clause`), and
+``docs/deathless-render-corpus.md`` Part 4 tested "does the camera clause
+name the face" across all 41 voiced chunks and it came out **backwards**
+(named 50.8% face presence, not-named 59.8%). The mechanism that did measure
+is #74's: ``demeanour`` naming a mouth and eyes took three arms at identical
+seeds to 100/100/100% face presence against 83/0/33% for manner-only
+phrasing, and doubled face presence over the whole render -- because H3
+renders the nouns it is given, and a *sentence of its own* naming facial
+anatomy puts a camera on it. So this field composes like ``demeanour``
+(concrete nouns, its own sentence, adjacent to the member it qualifies), not
+like ``camera``.
+
+The ``wide`` level deliberately names no facial anatomy at all, for the
+mirror of the same reason -- see :data:`_FRAMING_CLAUSES`.
+
+**Unverified on pixels, deliberately.** That this composes correctly is not
+evidence H3 honours it; #89's ``voiced_by`` is the precedent (the mechanism
+ships, the claim does not). The A/B that would settle it is in issue #97's
+own thread: three chunks, identical seeds, one config line different."""
+
+_FRAMING_CLAUSES: dict[str, tuple[str, str]] = {
+    "face": (
+        "{who}'s face fills the frame, eyes and mouth large and sharp",
+        "{who}'s faces fill the frame, eyes and mouths large and sharp",
+    ),
+    "close": (
+        "{who} is framed head and shoulders, the face taking up most of the frame",
+        "{who} are framed head and shoulders, the faces taking up most of the frame",
+    ),
+    "medium": (
+        "{who} is framed from the waist up, the face clearly legible",
+        "{who} are framed from the waist up, the faces clearly legible",
+    ),
+    "wide": (
+        "{who} is a small figure far from camera in a wide frame",
+        "{who} are small figures far from camera in a wide frame",
+    ),
+}
+"""The clause each :data:`FRAMING_LEVELS` value composes, singular and plural.
+
+Three properties, each one a measured lesson rather than a style preference:
+
+* **Concrete nouns, naming the anatomy the tight levels want in frame**
+  ("eyes and mouth large and sharp") -- #74's measured mechanism, used on
+  purpose here instead of as the side effect it was when a ``demeanour``
+  string silently re-framed 80 authored landscape shots.
+* **``wide`` names no face, no eyes and no mouth.** Saying "the face too far
+  away to read" would name exactly the nouns the level exists to keep out of
+  frame, which is #73's finding (``avoid``'s climbing-gear clause rendered a
+  harness on a chunk with no climbing in it; ``MiniMaxH3ReferenceToVideo``
+  has one ``prompt`` input into a single ``BasicGuider``, so there is no
+  negative-conditioning channel for "not this" to land in). It says what IS
+  true -- a small figure, far from camera, a wide frame.
+* **An endpoint, never a displacement.** "Framed head and shoulders" is a
+  state; "tighter than the last shot" would be a displacement, and the
+  chained I2V path applies every per-chunk instruction to its own previous
+  output (#44/#46/#47). Asking what this does on its fifth chained
+  application: nothing accumulates, because each level names where the frame
+  IS, not how it should move. That is also why this clause is **not**
+  stripped on the chained variant, exactly like ``camera``, ``location`` and
+  ``conditions``: it is about the frame, not about identity.
+
+Short on purpose, too: the 2026-08-22 location-tag A/B measured that the arm
+which *replaced* a clause (79 -> 86 characters) beat the arm that *added* to
+it (79 -> 114) on every axis, a clause long enough to out-compete the shot
+line having replaced the shot outright."""
+
+
 class UnknownCastMemberError(ValueError):
     """Raised when a chunk names an active character absent from the cast dictionary.
 
@@ -162,6 +256,7 @@ def expand_prompt(
     subject: str | None = None,
     location: str | None = None,
     conditions: str | None = None,  # #83
+    framing: str | None = None,  # #97
 ) -> ExpandedPrompt:
     """Compose the deterministic Stage 2b prompt for one audio chunk.
 
@@ -239,6 +334,21 @@ def expand_prompt(
     byte-identically to before this parameter existed; unlike ``location``
     there is no whole-video fallback field it substitutes for.
 
+    ``framing`` (issue #97) is this chunk's authored framing intent, from
+    ``ShotPlanEntry.framing`` -- one of :data:`FRAMING_LEVELS`. It composes
+    as its own short sentence naming the focus member(s), immediately after
+    the character clause, and it is the only field in the prompt that says
+    anything about delivered face size: ``camera`` is free text composed as
+    a trailing subordinate clause, and #97 measured that the word "close"
+    there spans delivered face fractions from 0.0000 to 0.3561. ``None``
+    (the default -- every caller before this parameter existed, and every
+    chunk a plan never tagged) composes nothing at all, byte-identically to
+    before it existed; there is no whole-video fallback field for it to
+    substitute for and no fabricated default. Raises :class:`ValueError`
+    naming the vocabulary if it is not one of :data:`FRAMING_LEVELS` -- the
+    shot-plan loader is the primary gate, this is defence in depth for the
+    same reason :class:`SubjectOnVoicedChunkError` is.
+
     Passing the text in rather than looking it up keeps this module free of
     file I/O and keeps it a pure function of its arguments -- resolution
     (including the drift check) happens once, upstream, in ``cli``.
@@ -256,6 +366,7 @@ def expand_prompt(
         present=present_members,
         location=location,
         conditions=conditions,  # #83
+        framing=framing,  # #97
     )
     # Issue #46: the chained I2V path has no reference photo, so the seed
     # frame (the predecessor's own output) is already the output of the
@@ -276,6 +387,11 @@ def expand_prompt(
         present=present_members,
         location=location,
         conditions=conditions,  # #83
+        # Issue #97: framing is about the frame, not identity -- kept on the
+        # chained variant for the same reason camera/location/conditions are,
+        # and safe to repeat because every level states an endpoint rather
+        # than a displacement (see _FRAMING_CLAUSES).
+        framing=framing,  # #97
     )
 
     logger.debug(
@@ -477,6 +593,7 @@ def _compose_prompt(
     present: tuple[CastMember, ...] = (),
     location: str | None = None,
     conditions: str | None = None,  # #83
+    framing: str | None = None,  # #97
 ) -> str:
     character_clause = _character_clause(config, members, subject_is_focus, include_appearance)
     lyric_clause = _lyric_clause(chunk.text, len(members), singers=members if present else ())
@@ -494,6 +611,11 @@ def _compose_prompt(
         _setting_clause(config.setting, location),
         _conditions_clause(conditions),  # #83
         character_clause,
+        # Issue #97: immediately after the clause that names the focus
+        # member(s), because this sentence's subject IS one of those names --
+        # the same adjacency `demeanour` gets, which is the only framing
+        # lever this project has actually measured.
+        _framing_clause(members, framing),  # #97
         _present_clause(present, include_appearance),
         lyric_clause,
         *_counterpoint_clauses(chunk),
@@ -599,6 +721,56 @@ def _setting_clause(setting: str | None, location: str | None = None) -> str | N
         "action or add landmarks to establish it, this shot's own described location "
         "is what is on screen"
     )
+
+
+def _framing_clause(members: tuple[CastMember, ...], framing: str | None) -> str | None:  # #97
+    """Compose this chunk's authored framing intent (issue #97) as its own
+    short sentence, naming the focus member(s): e.g. ``"Dianne's face fills
+    the frame, eyes and mouth large and sharp"``.
+
+    The subject of this sentence is a cast member's *name*, not "the camera"
+    and not "the frame". That is the whole difference between this field and
+    ``camera``: :func:`_apply_camera_clause` deliberately keeps camera
+    direction out of the subject slot, and ``docs/deathless-render-corpus.md``
+    Part 4 measured that naming the face inside that trailing clause does not
+    predict face presence at all (it runs slightly backwards, 50.8% vs
+    59.8%, n=41). What did measure is #74: a sentence of its own, attached to
+    the member, naming eyes and a mouth, moved three chunks at identical
+    seeds to 100/100/100% face presence.
+
+    ``None``/blank/unknown-after-validation composes nothing -- never a
+    fabricated "medium" default. An unknown value raises rather than being
+    dropped: a typo'd ordinal that silently composed nothing would render the
+    wrong frame with nothing in the log to show for the direction that was
+    written, which is the rule ``subject``/``present`` already follow.
+    """
+    if not framing or not framing.strip():
+        return None
+    level = framing.strip().lower()
+    if level not in _FRAMING_CLAUSES:
+        raise ValueError(
+            f"framing={framing!r} is not one of {list(FRAMING_LEVELS)}; it is an ordinal "
+            "from a closed vocabulary, not free text (issue #97)"
+        )
+    singular, plural = _FRAMING_CLAUSES[level]
+    template = singular if len(members) == 1 else plural
+    return template.format(who=_join_names(tuple(member.name for member in members)))
+
+
+def _join_names(names: tuple[str, ...]) -> str:
+    """Join bare cast names for a clause whose grammar needs a plain list.
+
+    Not :func:`_join_member_list`: that one forces a serial comma even at two
+    items because each descriptor it joins already contains internal commas
+    from the member's role. These are bare names with no internal punctuation,
+    so "Dianne and Jan" is the correct reading and "Dianne, and Jan's faces"
+    is not.
+    """
+    if len(names) <= 1:
+        return names[0] if names else ""
+    if len(names) == 2:
+        return f"{names[0]} and {names[1]}"
+    return ", ".join(names[:-1]) + f" and {names[-1]}"
 
 
 def _conditions_clause(conditions: str | None) -> str | None:  # #83
