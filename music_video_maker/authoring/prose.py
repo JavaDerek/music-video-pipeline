@@ -64,7 +64,12 @@ from music_video_maker.authoring.prompts import (
 )
 from music_video_maker.config import RunConfig
 from music_video_maker.contracts import AudioChunk
-from music_video_maker.shot_plan import _content_words, _distant_staging_match, _singularish
+from music_video_maker.shot_plan import (
+    _content_words,
+    _distant_staging_match,
+    _singularish,
+    stageable_noun_stems,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -503,6 +508,103 @@ def pop_distant_staging_issues(
                     "staged this way loses the shot; a pop beat staged this way loses the "
                     "whole reason this beat is marked pop -- restage the object in the near "
                     "or mid ground, coming toward the lens, not behind or distant"
+                ),
+            )
+        )
+    return tuple(issues)
+
+
+def pop_object_named_in_shot_issues(
+    shots: Mapping[int, str], beats: Sequence[Beat]
+) -> tuple[ProseIssue, ...]:
+    """Warn when a pop beat's own shot line never names its ``pop_object``
+    (issue #68, the step-3 lint -- the structural half of it).
+
+    **``pop_object`` reaches no prompt.** ``plan.render_plan_toml`` writes it
+    into the ``# beat:`` comment line beside ``act``, exactly like ``act``,
+    and the render composes neither. So the *only* channel by which the
+    object a pop beat exists for can reach H3 is the shot line itself. A beat
+    marked ``pop_object = "the needle"`` whose line never says "needle" is
+    marked for an object the render is never told about: the beat's plant
+    still pays for it in the beat sheet, ``camera`` is still composed toward
+    it by ``PHOTOGRAPHY_PREAMBLE``, and nothing pops. That is issue #55's own
+    general form one level down -- a stage's output with nowhere to land is
+    silently discarded -- and it needs **no vocabulary at all** to detect,
+    which is why it is the one pop check that could ship at n=3.
+
+    **Why this and not a keyword lint.** The corpus is
+    ``docs/pop-beat-corpus.md``: three rendered pop lines (2026-09-20), which
+    is barely a corpus and a third of what ``docs/idiom-corpus.md`` sets as
+    the bar for a *keyword* list. Every "toward the lens" candidate still
+    scores zero on the only 80-line corpus with per-chunk outcomes, so no
+    vocabulary may ship (#60, #76). This check has no vocabulary to be wrong
+    about: correct authoring names the object, incorrect authoring does not
+    -- the same shape ``worldstate.check_location_tags`` (#78) uses to fire
+    on 2 of 80 with no word list.
+
+    **What it can and cannot claim at n=3.** All three rendered pop lines
+    name their object, so this fires on **0 of 3** known-good lines -- the
+    false-positive half is measured, at n=3. The true-positive half is
+    **not**: no authored pop beat has ever been observed omitting its own
+    object, because only three have ever been authored and all three were
+    hand-written by the person who set the field. Re-score it when a
+    *generated* plan carries pop beats; that is the arm this corpus is
+    missing.
+
+    **Matching, and the case it declines.** Both sides go through
+    :func:`~music_video_maker.shot_plan.stageable_noun_stems` -- the same
+    normalisation ``lint_shots_against_lyrics`` uses, never a second copy of
+    it -- and the check fires only when **none** of the object's stems
+    appears, never on a partial match: "mushroom cap" staged as "the mushroom
+    cloud's cap" and as "the mushroom" are both authored, and a rule that
+    demanded every word would fire on the second. A ``pop_object`` whose
+    words are all stopwords or shorter than the lint's minimum ("the axe",
+    "an urn") normalises to no stems at all; that beat is **unexaminable**,
+    not passing, and says so in the log rather than returning a silent zero
+    (#93: "a zero from a detector is not evidence of absence unless something
+    asked the second question").
+
+    Warning tier and ``revisable=True`` like the rest of this module: naming
+    the object again is exactly what a prose rewrite can do, and a false
+    positive -- a line that stages the object under a synonym the field did
+    not use -- must never block a run.
+
+    Pure and a function of the text alone, exactly like
+    :func:`pop_distant_staging_issues`, and recomputed per round for the same
+    reason: shot lines move under a revision round.
+    """
+    issues: list[ProseIssue] = []
+    for beat in sorted(beats, key=lambda b: b.start):
+        if beat.pop_object is None:
+            continue
+        shot = shots.get(beat.chunk_id)
+        if not shot:
+            continue
+        wanted = stageable_noun_stems([beat.pop_object])
+        if not wanted:
+            logger.info(
+                "chunk_id=%d: pop_object %r has no word this lint can match on (every "
+                "word is a stopword or shorter than the minimum), so whether its shot "
+                "line names it is UNEXAMINED here, not confirmed -- check it by eye",
+                beat.chunk_id,
+                beat.pop_object,
+            )
+            continue
+        if wanted & stageable_noun_stems([shot]):
+            continue
+        issues.append(
+            ProseIssue(
+                chunk_id=beat.chunk_id,
+                severity="warning",
+                message=(
+                    f"chunk_id={beat.chunk_id} is a pop beat for {beat.pop_object!r} but "
+                    "its shot line never names that object. `pop_object` is composed "
+                    "into no prompt -- it rides in the plan's `# beat:` comment like "
+                    "`act` -- so the shot line is the only channel by which the object "
+                    "this beat exists for can reach the render (issue #68). Name it in "
+                    "the line, near and coming toward the lens. This is advisory and may "
+                    "be a false positive if the line stages the same object under a "
+                    "different noun"
                 ),
             )
         )
@@ -974,6 +1076,7 @@ __all__ = [
     "generate_prose",
     "plant_end_state_issues",
     "pop_distant_staging_issues",
+    "pop_object_named_in_shot_issues",
     "prose_input_hashes",
     "revise_prose",
     "validate_prose",

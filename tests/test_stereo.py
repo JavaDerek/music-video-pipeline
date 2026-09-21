@@ -1,0 +1,533 @@
+"""Tests for the stereoscopic conversion scaffold (issue #68).
+
+**The sign test is the reason this module exists.** `docs/design-stereoscopic-3d.md`:
+"Getting the sign backwards produces a headache, not an error. Any code that
+warps must name the convention in its docstring and assert it in a test with a
+synthetic depth ramp, because there is no runtime symptom to catch it." So the
+first test below builds a near square on a far background and asserts the
+left-eye image of it lands to the RIGHT -- crossed (negative) parallax, the
+thing that reads as in front of the screen.
+
+Everything here runs on frames a handful of pixels across, with ffmpeg
+replaced by fake runners and depth injected. Nothing in this file has ever
+touched a rendered chunk, and neither has the module it tests.
+"""
+
+from __future__ import annotations
+
+import subprocess
+from fractions import Fraction
+
+import pytest
+
+from music_video_maker import stereo
+
+BLACK = (0, 0, 0)
+WHITE = (255, 255, 255)
+
+
+def _frame(rows: list[list[tuple[int, int, int]]]) -> stereo.Frame:
+    height = len(rows)
+    width = len(rows[0])
+    pixels = bytes(channel for row in rows for px in row for channel in px)
+    return stereo.Frame(width=width, height=height, pixels=pixels)
+
+
+def _depth(rows: list[list[float]]) -> stereo.DepthMap:
+    return stereo.DepthMap(
+        width=len(rows[0]), height=len(rows), values=[v for row in rows for v in row]
+    )
+
+
+def _white_columns(frame: stereo.Frame, y: int = 0) -> list[int]:
+    """Which columns of row ``y`` are white -- how this file locates an object
+    after a warp without needing numpy."""
+    return [
+        x
+        for x in range(frame.width)
+        if frame.pixels[(y * frame.width + x) * 3] > 127
+    ]
+
+
+def _centroid(columns: list[int]) -> float:
+    return sum(columns) / len(columns)
+
+
+# --------------------------------------------------------------------------- #
+# THE SIGN. Everything else in this file is bookkeeping.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_near_object_puts_the_left_eye_image_to_the_right():
+    """Negative (crossed) parallax: the left-eye image of an object in front
+    of the screen plane sits to the RIGHT of the right-eye image. Get this
+    backwards and the only symptom is a headache."""
+    width = 41
+    row = [WHITE if 18 <= x <= 22 else BLACK for x in range(width)]
+    depth_row = [1.0 if 18 <= x <= 22 else 0.0 for x in range(width)]
+    frame = _frame([row])
+    depth = _depth([depth_row])
+    # convergence at the far plane, so the square is unambiguously in front
+    # of it; a large ceiling so the shift is several whole pixels.
+    params = stereo.StereoParams(convergence=0.0, max_disparity_fraction=0.1)
+
+    left, right = stereo.stereo_pair(frame, depth, params=params)
+
+    original = _centroid(_white_columns(frame))
+    left_centroid = _centroid(_white_columns(left))
+    right_centroid = _centroid(_white_columns(right))
+
+    assert left_centroid > original > right_centroid
+    assert left_centroid > right_centroid
+
+
+def test_a_far_object_puts_the_left_eye_image_to_the_left():
+    """The mirror: positive (uncrossed) parallax, behind the screen plane,
+    where most of a comfortable frame should live."""
+    width = 41
+    row = [WHITE if 18 <= x <= 22 else BLACK for x in range(width)]
+    depth_row = [0.0 if 18 <= x <= 22 else 1.0 for x in range(width)]
+    frame = _frame([row])
+    depth = _depth([depth_row])
+    params = stereo.StereoParams(convergence=1.0, max_disparity_fraction=0.1)
+
+    left, right = stereo.stereo_pair(frame, depth, params=params)
+
+    assert _centroid(_white_columns(left)) < _centroid(_white_columns(right))
+
+
+def test_the_convergence_plane_has_no_disparity():
+    """Exactly at the convergence plane an object sits on the screen and both
+    eyes agree -- the definition of the knob."""
+    width = 21
+    frame = _frame([[WHITE if x == 10 else BLACK for x in range(width)]])
+    depth = _depth([[0.5] * width])
+    params = stereo.StereoParams(convergence=0.5, max_disparity_fraction=0.1)
+
+    left, right = stereo.stereo_pair(frame, depth, params=params)
+
+    assert left.pixels == right.pixels == frame.pixels
+
+
+def test_half_disparity_is_signed_by_nearness_not_by_eye():
+    params = stereo.StereoParams(convergence=0.5, max_disparity_fraction=0.01)
+
+    near = stereo.half_disparity_pixels(1.0, params=params, width=800)
+    far = stereo.half_disparity_pixels(0.0, params=params, width=800)
+    at_plane = stereo.half_disparity_pixels(0.5, params=params, width=800)
+
+    assert near == pytest.approx(4.0)
+    assert far == pytest.approx(-4.0)
+    assert at_plane == pytest.approx(0.0)
+
+
+def test_depth_values_outside_the_range_are_clamped_not_rejected():
+    """A model emitting 1.0000001 is not a reason to abandon a chunk."""
+    params = stereo.StereoParams(convergence=0.0, max_disparity_fraction=0.01)
+
+    assert stereo.half_disparity_pixels(5.0, params=params, width=100) == pytest.approx(
+        stereo.half_disparity_pixels(1.0, params=params, width=100)
+    )
+    assert stereo.half_disparity_pixels(-5.0, params=params, width=100) == pytest.approx(
+        stereo.half_disparity_pixels(0.0, params=params, width=100)
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Occlusion, holes, and the naive fill
+# --------------------------------------------------------------------------- #
+
+
+def test_the_nearer_pixel_wins_a_collision():
+    """Two source pixels landing on one destination: the near one is in
+    front, so it is the one that survives."""
+    width = 11
+    frame = _frame([[(255, 0, 0) if x == 4 else (0, 0, 255) for x in range(width)]])
+    # The red pixel is near (moves right); its right-hand neighbour is at the
+    # convergence plane and does not move, so they collide on column 5.
+    depth = _depth([[1.0 if x == 4 else 0.5 for x in range(width)]])
+    params = stereo.StereoParams(convergence=0.5, max_disparity_fraction=0.1)
+
+    left, _ = stereo.stereo_pair(frame, depth, params=params)
+
+    assert left.pixels[5 * 3 : 5 * 3 + 3] == bytes((255, 0, 0))
+
+
+def test_a_disocclusion_is_filled_from_the_nearest_written_pixel():
+    """Naive by design and named as such: a real conversion inpaints. What is
+    asserted here is only that no hole is left black when the row has
+    neighbours to copy."""
+    width = 21
+    frame = _frame([[WHITE if x >= 10 else BLACK for x in range(width)]])
+    depth = _depth([[1.0 if x >= 10 else 0.0 for x in range(width)]])
+    params = stereo.StereoParams(convergence=0.0, max_disparity_fraction=0.08)
+
+    left, _ = stereo.stereo_pair(frame, depth, params=params)
+
+    # Every destination pixel got a value from somewhere (nothing left at the
+    # zero-initialised black except where the source itself was black).
+    assert set(_white_columns(left))
+
+
+def test_a_row_with_no_holes_is_left_alone():
+    """The fill has to be a no-op when the warp opened nothing -- a 4 px
+    frame at the default ceiling shifts by less than half a pixel, so every
+    destination is written and there is nothing to copy."""
+    frame = _frame([[WHITE, BLACK, WHITE, BLACK]])
+    depth = _depth([[1.0] * 4])
+
+    left = stereo.warp_eye(
+        frame,
+        depth,
+        eye="left",
+        params=stereo.StereoParams(convergence=0.0, max_disparity_fraction=0.1),
+    )
+
+    assert left.pixels == frame.pixels
+
+
+def test_an_entirely_empty_row_is_left_black(monkeypatch):
+    """The real out-of-frame case, forced: every pixel shifts past the right
+    edge, so the row receives nothing and the fill declines to invent."""
+    monkeypatch.setattr(stereo, "half_disparity_pixels", lambda *a, **k: 1000.0)
+    frame = _frame([[WHITE] * 5])
+    depth = _depth([[1.0] * 5])
+
+    left = stereo.warp_eye(frame, depth, eye="left", params=stereo.StereoParams())
+
+    assert left.pixels == bytes(len(frame.pixels))
+
+
+# --------------------------------------------------------------------------- #
+# Output formats
+# --------------------------------------------------------------------------- #
+
+
+def test_side_by_side_doubles_the_width_and_keeps_the_eyes_in_order():
+    left = _frame([[WHITE, BLACK]])
+    right = _frame([[BLACK, WHITE]])
+
+    out = stereo.side_by_side(left, right)
+
+    assert (out.width, out.height) == (4, 1)
+    assert _white_columns(out) == [0, 3]
+
+
+def test_anaglyph_takes_red_from_the_left_eye_and_cyan_from_the_right():
+    left = _frame([[(200, 10, 10)]])
+    right = _frame([[(10, 200, 200)]])
+
+    out = stereo.anaglyph(left, right)
+
+    assert out.pixels == bytes((200, 200, 200))
+    assert (out.width, out.height) == (1, 1)
+
+
+def test_compose_dispatches_on_the_format_name():
+    left = _frame([[WHITE]])
+    right = _frame([[BLACK]])
+
+    assert stereo.compose(left, right, stereo.FORMAT_SIDE_BY_SIDE).width == 2
+    assert stereo.compose(left, right, stereo.FORMAT_ANAGLYPH).width == 1
+    with pytest.raises(stereo.StereoError, match="unknown output format"):
+        stereo.compose(left, right, "over-under")
+
+
+def test_the_two_formats_refuse_mismatched_eyes():
+    with pytest.raises(stereo.StereoError):
+        stereo.side_by_side(_frame([[WHITE]]), _frame([[WHITE, BLACK]]))
+    with pytest.raises(stereo.StereoError):
+        stereo.anaglyph(_frame([[WHITE]]), _frame([[WHITE, BLACK]]))
+
+
+# --------------------------------------------------------------------------- #
+# Validation
+# --------------------------------------------------------------------------- #
+
+
+def test_a_frame_buffer_of_the_wrong_length_is_refused():
+    with pytest.raises(stereo.StereoError, match="frame buffer"):
+        stereo.Frame(width=2, height=2, pixels=b"\x00")
+    with pytest.raises(stereo.StereoError, match="dimensions must be positive"):
+        stereo.Frame(width=0, height=2, pixels=b"")
+
+
+def test_a_depth_map_of_the_wrong_length_is_refused():
+    with pytest.raises(stereo.StereoError, match="depth map has"):
+        stereo.DepthMap(width=2, height=2, values=[0.0])
+
+
+def test_a_depth_map_that_does_not_match_its_frame_is_refused():
+    with pytest.raises(stereo.StereoError, match="same size as the frame"):
+        stereo.warp_eye(
+            _frame([[WHITE, BLACK]]),
+            _depth([[1.0]]),
+            eye="left",
+            params=stereo.StereoParams(),
+        )
+
+
+def test_an_unknown_eye_is_refused():
+    with pytest.raises(stereo.StereoError, match="eye must be"):
+        stereo.warp_eye(
+            _frame([[WHITE]]), _depth([[1.0]]), eye="middle", params=stereo.StereoParams()
+        )
+
+
+def test_stereo_params_refuse_settings_outside_their_units():
+    with pytest.raises(stereo.StereoError, match="normalised inverse-depth"):
+        stereo.StereoParams(convergence=1.5)
+    with pytest.raises(stereo.StereoError, match="headache"):
+        stereo.StereoParams(max_disparity_fraction=0.5)
+
+
+def test_the_depth_model_note_records_a_licence_and_no_weights():
+    """CLAUDE.md: check redistribution before committing a third-party
+    binary, and "it downloaded fine" is not a licence. The Base/Large trap is
+    named because it is the mistake available to make."""
+    note = stereo.DEPTH_ANYTHING_V2_SMALL
+
+    assert note["committed"] is False
+    assert note["sha256"] is None
+    assert "Apache-2.0" in note["licence"]
+    assert "CC-BY-NC" in note["licence"]
+
+
+# --------------------------------------------------------------------------- #
+# The ffmpeg seam -- argv is asserted, no process is ever spawned
+# --------------------------------------------------------------------------- #
+
+
+def _completed(stdout: bytes = b"", returncode: int = 0) -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(args=["ffmpeg"], returncode=returncode, stdout=stdout)
+
+
+def test_probe_parses_width_height_and_an_exact_frame_rate():
+    info = stereo.probe_video("chunk.mp4", runner=lambda args: _completed(b"864,480,24/1\n"))
+
+    assert info == stereo.VideoInfo(width=864, height=480, fps=Fraction(24, 1))
+
+
+def test_probe_keeps_ntsc_rates_exact():
+    """23.976023976 is a different stream parameter from 24000/1001, and the
+    concat demuxer compares stream parameters."""
+    info = stereo.probe_video("c.mp4", runner=lambda args: _completed(b"864,480,24000/1001"))
+
+    assert info.fps == Fraction(24000, 1001)
+
+
+def test_probe_failures_raise_rather_than_degrade():
+    with pytest.raises(stereo.StereoError, match="ffprobe failed"):
+        stereo.probe_video("c.mp4", runner=lambda args: _completed(b"", returncode=1))
+    with pytest.raises(stereo.StereoError, match="could not parse"):
+        stereo.probe_video("c.mp4", runner=lambda args: _completed(b"864,480"))
+    with pytest.raises(stereo.StereoError, match="could not parse"):
+        stereo.probe_video("c.mp4", runner=lambda args: _completed(b"wide,tall,fast"))
+
+    def explode(args):
+        raise OSError("ffprobe not on PATH")
+
+    with pytest.raises(stereo.StereoError, match="could not run ffprobe"):
+        stereo.probe_video("c.mp4", runner=explode)
+
+
+def test_decode_splits_the_raw_stream_into_frames():
+    info = stereo.VideoInfo(width=2, height=1, fps=Fraction(24, 1))
+    raw = bytes(range(12))  # two 2x1 rgb24 frames
+
+    frames = stereo.decode_frames("c.mp4", info, runner=lambda args: _completed(raw))
+
+    assert [f.pixels for f in frames] == [raw[:6], raw[6:]]
+
+
+def test_decode_drops_a_trailing_partial_frame_with_a_warning(caplog):
+    info = stereo.VideoInfo(width=2, height=1, fps=Fraction(24, 1))
+
+    with caplog.at_level("WARNING"):
+        frames = stereo.decode_frames(
+            "c.mp4", info, runner=lambda args: _completed(bytes(9))
+        )
+
+    assert len(frames) == 1
+    assert "trailing bytes" in caplog.text
+
+
+def test_decode_failures_raise():
+    info = stereo.VideoInfo(width=2, height=1, fps=Fraction(24, 1))
+    with pytest.raises(stereo.StereoError, match="ffmpeg failed decoding"):
+        stereo.decode_frames("c.mp4", info, runner=lambda args: _completed(b"", returncode=1))
+    with pytest.raises(stereo.StereoError, match="no whole frames"):
+        stereo.decode_frames("c.mp4", info, runner=lambda args: _completed(b""))
+
+    def explode(args):
+        raise OSError("no ffmpeg")
+
+    with pytest.raises(stereo.StereoError, match="could not run ffmpeg to decode"):
+        stereo.decode_frames("c.mp4", info, runner=explode)
+
+
+def test_encode_passes_every_frame_down_one_pipe_and_names_the_size():
+    seen = {}
+
+    def runner(args, payload):
+        seen["args"] = list(args)
+        seen["payload"] = payload
+        return _completed()
+
+    frames = [_frame([[WHITE, BLACK]]), _frame([[BLACK, WHITE]])]
+    stereo.encode_frames(frames, "out.mp4", fps=Fraction(24, 1), runner=runner)
+
+    assert "2x1" in seen["args"]
+    assert "24" in seen["args"]
+    assert seen["payload"] == frames[0].pixels + frames[1].pixels
+    assert "-an" in seen["args"]  # generated audio is never carried anywhere
+
+
+def test_encode_refuses_an_empty_or_ragged_sequence():
+    with pytest.raises(stereo.StereoError, match="no frames"):
+        stereo.encode_frames([], "out.mp4", fps=Fraction(24, 1), runner=lambda a, p: _completed())
+    with pytest.raises(stereo.StereoError, match="same size"):
+        stereo.encode_frames(
+            [_frame([[WHITE]]), _frame([[WHITE, BLACK]])],
+            "out.mp4",
+            fps=Fraction(24, 1),
+            runner=lambda a, p: _completed(),
+        )
+
+
+def test_encode_failures_raise():
+    with pytest.raises(stereo.StereoError, match="ffmpeg failed encoding"):
+        stereo.encode_frames(
+            [_frame([[WHITE]])],
+            "out.mp4",
+            fps=Fraction(24, 1),
+            runner=lambda a, p: _completed(returncode=1),
+        )
+
+    def explode(args, payload):
+        raise OSError("no ffmpeg")
+
+    with pytest.raises(stereo.StereoError, match="could not run ffmpeg to encode"):
+        stereo.encode_frames([_frame([[WHITE]])], "out.mp4", fps=Fraction(24, 1), runner=explode)
+
+
+def test_the_argv_builders_are_pure():
+    assert stereo.build_probe_args("a.mp4")[0] == "ffprobe"
+    assert "rgb24" in stereo.build_decode_args("a.mp4")
+    args = stereo.build_encode_args("b.mp4", width=8, height=4, fps=Fraction(24, 1))
+    assert "8x4" in args and "libx264" in args and "yuv420p" in args
+
+
+# --------------------------------------------------------------------------- #
+# The external depth command (the production seam, never run for real)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_external_depth_source_reads_gray16le_back_as_normalised_depth():
+    frame = _frame([[WHITE, BLACK]])
+    payload = (0).to_bytes(2, "little") + (65535).to_bytes(2, "little")
+    source = stereo.external_depth_source(["depth"], runner=lambda a, p: _completed(payload))
+
+    depth = source(0, frame)
+
+    assert list(depth.values) == pytest.approx([0.0, 1.0])
+    assert (depth.width, depth.height) == (2, 1)
+
+
+def test_the_external_depth_source_refuses_a_short_reply():
+    frame = _frame([[WHITE, BLACK]])
+    source = stereo.external_depth_source(["depth"], runner=lambda a, p: _completed(b"\x00\x00"))
+
+    with pytest.raises(stereo.StereoError, match="returned 2 bytes"):
+        source(0, frame)
+
+
+def test_the_external_depth_source_reports_which_frame_failed():
+    frame = _frame([[WHITE]])
+    nonzero = stereo.external_depth_source(["d"], runner=lambda a, p: _completed(returncode=3))
+    with pytest.raises(stereo.StereoError, match="exited 3 on frame 7"):
+        nonzero(7, frame)
+
+    def explode(args, payload):
+        raise OSError("no such command")
+
+    with pytest.raises(stereo.StereoError, match="failed on frame 2"):
+        stereo.external_depth_source(["d"], runner=explode)(2, frame)
+
+
+# --------------------------------------------------------------------------- #
+# The orchestrator
+# --------------------------------------------------------------------------- #
+
+
+def test_convert_chunk_probes_decodes_warps_and_encodes(tmp_path):
+    raw = bytes([255, 255, 255, 0, 0, 0] * 2)  # two 2x1 frames
+    calls = []
+
+    def runner(args):
+        calls.append(args[0])
+        if args[0] == "ffprobe":
+            return _completed(b"2,1,24/1")
+        return _completed(raw)
+
+    encoded = {}
+
+    def pipe_runner(args, payload):
+        encoded["args"] = list(args)
+        encoded["payload"] = payload
+        return _completed()
+
+    seen_indices = []
+
+    def depth(index, frame):
+        seen_indices.append(index)
+        return stereo.DepthMap(width=frame.width, height=frame.height, values=[0.5, 0.5])
+
+    out = stereo.convert_chunk(
+        "chunk_0045.mp4",
+        tmp_path / "chunk_0045_sbs.mp4",
+        depth,
+        runner=runner,
+        pipe_runner=pipe_runner,
+    )
+
+    assert calls == ["ffprobe", "ffmpeg"]
+    assert seen_indices == [0, 1]
+    assert out == tmp_path / "chunk_0045_sbs.mp4"
+    # side-by-side, so each 2x1 frame became 4x1: 4*1*3 bytes * 2 frames.
+    assert "4x1" in encoded["args"]
+    assert len(encoded["payload"]) == 4 * 1 * 3 * 2
+
+
+def test_convert_chunk_can_emit_an_anaglyph_review_artifact(tmp_path):
+    raw = bytes([255, 255, 255, 0, 0, 0])
+
+    def runner(args):
+        return _completed(b"2,1,24/1") if args[0] == "ffprobe" else _completed(raw)
+
+    encoded = {}
+
+    def pipe_runner(args, payload):
+        encoded["args"] = list(args)
+        return _completed()
+
+    stereo.convert_chunk(
+        "c.mp4",
+        tmp_path / "c_anaglyph.mp4",
+        lambda i, f: stereo.DepthMap(width=f.width, height=f.height, values=[0.5, 0.5]),
+        output_format=stereo.FORMAT_ANAGLYPH,
+        runner=runner,
+        pipe_runner=pipe_runner,
+    )
+
+    assert "2x1" in encoded["args"]  # anaglyph keeps the original width
+
+
+def test_convert_chunk_refuses_an_unknown_format_before_spawning_anything(tmp_path):
+    def runner(args):  # pragma: no cover - must never be reached
+        raise AssertionError("no process should be spawned for a bad format")
+
+    with pytest.raises(stereo.StereoError, match="unknown output format"):
+        stereo.convert_chunk(
+            "c.mp4", tmp_path / "o.mp4", lambda i, f: None, output_format="mvhevc", runner=runner
+        )
