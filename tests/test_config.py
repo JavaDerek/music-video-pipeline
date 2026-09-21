@@ -1546,6 +1546,28 @@ def test_run_state_file_is_resolved_against_the_config_directory(tmp_path: Path)
     assert cfg.run_state_file == tmp_path / "state" / "run.json"
 
 
+def test_prepare_report_file_defaults_under_chunks_dir(tmp_path: Path) -> None:
+    """Issue #36: --prepare writes it and mvm-webui reads it, so both take
+    the path from this one resolution rather than deriving it twice."""
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path)
+
+    cfg = load_config(config_path)
+
+    assert cfg.prepare_report_file == cfg.chunks_dir / "prepare_report.json"
+
+
+def test_prepare_report_file_is_resolved_against_the_config_directory(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(
+        tmp_path, extra_toml='prepare_report_file = "reports/prepare.json"'
+    )
+
+    cfg = load_config(config_path)
+
+    assert cfg.prepare_report_file == tmp_path / "reports" / "prepare.json"
+
+
 def test_wave3_knobs_are_read_from_the_file(tmp_path: Path) -> None:
     _create_default_assets(tmp_path)
     config_path = _write_config(
