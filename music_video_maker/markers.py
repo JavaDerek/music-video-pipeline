@@ -72,6 +72,7 @@ be strictly ordered, tile with no gap or overlap, and end exactly at
 from __future__ import annotations
 
 import csv
+import io
 import logging
 import math
 import re
@@ -123,11 +124,22 @@ class MarkerTrack:
 class MarkerSource(Protocol):
     """Anything that can produce a :class:`MarkerTrack`.
 
-    ``MarkerCsvSource`` is the one implementation today. This is the named
-    place an Ableton (or Logic, or Cubase) locator reader lands once issue
-    #22's step 1 confirms what the band actually exports -- deliberately a
-    ``Protocol`` and not a stub class that raises ``NotImplementedError``,
-    because there is nothing to stub until that is known.
+    ``MarkerCsvSource`` is one implementation;
+    :class:`~music_video_maker.ableton.AbletonLocatorSource` (issue #22 step
+    1, 2026-09-21) is the other, and it reads a Live set's Locators.
+
+    Note what that reader can and cannot claim: it is written against
+    Ableton's *documented* on-disk shape and has never been given a real
+    ``.als``, because step 1's own questions -- is it Ableton, which major
+    version, are the sections in Locators at all -- are still unanswered.
+    Deliberately a ``Protocol`` rather than a base class, so a Logic or
+    Cubase reader lands here without inheriting anything, and so this module
+    stays free of every DAW's format.
+
+    The CSV remains the *contract*: a DAW reader is a producer of it (see
+    :func:`format_marker_csv`), not a way around it. That is what lets an
+    operator read, diff and correct what a reader extracted before a show
+    depends on it.
     """
 
     def read(self) -> MarkerTrack: ...
@@ -376,3 +388,31 @@ def to_alignment_result(
         for section in sections
     )
     return AlignmentResult(segments=segments, track_duration=track_duration)
+
+
+def format_marker_csv(track: MarkerTrack, *, provenance: str | None = None) -> str:
+    """Render a :class:`MarkerTrack` back out as the CSV this module reads.
+
+    Issue #22's own framing is that the labelled-marker CSV is the *input
+    contract* and a DAW reader is one **producer** of it. This is what makes
+    that true in practice rather than in a docstring: a reader that can only
+    hand a ``MarkerTrack`` to the next function in the same process leaves an
+    operator nothing to check, and the one thing everybody agrees about this
+    feature is that nobody has yet confirmed what the band's markers actually
+    are (step 1). A CSV can be read, diffed, corrected by hand and committed
+    beside the run config; an in-memory object cannot.
+
+    ``provenance`` is written as a leading ``#`` comment -- the reader skips
+    comments precisely so a file can carry where it came from. A label
+    containing a comma is quoted by :mod:`csv`, and the reader rejoins the
+    remaining fields, so a round trip is exact.
+    """
+    buffer = io.StringIO()
+    if provenance:
+        for line in provenance.splitlines():
+            buffer.write(f"# {line}\n")
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(["time", "label"])
+    for marker in track.markers:
+        writer.writerow([f"{marker.time:.3f}", marker.label])
+    return buffer.getvalue()
