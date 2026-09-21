@@ -339,6 +339,7 @@ def _serialize_fingerprint(fingerprint: ChunkFingerprint) -> dict[str, Any]:
     return {
         "start": fingerprint.start,
         "end": fingerprint.end,
+        "timeline": fingerprint.timeline,
         "frame_count": fingerprint.frame_count,
         "render_width": fingerprint.render_width,
         "render_height": fingerprint.render_height,
@@ -365,6 +366,12 @@ def _deserialize_fingerprint(raw: dict[str, Any] | None) -> ChunkFingerprint | N
     return ChunkFingerprint(
         start=float(raw["start"]),
         end=float(raw["end"]),
+        # Absent in a file written before issue #66: None = the song, which is
+        # also what a song chunk records today -- so an old file and a
+        # segment-free run compare equal and neither re-renders. That exact
+        # coincidence is why this field needed no schema_version bump; see
+        # RUN_STATE_SCHEMA_VERSION for the general rule.
+        timeline=raw.get("timeline"),
         frame_count=raw.get("frame_count"),
         render_width=raw.get("render_width"),
         render_height=raw.get("render_height"),
