@@ -1575,6 +1575,47 @@ def test_run_pipeline_passes_the_resolved_conditions_into_expand_prompt(
     assert len(calls) == 3
 
 
+def test_run_pipeline_passes_the_resolved_framing_into_expand_prompt(
+    tmp_path: Path, monkeypatch
+):
+    """`resolve_framing(plan, chunk)` must reach `expand_prompt`'s `framing=`
+    kwarg (issue #97), mirroring the `conditions` spy test above. A field
+    that resolves correctly and never reaches the prompt is exactly #55's
+    defect -- 631 characters of approved cinematography that appeared in no
+    render log -- so the wiring gets its own test rather than being implied
+    by the unit tests either side of it."""
+    rig = Rig(
+        tmp_path,
+        segment_specs=[("walking through the empty halls tonight", 10.0, 16.0)],
+        instrumental_coverage=True,
+    )
+    plan_path = tmp_path / "shot_plan.toml"
+    plan_path.write_text(
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\n'
+        'shot = "Ash settles over the split mill wheel."\n'
+        'framing = "close"\n'
+    )
+    rig.config = replace(rig.config, shot_plan=plan_path)
+
+    calls: dict[int, object] = {}
+    real_expand = cli.expand_prompt
+
+    def spy(config, chunk, **kwargs):
+        calls[chunk.chunk_id] = kwargs.get("framing")
+        return real_expand(config, chunk, **kwargs)
+
+    monkeypatch.setattr(cli, "expand_prompt", spy)
+    sequences = [build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)]
+
+    rig.run(sequences)
+
+    assert calls[0] == "close"
+    # Every other chunk (nothing authored for it) must resolve to None, not
+    # inherit chunk 0's framing.
+    assert all(framing is None for cid, framing in calls.items() if cid != 0)
+    assert len(calls) == 3
+
+
 # --------------------------------------------------------------------------- #
 # Issue #28: chain scope wiring
 # --------------------------------------------------------------------------- #
