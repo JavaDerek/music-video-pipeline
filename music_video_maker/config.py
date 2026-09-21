@@ -39,6 +39,7 @@ against the *config file's* directory, not the process cwd)::
     i2v_continuity           = false     # issue #12
     i2v_workflow_template    = "workflow_i2v_api.json"          # issue #12
     resume_ignore_prompt_changes = false # issue #34; --ignore-prompt-changes overrides
+    resume_require_same_stack = false    # issue #95; re-render chunks from another ComfyUI/torch
 
     strict_alignment         = false     # issue #35; --strict-alignment overrides
 
@@ -715,6 +716,28 @@ class RunConfig:
     render resolution moved is re-rendered regardless -- that is a desync (or,
     for resolution, a concat that Stage 5 cannot copy), not a cosmetic
     difference, and no flag makes it reusable."""
+
+    resume_require_same_stack: bool = False
+    """Issue #95: on ``--resume``, re-render a cached chunk that a *different*
+    ComfyUI/torch build produced.
+
+    Off by default, and that default is the finding rather than a convenience.
+    Measured 2026-09-20: three "Deathless" chunks re-rendered after the
+    0.30.2/2.13.0 -> 0.35.1/2.14.0 upgrade, same config and same seeds,
+    matched on every fingerprint field and on zero decoded frames (mean
+    absolute pixel difference 3.99 / 5.43 / 22.27 of 255). So the mixing is
+    real -- but the only way to un-mix it is to re-render the whole video,
+    because the old ComfyUI is gone, and at ~3.7 min/chunk that is five hours
+    across an 80-chunk song to remove a difference nobody may be able to see.
+    A run does not get to spend that on the operator's behalf, so by default
+    the run *reports* the split (``ResilientRunner`` names each stack and its
+    chunk count when the run ends) and reuses the chunks.
+
+    Turn it on for a keeper render where the video must come from one build
+    throughout. A chunk whose stack was never recorded -- every chunk in a
+    pre-#95 state file -- is *unknown*, not different, and this flag never
+    re-renders it: refusing a chunk for a stack nobody wrote down would
+    re-render whole songs over no evidence at all."""
 
     silent_output: bool = False
     """Issue #22: assemble a final video with **no audio stream at all**.
@@ -1698,6 +1721,7 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
     )
     values["i2v_continuity"] = _flag(merged, "i2v_continuity", False)
     values["resume_ignore_prompt_changes"] = _flag(merged, "resume_ignore_prompt_changes", False)
+    values["resume_require_same_stack"] = _flag(merged, "resume_require_same_stack", False)
     values["strict_alignment"] = _flag(merged, "strict_alignment", False)
 
     model_size = merged.get("alignment_model_size", DEFAULT_ALIGNMENT_MODEL_SIZE)

@@ -25,7 +25,7 @@ from music_video_maker.custody import (
     build_vram_probe,
     build_vram_releaser,
 )
-from tests.harness.comfyui_mock import FakeComfyUISession
+from tests.harness.comfyui_mock import FakeComfyUISession, default_system_stats
 
 HARDWARE = HardwareProfile(name="RTX 4090 24GB (doris)", vram_gb=24.0)
 
@@ -458,3 +458,128 @@ def test_build_vram_releaser_posts_free_with_unload_every_call():
     release()
 
     assert session.free_calls == [{"unload_models": True, "free_memory": True}] * 2
+
+
+# --------------------------------------------------------------------------- #
+# Issue #95: reading the render stack off the same /system_stats body
+# --------------------------------------------------------------------------- #
+
+
+class _StatusSession:
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+
+    def get(self, url, **kwargs):
+        return _FakeJsonResponse(self.status_code, {})
+
+
+class _NonJsonStatsSession:
+    def get(self, url, **kwargs):
+        class _R(_FakeJsonResponse):
+            def json(self):
+                raise ValueError("not JSON")
+
+        return _R(200, {})
+
+
+class _PayloadSession:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def get(self, url, **kwargs):
+        return _FakeJsonResponse(200, self.payload)
+
+
+def test_read_render_stack_reads_both_versions_from_the_mock_server():
+    session = FakeComfyUISession()
+
+    stack = custody.read_render_stack(session, session.base_url + "/")
+
+    assert stack.comfyui_version == "0.30.2"
+    assert stack.torch_version == "2.13.0+cu130"
+    assert stack.known is True
+
+
+def test_read_render_stack_accepts_torch_version_as_a_second_spelling():
+    """``pytorch_version`` is what ComfyUI's own server emits, but its value
+    comes from ``comfy.model_management.torch_version``; a build exposing the
+    underlying name is read rather than recorded as unknown."""
+    stack = custody.read_render_stack(
+        _PayloadSession({"system": {"comfyui_version": "0.35.1", "torch_version": "2.14.0"}}),
+        "http://doris:8188",
+    )
+
+    assert stack == custody.RenderStack("0.35.1", "2.14.0")
+
+
+def test_read_render_stack_prefers_pytorch_version_when_both_keys_are_present():
+    stack = custody.read_render_stack(
+        _PayloadSession(
+            {
+                "system": {
+                    "comfyui_version": "0.35.1",
+                    "pytorch_version": "2.14.0+cu130",
+                    "torch_version": "ignored",
+                }
+            }
+        ),
+        "http://doris:8188",
+    )
+
+    assert stack.torch_version == "2.14.0+cu130"
+
+
+@pytest.mark.parametrize(
+    "session_factory",
+    [
+        _NetworkErrorSession,
+        lambda: _StatusSession(503),
+        _NonJsonStatsSession,
+        lambda: _PayloadSession(["not", "a", "dict"]),
+        lambda: _PayloadSession({"system": "not a dict"}),
+        lambda: _PayloadSession({"system": {"comfyui_version": None}}),
+        lambda: _PayloadSession({"system": {"comfyui_version": "   "}}),
+    ],
+)
+def test_an_unreadable_stack_is_empty_and_never_raises(session_factory, caplog):
+    """Best-effort by construction: this is evidence recorded *about* a run,
+    not a precondition of one, so nothing here may refuse a render. An empty
+    RenderStack fingerprints as unknown -- the honest reading of a server that
+    would not say -- and never as agreement with this run.
+
+    The last two cases are why ``str()`` is not good enough: a JSON ``null``
+    and a blank string would each become a recorded "version" that compares
+    unequal to a real one, manufacturing the stack split this field exists to
+    report."""
+    with caplog.at_level(logging.WARNING):
+        stack = custody.read_render_stack(session_factory(), "http://doris:8188")
+
+    assert stack == custody.RenderStack()
+    assert stack.known is False
+    assert caplog.records  # it says why, every time
+
+
+def test_a_half_readable_stack_records_the_half_it_got():
+    """Half-known is not unknown: a run that can name ComfyUI but not torch
+    still carries evidence of a split, and discarding it would under-report
+    one."""
+    stack = custody.read_render_stack(
+        _PayloadSession({"system": {"comfyui_version": "0.35.1"}}), "http://doris:8188"
+    )
+
+    assert stack == custody.RenderStack("0.35.1", None)
+    assert stack.known is True
+
+
+def test_the_mock_can_fake_a_server_that_names_no_versions():
+    """The harness has to be able to produce the *absent-key* shape, not a
+    ``null`` one -- they are different responses and only one of them is what
+    an older ComfyUI actually sends."""
+    session = FakeComfyUISession(
+        system_stats=default_system_stats(comfyui_version=None, pytorch_version=None)
+    )
+    body = session.get(f"{session.base_url}/system_stats").json()
+
+    assert "comfyui_version" not in body["system"]
+    assert "pytorch_version" not in body["system"]
+    assert custody.read_render_stack(session, session.base_url) == custody.RenderStack()
