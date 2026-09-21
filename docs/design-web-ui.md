@@ -5,14 +5,17 @@ There is no UI. A run today is hand-edited TOML, a CLI, and `grep` over
 for anyone else — and it hides the two things that decide whether a run is
 worth starting.
 
-This document is the design. Three pieces of it are built:
+This document is the design. Four pieces of it are built:
 `music_video_maker/progress.py` (the reader-plus-differ underneath the server),
 `music_video_maker/review.py` (the read-only pre-render review page, `--review`;
-see "The next slice — built", below) and `music_video_maker/webui.py` (the
-server itself — a **read-only** HTTP monitor; see "What's built: the read-only
-monitor" below). **The start/configure half described in "What the page
-collects" is not built** — see "What is deliberately not here" for why, and
-read that section before assuming it was merely forgotten.
+see "The next slice — built", below), `music_video_maker/prepare_report.py`
+(what `--prepare` found, written down so something other than a terminal can
+read it; see "The pre-render gate, in the monitor — built") and
+`music_video_maker/webui.py` (the server itself — a **read-only** HTTP monitor;
+see "What's built: the read-only monitor" below). **The start/configure half
+described in "What the page collects" is not built** — see "What is
+deliberately not here" for why, and read that section before assuming it was
+merely forgotten.
 
 ## What is built, and why that piece first
 
@@ -90,8 +93,12 @@ Non-negotiables for whoever writes the server:
    `master_audio=/etc/…`.
 4. Serving chunk thumbnails means serving files. Serve them from the run's own
    `chunks_dir` by chunk id, never by path.
+5. **Binding correctly is not enough.** A DNS-rebinding page can have a
+   victim's own browser make same-origin requests to a loopback-bound server
+   and read the responses — loopback binding is that attack's precondition,
+   not a defence against it. Check the `Host` header before any handler runs.
 
-All four are now enforced code, not just this list — see "What's built: the
+All five are now enforced code, not just this list — see "What's built: the
 read-only monitor" immediately below. One implementation note against #4: the
 server extracts a still frame with ffmpeg and caches *that*, rather than
 serving anything out of `chunks_dir` directly — see "Thumbnails" there for
@@ -119,6 +126,11 @@ usually need `--bind` at all: `127.0.0.1` and the host's own Tailscale IPv4
 address (found via `tailscale ip -4`) are always included automatically;
 `--bind` only adds more validated addresses, e.g. for a second interface.
 
+If you reach it by a *name* rather than an address — a Tailscale MagicDNS
+name, typically — add `--allow-host <name>`, or the request is refused with
+`421` by the Host check below. The server's own bound address and `localhost`
+need no flag.
+
 ### Bind addresses
 
 `resolve_bind_addresses` always includes `127.0.0.1`, adds this host's
@@ -134,6 +146,37 @@ checks this two ways, matching point 2 above: the pure function's output for
 a wide range of addresses, and that a real `ThreadingHTTPServer` built from
 it only ever reports `server_address` on the address it was given —
 including one build with `AF_INET6` for a Tailscale IPv6 address.
+
+### The Host header (DNS rebinding)
+
+Non-negotiable 5 above, concretely. `host_header_allowed` runs at the top of
+every method handler — including the ones that only ever return `405`, so a
+refused request cannot learn which methods are allowed or which paths exist.
+A request is answered only when its `Host` is:
+
+* **this server's own bound address**, compared as an `ipaddress` value
+  rather than as text (so `::1` and `0:0:0:0:0:0:0:1` are one host), with an
+  optional port that must equal the port it is listening on;
+* `localhost` (`ALWAYS_ALLOWED_HOST_NAMES`);
+* a name the operator passed to `--allow-host` (repeatable, normalised, and
+  refused at startup if it is not a bare host name) — the Tailscale MagicDNS
+  case no IP literal covers.
+
+Everything else gets `421 Misdirected Request` with no run data in the body;
+the refused value is logged rather than echoed back. Two decisions in it:
+
+* **An absent `Host` is allowed.** Rebinding's whole leverage *is* the name
+  in that header, and a browser will not let script suppress or forge it.
+  Refusing an absent header would refuse HTTP/1.0 clients (`curl -0`) and
+  block no attack.
+* **Two `Host` headers are refused outright** — one request with two
+  authorities is a request-smuggling shape.
+
+Nothing here resolves a name, for the same reason `validate_bind_address`
+never does: resolution is the mechanism being defeated, so asking DNS whether
+`evil.example` points at us is asking the attacker. A test pins that by making
+`socket.gethostbyname`/`getaddrinfo` raise. Every response also carries
+`X-Content-Type-Options: nosniff`.
 
 ### run_state.json and "the run's known chunks"
 
@@ -214,12 +257,20 @@ double slash) at that route and asserts a flat 404 for every one, the same
   without anything having to notice the rename didn't happen. 404 if the
   chunk id is unknown to `run_state.json`, has no `video_file`, or the file
   is missing on disk; 502 if ffmpeg itself fails.
+* **`GET /prepare`** — the pre-render checks, rendered from the JSON report
+  `--prepare` writes (`RunConfig.prepare_report_file`; see "The pre-render
+  gate, in the monitor — built" below). Reads a file and nothing else: no
+  alignment, no slicing, no button that would run either. A run nobody has
+  prepared renders a page saying exactly that, with the command to run, at
+  `200` — an unprepared run is an ordinary state, not a server error, the
+  same contract `/` has for a missing `run_state.json`.
 * **`GET /review`** — serves the file at `--review-html PATH` verbatim if the
   operator passed one at startup (a fixed, operator-chosen path — never a
-  request parameter); 404 otherwise. The review page itself (see "The
-  pre-render half" below) is still unbuilt on another branch (`cli --review`)
-  — this route only ever serves whatever file is put there, never generates
-  one, and never imports that branch's code.
+  request parameter); 404 otherwise. The page it serves is the one
+  `cli --review` writes (see "The next slice — built" below); this route only
+  ever serves whatever file is put there, never generates one, and never
+  imports `review.py` — which is what keeps `webui.py` free of any import of
+  `alignment`/`slicing`.
 * Everything else 404s. Only `GET` and `HEAD` are accepted; every other
   method (`POST` included) gets a flat 405 with an `Allow: GET, HEAD` header.
 
@@ -375,6 +426,69 @@ in-flight one has, and a review is neither. It is one snapshot of one
 `--prepare`-style input, not live — opening it twice after editing the shot
 plan means running `--review` again.
 
+### The pre-render gate, in the monitor — built (issue #36)
+
+`--review` above is a file you generate and open. The monitor needed the same
+gate as a *page of the run*, and the obvious implementation — have the page
+run Stages 1-2 when somebody opens it — is the one thing it must not do:
+`slice_audio` writes `chunk_NNN.wav` into the live run's own `chunks_dir`, and
+alignment is ~6 s of CPU per open. Measuring is a step the operator invokes.
+
+So the work is split at a file. `--prepare` already computed all of this and
+logged it; now it also writes `prepare_report.json`
+(`music_video_maker/prepare_report.py`, at `RunConfig.prepare_report_file` —
+defaulting to `chunks_dir/prepare_report.json`, resolved by `load_config`
+exactly the way `run_state_file` is, so the writer and the reader share one
+rule rather than two that agree today). `GET /prepare` renders it.
+
+What the report carries, all of it already produced by the one
+`prepare_timeline` run that wrote the skeleton:
+
+* the #35 alignment summary line verbatim (`format_summary` — one place
+  decides how a report reads), the finding counts by severity, and every
+  finding at WARNING or above;
+* the timeline: chunk count, voiced/instrumental split, span, total frames,
+  and the #22 drift against the master track in seconds and frames, with the
+  run's own tolerance;
+* every WARNING-or-above record `slicing` and `cli` emitted during Stage 1-2
+  — which is #70's untenable segments and mid-phrase cuts, #79's surviving
+  leading vocal offsets, and the drift line — captured *while they were
+  emitted* (`collect_stage_notices`), never re-derived. Captured even when
+  `--log-level ERROR` would have gated them before any handler saw them: the
+  console's verbosity is the operator's choice, the report's contents are
+  not. Each carries the issue number its own text names, purely so the page
+  can group thirty mid-phrase-cut warnings under one heading;
+* the shot plan resolved against *this* timeline through `load_shot_plan` /
+  `resolve_shot` themselves — the `ShotPlanDriftError` a human review of the
+  plan cannot perform, because the file reads perfectly well either way. The
+  report records whether the timeline was re-anchored against that plan's own
+  `length_seconds`, and the page says so, because a plan setting a length
+  describes a different timeline *by construction* when it was not (CLAUDE.md:
+  "a plan that sets `length_seconds` has two timelines, and only one is
+  real") — a drift list produced against the other one would read as a defect
+  in the plan;
+* **an `InputStamp` per input** — resolved path, size, mtime. `stale_inputs`
+  re-stats them when the page is rendered, so a report whose lyrics file has
+  been edited since says so in a banner instead of quietly describing a
+  timeline no render would now produce. This is #93's lesson as a field: a
+  measurement artefact that cannot name what it was computed from can assert
+  a subject it never opened.
+
+Three things it deliberately is not. It is **not a behaviour change** —
+`--prepare` slices the same timeline, writes the same skeleton, refuses the
+same things; the order is Stage 1-2, skeleton, *then* report, so a prepare
+that refuses leaves no report at all (one that did would be an artefact
+describing something other than what its reader assumes), and a report that
+cannot be written logs loudly rather than failing a prepare whose real output
+already landed. It is **not read back into a render** — the same boundary an
+authored `shot_plan.toml` sits on the other side of. And it is **not a second
+implementation of any check**: every number in it came from the render's own
+Stage 1-2 code.
+
+`PREPARE_REPORT_SCHEMA_VERSION` is refused rather than guessed at on read,
+unlike `run_state.json`'s — nothing is lost by refusing a report, since
+re-running `--prepare` costs ~50 s and no GPU.
+
 ## What the page collects
 
 Everything in `config.RunConfig`: master audio, lyrics, cast
@@ -421,6 +535,17 @@ does.
   against in either case, and inventing a per-chunk reason for the second
   would be less honest than `None`, not more. See "Closed" below. **Built:**
   the monitor's per-chunk table shows this column verbatim.
+
+  One correction from the 2026-09-20 real-render acceptance: a *cached* chunk
+  used to carry a previous `--resume`'s reason forward
+  (`replace(existing, status=CACHED)` copied every other field), so the table
+  showed "cached … content_changed (prompt_hash)" beside a chunk this run had
+  reused without comparing or rejecting anything. `resilience._as_cached` is
+  now the one place a reused result is built and it clears both fields. Note
+  the asymmetry, which is the point: `render_seconds` is *kept*, because it is
+  still true of the mp4 that exists and `progress.py` already excludes cached
+  chunks from its projection by status; `rerender_reason` answers "why did
+  *this* run re-render this chunk", and this run did not.
 * **Dead-lettered chunks** are called out with their error history. **Built,
   with one adjustment:** the read-only monitor shows the errors
   (`ProgressEvent("chunk_dead_lettered")` carries the full `errors` tuple)
@@ -456,7 +581,9 @@ code before this change still loads and resumes).
    `None` for a freshly rendered chunk with nothing to reject, including
    every chunk after a schema-version rejection — see the "Custody and
    resume" bullet above for why that collapse is deliberate rather than a
-   missing case.
+   missing case — and `None` on every `CACHED` chunk, which is a guarantee
+   `resilience._as_cached` provides rather than a property of which paths
+   happen to set it.
 3. **Within-chunk step progress** — still open. Lives on ComfyUI's WebSocket
    inside `execution.py`, never persisted. Needs a seam there; nothing in
    this pass touched it, and it remains the one gap `run_state.json` cannot
@@ -509,3 +636,14 @@ else offline: pure functions directly where possible
 and a small number of real sockets on `127.0.0.1` with port 0, torn down in
 a fixture, where HTTP semantics (status codes, headers, method dispatch)
 are what's actually under test.
+
+The `Host` check is tested both ways for the same reason the bind list is:
+the pure predicate over a table of names, literals, ports and malformed
+authorities, and real loopback requests carrying a hand-set `Host` (including
+one with no `Host` at all, and one with two) asserting `421` with no run data
+in the body across `/`, `/events`, `/chunks/<id>/thumbnail.png`, `/review`,
+an unknown path, `POST` and `HEAD`.
+
+`/prepare` is tested against real written report files, not a mocked reader:
+an unprepared run, a torn one, a report whose stamped input has since been
+edited (the stale banner), and one whose plan text contains `<script>`.
