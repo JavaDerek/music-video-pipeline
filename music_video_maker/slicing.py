@@ -2330,6 +2330,7 @@ def slice_audio(
     instrumental_audio_gain_db: float | None = None,
     suspect_segment_indices: Collection[int] = (),
     measured_ceiling: MeasuredCeiling = CALIBRATED_CEILING,
+    timeline: str | None = None,
 ) -> tuple[AudioChunk, ...]:
     """Slice ``audio_path`` per ``alignment`` into ``AudioChunk``s honoring
     ``hardware``'s min/max chunk-duration window (clamped into H3's trained
@@ -2384,6 +2385,15 @@ def slice_audio(
     ``envelope.measured_ceiling(run_state_file)`` instead, which reads the
     longest chunk a previous run *actually rendered* and so makes the number
     evidence rather than a memory. It changes nothing but a log line.
+    ``timeline`` (issue #66) stamps every emitted chunk with the timeline it
+    belongs to -- ``None``, the default, is the song, so a run with no
+    ``[[segment]]`` table produces chunks identical to the ones it always
+    produced. It changes nothing about the slicing itself: a prologue is the
+    same five stages run over a second (audio, text) pair, and its chunk
+    ``start``/``end`` are seconds from the start of *its own* audio, never
+    offset into the finished video. See
+    :attr:`~music_video_maker.contracts.AudioChunk.timeline` for why the
+    offset lives on the timeline rather than in these numbers.
     """
     if not alignment.segments and not cover_instrumentals:
         # With cover_instrumentals on, zero segments is not "nothing to
@@ -2588,6 +2598,7 @@ def slice_audio(
                     is_split_continuation=piece.is_split_continuation,
                     frame_count=piece.frame_count,
                     is_instrumental=True,
+                    timeline=timeline,
                 )
             )
             prev_end = piece.end
@@ -2681,6 +2692,7 @@ def slice_audio(
                 source_segment_indices=tuple(m.index for m in piece.members),
                 is_split_continuation=piece.is_split_continuation,
                 frame_count=piece.frame_count,
+                timeline=timeline,
             )
         )
         prev_end = piece.end

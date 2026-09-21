@@ -8,7 +8,9 @@ track* end to end, and Stage 5 concatenates chunks and muxes that one file over
 them. A prologue is video with no position on that timeline and audio that is
 not in that file.
 
-Design only. Nothing here is built. What follows is the shape, the four places
+Originally design only. **The shape below was built on 2026-09-21 -- see "What
+is built" at the foot of this document for what landed and for every open
+decision, answered.** What follows is the shape, the four places
 it will actually break, and the decisions that must be made before code.
 
 ## The reframing
@@ -190,3 +192,135 @@ the sentence outranks any field that argues with it) transfers unchanged.
 A prologue is chunks like any other: at 864×480, ~3.7 min/chunk on the 4090. A
 four-minute prologue at ~6 s/chunk is ~40 chunks, ~2.5 h — comparable to a
 whole song. It is not a small feature to *run*, whatever it costs to build.
+
+---
+
+## What is built (2026-09-21)
+
+Everything above this line was design. This section records what landed, and
+— more usefully — every decision the design left open, with the answer and
+why. All of it is offline: no GPU, no ComfyUI, no render has ever used it.
+
+| Piece | State |
+|---|---|
+| `[[segment]]` config tables, closed key set, validated paths | **built** — `music_video_maker/timelines.py`, `config.py` |
+| A second Stage 1-2 per timeline | **built** — `cli._align_and_slice_timeline` |
+| Per-timeline chunk id space, chunks directory, run state | **built** |
+| `ChunkFingerprint.timeline`, timeline tier | **built** — `contracts.py`, no schema bump |
+| Stage 5 across timelines + the measured seam | **built** — `assembly.assemble_timelines` |
+| `-c:v copy` concat signature probe + comparison | **built** |
+| `--prepare` reporting both timelines and the predicted seam | **built** |
+| A prologue prompted as speech rather than as a sung lyric | **built** — `prompting`'s `spoken` |
+| Authoring a script | **deliberately not built** — see below |
+| Anything rendered | **not done** — nothing has run on the GPU |
+
+### The decisions, and what was chosen
+
+**The offset is a property of the timeline, not of a chunk.** The design said
+to join two timelines; it did not say where the join lives. It lives on
+`timelines.Timeline`/`TimelinePlacement`, and a chunk's `start`/`end` stay
+seconds from the start of *its own* track. Three reasons, in order of how
+expensive each would have been to discover later:
+
+1. Every anchor in the project is measured from the chunk's own track — a
+   shot plan's `chunk_id`/`start`, `ShotPlanDriftError`'s comparison,
+   `_text_within`, the stem slicing. Folding an offset in would move every
+   authored anchor in the song the moment a prologue's length changed, which
+   is the same silent renumbering the separate id space exists to avoid.
+2. It would make an offset change a *fingerprint* change on chunks whose
+   pixels are identical, re-rendering the whole song because the thing in
+   front of it got longer.
+3. The offset is only honestly knowable from the *rendered* files anyway
+   (measured, not computed — see below), which is after the chunks exist.
+
+**Reconciliation: pad the audio, and prove it with a second probe.** As the
+design predicted, padding is right. What the design did not say is that
+computing the pad is not evidence it happened, and this project has already
+shipped one duration check that silently measured the wrong thing. So
+`assemble_timelines` concats each timeline on its own, **probes its real
+duration with ffprobe**, pads that timeline's audio to it, **probes the
+padded file**, and raises `SeamMismatchError` if the two disagree. The
+finished file is then checked against the sum of the measured per-timeline
+durations. `timelines.SeamOverrunError` refuses the opposite case — audio
+longer than its video — rather than trimming picture, because trimming is a
+re-encode or a keyframe cut and cutting somebody off mid-sentence is the
+failure a seam check exists to prevent.
+
+**The last timeline is padded too.** With one timeline, `-shortest` discards
+the overshoot (47 frames on "Deathless", unlogged) and nothing is harmed.
+With a seam, treating the last timeline differently would reintroduce exactly
+that invisible discard in the one configuration where a length is being
+asserted. A run with no segments is untouched and still uses `-shortest`.
+
+**Per-segment `cinematography`: not built.** The design flagged it as "worth
+deciding deliberately rather than discovering". The conservative answer is
+no, for now, on #55's own constraint: every field a look file may set must
+already be recorded in `ChunkFingerprint`, and a *per-timeline* look field
+would need the fingerprint to record which timeline's look it used — which is
+buildable, but it is a second mechanism shipped with nothing to measure it
+against, on a feature where nothing has rendered at all. A prologue that
+should look different can say so in its own `shot_plan`'s `camera` lines
+today, which is already per chunk and already fingerprinted.
+
+**`chain_across_seam`: not a key.** The design's default is `false`, and
+`false` is what the implementation does — each timeline's continuity provider
+has its own `frames_dir` and its own chunk id space, so nothing can chain
+across the join. A config key whose only legal value is its own default is
+noise, and `markers.py` already set the precedent: a stub that cannot do the
+thing is worse than a named seam. If chaining across a seam is ever wanted,
+the key arrives with the mechanism.
+
+**A slice names its timeline.** `--only-chunks 3` is ambiguous the moment two
+timelines both have a chunk 3, so `--timeline NAME` says which id space the
+ids are in (default: the song). With `--only-chunks` the named timeline is
+the *only* one rendered — a slice assembles nothing, so rendering the others
+would be hours of exclusive GPU custody spent on an artefact the run
+deliberately does not produce. An unknown name is refused rather than falling
+back to the song.
+
+**Song-only inputs stay song-only.** `alignment_overrides` name a
+`segment_index` in the song's own alignment (#42), so applying them to a
+prologue would pin arbitrary unrelated segments — they are not applied, and
+the run says so at INFO. `vocal_stem` is an isolated vocal cut from the
+master (#25); a dialogue take has no such thing, so a segment conditions on
+its own mix and its fingerprint records `"mix"`.
+
+**A segment's shot plan is its own.** The song's plan anchors `chunk_id`s in
+the song's id space; resolving it against a segment would attach the song's
+shot 3 to the prologue's shot 3 with nothing raising. `--prepare` writes one
+skeleton per timeline, the segment's beside the song's as
+`<stem>__<segment>.toml`, derived rather than asked for.
+
+**A prologue chunk is prompted as speech.** `prompting`'s new `spoken` flag
+changes one clause — "actively speaking the line" rather than "actively
+singing the lyric", and "Wordless passage" rather than "Instrumental
+passage". It is taken from the timeline, never inferred from the text (a
+segment whose script happens to be sung is still a segment), and `False` —
+every song chunk — composes byte-identically to before. This is *not* a
+lip-sync change: H3 syncs to whatever audio it is handed either way. It stops
+the prompt asserting a sung performance over dialogue.
+
+**v1 does not author the script**, as the design said. Unchanged, and worth
+restating with the reason: the recording is a physical dependency no
+generation removes, and a dialogue stage's output is not *checkable* the way
+`beat_role`/`beat_group`/`act` make the beats stage's output checkable.
+
+**The silent-placeholder answer needs no code.** A silent wav of the intended
+duration aligns to nothing, so `instrumental_coverage` tiles the whole
+segment as filler and the shots can be authored before the recording session
+— which is what the design predicted, and it already works because a segment
+is the same Stage 1-2 as the song. When the real recording lands, the
+timeline re-anchors and `ShotPlanDriftError` catches anyone who forgot.
+
+### What a first prologue render still has to prove
+
+Nothing here has touched a GPU, and three claims are offline-only:
+
+* that two timelines' chunks really do share one concat signature (the check
+  is built; it has only ever compared fixtures);
+* that `apad=whole_dur` produces exactly the duration ffprobe then reports on
+  a real file — the assertion exists precisely because this is the kind of
+  thing that is true until it isn't;
+* that a spoken chunk lip-syncs at all. H3 is trained on singing; dialogue is
+  the same conditioning signal, and the design's claim that "H3 does not know
+  or care" is reasoning, not a measurement.

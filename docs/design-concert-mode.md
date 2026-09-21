@@ -17,10 +17,12 @@ the priority of the third piece.
 | Piece | State |
 |---|---|
 | The `(time, label)` marker contract, reader, fixture | **built** — `music_video_maker/markers.py`, `tests/test_markers.py` |
+| An Ableton `.als` Locator reader producing that contract | **built, UNVERIFIED against a real set file** — `music_video_maker/ableton.py`; see "The Ableton reader" below |
+| `format_marker_csv`: a DAW reader *produces* the contract rather than bypassing it | **built** — `markers.format_marker_csv` |
 | Silent-output assembly + measured duration check | **built** — `assembly.assemble_final_video(master_audio=None, expected_duration=…)` |
 | The duration check armed end to end on the silent path | **built** — `run_pipeline` now passes `expected_duration=alignment.track_duration` whenever `silent_output = true`; see "The duration check" below |
 | Stage 2 timeline-drift reporting (before any GPU work) | **built** — `slicing.timeline_track_drift_seconds` + `cli._log_timeline_track_drift`, wired into both `run_pipeline` and `--prepare` |
-| What the click tracks actually are | **blocked on the owner / the band** |
+| What the click tracks actually are | **blocked on the owner / the band** — the eight questions below are unchanged |
 | t2v (or i2v) workflow template, projection aspect ratio | **blocked on the GPU** |
 | Wiring the marker reader as an alternate Stage 1 | **deliberately not done** — see "Why nothing is wired up" |
 
@@ -125,6 +127,42 @@ default** — the caller must state which it means — and logs a WARNING every
 time it is `True`. A concert-mode prompt composer must consume a label as
 section identity; if "Chorus 2" ever reaches a prompt as a sung line, this is
 where it came in.
+
+### The Ableton reader (built 2026-09-21, and what it cannot claim)
+
+`music_video_maker/ableton.py` reads a Live set's **Locators** and produces a
+`MarkerTrack` — the same shape the CSV reader produces, so everything
+downstream is unchanged. `markers.format_marker_csv` writes one back out, which
+is what makes "the CSV is the contract, a DAW reader is one producer of it"
+true in practice rather than in a docstring: an operator gets a file they can
+read, diff, correct by hand and commit beside the run config.
+
+**It has never been given a real `.als`.** Every test runs against a synthetic
+fixture this repo authored (`tests/fixtures/markers/synthetic_live_set.als.xml`,
+committed as plain XML precisely so it can be reviewed in a diff, and gzipped
+at test time). It is written against Ableton's *documented* on-disk shape.
+Step 1's questions 1, 2 and 4 are still unanswered, and the honest status is
+"a starting point that will need correcting against a real export" — if the
+band can export a marker CSV directly (question 4), that is still the cheaper
+answer and this module is unnecessary.
+
+Two things it refuses rather than guesses, which is the part worth having
+before a real file arrives:
+
+* **Tempo automation.** A Locator's `Time` is in **beats**. With one manual
+  tempo, beats → seconds is a division; with automation it is an integral, and
+  using the manual value anyway places every marker after the first tempo
+  change wrong — progressively worse through the song, with nothing to notice
+  it, which is this issue's own failure mode. That is design question 3,
+  answered by refusing. `tempo_bpm` lets an operator supply the click's own
+  tempo instead, and the reader says loudly when that disagrees with the file.
+* **A set with no Locators.** Clip names are a different claim — a clip has a
+  length and can be moved or duplicated — and reading them as section markers
+  would produce a plausible-looking timeline nobody authored. The refusal names
+  the alternatives, because *which of the three* is question 2 and it is open.
+
+Both spellings of the tempo track are looked for (`MasterTrack`, and Live 12's
+`MainTrack`), since question 1 — which major version — is also open.
 
 ## Change 2: conceptual conditioning, not the cast
 

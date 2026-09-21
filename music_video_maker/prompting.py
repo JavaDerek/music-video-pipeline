@@ -104,6 +104,19 @@ _INSTRUMENTAL_CLAUSE_SINGULAR = (
 _INSTRUMENTAL_CLAUSE_PLURAL = (
     "Instrumental passage: the characters stay silent throughout this shot"
 )
+_WORDLESS_CLAUSE_SINGULAR = (
+    "Wordless passage: the character stays silent throughout this shot"
+)
+_WORDLESS_CLAUSE_PLURAL = (
+    "Wordless passage: the characters stay silent throughout this shot"
+)
+"""Issue #66: the same clause for a spoken timeline, where "instrumental" is
+a false description -- a prologue has no instruments to be a passage of. The
+positive-statement shape is #73's and is kept exactly: it says what IS true
+("stays silent"), never what must not happen, because
+``MiniMaxH3ReferenceToVideo`` has one prompt input into a single
+``BasicGuider`` and no negative-conditioning channel for a prohibition to
+live in."""
 """Issue #73, in the most-composed prohibition in this codebase.
 
 This read ``"the character performs silently, no lyric to sing"`` until
@@ -257,6 +270,7 @@ def expand_prompt(
     location: str | None = None,
     conditions: str | None = None,  # #83
     framing: str | None = None,  # #97
+    spoken: bool = False,  # #66
 ) -> ExpandedPrompt:
     """Compose the deterministic Stage 2b prompt for one audio chunk.
 
@@ -348,6 +362,13 @@ def expand_prompt(
     naming the vocabulary if it is not one of :data:`FRAMING_LEVELS` -- the
     shot-plan loader is the primary gate, this is defence in depth for the
     same reason :class:`SubjectOnVoicedChunkError` is.
+    ``spoken`` (issue #66) says this chunk belongs to a prologue/epilogue
+    timeline, whose audio is dialogue. It changes exactly one clause -- the
+    lyric clause becomes "actively speaking the line" -- and is passed by
+    ``cli`` from the timeline, never inferred from the text, because a
+    segment whose script happens to be sung is still a segment. ``False``
+    (the default, and every song chunk) composes byte-identically to before
+    this parameter existed.
 
     Passing the text in rather than looking it up keeps this module free of
     file I/O and keeps it a pure function of its arguments -- resolution
@@ -367,6 +388,7 @@ def expand_prompt(
         location=location,
         conditions=conditions,  # #83
         framing=framing,  # #97
+        spoken=spoken,  # #66
     )
     # Issue #46: the chained I2V path has no reference photo, so the seed
     # frame (the predecessor's own output) is already the output of the
@@ -392,6 +414,7 @@ def expand_prompt(
         # and safe to repeat because every level states an endpoint rather
         # than a displacement (see _FRAMING_CLAUSES).
         framing=framing,  # #97
+        spoken=spoken,  # #66
     )
 
     logger.debug(
@@ -594,9 +617,12 @@ def _compose_prompt(
     location: str | None = None,
     conditions: str | None = None,  # #83
     framing: str | None = None,  # #97
+    spoken: bool = False,  # #66
 ) -> str:
     character_clause = _character_clause(config, members, subject_is_focus, include_appearance)
-    lyric_clause = _lyric_clause(chunk.text, len(members), singers=members if present else ())
+    lyric_clause = _lyric_clause(
+        chunk.text, len(members), singers=members if present else (), spoken=spoken
+    )
     concept = shot if shot and shot.strip() else config.narrative_concept
     concept = _apply_camera_clause(concept, camera)
     parts = (
@@ -1029,7 +1055,11 @@ def _global_demeanour_text(config: RunConfig) -> str | None:
 
 
 def _lyric_clause(
-    text: str, character_count: int = 1, singers: tuple[CastMember, ...] = ()
+    text: str,
+    character_count: int = 1,
+    singers: tuple[CastMember, ...] = (),
+    *,
+    spoken: bool = False,
 ) -> str:
     """The sole authority on whether anyone is singing (see module
     docstring). ``character_count`` only changes grammatical number --
@@ -1044,17 +1074,28 @@ def _lyric_clause(
     so the overwhelmingly common single-character prompt stays byte-identical.
 
     The instrumental branch deliberately does *not* name anyone: nobody is
-    singing, so there is nothing to disambiguate."""
+    singing, so there is nothing to disambiguate.
+
+    ``spoken`` (issue #66) is set for a prologue/epilogue timeline, whose
+    audio is dialogue rather than a vocal. It changes the verb and the noun
+    -- "speaking the line" rather than "singing the lyric" -- and nothing
+    else: H3 lip-syncs whatever audio it is handed either way, so this is
+    about not telling the model a sung performance is happening over speech,
+    not about the sync. ``False`` (every song chunk, and every caller that
+    existed before segments did) composes byte-identically to before."""
     stripped = text.strip() if text else ""
     plural = character_count > 1
     if not stripped:
+        if spoken:
+            return _WORDLESS_CLAUSE_PLURAL if plural else _WORDLESS_CLAUSE_SINGULAR
         return _INSTRUMENTAL_CLAUSE_PLURAL if plural else _INSTRUMENTAL_CLAUSE_SINGULAR
+    action = "speaking the line" if spoken else "singing the lyric"
     if singers:
         names = _join_member_list(tuple(member.name for member in singers))
         verb = "are" if plural else "is"
-        return f"{names} {verb} actively singing the lyric: '{stripped}'"
+        return f"{names} {verb} actively {action}: '{stripped}'"
     subject = "The characters are" if plural else "The character is"
-    return f"{subject} actively singing the lyric: '{stripped}'"
+    return f"{subject} actively {action}: '{stripped}'"
 
 
 def _join_sentences(parts: tuple[str, ...]) -> str:
