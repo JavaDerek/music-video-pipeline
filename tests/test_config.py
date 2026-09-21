@@ -2499,3 +2499,16 @@ def test_release_vram_between_chunks_defaults_on(tmp_path):
 def test_release_vram_between_chunks_can_be_turned_off(tmp_path):
     config = _load_with(tmp_path, release_vram_between_chunks="false")
     assert config.release_vram_between_chunks is False
+
+
+def test_acknowledge_unproven_envelope_defaults_off(tmp_path):
+    """Issues #24/#98: off means the run is *refused* when a chunk is bigger
+    than anything measured on this card. Every config written before the key
+    existed means false, which is what every one of them already did on any
+    run whose chunks are inside the envelope."""
+    assert _load_with(tmp_path).acknowledge_unproven_envelope is False
+
+
+def test_acknowledge_unproven_envelope_can_be_set_for_an_attended_proof(tmp_path):
+    config = _load_with(tmp_path, acknowledge_unproven_envelope="true")
+    assert config.acknowledge_unproven_envelope is True

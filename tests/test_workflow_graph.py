@@ -1364,6 +1364,38 @@ def test_read_text_encoder_is_none_when_the_graph_has_no_clip_loader():
     assert workflow_graph.read_text_encoder(workflow) is None
 
 
+def test_read_render_dimensions_reports_what_the_template_already_carries():
+    """``render_width``/``render_height`` default to None, which means "the
+    template's own value" -- and the committed templates carry ComfyUI's
+    1344x768 H3 default. The envelope check (#24/#98) reasons about the size
+    of what is being submitted, so it needs the resolved pair, and reading it
+    off the graph is the only way that cannot drift from the template."""
+    width, height = workflow_graph.read_render_dimensions(make_workflow_baseline())
+    assert (width, height) == (1344, 768)
+
+
+def test_read_render_dimensions_is_none_when_the_graph_does_not_say():
+    """Unknown, never a guessed number: a size gate that guesses the size is
+    worse than no gate."""
+    workflow = {
+        node_id: node
+        for node_id, node in make_workflow_baseline().items()
+        if node["class_type"] != workflow_graph.CLASS_TYPE_H3_REFERENCE_TO_VIDEO
+    }
+    assert workflow_graph.read_render_dimensions(workflow) == (None, None)
+
+
+def test_read_render_dimensions_rejects_a_non_integer_dimension():
+    workflow = json.loads(json.dumps(make_workflow_baseline()))
+    node = next(
+        n
+        for n in workflow.values()
+        if n["class_type"] == workflow_graph.CLASS_TYPE_H3_REFERENCE_TO_VIDEO
+    )
+    node["inputs"]["width"] = "1344"
+    assert workflow_graph.read_render_dimensions(workflow) == (None, 768)
+
+
 def test_mutate_leaves_the_template_encoder_alone_by_default():
     workflow = workflow_graph.WorkflowGraphMutator().mutate(
         make_workflow_baseline(), _prompt(), _assets()

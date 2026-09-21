@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from music_video_maker import contracts
+from music_video_maker import contracts, execution
 from music_video_maker.execution import (
     ComfyUIExecutionClient,
     HistoryError,
@@ -768,3 +768,47 @@ def test_tcp_keepalive_skipped_when_ws_timeout_not_configured(tmp_path: Path, ca
     assert result.status is contracts.ChunkStatus.RENDERED
     assert fake_sock.setsockopt_calls == []
     assert "ws_timeout" in caplog.text.lower()
+
+
+# --------------------------------------------------------------------------- #
+# Issue #24: every HTTP call is bounded
+# --------------------------------------------------------------------------- #
+
+
+def test_every_http_call_carries_a_timeout(tmp_path: Path):
+    """``requests`` waits forever by default, and issue #24's recovery path
+    talks to a ComfyUI whose worker is blocked inside a driver call. An
+    unbounded call there turns one unrecoverable failure on the card into an
+    unrecoverable failure in the process built to survive it -- no retry, no
+    dead-letter, no custody release.
+
+    Asserted over *every* call the client makes rather than just
+    ``interrupt()``: the next unbounded one is always the one nobody thought
+    about.
+    """
+    session = FakeComfyUISession()
+    session.seed_history_success("prompt-0001", video_filename="chunk.mp4")
+    ws_factory = make_ws_factory(build_success_sequence("prompt-0001"))
+    client = _make_client(session, ws_factory)
+
+    client.execute(WORKFLOW, chunk_id=1, output_dir=tmp_path / "out")
+    client.interrupt()
+    client.free()
+
+    assert session.requests, "the rig recorded nothing -- this test proves nothing"
+    unbounded = [
+        f"{r.method} {r.url}" for r in session.requests if r.kwargs.get("timeout") is None
+    ]
+    assert not unbounded, f"HTTP call(s) with no timeout: {unbounded}"
+    assert {r.kwargs["timeout"] for r in session.requests} == {
+        execution.DEFAULT_HTTP_TIMEOUT_SECONDS
+    }
+
+
+def test_the_timeout_is_configurable_per_client():
+    session = FakeComfyUISession()
+    client = ComfyUIExecutionClient(
+        base_url=session.base_url, session=session, http_timeout=5.0
+    )
+    client.interrupt()
+    assert session.requests[-1].kwargs["timeout"] == 5.0

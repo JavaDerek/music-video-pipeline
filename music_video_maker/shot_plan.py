@@ -234,18 +234,39 @@ from music_video_maker.contracts import H3_FRAME_GRID, AudioChunk, CastMember
 logger = logging.getLogger(__name__)
 
 MEASURED_MAX_FRAMES = 141
-"""The longest chunk ever actually rendered on doris's 4090, at any resolution.
+"""The largest chunk frame count that had been **measured when this line was
+written** -- not a live reading, and no longer the longest thing this card has
+rendered (issue #98).
+
+The finished "Deathless" v13 render holds **45 of 80 chunks above 141 frames,
+15 of them at 192**, all at 864x480 on this 4090, confirmed with ``ffprobe
+-count_frames`` against the mp4s themselves rather than against
+``run_state.json``. Nothing updates this constant when a render quietly goes
+past it, and for months every warning built on it asserted "the longest
+anything ever rendered on this card", which was false.
+
+Raising it is a **decision** about what an operator wants warned, not a
+correction, so it stays where it is; what was fixed is the sentences around
+it. Two things now carry the honest version:
+
+* :class:`~music_video_maker.envelope.MeasuredCeiling` pairs a frame count
+  with its provenance, and ``envelope.measured_ceiling(run_state_file)``
+  derives it from what a previous run *actually rendered*.
+* :func:`~music_video_maker.envelope.check_render_envelope` is the refusal on
+  the same axis -- it knows the run's resolution as well as its frame counts,
+  which is why it can refuse where this can only warn.
 
 H3's *trained* range reaches 362 frames (15.083 s) and the cost model says a
 long take is effectively free -- total render time tracks total latent volume,
 which the song's length fixes, so longer shots just mean fewer of them. What
 is unknown is VRAM: temporal VAE decode memory scales non-linearly with frame
-count, and 362 frames is ~2.6x anything attempted here.
+count, and 362 frames is ~1.9x the longest chunk this card has rendered.
 
-That is a reason to *name* the risk, not to gate on it: an over-committed card
-on this box does not raise CUDA OOM, it goes silent and wedges the host past
-SIGKILL (issues #23, #24), so the first long take is worth watching. Step up
-gradually rather than jumping to the ceiling."""
+An over-committed card on this box does not raise CUDA OOM, it goes silent and
+wedges the host past SIGKILL (issues #23, #24), so the first long take is
+worth watching. Step up gradually rather than jumping to the ceiling -- and
+that stepping up is now something the code can hold the operator to, through
+``envelope.PROVEN_ENVELOPES``, rather than only advise in a docstring."""
 
 _LANDMARK_LOCALES: dict[str, str] = {
     # A small, deliberately curated set of unambiguous, single-city

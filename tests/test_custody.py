@@ -458,3 +458,34 @@ def test_build_vram_releaser_posts_free_with_unload_every_call():
     release()
 
     assert session.free_calls == [{"unload_models": True, "free_memory": True}] * 2
+
+
+def test_the_probe_and_the_release_are_both_bounded(tmp_path):
+    """Issue #24. Both of these run against a ComfyUI that may be wedged, and
+    both are on paths whose whole value is stopping *cleanly*: the probe is
+    what ``ResilientRunner`` waits on between chunks (bounded by
+    ``release_wait_seconds`` only if each individual reading returns), and the
+    release is the custody handback, which is a try/finally that never
+    finishes if the POST can block forever."""
+    session = FakeComfyUISession()
+    build_vram_probe(session, session.base_url)()
+    build_vram_releaser(session, session.base_url)()
+
+    with VramCustodyManager(
+        base_url=session.base_url, hardware=HARDWARE, session=session, min_free_vram_gb=0.0
+    ):
+        pass
+
+    assert session.requests
+    unbounded = [
+        f"{r.method} {r.url}" for r in session.requests if r.kwargs.get("timeout") is None
+    ]
+    assert not unbounded, f"HTTP call(s) with no timeout: {unbounded}"
+    assert {r.kwargs["timeout"] for r in session.requests} == {custody.HTTP_TIMEOUT_SECONDS}
+
+
+def test_the_custody_timeout_is_the_execution_clients_own_number():
+    """Aliased rather than restated so the two cannot drift apart."""
+    from music_video_maker import execution
+
+    assert custody.HTTP_TIMEOUT_SECONDS == execution.DEFAULT_HTTP_TIMEOUT_SECONDS
