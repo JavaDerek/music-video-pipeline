@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+from music_video_maker import prepare_report as prepare_report_module
 from music_video_maker import resilience as resilience_module
 from music_video_maker import webui
 from music_video_maker.contracts import ChunkResult, ChunkStatus, RunState, VramStopEvent
@@ -699,6 +700,208 @@ class TestRouteDispatch:
             assert b"event: run_snapshot" in chunk
         finally:
             conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# /prepare -- the pre-render checks, READ from what --prepare wrote
+# --------------------------------------------------------------------------- #
+
+
+def _prepare_report(**overrides) -> prepare_report_module.PrepareReport:
+    base = prepare_report_module.PrepareReport(
+        generated_at="2026-09-21",
+        config_path="run.toml",
+        alignment_summary="Alignment quality: 57 segment(s), 2 critical, 5 warning finding(s)",
+        alignment_finding_counts={"CRITICAL": 2, "WARNING": 5, "INFO": 0},
+        alignment_findings=(
+            prepare_report_module.AlignmentFindingRow(
+                severity="CRITICAL",
+                code="zero_length_segment",
+                message="segment 0 is 20ms long",
+                start=0.0,
+                end=0.02,
+                segment_index=0,
+            ),
+        ),
+        chunk_count=80,
+        voiced_chunk_count=41,
+        instrumental_chunk_count=39,
+        timeline_start=0.0,
+        timeline_end=513.917,
+        track_duration_seconds=512.08,
+        timeline_drift_seconds=1.837,
+        timeline_drift_frames=44.1,
+        duration_tolerance_seconds=0.042,
+        notices=(
+            prepare_report_module.StageNotice(
+                logger="music_video_maker.slicing",
+                level="WARNING",
+                message="Final chunk boundary at 261.000s ... (issue #70).",
+                issue="70",
+            ),
+        ),
+    )
+    return type(base)(**{**base.__dict__, **overrides})
+
+
+class TestPrepareRoute:
+    def _serve(self, tmp_path: Path, report_path: Path | None):
+        ctx = webui.MonitorContext(
+            run_state_path=tmp_path / "chunks" / "run_state.json",
+            prepare_report_path=report_path,
+            thumbnail_cache_dir=tmp_path / "thumbcache",
+        )
+        server = webui.make_server("127.0.0.1", 0, ctx)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        host, port = server.server_address[0], server.server_address[1]
+        return f"http://{host}:{port}", server, thread
+
+    def test_a_run_nobody_has_prepared_says_so_and_names_the_command(
+        self, tmp_path: Path
+    ) -> None:
+        base_url, server, thread = self._serve(tmp_path, tmp_path / "prepare_report.json")
+        try:
+            resp = _get(base_url, "/prepare")
+            assert resp.status == 200  # an ordinary state, never a 500
+            body = resp.read_body.decode("utf-8")
+            assert "Nothing has been prepared for this run" in body
+            assert "--prepare" in body
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_the_page_never_offers_to_run_alignment_itself(self, tmp_path: Path) -> None:
+        """Alignment writes chunk audio into the live run's own directory and
+        costs ~6s of CPU: a step the operator invokes, not one a page performs
+        because somebody opened it. There is no control here at all -- this
+        route only ever reads a file."""
+        base_url, server, thread = self._serve(tmp_path, tmp_path / "prepare_report.json")
+        try:
+            body = _get(base_url, "/prepare").read_body.decode("utf-8")
+            assert "<form" not in body
+            assert "<button" not in body
+            assert _get(base_url, "/prepare", method="POST").status == 405
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_a_written_report_renders_its_findings_drift_and_notices(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "prepare_report.json"
+        prepare_report_module.write_prepare_report(_prepare_report(), path)
+        base_url, server, thread = self._serve(tmp_path, path)
+        try:
+            body = _get(base_url, "/prepare").read_body.decode("utf-8")
+            assert "2 critical" in body
+            assert "zero_length_segment" in body
+            assert "1.837s" in body  # the #22 timeline drift
+            assert "issue #70" in body  # notices grouped by the issue they name
+            assert "80" in body
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_a_report_whose_inputs_moved_renders_a_stale_banner(self, tmp_path: Path) -> None:
+        lyrics = tmp_path / "lyrics.txt"
+        lyrics.write_text("la la la\n", encoding="utf-8")
+        path = tmp_path / "prepare_report.json"
+        prepare_report_module.write_prepare_report(
+            _prepare_report(
+                inputs=(prepare_report_module.InputStamp.of("lyrics_file", lyrics),)
+            ),
+            path,
+        )
+        lyrics.write_text("an entirely different song\n", encoding="utf-8")
+        base_url, server, thread = self._serve(tmp_path, path)
+        try:
+            body = _get(base_url, "/prepare").read_body.decode("utf-8")
+            assert "Stale:" in body
+            assert "lyrics_file" in body
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_an_unreadable_report_reads_as_not_prepared_not_a_500(self, tmp_path: Path) -> None:
+        path = tmp_path / "prepare_report.json"
+        path.write_text("{not json", encoding="utf-8")
+        base_url, server, thread = self._serve(tmp_path, path)
+        try:
+            resp = _get(base_url, "/prepare")
+            assert resp.status == 200
+            assert b"Nothing has been prepared" in resp.read_body
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_no_configured_path_still_renders_the_not_prepared_page(
+        self, tmp_path: Path
+    ) -> None:
+        base_url, server, thread = self._serve(tmp_path, None)
+        try:
+            resp = _get(base_url, "/prepare")
+            assert resp.status == 200
+            assert b"no prepare-report path configured" in resp.read_body
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_the_index_links_to_it(self, tmp_path: Path) -> None:
+        run_state = RunState(run_id="run-1", results={0: _result(0, ChunkStatus.RENDERED)})
+        body = webui.render_index_html(webui.current_progress(run_state)).decode("utf-8")
+        assert 'href="/prepare"' in body
+
+
+class TestPrepareHtmlEscaping:
+    def test_every_report_derived_string_is_escaped(self) -> None:
+        """A shot-plan refusal quotes the plan's own text, a notice quotes a
+        lyric, and an input path is whatever the operator named: all three
+        reach this page as free text."""
+        report = _prepare_report(
+            plan_checked="<script>alert(1)</script>.toml",
+            plan_errors=('drift on <img src=x onerror="alert(2)">',),
+            notices=(
+                prepare_report_module.StageNotice(
+                    logger="music_video_maker.slicing",
+                    level="WARNING",
+                    message="<script>alert(3)</script>",
+                    issue=None,
+                ),
+            ),
+        )
+        body = webui.render_prepare_html(report).decode("utf-8")
+        assert "<script>alert(1)" not in body
+        assert "<script>alert(3)" not in body
+        # The tag that would have carried the handler is escaped, so
+        # `onerror=` survives only as inert text inside a <li>.
+        assert "<img" not in body
+        assert "&lt;img" in body
+        assert "&lt;script&gt;" in body
+
+    def test_a_plan_free_run_says_no_plan_was_checked_rather_than_passing(self) -> None:
+        body = webui.render_prepare_html(_prepare_report()).decode("utf-8")
+        assert "No shot plan was checked" in body
+
+    def test_a_plan_checked_without_its_lengths_says_the_comparison_is_not_real(self) -> None:
+        """CLAUDE.md: a plan that sets length_seconds has two timelines and
+        only one is real. A drift list produced against the other one has to
+        say so, or it reads as a defect in the plan."""
+        body = webui.render_prepare_html(
+            _prepare_report(
+                plan_checked="shot_plan.toml",
+                plan_lengths_applied=False,
+                plan_errors=("shot plan drift on chunk_id=7",),
+            )
+        ).decode("utf-8")
+        assert "NO editorial lengths" in body
+        assert "--from-plan" in body
 
 
 # --------------------------------------------------------------------------- #

@@ -2428,6 +2428,25 @@ def test_main_prepare_defaults_from_plan_to_none(tmp_path: Path, monkeypatch):
     assert captured["from_plan"] is None
 
 
+def test_main_prepare_writes_its_report_where_the_config_resolved_it(tmp_path: Path, monkeypatch):
+    """Issue #36: mvm-webui reads ``config.prepare_report_file``, so
+    ``--prepare`` must write the file that same resolution names -- not a
+    path it derives itself, which would be a second rule to keep in step."""
+    config_path = _make_config_file(tmp_path)
+    captured = {}
+
+    def fake_prepare_shot_plan(config, output_path, **kwargs):
+        captured["config"] = config
+        captured.update(kwargs)
+        return output_path
+
+    monkeypatch.setattr(cli, "prepare_shot_plan", fake_prepare_shot_plan)
+    cli.main(["--config", str(config_path), "--prepare"])
+
+    assert captured["report_path"] == captured["config"].prepare_report_file
+    assert captured["report_path"].name == "prepare_report.json"
+
+
 def test_main_prepare_flag_calls_prepare_shot_plan_and_returns_success(
     tmp_path: Path, monkeypatch
 ):

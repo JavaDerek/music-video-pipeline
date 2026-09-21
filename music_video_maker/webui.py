@@ -47,11 +47,17 @@ gets a ``ChunkResult`` of its own -- see :func:`_known_chunk_ids`). That is
 strictly a subset of the run's true chunk plan until the last chunk lands, so
 :class:`~music_video_maker.progress.RunProgress`'s ``total``/``finished``
 here mean "recorded so far", never "the whole plan" -- the rendered page says
-so in words rather than implying a total it cannot back up. The pre-render
-review page ``docs/design-web-ui.md`` specifies (still unbuilt) is the right
-place for the true chunk plan, because it runs Stage 1-2 once, on demand,
-from the CLI -- not from a long-lived poller that might be watching a live
-render.
+so in words rather than implying a total it cannot back up.
+
+The true chunk plan belongs to the thing that runs Stage 1-2 once, on
+demand, from the CLI -- and that is ``--prepare``. ``GET /prepare`` shows
+what its last run found (alignment quality, every Stage-2 warning, the
+timeline-versus-track drift, and any shot-plan drift) by **reading the JSON
+report ``--prepare`` writes** (:mod:`music_video_maker.prepare_report`,
+``RunConfig.prepare_report_file``). A run nobody has prepared renders a page
+saying so, with the command; the page never offers to run it. The same rule
+as above, stated from the other side: the measurement is a step the operator
+invokes, and this process only ever reads what it left behind.
 
 The bind-address constraint
 ------------------------------
@@ -141,6 +147,12 @@ from urllib.parse import urlsplit
 from music_video_maker.config import ConfigError, load_config
 from music_video_maker.contracts import RunState
 from music_video_maker.logging_setup import configure_logging
+from music_video_maker.prepare_report import (
+    PrepareReport,
+    PrepareReportError,
+    read_prepare_report,
+    stale_inputs,
+)
 from music_video_maker.progress import (
     ProgressError,
     ProgressEvent,
@@ -649,6 +661,14 @@ th { background: #eee; }
              padding: 8px 12px; margin: 12px 0; }
 .dead-letters { background: #fff; border: 1px solid #ddd; border-radius: 6px;
                 padding: 8px 16px; }
+.sev-CRITICAL { background: #ffecec; }
+.sev-WARNING { background: #fff6e0; }
+.level-ERROR { background: #ffecec; }
+.level-WARNING { background: #fff6e0; }
+.banner { border-radius: 6px; padding: 8px 12px; margin: 12px 0;
+          background: #fff; border: 1px solid #ddd; }
+.banner-bad { background: #ffecec; border-color: #e88; }
+.msg { font-family: ui-monospace, monospace; font-size: 0.82rem; white-space: pre-wrap; }
 """
 
 _SSE_SCRIPT = """
@@ -712,6 +732,9 @@ timeline (it would write chunk audio into the live run's own directory). See
 <div>Pending (known but not yet resolved): {_e(progress.pending)}</div>
 <div>Mean render time (rendered only): {mean_text}</div>
 </div>
+<p class="note"><a href="/prepare">Pre-render checks</a> &mdash; what the last
+<code>--prepare</code> found for this run (alignment quality, Stage-2 warnings, timeline
+drift, shot-plan drift). Read from disk; this monitor never runs Stage 1-2 itself.</p>
 <h2>Dead-lettered chunks</h2>
 {_render_dead_letters(progress)}
 <h2>Chunks</h2>
@@ -722,6 +745,200 @@ timeline (it would write chunk audio into the live run's own directory). See
 </table>
 <div id="live-updates"></div>
 <script>{_SSE_SCRIPT}</script>
+</body></html>"""
+    return body.encode("utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# The pre-render checks page (issue #36) -- read from what --prepare wrote,
+# never recomputed here. See prepare_report.py's module docstring.
+# --------------------------------------------------------------------------- #
+
+
+def _seconds(value: float | None) -> str:
+    return "-" if value is None else f"{value:.3f}s"
+
+
+def _frames(value: float | None) -> str:
+    return "-" if value is None else f"{value:.1f} frames"
+
+
+def _render_prepare_inputs(report: PrepareReport, changed: Sequence[str]) -> str:
+    if not report.inputs:
+        return "<p>This report records no inputs.</p>"
+    rows = []
+    for stamp in report.inputs:
+        state = "changed since this report" if stamp.label in changed else (
+            "unchanged" if stamp.exists else "missing when this report was written"
+        )
+        rows.append(
+            "<tr class=\"{css}\"><td>{label}</td><td>{path}</td><td>{size}</td>"
+            "<td>{state}</td></tr>".format(
+                css="level-WARNING" if stamp.label in changed else "",
+                label=_e(stamp.label),
+                path=_e(stamp.path),
+                size="-" if stamp.size_bytes is None else _e(f"{stamp.size_bytes:,} bytes"),
+                state=_e(state),
+            )
+        )
+    return (
+        "<table><tr><th>input</th><th>path</th><th>size when prepared</th><th>now</th></tr>"
+        + "\n".join(rows)
+        + "</table>"
+    )
+
+
+def _render_prepare_findings(report: PrepareReport) -> str:
+    if not report.alignment_findings:
+        return "<p>No alignment findings at WARNING or above.</p>"
+    rows = [
+        "<tr class=\"sev-{sev}\"><td>{sev}</td><td>{code}</td><td>{span}</td>"
+        "<td class=\"msg\">{message}</td></tr>".format(
+            sev=_e(row.severity),
+            code=_e(row.code),
+            span=_e(f"{row.start:.2f}-{row.end:.2f}s"),
+            message=_e(row.message),
+        )
+        for row in report.alignment_findings
+    ]
+    return (
+        "<table><tr><th>severity</th><th>code</th><th>span</th><th>message</th></tr>"
+        + "\n".join(rows)
+        + "</table>"
+    )
+
+
+def _render_prepare_notices(report: PrepareReport) -> str:
+    if not report.notices:
+        return "<p>Stage 1-2 warned about nothing on this prepare.</p>"
+    blocks = []
+    for issue, notices in report.notices_by_issue():
+        heading = (
+            f"issue #{_e(issue)}" if issue != "other" else "not attributed to an issue"
+        )
+        items = "\n".join(
+            f'<li class="level-{_e(notice.level)} msg">{_e(notice.message)}</li>'
+            for notice in notices
+        )
+        blocks.append(
+            f"<h3>{heading} &mdash; {_e(len(notices))} notice(s)</h3><ul>{items}</ul>"
+        )
+    return "\n".join(blocks)
+
+
+def _render_prepare_plan(report: PrepareReport) -> str:
+    if report.plan_checked is None:
+        return (
+            "<p>No shot plan was checked: this run's config sets no <code>shot_plan</code> "
+            "and <code>--prepare</code> was given no <code>--from-plan</code>.</p>"
+        )
+        # (An unauthored run is a legitimate state, not a missing check.)
+    basis = (
+        "the timeline was re-anchored against this plan's own length_seconds "
+        "(--prepare --from-plan)"
+        if report.plan_lengths_applied
+        else "the timeline was sliced with NO editorial lengths, so a plan that sets "
+        "length_seconds describes a different timeline by construction -- re-run with "
+        "--prepare --from-plan before acting on anything below"
+    )
+    if not report.plan_errors:
+        return (
+            f"<p>{_e(report.plan_checked)} resolves against every chunk in this timeline "
+            f"({_e(basis)}).</p>"
+        )
+    items = "\n".join(f'<li class="msg">{_e(error)}</li>' for error in report.plan_errors)
+    return (
+        f'<div class="banner banner-bad"><strong>{_e(len(report.plan_errors))} shot-plan '
+        f"refusal(s)</strong> resolving {_e(report.plan_checked)} against this timeline "
+        f"&mdash; {_e(basis)}.</div><ul>{items}</ul>"
+    )
+
+
+def render_prepare_html(
+    report: PrepareReport | None,
+    *,
+    not_prepared_reason: str | None = None,
+    changed_inputs: Sequence[str] = (),
+) -> bytes:
+    """Render ``GET /prepare``: what the last ``--prepare`` found.
+
+    ``report is None`` means no readable report exists for this run, which
+    is an ordinary state (nobody has prepared it yet, or the file is from a
+    schema this build does not read) and never a 500. The page then says so
+    and gives the command -- it does **not** offer to run it: alignment is
+    ~6 s of CPU that writes chunk audio into the live run's own directory,
+    and that is a step an operator invokes, not something a page does when
+    somebody opens it.
+
+    ``changed_inputs`` comes from :func:`prepare_report.stale_inputs`, i.e.
+    re-stat'ing now what the report stamped then. It is the difference
+    between "these were the checks" and "these are the checks for the files
+    you have"."""
+    if report is None:
+        reason = _e(not_prepared_reason or "no report file yet")
+        return f"""<!doctype html><html><head><meta charset="utf-8">
+<title>pre-render checks</title><style>{_PAGE_CSS}</style></head>
+<body><h1>Pre-render checks</h1>
+<p class="note">Nothing has been prepared for this run: {reason}.</p>
+<p class="note">Run <code>music-video-maker --config &lt;run.toml&gt; --prepare</code> (Stages
+1-2 only: ~50 s of CPU, no GPU, no ComfyUI) and reload this page. This monitor never runs
+alignment itself &mdash; it writes chunk audio into the run's own directory, so it is a step
+you invoke, not one a page performs when it is opened.</p>
+<p><a href="/">&larr; run progress</a></p>
+</body></html>""".encode()
+
+    stale_banner = (
+        '<div class="banner banner-bad"><strong>Stale:</strong> '
+        f"{_e(', '.join(changed_inputs))} changed on disk since this report was written, so "
+        "it describes a timeline a render would no longer produce. Re-run "
+        "<code>--prepare</code>.</div>"
+        if changed_inputs
+        else ""
+    )
+    strict = (
+        "on &mdash; a CRITICAL finding refuses the run (and would have refused this prepare)"
+        if report.strict_alignment
+        else "off &mdash; a CRITICAL finding is reported and the render proceeds anyway"
+    )
+    body = f"""<!doctype html><html><head><meta charset="utf-8">
+<title>pre-render checks</title><style>{_PAGE_CSS}</style></head>
+<body>
+<h1>Pre-render checks</h1>
+<p class="note">What <code>--prepare</code> found on {_e(report.generated_at)} for
+<code>{_e(report.config_path)}</code>. Read from
+<code>prepare_report.json</code>; nothing on this page was recomputed when you opened it.</p>
+{stale_banner}
+<div class="summary">
+<div>Chunks: {_e(report.chunk_count)} ({_e(report.voiced_chunk_count)} voiced,
+{_e(report.instrumental_chunk_count)} instrumental)</div>
+<div>Critical findings: {_e(report.critical_finding_count)}</div>
+<div>Warning findings: {_e(report.warning_finding_count)}</div>
+<div>Stage 1-2 notices: {_e(len(report.notices))}</div>
+<div>Shot-plan refusals: {_e(len(report.plan_errors))}</div>
+<div>Timeline drift: {_e(_seconds(report.timeline_drift_seconds))}</div>
+</div>
+<h2>Alignment (issue #35)</h2>
+<p>{_e(report.alignment_summary)}</p>
+<p class="note">Whisper model: <code>{_e(report.alignment_model_size or 'default')}</code>.
+strict_alignment is {strict}.</p>
+{_render_prepare_findings(report)}
+<h2>Timeline (issue #22)</h2>
+<p>{_e(report.chunk_count)} chunk(s) spanning
+{_e(_seconds(report.timeline_start))}&ndash;{_e(_seconds(report.timeline_end))}
+against a {_e(_seconds(report.track_duration_seconds))} master track: drift
+{_e(_seconds(report.timeline_drift_seconds))}
+({_e(_frames(report.timeline_drift_frames))}), tolerance
+{_e(_seconds(report.duration_tolerance_seconds))}.</p>
+<p class="note">Positive drift overshoots the track and the mux's <code>-shortest</code>
+silently discards those rendered frames; negative drift cuts the song's own ending out of
+the finished file.</p>
+<h2>Shot plan</h2>
+{_render_prepare_plan(report)}
+<h2>What Stage 1-2 warned about</h2>
+{_render_prepare_notices(report)}
+<h2>Inputs this report was computed from</h2>
+{_render_prepare_inputs(report, changed_inputs)}
+<p><a href="/">&larr; run progress</a></p>
 </body></html>"""
     return body.encode("utf-8")
 
@@ -739,6 +956,11 @@ class MonitorContext:
     address (see :func:`make_servers`)."""
 
     run_state_path: Path
+    prepare_report_path: Path | None = None
+    """Where ``--prepare`` wrote this run's pre-render report
+    (``RunConfig.prepare_report_file``), served at ``/prepare``. ``None``
+    disables that route entirely -- it is a fixed path resolved from the
+    config at startup, never a request parameter."""
     review_html_path: Path | None = None
     thumbnail_cache_dir: Path = field(default_factory=lambda: DEFAULT_THUMBNAIL_CACHE_DIR)
     ffmpeg_runner: SubprocessRunner = field(default=_default_subprocess_runner)
@@ -861,6 +1083,9 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         if match is not None:
             self._serve_thumbnail(ctx, int(match.group(1)), write_body=write_body)
             return
+        if path == "/prepare":
+            self._serve_prepare(ctx, write_body=write_body)
+            return
         if path == "/review":
             self._serve_review(ctx, write_body=write_body)
             return
@@ -927,6 +1152,28 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if write_body:
             self.wfile.write(png_bytes)
+
+    def _serve_prepare(self, ctx: MonitorContext, *, write_body: bool) -> None:
+        """``GET /prepare``: the last ``--prepare``'s report, rendered.
+
+        Reading is the whole of it. This handler never runs alignment or
+        slicing -- see ``prepare_report.py``'s module docstring -- so a run
+        nobody has prepared renders a page saying exactly that, with the
+        command to run, rather than a page that quietly spends 6 s of CPU
+        and writes into a live render's chunk directory."""
+        if ctx.prepare_report_path is None:
+            body = render_prepare_html(
+                None, not_prepared_reason="this server has no prepare-report path configured"
+            )
+            self._send_bytes(200, "text/html; charset=utf-8", body, write_body=write_body)
+            return
+        try:
+            report = read_prepare_report(ctx.prepare_report_path)
+        except PrepareReportError as exc:
+            body = render_prepare_html(None, not_prepared_reason=str(exc))
+        else:
+            body = render_prepare_html(report, changed_inputs=stale_inputs(report))
+        self._send_bytes(200, "text/html; charset=utf-8", body, write_body=write_body)
 
     def _serve_review(self, ctx: MonitorContext, *, write_body: bool) -> None:
         if ctx.review_html_path is None:
@@ -1086,6 +1333,9 @@ def main(argv: list[str] | None = None) -> int:
 
     ctx = MonitorContext(
         run_state_path=config.run_state_file,
+        # Issue #36: the same path --prepare writes, taken from the same
+        # config resolution, so neither side has to derive the other's rule.
+        prepare_report_path=config.prepare_report_file,
         review_html_path=args.review_html,
         thumbnail_cache_dir=args.thumbnail_cache_dir or DEFAULT_THUMBNAIL_CACHE_DIR,
         poll_interval_seconds=args.poll_interval_seconds,
@@ -1147,6 +1397,7 @@ __all__ = [
     "make_server",
     "make_servers",
     "render_index_html",
+    "render_prepare_html",
     "resolve_bind_addresses",
     "stream_progress_events",
     "validate_bind_address",

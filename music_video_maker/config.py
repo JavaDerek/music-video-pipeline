@@ -200,6 +200,20 @@ class RunConfig:
     ``chunks_dir/run_state.json``); it is ``None`` only on a hand-constructed
     :class:`RunConfig`."""
 
+    prepare_report_file: Path | None = None
+    """Issue #36: where ``--prepare`` writes its pre-render report, and where
+    the read-only monitor looks for one.
+
+    Resolved by :func:`load_config` exactly the way ``run_state_file`` is
+    (defaulting to ``chunks_dir/prepare_report.json``), and for the same
+    reason: the writer and the reader are different processes, invoked at
+    different times, and a path either of them *derived* would be a second
+    rule to keep in step with the first. ``None`` only on a hand-constructed
+    :class:`RunConfig`.
+
+    Derived data, overwritten on every ``--prepare`` -- see
+    :mod:`music_video_maker.prepare_report`."""
+
     shot_plan: Path | None = None
     """Optional authored per-chunk narrative direction (see
     :mod:`music_video_maker.shot_plan`).
@@ -2083,6 +2097,16 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
         _resolve_path(run_state_file, base_dir)
         if run_state_file
         else Path(values["chunks_dir"]) / "run_state.json"  # type: ignore[arg-type]
+    )
+
+    # Issue #36: same shape, same reason -- --prepare writes this and
+    # mvm-webui reads it, so the path has to come from one resolution both
+    # of them share rather than from two rules that agree today.
+    prepare_report_file = merged.get("prepare_report_file")
+    values["prepare_report_file"] = (
+        _resolve_path(prepare_report_file, base_dir)
+        if prepare_report_file
+        else Path(values["chunks_dir"]) / "prepare_report.json"  # type: ignore[arg-type]
     )
 
     config = RunConfig(**values)  # type: ignore[arg-type]
