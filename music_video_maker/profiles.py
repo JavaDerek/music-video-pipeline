@@ -109,6 +109,25 @@ module docstring's closing paragraph. Written into every record
 :func:`write_profile_record` produces, so a reader of an old sidecar knows
 which shape it is reading rather than guessing from the keys present."""
 
+PLACEHOLDER_PREFIX = "<TODO"
+"""A look value starting with this is a **skeleton nobody has filled in**, and
+:func:`load_profile` refuses it (issue #55, the ``profiles/`` directory).
+
+A house style is meant to be committed and shared, which means a profile file
+can exist in a repository before the look it names has been promoted into it --
+``profiles/refestramus-house-v1.toml`` is exactly that today, because the
+approved text lives in a run directory that is not part of this repo. The
+question is which mistake is cheap. A skeleton carrying a *plausible but
+truncated* look renders a video that claims to be the house style and is not,
+with no symptom anywhere -- the expensive kind of wrong this project keeps
+recording. A skeleton that refuses at config load costs a run that never
+started.
+
+So the sentinel is a shape no real look ever has (a leading ``<``), it is
+checked where every other profile value is checked, and the message says how
+to fill it. This is the same "refuse loudly at config-load rather than degrade
+silently" split ``i2v_require_seed_face``'s recognition option already uses."""
+
 PROFILE_RECORD_FILENAME = "cinematography_profile.json"
 """Where :func:`write_profile_record`'s sidecar lands, by convention, inside a
 run's ``chunks_dir`` -- beside ``run_state.json``, so everything that proves
@@ -245,6 +264,17 @@ def _validated_look_value(field: str, value: object) -> object:
         raise ProfileError(
             f"{field} is present but blank -- a profile locks explicit values; an "
             "unfilled look field should be omitted, not set to an empty string"
+        )
+    if stripped.startswith(PLACEHOLDER_PREFIX):
+        raise ProfileError(
+            f"{field} is still the committed placeholder ({stripped[:60]!r}...) -- this "
+            "profile is a skeleton nobody has filled in yet. Promote the approved look "
+            "into it first:\n"
+            "    python -m music_video_maker.profiles promote --run-dir <run> "
+            "--name <name> --out <this file> --overwrite\n"
+            "Refused here rather than rendered, because a half-filled house style "
+            "produces a video that claims the look and does not have it, with no "
+            "symptom anywhere (see PLACEHOLDER_PREFIX)"
         )
     return stripped
 
