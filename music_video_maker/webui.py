@@ -68,6 +68,39 @@ outright. Nothing here resolves a hostname; an address must already be an IP
 literal, so a DNS name that happens to resolve to a LAN address can never
 sneak through by never being looked up.
 
+The Host header, and why binding correctly is not enough
+-----------------------------------------------------------
+A correct bind list stops the *network* from reaching this server. It does
+not stop a *browser* from being told to reach it: in a DNS-rebinding attack
+a page on ``evil.example`` is served from a name whose DNS record flips to
+``127.0.0.1`` a few seconds later, and the victim's own browser then issues
+same-origin requests to this server carrying ``Host: evil.example`` -- and
+reads the responses, because as far as it is concerned the origin never
+changed. Loopback-only binding is exactly what that attack exists to
+defeat, so "we only bind to 127.0.0.1" is the precondition for the attack,
+not a defence against it.
+
+:func:`host_header_allowed` is the defence, and it runs *before* any route
+handler (see :meth:`MonitorRequestHandler._reject_unless_host_allowed`): a
+request is answered only when its ``Host`` names **this server's own bound
+address** (the literal, with an optional port that must match), the name
+``localhost``, or something the operator explicitly listed with
+``--allow-host`` -- a Tailscale MagicDNS name, typically, which is the one
+real case a literal does not cover. Everything else gets ``421 Misdirected
+Request`` with no run data in the body. The rejected value is logged, never
+echoed back into the response.
+
+Two deliberate choices in it:
+
+* **An absent ``Host`` is allowed.** Rebinding cannot produce one: the
+  attacker's leverage *is* the name in that header, and a browser will not
+  let script suppress or forge it. Refusing an absent header would refuse
+  only HTTP/1.0 clients (``curl -0``, a hand-rolled socket probe) while
+  blocking no attack.
+* **More than one ``Host`` header is refused.** One request with two
+  authorities is a request-smuggling shape, not something a client this
+  server should answer produces by accident.
+
 Testing (issue #36's day-one list)
 -------------------------------------
 The design doc names two tests that must exist on day one for a server like
@@ -247,6 +280,125 @@ def resolve_bind_addresses(
             addresses.append(validated)
 
     return tuple(addresses)
+
+
+# --------------------------------------------------------------------------- #
+# Host-header validation -- the DNS-rebinding defence (see the module
+# docstring's "The Host header, and why binding correctly is not enough")
+# --------------------------------------------------------------------------- #
+
+ALWAYS_ALLOWED_HOST_NAMES = frozenset({"localhost"})
+"""Names always accepted in a ``Host`` header, whatever this server bound to.
+
+``localhost`` only, and it is safe for the same reason an IP literal is: an
+attacker's page cannot make a browser send this value at all. Reaching this
+server as ``localhost`` requires typing (or linking) ``http://localhost:PORT``,
+which is a first-party navigation whose response a cross-origin script still
+cannot read. What rebinding actually delivers is the *attacker's own* name,
+and that is what this set does not contain."""
+
+
+class HostAllowlistError(ValueError):
+    """An operator-supplied ``--allow-host`` value is not a usable host name.
+
+    Refused rather than normalised away: a wildcard, an empty string, a URL,
+    or anything carrying a port, path, scheme or userinfo is far more likely
+    to be a misunderstanding of what this flag does than a name somebody
+    meant, and a silently-ignored allowlist entry is the failure mode where
+    an operator believes a check is looser than it is."""
+
+
+_HOST_NAME_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$")
+
+
+def normalise_allowed_host(raw: str) -> str:
+    """Canonicalise one ``--allow-host`` value: case-folded, with a trailing
+    root dot removed (``doris.`` and ``doris`` are the same name, and a
+    browser may send either).
+
+    Raises :class:`HostAllowlistError` for anything that is not a bare host
+    name or IP literal -- including ``*``, ``""``, ``http://doris``,
+    ``doris:8787`` and ``doris/path``."""
+    candidate = raw.strip().rstrip(".").casefold()
+    if not candidate:
+        raise HostAllowlistError(f"{raw!r} is not a host name")
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        pass
+    if not _HOST_NAME_RE.match(candidate):
+        raise HostAllowlistError(
+            f"{raw!r} is not a bare host name -- pass just the name a browser would send in "
+            "its Host header (no scheme, no port, no path, no wildcard)"
+        )
+    return candidate
+
+
+def _split_host_header(raw: str) -> tuple[str, int | None] | None:
+    """``"[::1]:8787"`` -> ``("::1", 8787)``; ``None`` when ``raw`` is not a
+    plain authority this server should answer for.
+
+    Parsed through :func:`urllib.parse.urlsplit` rather than by hand so the
+    bracketed-IPv6 and port rules are the stdlib's, not a second guess at
+    them. Anything carrying a path, scheme, userinfo or whitespace is
+    rejected outright before parsing: a ``Host`` header is an authority, and
+    a value shaped like anything else is not a client this server needs to
+    understand."""
+    candidate = raw.strip()
+    if not candidate or any(ch in candidate for ch in "/\\@ \t"):
+        return None
+    try:
+        parsed = urlsplit(f"//{candidate}")
+        hostname, port = parsed.hostname, parsed.port
+    except ValueError:
+        return None
+    if hostname is None or parsed.path or parsed.query or parsed.fragment:
+        return None
+    return hostname, port
+
+
+def host_header_allowed(
+    raw: str | None,
+    *,
+    bound_address: str,
+    port: int,
+    extra_allowed: frozenset[str] = frozenset(),
+) -> bool:
+    """Whether a request carrying ``Host: raw`` may be answered by a server
+    listening on ``bound_address:port``.
+
+    ``raw is None`` (no ``Host`` header at all) is **allowed** -- see the
+    module docstring for why that refuses nothing an attacker can do. Every
+    other value must be one of:
+
+    * this server's own bound address as an IP literal, compared as an
+      address rather than as text (so ``::1`` and ``0:0:0:0:0:0:0:1`` are the
+      same host) and with an optional port that must equal ``port``;
+    * ``localhost`` (:data:`ALWAYS_ALLOWED_HOST_NAMES`);
+    * a name in ``extra_allowed``, which comes only from ``--allow-host``.
+
+    A name is never resolved, exactly as :func:`validate_bind_address` never
+    resolves one: resolution is the mechanism this check exists to defeat, so
+    performing one here to "see if it points at us" would answer the
+    attacker's own DNS query and let the attack through by design."""
+    if raw is None:
+        return True
+    split = _split_host_header(raw)
+    if split is None:
+        return False
+    hostname, host_port = split
+    if host_port is not None and host_port != port:
+        return False
+    try:
+        requested = ipaddress.ip_address(hostname)
+    except ValueError:
+        name = hostname.rstrip(".").casefold()
+        return name in ALWAYS_ALLOWED_HOST_NAMES or name in extra_allowed
+    try:
+        bound = ipaddress.ip_address(bound_address)
+    except ValueError:  # pragma: no cover - make_server only ever binds literals
+        return False
+    return requested == bound
 
 
 # --------------------------------------------------------------------------- #
@@ -592,6 +744,13 @@ class MonitorContext:
     ffmpeg_runner: SubprocessRunner = field(default=_default_subprocess_runner)
     poll_interval_seconds: float = 2.0
     sleeper: Callable[[float], None] = time.sleep
+    allowed_hosts: frozenset[str] = frozenset()
+    """Extra ``Host`` values this server answers for, from ``--allow-host``
+    (normalised through :func:`normalise_allowed_host`). Empty by default:
+    the server's own bound address and ``localhost`` are always accepted
+    without anything being configured, so the usual case needs no entry at
+    all -- this is for a name, typically a Tailscale MagicDNS one, that no
+    literal covers."""
 
 
 _CHUNK_THUMBNAIL_RE = re.compile(r"^/chunks/(\d+)/thumbnail\.png$")
@@ -609,12 +768,72 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
     # -- dispatch -------------------------------------------------------- #
 
     def do_GET(self) -> None:
+        if self._reject_unless_host_allowed():
+            return
         self._dispatch(write_body=True)
 
     def do_HEAD(self) -> None:
+        if self._reject_unless_host_allowed(write_body=False):
+            return
         self._dispatch(write_body=False)
 
+    # -- Host header ------------------------------------------------------ #
+
+    def _reject_unless_host_allowed(self, *, write_body: bool = True) -> bool:
+        """Answer ``421`` and return ``True`` when this request's ``Host``
+        is not one this server answers for (see the module docstring).
+
+        Called first in every method handler, including the ones that only
+        ever return ``405``: "before any handler runs" is the whole point,
+        and a rejected request must not be able to tell a ``405`` from a
+        ``404`` either, since both would confirm what is listening here."""
+        ctx: MonitorContext = self.server.ctx  # type: ignore[attr-defined]
+        values = self.headers.get_all("Host") or []
+        if len(values) > 1:
+            logger.warning(
+                "Refusing a request carrying %d Host headers from %s -- one request with two "
+                "authorities is a request-smuggling shape, not a client to answer",
+                len(values),
+                self.address_string(),
+            )
+            self._send_misdirected(write_body=write_body)
+            return True
+        raw = values[0] if values else None
+        if host_header_allowed(
+            raw,
+            bound_address=str(self.server.server_address[0]),
+            port=int(self.server.server_address[1]),
+            extra_allowed=ctx.allowed_hosts,
+        ):
+            return False
+        logger.warning(
+            # Logged, never echoed into the response body: the value is
+            # attacker-chosen text, and the operator debugging a real
+            # misconfiguration reads the log, not the browser.
+            "Refusing a request from %s whose Host header (%r) is neither this server's own "
+            "bound address (%s:%s) nor localhost nor an --allow-host value (%s) -- see "
+            "music_video_maker/webui.py's Host-header section (DNS rebinding)",
+            self.address_string(),
+            raw,
+            self.server.server_address[0],
+            self.server.server_address[1],
+            sorted(ctx.allowed_hosts) or "none configured",
+        )
+        self._send_misdirected(write_body=write_body)
+        return True
+
+    def _send_misdirected(self, *, write_body: bool) -> None:
+        self._send_plain(
+            421,
+            "This monitor only answers requests addressed to its own bound address or to "
+            "localhost. If you reach it by a name (a Tailscale MagicDNS name, say), start it "
+            "with --allow-host <name>.\n",
+            write_body=write_body,
+        )
+
     def _method_not_allowed(self) -> None:
+        if self._reject_unless_host_allowed():
+            return
         self.send_response(405)
         self.send_header("Allow", "GET, HEAD")
         self.send_header("Content-Length", "0")
@@ -733,6 +952,10 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        # Every response here has a content type this module chose itself, so
+        # a browser has no reason to guess at one -- and the one place a guess
+        # could matter is a text/plain error carrying operator-facing text.
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         if write_body:
             self.wfile.write(body)
@@ -799,6 +1022,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--port", type=int, default=8787, help="TCP port for every bound address")
     parser.add_argument(
+        "--allow-host",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="an additional value to accept in a request's Host header (repeatable). The "
+        "server's own bound address and 'localhost' are always accepted; this is for a NAME "
+        "-- typically a Tailscale MagicDNS name -- that no IP literal covers. Everything "
+        "else is refused with 421 before any handler runs (DNS rebinding).",
+    )
+    parser.add_argument(
         "--review-html",
         type=Path,
         default=None,
@@ -845,11 +1078,18 @@ def main(argv: list[str] | None = None) -> int:
         logger.exception("Refusing to start: invalid --bind address")
         return 1
 
+    try:
+        allowed_hosts = frozenset(normalise_allowed_host(name) for name in args.allow_host)
+    except HostAllowlistError:
+        logger.exception("Refusing to start: invalid --allow-host value")
+        return 1
+
     ctx = MonitorContext(
         run_state_path=config.run_state_file,
         review_html_path=args.review_html,
         thumbnail_cache_dir=args.thumbnail_cache_dir or DEFAULT_THUMBNAIL_CACHE_DIR,
         poll_interval_seconds=args.poll_interval_seconds,
+        allowed_hosts=allowed_hosts,
     )
 
     servers = make_servers(bind_addresses, args.port, ctx)
@@ -888,8 +1128,10 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "ALWAYS_ALLOWED_HOST_NAMES",
     "BindAddressError",
     "DEFAULT_THUMBNAIL_CACHE_DIR",
+    "HostAllowlistError",
     "MonitorContext",
     "MonitorRequestHandler",
     "TAILSCALE_IPV4_RANGE",
@@ -898,7 +1140,9 @@ __all__ = [
     "current_progress",
     "default_tailscale_ipv4",
     "get_or_render_thumbnail",
+    "host_header_allowed",
     "is_valid_chunk_id",
+    "normalise_allowed_host",
     "main",
     "make_server",
     "make_servers",
