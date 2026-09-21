@@ -25,8 +25,10 @@ import copy
 import json
 import logging
 import math
+import random
 import struct
 import wave
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -584,6 +586,114 @@ def write_tone_wav(
         wf.setsampwidth(2)
         wf.setframerate(sample_rate)
         wf.writeframes(frame_data)
+    return path
+
+
+# --------------------------------------------------------------------------- #
+# Voiced-vs-unvoiced test signals (issue #96)
+# --------------------------------------------------------------------------- #
+#
+# The #96 check asks whether the sound under a placed lyric is PERIODIC, so
+# the fixtures have to differ on periodicity rather than on level or
+# brightness. Four sources, built from stdlib `math`/`random` only:
+#
+#   voice  -- a harmonic stack whose F0 wobbles (vibrato + micro-jitter), i.e.
+#             periodic AND unstable, which is what a sung vowel is;
+#   pluck  -- the same harmonic stack at a rigidly constant F0 under an
+#             exponential decay, i.e. periodic and metronomic, which is what a
+#             struck or plucked string is. This is the fixture that pins the
+#             DOCUMENTED LIMIT of the check: it must read as voiced, because
+#             periodicity genuinely cannot tell it from a vowel;
+#   noise  -- broadband, loud, aperiodic (drums/hiss/room tone);
+#   quiet  -- near-digital-silence, which the level gate must remove rather
+#             than judge (#93: a zero is not evidence of absence).
+#
+# Nothing binary is committed; every waveform is generated per test run.
+
+VOICING_SAMPLE_RATE = 16000
+"""The rate alignment_quality's own ffmpeg decode produces, so these fixtures
+exercise the same decimation path the real check runs."""
+
+
+def voiced_samples(
+    seconds: float,
+    f0: float = 180.0,
+    amplitude: float = 8000.0,
+    vibrato_depth: float = 0.03,
+    vibrato_hz: float = 5.5,
+    seed: int = 1,
+    sample_rate: int = VOICING_SAMPLE_RATE,
+) -> list[float]:
+    """A harmonic stack with vibrato -- periodic and unstable, like a voice."""
+    rnd = random.Random(seed)
+    gains = (1.0, 0.6, 0.4, 0.25, 0.15)
+    scale = amplitude / sum(gains)
+    out: list[float] = []
+    phase = 0.0
+    for i in range(int(seconds * sample_rate)):
+        t = i / sample_rate
+        frequency = f0 * (1.0 + vibrato_depth * math.sin(2 * math.pi * vibrato_hz * t))
+        phase += 2 * math.pi * frequency / sample_rate
+        value = sum(gain * math.sin(k * phase) for k, gain in enumerate(gains, start=1))
+        out.append((value + rnd.uniform(-0.05, 0.05)) * scale)
+    return out
+
+
+def plucked_samples(
+    seconds: float,
+    f0: float = 196.0,
+    amplitude: float = 9000.0,
+    decay_per_second: float = 1.5,
+    seed: int = 2,
+    sample_rate: int = VOICING_SAMPLE_RATE,
+) -> list[float]:
+    """A decaying harmonic stack at a rigidly constant F0 -- periodic and
+    metronomic, like a plucked string. Reads as VOICED; that is the point."""
+    rnd = random.Random(seed)
+    gains = (1.0, 0.5, 0.3, 0.2, 0.12, 0.08)
+    scale = amplitude / sum(gains)
+    out: list[float] = []
+    for i in range(int(seconds * sample_rate)):
+        t = i / sample_rate
+        value = sum(gain * math.sin(2 * math.pi * f0 * k * t) for k, gain in enumerate(gains, 1))
+        out.append((value + rnd.uniform(-0.03, 0.03)) * scale * math.exp(-t * decay_per_second))
+    return out
+
+
+def noise_samples(
+    seconds: float,
+    amplitude: float = 6000.0,
+    seed: int = 3,
+    sample_rate: int = VOICING_SAMPLE_RATE,
+) -> list[float]:
+    """Loud broadband noise -- aperiodic at any lag."""
+    rnd = random.Random(seed)
+    return [rnd.uniform(-amplitude, amplitude) for _ in range(int(seconds * sample_rate))]
+
+
+def near_silence_samples(
+    seconds: float,
+    amplitude: float = 20.0,
+    seed: int = 4,
+    sample_rate: int = VOICING_SAMPLE_RATE,
+) -> list[float]:
+    """Dither-level noise: loud enough not to be digital silence, far too
+    quiet for a level-gated statistic to mean anything."""
+    return noise_samples(seconds, amplitude=amplitude, seed=seed, sample_rate=sample_rate)
+
+
+def write_samples_wav(
+    path: Path, blocks: Sequence[Sequence[float]], sample_rate: int = VOICING_SAMPLE_RATE
+) -> Path:
+    """Concatenate ``blocks`` of float samples into one mono 16-bit PCM WAV --
+    the exact shape ``alignment_quality``'s ffmpeg decode produces."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flat = [max(-32768, min(32767, int(value))) for block in blocks for value in block]
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(struct.pack(f"<{len(flat)}h", *flat))
     return path
 
 

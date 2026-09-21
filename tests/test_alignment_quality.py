@@ -12,6 +12,7 @@ The real-timing fixtures below are taken verbatim from issue #35's evidence
 on "The Lucky Ones" (2026-08-08 alignment run).
 """
 
+import logging
 import math
 import shutil
 import subprocess
@@ -21,7 +22,9 @@ import pytest
 
 from music_video_maker.alignment_quality import (
     FINDING_ISOLATED,
+    FINDING_LOW_CONFIDENCE,
     FINDING_NO_VOCAL_ENERGY,
+    FINDING_NO_VOICED_PERIODICITY,
     FINDING_OUT_OF_ORDER,
     FINDING_OVERLAP,
     FINDING_SPLIT_LINE,
@@ -31,18 +34,25 @@ from music_video_maker.alignment_quality import (
     FINDING_ZERO_LENGTH,
     AlignmentQualityError,
     AlignmentQualityReport,
+    Finding,
     LowConfidenceWord,
     Severity,
     evaluate_alignment_quality,
     format_summary,
     log_report,
     raise_if_blocking,
+    suspect_segment_indices,
 )
 from music_video_maker.contracts import AlignmentResult, WordTiming
 from tests.harness.factories import (
     make_aligned_segment,
     make_alignment_result_normal_song,
     make_alignment_result_with_gaps,
+    near_silence_samples,
+    noise_samples,
+    plucked_samples,
+    voiced_samples,
+    write_samples_wav,
 )
 
 
@@ -1417,3 +1427,176 @@ def test_real_deathless_gap_check_flags_the_495s_silent_tower_and_not_the_fadeou
     assert not any(f.start >= trailing_tail_start - 0.01 for f in gap_hits), (
         f"the trailing tail after the last placed segment must not fire; got {gap_hits}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Voiced-periodicity check (issue #96): "is the sound where this lyric was
+# placed PERIODIC?" -- the axis #71's consonant-band share is blind to.
+#
+# Unlike #71/#80, this check reads SAMPLES, not ffmpeg's astats text, so the
+# fake runner here writes a real synthesized mono-16kHz WAV at the decode
+# step -- exactly what ffmpeg would have produced -- and answers the per-
+# window astats calls the same way the #71 fake does. Two seams, one decode,
+# which is how the real check works too.
+# --------------------------------------------------------------------------- #
+
+
+class _FakeDecodingRunner(_FakeVocalEnergyRunner):
+    """``_FakeVocalEnergyRunner`` that also *produces* the decoded track.
+
+    ``blocks`` is the list of sample blocks making up the whole track,
+    concatenated in order; the decode call (identified, like the parent's,
+    by the absence of ``-ss``) writes them to the output path the check
+    asked for."""
+
+    def __init__(self, blocks, profile=None, **kwargs):
+        super().__init__(profile or {}, **kwargs)
+        self.blocks = blocks
+
+    def __call__(self, args):
+        args = list(args)
+        if "-ss" not in args and self.decode_ok:
+            write_samples_wav(Path(args[-1]), self.blocks)
+        return super().__call__(args)
+
+
+_PERIODICITY_SPAN = 2.0
+
+_SOURCES = {
+    "voice": voiced_samples,
+    "pluck": plucked_samples,
+    "noise": noise_samples,
+    "quiet": near_silence_samples,
+}
+
+
+def _periodicity_segments(labels):
+    """One 2s segment per label, separated by 1s of filler, so no gap ever
+    reaches GAP_MIN_DURATION_S and #80 stays out of these tests."""
+    return tuple(
+        make_aligned_segment(i, f"lyric {i}", i * 3.0, i * 3.0 + _PERIODICITY_SPAN, "Dianne")
+        for i, _ in enumerate(labels)
+    )
+
+
+def _periodicity_blocks(labels):
+    """The whole track: each labelled source in its segment's span, near
+    silence in the 1s gaps between them."""
+    blocks = []
+    for index, label in enumerate(labels):
+        blocks.append(_SOURCES[label](_PERIODICITY_SPAN, seed=index + 10))
+        blocks.append(near_silence_samples(1.0, seed=index + 50))
+    return blocks
+
+
+def _periodicity_report(tmp_path, labels, **kwargs):
+    segments = _periodicity_segments(labels)
+    result = AlignmentResult(segments=segments, track_duration=len(labels) * 3.0)
+    runner = _FakeDecodingRunner(_periodicity_blocks(labels))
+    return evaluate_alignment_quality(
+        result, audio_path=_write_stub_audio(tmp_path), ffmpeg_runner=runner, **kwargs
+    )
+
+
+def test_a_lyric_over_aperiodic_noise_is_flagged(tmp_path):
+    report = _periodicity_report(tmp_path, ["voice", "voice", "voice", "voice", "noise"])
+
+    hits = [f for f in report.findings if f.code == FINDING_NO_VOICED_PERIODICITY]
+    assert [f.segment_index for f in hits] == [4]
+    assert hits[0].severity is Severity.WARNING
+
+
+def test_the_periodicity_finding_is_never_critical_and_never_blocks(tmp_path):
+    # Ground rule for every acoustic finding whose threshold is not calibrated
+    # against a real master: --strict-alignment must not refuse on it.
+    report = _periodicity_report(tmp_path, ["voice", "voice", "voice", "voice", "noise"])
+
+    raise_if_blocking(report, strict=True)  # must not raise
+
+
+def test_a_track_of_real_voices_produces_no_periodicity_finding(tmp_path):
+    report = _periodicity_report(tmp_path, ["voice"] * 5)
+
+    assert not [f for f in report.findings if f.code == FINDING_NO_VOICED_PERIODICITY]
+
+
+def test_a_plucked_string_passes_and_that_is_the_documented_limit(tmp_path):
+    # Issue #96's headline case: a phantom lyric over a guitar note. This
+    # check does not catch it, and the test says so rather than leaving the
+    # limitation only in prose -- see voicing.py's "What this CANNOT
+    # distinguish" and calibrate_voicing's jitter%/f0_span columns.
+    report = _periodicity_report(tmp_path, ["voice", "voice", "voice", "voice", "pluck"])
+
+    assert not [f for f in report.findings if f.code == FINDING_NO_VOICED_PERIODICITY]
+
+
+def test_a_segment_whose_frames_are_all_too_quiet_is_unmeasured_not_flagged(tmp_path, caplog):
+    # #93: a zero from a detector is not evidence of absence. #71 owns the
+    # level question and has already run on the same span.
+    with caplog.at_level(logging.INFO, logger="music_video_maker.alignment_quality"):
+        report = _periodicity_report(tmp_path, ["voice", "voice", "voice", "voice", "quiet"])
+
+    assert not [f for f in report.findings if f.code == FINDING_NO_VOICED_PERIODICITY]
+    assert any("UNMEASURED rather than unvoiced" in r.getMessage() for r in caplog.records)
+
+
+def test_too_few_measurable_segments_skips_the_check(tmp_path, caplog):
+    with caplog.at_level(logging.INFO, logger="music_video_maker.alignment_quality"):
+        report = _periodicity_report(tmp_path, ["voice", "voice", "noise"])
+
+    assert not [f for f in report.findings if f.code == FINDING_NO_VOICED_PERIODICITY]
+    assert any("a baseline needs more than" in r.getMessage() for r in caplog.records)
+
+
+def test_an_unreadable_decode_skips_the_check_and_leaves_the_others_running(tmp_path, caplog):
+    # This is what every pre-#96 test in this module exercises: the fake
+    # runner reports a successful decode and writes nothing, so the samples
+    # cannot be read. The check must degrade to a logged skip, never a crash,
+    # and #71's findings must still arrive.
+    result = AlignmentResult(segments=_energy_segments(), track_duration=70.0)
+    profile = {0.0: 0.02, 20.0: 0.021, 40.0: 0.019, 60.0: 0.0015}
+    runner = _FakeVocalEnergyRunner(profile)
+
+    with caplog.at_level(logging.WARNING, logger="music_video_maker.alignment_quality"):
+        report = evaluate_alignment_quality(
+            result, audio_path=_write_stub_audio(tmp_path), ffmpeg_runner=runner
+        )
+
+    assert not [f for f in report.findings if f.code == FINDING_NO_VOICED_PERIODICITY]
+    assert [f.segment_index for f in report.findings if f.code == FINDING_NO_VOCAL_ENERGY] == [3]
+    assert any("issue #96" in r.getMessage() for r in caplog.records)
+
+
+def test_the_threshold_is_overridable_like_every_other_one(tmp_path):
+    # A threshold this module ships uncalibrated has to be reachable without
+    # editing the module, the same way every other constant here is.
+    loose = _periodicity_report(tmp_path, ["voice"] * 4 + ["noise"], voicing_ratio_threshold=0.0)
+
+    assert not [f for f in loose.findings if f.code == FINDING_NO_VOICED_PERIODICITY]
+
+
+def test_the_finding_message_reports_jitter_and_pitch_spread(tmp_path):
+    # The two statistics that might separate a pluck from a vowel are carried
+    # in the message precisely because they are not thresholded: the next
+    # revision starts from data, not from a rebuilt experiment.
+    report = _periodicity_report(tmp_path, ["voice"] * 4 + ["noise"])
+
+    message = next(f.message for f in report.findings if f.code == FINDING_NO_VOICED_PERIODICITY)
+    assert "jitter" in message
+    assert "F0 spread" in message
+    assert "not evidence of a voice" in message
+
+
+def test_suspect_segment_indices_names_the_phantom_codes_only():
+    findings = (
+        Finding(0, 0.0, 1.0, Severity.CRITICAL, FINDING_NO_VOCAL_ENERGY, "m"),
+        Finding(1, 0.0, 1.0, Severity.WARNING, FINDING_NO_VOICED_PERIODICITY, "m"),
+        Finding(2, 0.0, 1.0, Severity.CRITICAL, FINDING_ISOLATED, "m"),
+        # Not suspect: 24% of a GOOD track's words score under 0.10, so a set
+        # this broad would mark most of a real song and inform nobody.
+        Finding(3, 0.0, 1.0, Severity.WARNING, FINDING_LOW_CONFIDENCE, "m"),
+        # Not suspect and has no segment index at all: #80 is about a gap.
+        Finding(None, 0.0, 1.0, Severity.WARNING, FINDING_VOICE_IN_UNPLACED_GAP, "m"),
+    )
+
+    assert suspect_segment_indices(AlignmentQualityReport(findings=findings)) == {0, 1, 2}
