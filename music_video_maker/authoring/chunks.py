@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 
+from music_video_maker import alignment_quality
 from music_video_maker.alignment import align
 from music_video_maker.config import RunConfig
 from music_video_maker.contracts import AudioChunk
@@ -51,10 +52,15 @@ def load_chunk_skeleton(
     :mod:`~music_video_maker.authoring.reanchor`.
     """
     lines = parse_lyrics(config.lyrics_file, config.cast, config.default_lead_vocalist)
+    # Issue #96/#92: the third align() call site, and the one CLAUDE.md warns
+    # is easiest to miss. An authored plan is written against these chunk ids,
+    # so the same segment-to-chunk mapping the render logs belongs here too.
+    quality_reports: list[alignment_quality.AlignmentQualityReport] = []
     alignment = align(
         config.master_audio,
         lines,
         model=align_model,
+        on_quality_report=quality_reports.append,
         # The third call site, and the one easiest to miss: a plan authored
         # against a different alignment than the render uses describes chunks
         # the render never emits. On "Deathless" that was 71 chunks (15 voiced)
@@ -71,6 +77,11 @@ def load_chunk_skeleton(
         cover_instrumentals=config.instrumental_coverage,
         instrumental_shot_seconds=config.instrumental_shot_seconds,
         shot_lengths=shot_lengths,
+        suspect_segment_indices=(
+            alignment_quality.suspect_segment_indices(quality_reports[0])
+            if quality_reports
+            else ()
+        ),
     )
     if not chunks:
         raise SkeletonError(

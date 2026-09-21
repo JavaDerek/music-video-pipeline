@@ -57,7 +57,11 @@ from typing import Any
 import requests
 
 from music_video_maker.alignment import align
-from music_video_maker.alignment_quality import AlignmentQualityReport, evaluate_alignment_quality
+from music_video_maker.alignment_quality import (
+    AlignmentQualityReport,
+    evaluate_alignment_quality,
+    suspect_segment_indices,
+)
 from music_video_maker.assembly import assemble_final_video
 from music_video_maker.config import ConfigError, RunConfig, load_config
 from music_video_maker.continuity import ContinuityWorkflowProvider, planned_chain_source
@@ -734,10 +738,16 @@ def run_pipeline(
     # runs before custody is ever taken.
     with prevent_host_sleep(), custody:
         lines = parse_lyrics(config.lyrics_file, config.cast, config.default_lead_vocalist)
+        # Issue #96/#92: the report align() already computes is the only thing
+        # that knows which segments may hold no voice at all. Captured through
+        # the same seam --prepare uses, so slicing can map those segments onto
+        # the chunk ids a render actually emits.
+        render_quality_reports: list[AlignmentQualityReport] = []
         alignment = align(
             config.master_audio,
             lines,
             model=align_model,
+            on_quality_report=render_quality_reports.append,
             # Ignored when `model` is injected (the test rigs), and the only
             # thing that decides the timeline when it is not. Unpassed until
             # now, which pinned every run to "base" however the config read.
@@ -769,6 +779,11 @@ def run_pipeline(
             # F26: H3 lip-syncs whatever audio it is handed, so an
             # instrumental chunk fed full-level music grows a mouth.
             instrumental_audio_gain_db=config.instrumental_audio_gain_db,
+            suspect_segment_indices=(
+                suspect_segment_indices(render_quality_reports[0])
+                if render_quality_reports
+                else ()
+            ),
         )
         if not chunks:
             raise PipelineError(
@@ -1199,6 +1214,9 @@ def prepare_timeline(
         # identical either way -- this is consistency, not correctness.
         instrumental_audio_gain_db=config.instrumental_audio_gain_db,
         shot_lengths=shot_lengths,
+        suspect_segment_indices=(
+            suspect_segment_indices(quality_reports[0]) if quality_reports else ()
+        ),
     )
     if not chunks:
         raise PipelineError(

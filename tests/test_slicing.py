@@ -20,7 +20,9 @@ shared fixtures were designed around.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
+import re
 import wave
 from pathlib import Path
 
@@ -2686,3 +2688,130 @@ def test_a_rounding_residue_after_outro_filler_grows_that_filler_not_a_new_chunk
         (243, True), (158, False), (209, True)
     ]
     assert 0.0 <= timeline_track_drift_seconds(chunks, 25.0) < GRID.frames_to_seconds(17)
+
+
+# --------------------------------------------------------------------------- #
+# Doubted aligned segments mapped onto chunk ids (issues #96, #92).
+#
+# The alignment-quality report names SEGMENTS; a render names CHUNKS; slicing
+# is the only pass that knows the translation. These tests pin that it is a
+# report and nothing more: the same suspect set must leave the timeline, the
+# attribution, the text and every fingerprint-bearing field untouched.
+# --------------------------------------------------------------------------- #
+
+
+def _cross_character_alignment():
+    segments = (
+        make_aligned_segment(0, "his line", 0.0, 2.0, "Marcus"),
+        make_aligned_segment(1, "her line", 2.1, 5.0, "Dianne"),
+    )
+    return AlignmentResult(segments=segments, track_duration=10.0)
+
+
+def test_a_doubted_segment_is_reported_against_the_chunk_that_renders_it(tmp_path, caplog):
+    alignment = _cross_character_alignment()
+    master = write_silent_wav(tmp_path / "master.wav", alignment.track_duration)
+
+    with caplog.at_level(logging.WARNING):
+        slice_audio(
+            master,
+            alignment,
+            DEFAULT_HARDWARE,
+            tmp_path / "chunks",
+            suspect_segment_indices={1},
+        )
+
+    assert "chunk 0 <- segment(s) [1]" in caplog.text
+    assert "issue #96" in caplog.text
+
+
+def test_a_merge_dropping_a_doubted_segment_says_it_may_not_be_a_merge(tmp_path, caplog):
+    # The #92 follow-up: on "Deathless" two of the three chunks the fix acted
+    # on dropped words nobody sings, so they were never merges at all.
+    alignment = _cross_character_alignment()
+    master = write_silent_wav(tmp_path / "master.wav", alignment.track_duration)
+
+    with caplog.at_level(logging.WARNING):
+        slice_audio(
+            master,
+            alignment,
+            DEFAULT_HARDWARE,
+            tmp_path / "chunks",
+            suspect_segment_indices={0},
+        )
+
+    assert "chunk 0 <- dropped segment(s) [0]" in caplog.text
+    assert "never a merge" in caplog.text
+
+
+def test_the_merge_warning_names_the_dropped_segment_indices_even_with_no_suspects(
+    tmp_path, caplog
+):
+    # Without the indices an operator cannot cross-reference the merge log
+    # against a quality report at all, suspect set or no suspect set.
+    alignment = _cross_character_alignment()
+    master = write_silent_wav(tmp_path / "master.wav", alignment.track_duration)
+
+    with caplog.at_level(logging.WARNING):
+        slice_audio(master, alignment, DEFAULT_HARDWARE, tmp_path / "chunks")
+
+    assert "aligned segment(s) [0]" in caplog.text
+
+
+def test_a_suspect_set_changes_no_chunk_field_at_all(tmp_path):
+    # Reports only. Dropping a phantom's words from the attributed singer's
+    # prompt is the same right answer whether or not it is a phantom, and a
+    # WARNING-grade acoustic finding must never move a timeline.
+    alignment = _cross_character_alignment()
+    master = write_silent_wav(tmp_path / "master.wav", alignment.track_duration)
+
+    plain = slice_audio(master, alignment, DEFAULT_HARDWARE, tmp_path / "a")
+    doubted = slice_audio(
+        master,
+        alignment,
+        DEFAULT_HARDWARE,
+        tmp_path / "b",
+        suspect_segment_indices={0, 1},
+    )
+
+    assert [dataclasses.replace(c, audio_file=Path("x")) for c in plain] == [
+        dataclasses.replace(c, audio_file=Path("x")) for c in doubted
+    ]
+
+
+def test_an_empty_suspect_set_logs_nothing_new(tmp_path, caplog):
+    alignment = _cross_character_alignment()
+    master = write_silent_wav(tmp_path / "master.wav", alignment.track_duration)
+
+    with caplog.at_level(logging.WARNING):
+        slice_audio(master, alignment, DEFAULT_HARDWARE, tmp_path / "chunks")
+
+    assert "doubts there is a voice under" not in caplog.text
+    assert "dropped segment(s)" not in caplog.text
+
+
+def test_an_instrumental_chunk_is_never_reported_as_singing_a_doubted_lyric(tmp_path, caplog):
+    # A filler chunk has no members and no text; naming it here would be a
+    # false positive in the one register that has to stay trustworthy.
+    segments = (make_aligned_segment(0, "her line", 20.0, 25.0, "Dianne"),)
+    alignment = AlignmentResult(segments=segments, track_duration=40.0)
+    master = write_silent_wav(tmp_path / "master.wav", alignment.track_duration)
+
+    with caplog.at_level(logging.WARNING):
+        chunks = slice_audio(
+            master,
+            alignment,
+            DEFAULT_HARDWARE,
+            tmp_path / "chunks",
+            cover_instrumentals=True,
+            suspect_segment_indices={0},
+        )
+
+    voiced = [c.chunk_id for c in chunks if not c.is_instrumental]
+    reported = [
+        int(match)
+        for record in caplog.records
+        if "doubts there is a voice under" in record.getMessage()
+        for match in re.findall(r"chunk (\d+) <- segment", record.getMessage())
+    ]
+    assert reported and set(reported) <= set(voiced)
