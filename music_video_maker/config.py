@@ -64,6 +64,20 @@ against the *config file's* directory, not the process cwd)::
     max_chunk_seconds = 15.0     # optional
     recommended_nodes = ["SageAttention"]   # optional
 
+    # Issue #66, optional and repeatable: a second timeline around the song.
+    # The song itself stays exactly where it is (master_audio / lyrics_file).
+    # NOTE, as with [hardware] and [[alignment_override]]: TOML binds a bare
+    # key to whichever table precedes it, so every top-level setting must be
+    # written ABOVE the first table. The key set here is closed, so a
+    # misplaced one is a loud failure naming the key rather than a silent
+    # reassignment.
+    [[segment]]
+    name      = "prologue"
+    position  = "before"                  # optional; "before" (default) or "after"
+    audio     = "audio/prologue.wav"      # the recorded dialogue
+    script    = "prologue.txt"            # lyrics-format text for that recording
+    shot_plan = "prologue_shot_plan.toml" # optional, authored against THIS timeline
+
 A cast member is not required to ever be the active vocalist -- background
 members (e.g. a drummer who appears in shots but never sings) are simply
 entries in ``cast`` that are never ``default_lead_vocalist`` and never named
@@ -95,6 +109,7 @@ from music_video_maker.faces import (
 )
 from music_video_maker.profiles import LOOK_FIELDS as PROFILE_LOOK_FIELDS
 from music_video_maker.profiles import Profile, ProfileError, load_profile, resolve_look
+from music_video_maker.timelines import Segment, TimelineError, build_segments
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -778,6 +793,29 @@ class RunConfig:
     pre-#95 state file -- is *unknown*, not different, and this flag never
     re-renders it: refusing a chunk for a stack nobody wrote down would
     re-render whole songs over no evidence at all."""
+    segments: tuple[Segment, ...] = ()
+    """Issue #66: second timelines rendered around the song -- a spoken
+    prologue, an epilogue, or both.
+
+    Each ``[[segment]]`` table names its own recording (``audio``), its own
+    text (``script``, in lyrics format), an optional ``shot_plan`` authored
+    against *that* timeline's chunk ids, and ``position`` (``"before"`` --
+    the default -- or ``"after"``). Empty, which is every config written
+    before this existed, means one timeline and a pipeline that behaves
+    exactly as it always did: no second alignment, no second chunks
+    directory, no change to the concat.
+
+    A sequence rather than a ``prologue`` field, deliberately. An epilogue is
+    the same machinery (Thriller opens with four minutes of film and closes
+    with a laugh), and a bespoke ``prologue`` key guarantees a second
+    implementation for the laugh at the end.
+
+    Parsed and validated by :mod:`music_video_maker.timelines`, including the
+    closed key set -- TOML binds a bare key to whichever table precedes it,
+    and a ``[[segment]]`` table is the last thing anybody adds to a config,
+    so a top-level setting written below one would silently become a segment
+    key (see :data:`~music_video_maker.timelines.SEGMENT_KEYS` for the two
+    times this repo has already paid for that)."""
 
     silent_output: bool = False
     """Issue #22: assemble a final video with **no audio stream at all**.
@@ -1648,6 +1686,22 @@ def _validate(config: RunConfig) -> None:
     _ensure_dir("chunks_dir", config.chunks_dir)
     _ensure_dir("final_video_dir", config.final_video_dir)
 
+    # Issue #66: a segment's own three files, validated exactly like the
+    # song's. A missing prologue recording found here costs nothing; found
+    # after custody is taken it costs the card.
+    for segment in config.segments:
+        _validate_file(f"segment.{segment.name}.audio", segment.audio)
+        _validate_file(f"segment.{segment.name}.script", segment.script)
+        if segment.shot_plan is not None:
+            _validate_file(f"segment.{segment.name}.shot_plan", segment.shot_plan)
+        if segment.audio == config.master_audio:
+            _fail(
+                f"segment.{segment.name}.audio",
+                "is the song's own master_audio. A segment is a SECOND timeline with its "
+                "own recording; pointing it at the master would render the whole song "
+                "twice and concatenate both copies.",
+            )
+
     if config.i2v_continuity and config.i2v_workflow_template is None:
         _fail(
             "i2v_workflow_template",
@@ -1956,6 +2010,18 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
         values["shot_plan"] = resolved_plan
     else:
         values["shot_plan"] = None
+
+    # Issue #66: second timelines. Parsed here, beside the song's own
+    # shot_plan, because a segment is exactly the same three inputs one
+    # level down -- and refused at load time for the same reason every other
+    # closed key set is: a config error is the cheapest failure there is.
+    try:
+        values["segments"] = build_segments(
+            merged.get("segment"), resolve=lambda value: _resolve_path(value, base_dir)
+        )
+    except TimelineError as exc:
+        logger.exception("Failed to parse [[segment]] tables in %s", path)
+        raise ConfigError(str(exc)) from exc
 
     noise_seed = merged.get("noise_seed", 0)
     if (

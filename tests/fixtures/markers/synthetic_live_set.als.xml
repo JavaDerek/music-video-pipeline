@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SYNTHETIC Ableton Live set, authored by this repo for tests/test_ableton.py.
+  It is NOT an export from Ableton and has never been opened by it: issue #22's
+  step 1 ("is it Ableton at all, which major version, are the sections in
+  Locators?") is unanswered, so this fixture records what the format is
+  *documented* to look like, not what the band's files contain.
+
+  Committed as plain XML rather than as a gzipped .als deliberately. A .als is
+  gzipped XML and the reader handles both, but a binary fixture cannot be read
+  in a diff, cannot be corrected by hand when a real export contradicts it, and
+  would need an entry in tests/test_repo_assets.py's provenance manifest for a
+  file whose provenance is "we made it up". The test gzips it at runtime, which
+  is also what exercises the gzip path.
+
+  Tempo: 120 BPM constant => 0.5 s/beat. The locator times below are therefore
+  0, 8, 24, 56 beats = 0.0, 4.0, 12.0, 28.0 seconds.
+-->
+<Ableton MajorVersion="5" MinorVersion="12.0_12049" SchemaChangeCount="3" Creator="Synthetic fixture" Revision="0">
+  <LiveSet>
+    <Tracks>
+      <MidiTrack Id="8">
+        <Name>
+          <EffectiveName Value="Click" />
+        </Name>
+      </MidiTrack>
+    </Tracks>
+    <MainTrack>
+      <DeviceChain>
+        <Mixer>
+          <Tempo>
+            <LomId Value="0" />
+            <Manual Value="120" />
+            <MidiControllerRange>
+              <Min Value="60" />
+              <Max Value="200" />
+            </MidiControllerRange>
+            <AutomationTarget Id="8">
+              <LockEnvelope Value="0" />
+            </AutomationTarget>
+            <ModulationTarget Id="9">
+              <LockEnvelope Value="0" />
+            </ModulationTarget>
+          </Tempo>
+        </Mixer>
+      </DeviceChain>
+    </MainTrack>
+    <Locators>
+      <Locators>
+        <Locator Id="0">
+          <LomId Value="0" />
+          <Time Value="0" />
+          <Name Value="Count-in" />
+          <Annotation Value="" />
+          <IsSongStart Value="true" />
+        </Locator>
+        <Locator Id="1">
+          <LomId Value="0" />
+          <Time Value="8" />
+          <Name Value="Intro" />
+          <Annotation Value="" />
+          <IsSongStart Value="false" />
+        </Locator>
+        <Locator Id="2">
+          <LomId Value="0" />
+          <Time Value="24" />
+          <Name Value="Verse 1" />
+          <Annotation Value="" />
+          <IsSongStart Value="false" />
+        </Locator>
+        <Locator Id="3">
+          <LomId Value="0" />
+          <Time Value="56" />
+          <Name Value="Chorus 1, first" />
+          <Annotation Value="" />
+          <IsSongStart Value="false" />
+        </Locator>
+      </Locators>
+    </Locators>
+  </LiveSet>
+</Ableton>
