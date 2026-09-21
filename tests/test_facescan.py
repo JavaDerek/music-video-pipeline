@@ -367,6 +367,77 @@ def test_main_writes_to_stdout_when_no_out_given(tmp_path, capsys):
     assert "chunk_id" in out
 
 
+def test_two_scans_of_two_directories_can_never_be_byte_identical(tmp_path, capsys):
+    """The regression test for #93 itself, stated as the tell rather than as
+    the typo.
+
+    `face_presence_v12.csv` was byte-identical (md5 e5f13e77...) to a
+    week-older `face_presence.csv` because the run-local script hardcoded its
+    input directory and only the *output filename* ever changed. Nothing
+    about the CSV could say which render it had read, so the byte-identity
+    was the only evidence -- and it took a human looking at pixels to notice.
+
+    Here two directories hold videos with identical *content* and identical
+    per-chunk measurements, which is the hardest case: the only thing that
+    can distinguish the two reports is the provenance the module records. If
+    a future change ever drops the input directory from the header or the
+    source path from the rows, these two reports collapse into one and this
+    test fails -- which is the whole guarantee, expressed as the thing that
+    must not happen rather than as the field that must be present.
+    """
+    first = tmp_path / "chunks"
+    second = tmp_path / "chunks_v12"
+    for directory in (first, second):
+        directory.mkdir()
+        (directory / "chunk_0076.mp4").write_bytes(b"identical bytes")
+
+    reports = []
+    for directory in (first, second):
+        rc = facescan.main(
+            [str(directory), "--samples", "1"],
+            extractor_factory=lambda _tmp, _dir=directory: _FakeExtractor(
+                {
+                    path: facescan.SampledFrames(total_frames=141, sample_paths=())
+                    for path in _dir.glob("*.mp4")
+                }
+            ),
+            detector_factory=lambda **_kwargs: _FakeDetector({}),
+        )
+        assert rc == 0
+        reports.append(capsys.readouterr().out)
+
+    assert reports[0] != reports[1]
+    assert str(first.resolve()) in reports[0]
+    assert str(second.resolve()) in reports[1]
+    assert "chunks_v12" not in reports[0]
+
+
+def test_every_row_names_the_file_it_read_even_when_the_measurements_match(tmp_path):
+    """The per-row half of the same guarantee. The header says which
+    directory; the row says which file, which is the field the run-local
+    script never had."""
+    first = tmp_path / "a" / "chunk_0007.mp4"
+    second = tmp_path / "b" / "chunk_0007.mp4"
+    for path in (first, second):
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"same content")
+
+    rows = [
+        facescan.scan_chunk(
+            path,
+            samples=1,
+            extractor=_FakeExtractor(
+                {path: facescan.SampledFrames(total_frames=141, sample_paths=())}
+            ),
+            detector=_FakeDetector({}),
+        )
+        for path in (first, second)
+    ]
+
+    assert rows[0].max_face_fraction == rows[1].max_face_fraction
+    assert rows[0].source_path != rows[1].source_path
+
+
 def test_main_returns_nonzero_when_the_directory_does_not_exist(tmp_path, caplog):
     with caplog.at_level(logging.ERROR):
         rc = facescan.main([str(tmp_path / "does_not_exist")])
