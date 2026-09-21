@@ -1048,6 +1048,17 @@ was rendered for, and a resumed run compares it (issue #34):
   chunk across the swap would score the control against itself. A template edit
   is not a prompt typo either. Always re-rendered;
   `resume_ignore_prompt_changes` does not reach it.
+- **The ComfyUI and torch versions that rendered it** (issue #95) — read once
+  per run from `GET /system_stats`. This tier **reports, it does not
+  re-render**: three chunks re-rendered after the 0.30.2/2.13.0 →
+  0.35.1/2.14.0 upgrade at the same config and the same seeds matched on every
+  other fingerprint field and on *zero* decoded frames, so the mixing is real —
+  but the only remedy is re-rendering the whole song, because the old ComfyUI
+  is gone. So a resumed run names each stack and its chunk count when it
+  finishes, and reuses the chunks. Set `resume_require_same_stack = true` to
+  re-render them instead. A chunk whose stack was never recorded (every chunk
+  in a state file written before this) is reported as *unknown*, never as a
+  difference, and that flag does not re-render it.
 
 Two asymmetries worth knowing. A run holds **two** templates and a chunk
 renders through exactly one, so the recorded hash is of the graph *that chunk*

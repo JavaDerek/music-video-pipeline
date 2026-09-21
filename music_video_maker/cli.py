@@ -74,6 +74,7 @@ from music_video_maker.custody import (
     build_vram_probe,
     build_vram_releaser,
     prevent_host_sleep,
+    read_render_stack,
 )
 from music_video_maker.execution import ComfyUIExecutionClient
 from music_video_maker.faces import build_seed_face_gate
@@ -879,6 +880,20 @@ def run_pipeline(
         scan_workflow_for_missing_optimizations(base_template, config.hardware)
         text_encoder = _resolve_text_encoder(config, base_template, i2v_template)
 
+        # Issue #95: which build is about to make these pixels. One read per
+        # run, over the session custody already uses -- a stack does not
+        # change between chunks, and the only consumer is the fingerprint,
+        # which a resumed run compares at the end rather than per chunk.
+        # Best-effort by construction: an unreadable answer is recorded as
+        # unknown and never as agreement.
+        render_stack = read_render_stack(session, config.comfyui_url)
+        if render_stack.known:
+            logger.info(
+                "Render stack for this run: comfyui %s / torch %s (issue #95)",
+                render_stack.comfyui_version or "unknown",
+                render_stack.torch_version or "unknown",
+            )
+
         stager = ComfyUIAssetStager(base_url=config.comfyui_url, session=session)
         assets = {
             chunk.chunk_id: stager.stage_chunk(prompts[chunk.chunk_id], chunk) for chunk in chunks
@@ -991,6 +1006,12 @@ def run_pipeline(
                 # during mutation rather than authored into the template.
                 lora=config.lora,
                 lora_strength=config.lora_strength if config.lora else None,
+                # Issue #95: which ComfyUI/torch made the pixels. Reportable
+                # tier -- a resumed run across an upgrade names the split and
+                # reuses the chunks anyway, unless resume_require_same_stack
+                # says otherwise.
+                comfyui_version=render_stack.comfyui_version,
+                torch_version=render_stack.torch_version,
             )
             for chunk in chunks
         }

@@ -164,6 +164,7 @@ def _make_runner(
     disk_usage=None,
     run_id: str | None = "test-run",
     ignore_prompt_changes: bool = False,
+    require_same_stack: bool = False,
     vram_probe=None,
     min_free_vram_gb: float | None = None,
     between_chunk_min_free_vram_gb: float | None = None,
@@ -192,6 +193,7 @@ def _make_runner(
         sleeper=sleeper,
         disk_usage=disk_usage,
         ignore_prompt_changes=ignore_prompt_changes,
+        require_same_stack=require_same_stack,
         vram_probe=vram_probe,
         **kwargs,
     )
@@ -2998,3 +3000,325 @@ def test_instrumental_audio_gain_is_conditioning_and_never_escapable():
     assert "instrumental_audio_gain_db" in quiet.conditioning_differences(loud)
     assert "instrumental_audio_gain_db" in loud.conditioning_differences(quiet)
     assert quiet.conditioning_differences(quiet) == ()
+
+
+# --------------------------------------------------------------------------- #
+# Issue #95: the render stack is recorded, reported, and never forces a
+# re-render unless the operator asks.
+# --------------------------------------------------------------------------- #
+
+
+def _stacked(fp: ChunkFingerprint, comfyui: str | None, torch: str | None) -> ChunkFingerprint:
+    import dataclasses as dc
+
+    return dc.replace(fp, comfyui_version=comfyui, torch_version=torch)
+
+
+def test_stack_fields_are_in_no_forcing_tier():
+    """The one structural guarantee: adding #95's fields must not change what
+    any existing comparison compares. If ``comfyui_version`` leaked into a
+    forcing tuple, every resume across an upgrade would re-render the whole
+    song -- the opposite of what the issue asked for."""
+    for name in ChunkFingerprint.STACK_FIELDS:
+        assert name not in ChunkFingerprint.TIMELINE_FIELDS
+        assert name not in ChunkFingerprint.CONTENT_FIELDS
+        assert name not in ChunkFingerprint.CONDITIONING_FIELDS
+
+    old = _stacked(_fp(0.0, 6.0), "0.30.2", "2.13.0+cu130")
+    new = _stacked(_fp(0.0, 6.0), "0.35.1", "2.14.0+cu130")
+    assert new.timeline_differences(old) == ()
+    assert new.content_differences(old) == ()
+    assert new.conditioning_differences(old) == ()
+    assert new.stack_differences(old) == ("comfyui_version", "torch_version")
+
+
+def test_an_unrecorded_stack_is_unknown_not_a_difference():
+    """``None`` means the opposite here of what it means everywhere else in
+    this class, and that asymmetry is the point: a pre-#95 state file must
+    not claim to differ from a stack nobody wrote down."""
+    unrecorded = _fp(0.0, 6.0)
+    recorded = _stacked(_fp(0.0, 6.0), "0.35.1", "2.14.0+cu130")
+
+    assert recorded.stack_differences(unrecorded) == ()
+    assert unrecorded.stack_differences(recorded) == ()
+    assert unrecorded.stack_label is None
+    assert recorded.stack_label == "comfyui 0.35.1 / torch 2.14.0+cu130"
+    # Half-recorded stays half-recorded rather than collapsing to unknown.
+    assert _stacked(_fp(0.0, 6.0), "0.35.1", None).stack_label == (
+        "comfyui 0.35.1 / torch unknown"
+    )
+    assert _stacked(_fp(0.0, 6.0), None, "2.14.0+cu130").stack_label == (
+        "comfyui unknown / torch 2.14.0+cu130"
+    )
+
+
+def test_resume_across_a_stack_upgrade_reuses_the_chunks_by_default(tmp_path: Path, caplog):
+    """Issue #95's headline behaviour: nothing re-renders, and the run says
+    which stack its chunks came from."""
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    old = {
+        0: _stacked(_fp(0.0, 6.0), "0.30.2", "2.13.0+cu130"),
+        1: _stacked(_fp(6.0, 12.0), "0.30.2", "2.13.0+cu130"),
+    }
+    _complete_a_run(tmp_path, output_dir, old)
+
+    new = {
+        0: _stacked(_fp(0.0, 6.0), "0.35.1", "2.14.0+cu130"),
+        1: _stacked(_fp(6.0, 12.0), "0.35.1", "2.14.0+cu130"),
+    }
+    client = StubExecutionClient({})  # any render attempt fails loudly
+    runner = _make_runner(client, tmp_path)
+    with caplog.at_level(logging.INFO):
+        run_state = runner.render_run(
+            [0, 1], _provider_returning(), output_dir, resume=True, fingerprints=new
+        )
+
+    assert [r.status for r in run_state.results.values()] == [ChunkStatus.CACHED] * 2
+    assert client.calls == []
+    # The cached fingerprints keep saying which stack really made them.
+    assert run_state.results[0].fingerprint.comfyui_version == "0.30.2"
+    assert all(r.rerender_reason is None for r in run_state.results.values())
+    assert (
+        "Render stack for this run's chunks: comfyui 0.30.2 / torch 2.13.0+cu130 (2 chunk(s))"
+        in caplog.text
+    )
+
+
+def test_a_mixed_stack_run_names_the_split_and_the_counts(tmp_path: Path, caplog):
+    """The census runs over the *state file*, not over the chunk ids this
+    invocation touched -- a resume that re-renders one chunk of eighty is
+    exactly the run that mixes them."""
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    old = {
+        0: _stacked(_fp(0.0, 6.0), "0.30.2", "2.13.0+cu130"),
+        1: _stacked(_fp(6.0, 12.0), "0.30.2", "2.13.0+cu130"),
+    }
+    _complete_a_run(tmp_path, output_dir, old)
+
+    # Chunk 1's prompt changed, so it re-renders on the new stack; chunk 0 is
+    # reused from the old one.
+    new = {
+        0: _stacked(_fp(0.0, 6.0), "0.35.1", "2.14.0+cu130"),
+        1: _stacked(_fp(6.0, 12.0, prompt="rewritten"), "0.35.1", "2.14.0+cu130"),
+    }
+    client = StubExecutionClient({1: [_rendered(1, output_dir)]})
+    runner = _make_runner(client, tmp_path)
+    with caplog.at_level(logging.INFO):
+        run_state = runner.render_run(
+            [0, 1], _provider_returning(), output_dir, resume=True, fingerprints=new
+        )
+
+    assert run_state.results[0].status is ChunkStatus.CACHED
+    assert run_state.results[1].status is ChunkStatus.RENDERED
+    assert run_state.results[1].rerender_reason == "content_changed"
+    assert "2 DIFFERENT RENDER STACKS" in caplog.text
+    assert "comfyui 0.30.2 / torch 2.13.0+cu130: 1 chunk(s)" in caplog.text
+    assert "comfyui 0.35.1 / torch 2.14.0+cu130: 1 chunk(s)" in caplog.text
+    assert "resume_require_same_stack" in caplog.text
+
+
+def test_a_pre_95_state_file_resumes_with_every_chunk_reported_unknown(
+    tmp_path: Path, caplog
+):
+    """A pre-#95 state file resumed under a stack-reading build: everything
+    reuses, and the whole file is reported as unproven rather than credited
+    to this run's own stack, which never touched those pixels."""
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    _complete_a_run(tmp_path, output_dir, {0: _fp(0.0, 6.0), 1: _fp(6.0, 12.0)})
+
+    new = {
+        0: _stacked(_fp(0.0, 6.0), "0.35.1", "2.14.0+cu130"),
+        1: _stacked(_fp(6.0, 12.0), "0.35.1", "2.14.0+cu130"),
+    }
+    client = StubExecutionClient({})
+    runner = _make_runner(client, tmp_path)
+    with caplog.at_level(logging.INFO):
+        run_state = runner.render_run(
+            [0, 1], _provider_returning(), output_dir, resume=True, fingerprints=new
+        )
+
+    assert [r.status for r in run_state.results.values()] == [ChunkStatus.CACHED] * 2
+    assert client.calls == []
+    assert "Render stack unrecorded for all 2 chunk(s)" in caplog.text
+    assert "DIFFERENT RENDER STACKS" not in caplog.text
+
+
+def test_unknown_chunks_are_counted_beside_a_known_stack_not_absorbed_into_it(
+    tmp_path: Path, caplog
+):
+    """The mixed case that a naive census gets wrong: one chunk re-rendered
+    on a known stack, one reused from a pre-#95 file. Reporting "1 stack" and
+    stopping would claim the video is single-stack when one chunk of it is
+    simply unproven."""
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    _complete_a_run(tmp_path, output_dir, {0: _fp(0.0, 6.0), 1: _fp(6.0, 12.0)})
+
+    new = {
+        0: _stacked(_fp(0.0, 6.0), "0.35.1", "2.14.0+cu130"),
+        1: _stacked(_fp(6.0, 12.0, prompt="rewritten"), "0.35.1", "2.14.0+cu130"),
+    }
+    client = StubExecutionClient({1: [_rendered(1, output_dir)]})
+    runner = _make_runner(client, tmp_path)
+    with caplog.at_level(logging.INFO):
+        runner.render_run(
+            [0, 1], _provider_returning(), output_dir, resume=True, fingerprints=new
+        )
+
+    assert "comfyui 0.35.1 / torch 2.14.0+cu130 (1 chunk(s))" in caplog.text
+    assert "stack unknown for 1 chunk(s)" in caplog.text
+    assert "DIFFERENT RENDER STACKS" not in caplog.text
+
+
+def test_a_run_with_no_fingerprints_at_all_says_the_stack_is_unrecorded(tmp_path: Path, caplog):
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    client = StubExecutionClient({0: [_rendered(0, output_dir)]})
+    runner = _make_runner(client, tmp_path)
+    with caplog.at_level(logging.INFO):
+        runner.render_run([0], _provider_returning(), output_dir)
+
+    assert "Render stack unrecorded for all 1 chunk(s)" in caplog.text
+
+
+def test_the_stack_census_is_silent_when_a_run_rendered_nothing(tmp_path: Path, caplog):
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    runner = _make_runner(StubExecutionClient({}), tmp_path)
+    with caplog.at_level(logging.INFO):
+        runner.render_run([], _provider_returning(), output_dir)
+
+    assert "Render stack" not in caplog.text
+
+
+def test_require_same_stack_re_renders_the_chunks_from_the_other_stack(tmp_path: Path):
+    """The opt-in lever. Off it reuses (the test above); on it re-renders,
+    with its own reason so a UI can say why."""
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    _complete_a_run(
+        tmp_path, output_dir, {0: _stacked(_fp(0.0, 6.0), "0.30.2", "2.13.0+cu130")}
+    )
+
+    new = {0: _stacked(_fp(0.0, 6.0), "0.35.1", "2.14.0+cu130")}
+    client = StubExecutionClient({0: [_rendered(0, output_dir)]})
+    runner = _make_runner(client, tmp_path, require_same_stack=True)
+    run_state = runner.render_run(
+        [0], _provider_returning(), output_dir, resume=True, fingerprints=new
+    )
+
+    assert run_state.results[0].status is ChunkStatus.RENDERED
+    assert run_state.results[0].rerender_reason == "stack_changed"
+    assert run_state.results[0].rerender_reason_fields == (
+        "comfyui_version",
+        "torch_version",
+    )
+
+
+def test_require_same_stack_never_re_renders_a_chunk_whose_stack_is_unknown(tmp_path: Path):
+    """The expensive mistake this lever could make: re-rendering a whole song
+    because an older state file does not say which build made it. Unknown is
+    not a difference, flag or no flag."""
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    _complete_a_run(tmp_path, output_dir, {0: _fp(0.0, 6.0)})
+
+    new = {0: _stacked(_fp(0.0, 6.0), "0.35.1", "2.14.0+cu130")}
+    client = StubExecutionClient({})  # must never be reached
+    runner = _make_runner(client, tmp_path, require_same_stack=True)
+    run_state = runner.render_run(
+        [0], _provider_returning(), output_dir, resume=True, fingerprints=new
+    )
+
+    assert run_state.results[0].status is ChunkStatus.CACHED
+    assert client.calls == []
+
+
+def test_require_same_stack_is_not_escapable_via_ignore_prompt_changes(tmp_path: Path):
+    """The two flags answer different questions. ``ignore_prompt_changes``
+    forgives an edit to *this run's* config; a stack difference is not
+    something this run's config said, so a run that asked to refuse it still
+    refuses when the prompt also changed."""
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    _complete_a_run(
+        tmp_path, output_dir, {0: _stacked(_fp(0.0, 6.0), "0.30.2", "2.13.0+cu130")}
+    )
+
+    new = {0: _stacked(_fp(0.0, 6.0, prompt="rewritten"), "0.35.1", "2.14.0+cu130")}
+    client = StubExecutionClient({0: [_rendered(0, output_dir)]})
+    runner = _make_runner(client, tmp_path, require_same_stack=True, ignore_prompt_changes=True)
+    run_state = runner.render_run(
+        [0], _provider_returning(), output_dir, resume=True, fingerprints=new
+    )
+
+    assert run_state.results[0].status is ChunkStatus.RENDERED
+    assert run_state.results[0].rerender_reason == "stack_changed"
+
+
+def test_a_state_file_with_no_stack_keys_round_trips_and_still_resumes(tmp_path: Path):
+    """No ``schema_version`` bump: a file written before #95 has no
+    ``comfyui_version``/``torch_version`` keys at all, loads with both
+    ``None``, and reuses its chunk exactly as it did before."""
+    video = tmp_path / "chunks" / "chunk_0000.mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"fake-mp4-bytes")
+    fingerprint = _fp(0.0, 6.0)
+    payload = {
+        "schema_version": resilience_module.RUN_STATE_SCHEMA_VERSION,
+        "run_id": "pre-95-run",
+        "results": {
+            "0": {
+                "chunk_id": 0,
+                "status": "rendered",
+                "video_file": str(video),
+                "attempts": 1,
+                "errors": [],
+                "fingerprint": {
+                    "start": 0.0,
+                    "end": 6.0,
+                    "frame_count": 141,
+                    "render_width": 864,
+                    "render_height": 480,
+                    "prompt_hash": fingerprint.prompt_hash,
+                    "character": "Dianne",
+                    "image_ref": "/cast/dianne.png",
+                    "noise_seed": 0,
+                },
+            }
+        },
+    }
+    state_file = tmp_path / "run_state.json"
+    state_file.write_text(json.dumps(payload))
+
+    loaded = resilience_module.load_run_state(state_file)
+    assert loaded.results[0].fingerprint.comfyui_version is None
+    assert loaded.results[0].fingerprint.torch_version is None
+
+    client = StubExecutionClient({})  # must never be reached
+    runner = _make_runner(client, tmp_path)
+    run_state = runner.render_run(
+        [0],
+        _provider_returning(),
+        tmp_path / "chunks",
+        resume=True,
+        fingerprints={0: _stacked(fingerprint, "0.35.1", "2.14.0+cu130")},
+    )
+
+    assert run_state.results[0].status is ChunkStatus.CACHED
+    assert client.calls == []
+
+
+def test_the_stack_survives_a_serialization_round_trip(tmp_path: Path):
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    _complete_a_run(
+        tmp_path, output_dir, {0: _stacked(_fp(0.0, 6.0), "0.35.1", "2.14.0+cu130")}
+    )
+
+    loaded = resilience_module.load_run_state(tmp_path / "run_state.json")
+    assert loaded.results[0].fingerprint.comfyui_version == "0.35.1"
+    assert loaded.results[0].fingerprint.torch_version == "2.14.0+cu130"

@@ -523,6 +523,10 @@ class ChunkFingerprint:
       so this tier is escapable via ``resume_ignore_prompt_changes`` --
       re-rendering 39 chunks to pick up a typo fix in one shot line is hours of
       GPU time.
+    * :data:`STACK_FIELDS` -- **right chunk, different renderer** (issue #95).
+      Reportable, not forcing: the run says how many chunks came from each
+      stack and reuses them anyway, because the remedy for a ComfyUI upgrade
+      is not something the run gets to choose on the operator's behalf.
 
     The prompt is stored as a hash rather than verbatim: the state file is
     diagnostic output a human reads, and 39 full prompts would bury it.
@@ -711,6 +715,34 @@ class ChunkFingerprint:
     degradation rule in :meth:`content_differences` safe, not a property of the
     chunk."""
 
+    comfyui_version: str | None = None
+    """Which ComfyUI built this chunk's pixels (issue #95), as
+    ``/system_stats``' ``system.comfyui_version`` reads it, e.g. ``"0.35.1"``.
+
+    **Reportable tier, not a forcing one** -- see :data:`STACK_FIELDS`. Every
+    other field here answers "was this chunk rendered for the right place,
+    from the right inputs"; this one answers "by which build", which no
+    amount of configuration can make true of a chunk already on disk. A
+    resume across an upgrade must *say* it is mixing stacks, not decide for
+    the operator that eight hours of GPU time are due.
+
+    ``None`` means unrecorded (a pre-#95 state file), and unrecorded is
+    **unknown**, never "the same stack as this run" -- which is why
+    :meth:`stack_differences` skips a field either side leaves ``None``
+    rather than counting it as a difference. A mismatch it cannot see is
+    better than one it invents: the honest report is "stack unknown for N
+    chunks"."""
+
+    torch_version: str | None = None
+    """The torch build underneath it (issue #95), from the same call's
+    ``system.pytorch_version``, e.g. ``"2.14.0+cu130"``.
+
+    Recorded separately from :attr:`comfyui_version` because the two move
+    independently -- a venv can take a torch point release with ComfyUI
+    untouched, and on this project's own card the 2026-09-16 upgrade moved
+    both at once and nothing could afterwards say which one changed the
+    pixels. Same tier and the same ``None``-is-unknown rule."""
+
     TIMELINE_FIELDS: ClassVar[tuple[str, ...]] = (
         "start",
         "end",
@@ -739,6 +771,41 @@ class ChunkFingerprint:
     the run exists to make (issues #25, #39, #45). Each names a *component* of
     the conditioning -- the audio that drove the mouth, the encoder that read
     the sentence, and the graph they were fed into."""
+
+    STACK_FIELDS: ClassVar[tuple[str, ...]] = (
+        "comfyui_version",
+        "torch_version",
+    )
+    """The **reportable** tier (issue #95): which render stack produced the
+    pixels. Deliberately not a forcing tier, and deliberately not escapable
+    either, because it is not a gate at all.
+
+    Measured 2026-09-20: three "Deathless" chunks re-rendered on ComfyUI
+    0.35.1 / torch 2.14.0 against their 0.30.2 / torch 2.13.0 originals, same
+    config and same seeds, matched on *every* fingerprint field and matched on
+    *zero* decoded frames (mean absolute pixel difference 3.99, 5.43 and
+    22.27 of 255, the last visibly reframed). The new stack is byte-identical
+    with itself on a repeat render, so the difference is the stack. Same shape
+    as #38/#39/#45/#62: an input that decides the pixels with nothing writing
+    it down.
+
+    What makes this one different is the remedy. Every other such field was
+    fixed by re-rendering, because a run can be reconfigured to agree with the
+    cached chunk -- point ``text_encoder`` back at the old encoder and the
+    mismatch goes away. A stack cannot: the old ComfyUI is not installed any
+    more, so "make them agree" means re-rendering the whole video, hours of
+    GPU time, over a difference an operator may be perfectly happy to accept
+    in a draft. A guard whose only remedy is the expensive one, applied
+    without asking, is not a guard. So this tier *reports* --
+    ``ResilientRunner`` names the split and the per-stack chunk counts at the
+    end of every run -- and the operator opts into the re-render with
+    ``resume_require_same_stack``.
+
+    Not in :data:`CONDITIONING_FIELDS`, and the difference is worth naming:
+    those are a run's experiment *variable*, chosen per run, and reusing
+    across one hands the comparison its control twice. A stack upgrade is
+    chosen by whoever ran ``pip install``, months earlier, for unrelated
+    reasons."""
 
     TIME_PRECISION: ClassVar[int] = 3
     """Chunk bounds are rounded to milliseconds before comparison. They are
@@ -769,6 +836,8 @@ class ChunkFingerprint:
         template_hash: str | None = None,
         lora: str | None = None,
         lora_strength: float | None = None,
+        comfyui_version: str | None = None,
+        torch_version: str | None = None,
     ) -> ChunkFingerprint:
         """Build a fingerprint from what the orchestrator already holds.
 
@@ -809,6 +878,13 @@ class ChunkFingerprint:
             text_encoder=text_encoder,
             lora=lora,
             lora_strength=lora_strength,
+            # Issue #95: read once per run from GET /system_stats, not
+            # amended per chunk -- a stack does not change mid-run, and a
+            # reading per chunk would be a second network call for an answer
+            # nothing can act on until the run ends. ``None`` when the caller
+            # could not read one; unknown, never "the same as yours".
+            comfyui_version=comfyui_version,
+            torch_version=torch_version,
             # Issue #45: normally left unset here and amended in at render
             # time, since which of the two templates a chunk used is the
             # provider's decision, not something Stage 2b can predict.
@@ -882,6 +958,46 @@ class ChunkFingerprint:
             differences = tuple(name for name in differences if name != "template_hash")
         return differences
 
+    def stack_differences(self, other: ChunkFingerprint) -> tuple[str, ...]:
+        """:data:`STACK_FIELDS` that are known on **both** sides and disagree.
+
+        A field either side leaves ``None`` is skipped, and that asymmetry is
+        the whole reason this is a separate method rather than a fourth entry
+        in :meth:`_differences`. Everywhere else in this class ``None`` means
+        "cannot prove a match" and therefore re-renders; here the same reading
+        would have every pre-#95 state file report a stack change against any
+        run that can read one -- a claim about the pixels that nothing
+        measured, on a file whose chunks may well have come from this very
+        stack. Unknown is unknown. The caller reports it as a count of chunks
+        ("stack unknown for N") and never as a mismatch.
+
+        Reporting only, whatever it returns: see :data:`STACK_FIELDS`. The one
+        caller that acts on it does so because the operator asked
+        (``resume_require_same_stack``)."""
+        return tuple(
+            name
+            for name in self.STACK_FIELDS
+            if getattr(self, name) is not None
+            and getattr(other, name) is not None
+            and getattr(self, name) != getattr(other, name)
+        )
+
+    @property
+    def stack_label(self) -> str | None:
+        """One printable string for this chunk's render stack (issue #95), or
+        ``None`` when neither half was recorded.
+
+        Half-known stays half-known (``"comfyui 0.35.1 / torch unknown"``)
+        rather than collapsing to ``None``: a chunk that can name one of the
+        two still carries evidence of a split, and a census that threw it away
+        would under-report a real one."""
+        if self.comfyui_version is None and self.torch_version is None:
+            return None
+        return (
+            f"comfyui {self.comfyui_version or 'unknown'} / "
+            f"torch {self.torch_version or 'unknown'}"
+        )
+
 
 @dataclass(frozen=True)
 class ChunkResult:
@@ -927,8 +1043,10 @@ class ChunkResult:
     """Why a chunk with a prior cached result re-rendered instead of being
     reused on ``--resume`` (issue #36): one of ``"explicit_selection"``,
     ``"video_missing"``, ``"no_fingerprint"``, ``"chain_blocked"``,
-    ``"conditioning_changed"``, ``"timeline_changed"`` or
-    ``"content_changed"`` -- see ``resilience._reusable_cached_result``, which
+    ``"conditioning_changed"``, ``"timeline_changed"``, ``"content_changed"``
+    or ``"stack_changed"`` (issue #95, only ever set when the operator turned
+    ``resume_require_same_stack`` on)
+    -- see ``resilience._reusable_cached_result``, which
     is the only place that ever sets it. ``None`` covers two different
     situations that this field deliberately does not distinguish: a chunk
     rendered fresh with no prior entry at all (nothing to reject), and a

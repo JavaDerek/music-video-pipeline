@@ -32,7 +32,7 @@ if sys.version_info >= (3, 11):
 else:
     import tomli as tomllib
 
-from music_video_maker import cli, contracts
+from music_video_maker import cli, contracts, resilience
 from music_video_maker.assembly import DEFAULT_OUTPUT_FILENAME
 from music_video_maker.contracts import ChunkFingerprint
 from music_video_maker.workflow_graph import (
@@ -42,7 +42,11 @@ from music_video_maker.workflow_graph import (
     find_one_node,
     resolve_chunk_seed,
 )
-from tests.harness.comfyui_mock import FakeComfyUISession, make_fake_png_bytes
+from tests.harness.comfyui_mock import (
+    FakeComfyUISession,
+    default_system_stats,
+    make_fake_png_bytes,
+)
 from tests.harness.factories import make_workflow_baseline, make_workflow_i2v, write_silent_wav
 from tests.harness.ws import ScriptedWebSocket, build_hang_sequence, build_success_sequence
 
@@ -634,7 +638,12 @@ def test_free_vram_is_re_read_before_every_chunk_not_just_at_run_start(tmp_path:
         r for r in rig.session.requests if r.method == "GET" and r.url.endswith("/system_stats")
     ]
     assert report.rendered == 3
-    assert len(stats_reads) == 4  # one custody pre-flight + one per rendered chunk
+    # One custody pre-flight, one issue #95 render-stack read, one per
+    # rendered chunk. The stack read is deliberately its own request rather
+    # than a value smuggled out of the pre-flight: the pre-flight's answer is
+    # a float, and threading a second return value through the custody
+    # manager to save one GET would couple the two readings' lifetimes.
+    assert len(stats_reads) == 5
 
 
 def test_custody_teardown_runs_even_when_a_chunk_dead_letters(tmp_path: Path):
@@ -2528,3 +2537,55 @@ def test_alignment_model_size_default_is_passed_not_assumed(tmp_path, monkeypatc
     rig.run([rig.seed_success(1, 0), rig.seed_success(2, 1), rig.seed_success(3, 2)])
 
     assert seen["model_size"] == "base"
+
+
+# --------------------------------------------------------------------------- #
+# Issue #95: the render stack reaches the fingerprint, and a resume across an
+# upgrade reports the mix instead of re-rendering it.
+# --------------------------------------------------------------------------- #
+
+
+def _stack_session(comfyui: str, torch: str) -> FakeComfyUISession:
+    return FakeComfyUISession(
+        system_stats=default_system_stats(comfyui_version=comfyui, pytorch_version=torch)
+    )
+
+
+def test_the_render_stack_reaches_every_fingerprint_in_the_state_file(tmp_path: Path):
+    """Wired end to end, from ``GET /system_stats`` to ``run_state.json``.
+    Asserted from the outside because the hole issue #95 describes is exactly
+    a field that exists and nothing composes: three chunks rendered and not
+    one of them able to say which build made it."""
+    rig = Rig(tmp_path)
+    rig.session = _stack_session("0.35.1", "2.14.0+cu130")
+    sequences = [build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)]
+
+    rig.run(sequences)
+
+    state = resilience.load_run_state(rig.config.run_state_file)
+    assert [r.fingerprint.comfyui_version for r in state.results.values()] == ["0.35.1"] * 3
+    assert [r.fingerprint.torch_version for r in state.results.values()] == [
+        "2.14.0+cu130"
+    ] * 3
+
+
+def test_a_resume_across_a_stack_upgrade_reuses_and_reports(tmp_path: Path, caplog):
+    """The whole point of the reportable tier: five hours of GPU time are not
+    spent silently, and the mix is not silent either. Only the server's
+    reported stack differs between the two invocations."""
+    rig = Rig(tmp_path)
+    rig.session = _stack_session("0.30.2", "2.13.0+cu130")
+    rig.run([build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)])
+
+    rig.session = _stack_session("0.35.1", "2.14.0+cu130")
+    with caplog.at_level(logging.INFO):
+        report = rig.run([], resume=True)
+
+    assert report.rendered == 0
+    assert report.cached == 3
+    assert rig.session.submitted_prompts == []
+    assert "Render stack for this run: comfyui 0.35.1 / torch 2.14.0+cu130" in caplog.text
+    assert (
+        "Render stack for this run's chunks: comfyui 0.30.2 / torch 2.13.0+cu130 (3 chunk(s))"
+        in caplog.text
+    )
