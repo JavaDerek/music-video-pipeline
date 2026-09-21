@@ -75,6 +75,7 @@ from music_video_maker.shot_plan import (
     load_shot_plan,
     resolve_camera,
     resolve_conditions,
+    resolve_framing,
     resolve_location,
     resolve_present,
     resolve_shot,
@@ -219,6 +220,7 @@ _EMPTY_PLAN_FIELDS: Mapping[str, object] = {
     "present": (),
     "subject": None,
     "conditions": None,
+    "framing": None,
 }
 
 
@@ -240,6 +242,11 @@ class ChunkReview:
     present: tuple[str, ...]
     subject: str | None
     conditions: str | None
+    framing: str | None = None
+    """This chunk's authored framing intent (issue #97) -- how much of the
+    frame its focus member should fill. Defaulted, unlike the fields above
+    it, so every construction site that predates the field keeps working;
+    `_resolve_chunk_plan_fields` always supplies it."""
     findings: tuple[AlignmentFindingView, ...] = ()
     """Every alignment-quality finding whose span touches this chunk's --
     see :func:`_findings_for_chunk`."""
@@ -261,6 +268,7 @@ class ChunkReview:
             "present": list(self.present),
             "subject": self.subject,
             "conditions": self.conditions,
+            "framing": self.framing,
             "findings": [finding.to_dict() for finding in self.findings],
             "lint_warnings": [warning.to_dict() for warning in self.lint_warnings],
         }
@@ -357,6 +365,7 @@ def _resolve_chunk_plan_fields(
             "present": resolve_present(plan, chunk),
             "subject": resolve_subject(plan, chunk),
             "conditions": resolve_conditions(plan, chunk),
+            "framing": resolve_framing(plan, chunk),
         }
     except ShotPlanError as exc:
         plan_errors.append(str(exc))
@@ -575,6 +584,7 @@ _CHUNK_ROW_TEMPLATE = """
       <td>{present}</td>
       <td>{subject}</td>
       <td>{conditions}</td>
+      <td>{framing}</td>
       <td>{findings}</td>
       <td>{lint_warnings}</td>
     </tr>"""
@@ -600,6 +610,7 @@ def _chunk_row(chunk: ChunkReview) -> str:
         present=_list_cell(chunk.present),
         subject=_text_cell(chunk.subject),
         conditions=_text_cell(chunk.conditions),
+        framing=_text_cell(chunk.framing),
         findings=_findings_cell(chunk.findings),
         lint_warnings=_lint_cell(chunk.lint_warnings),
     )
@@ -651,7 +662,8 @@ _PAGE_TEMPLATE = """<!doctype html>
     <tr>
       <th>chunk_id</th><th>span</th><th>duration</th><th>frames</th><th>voicing</th>
       <th>lyric</th><th>shot</th><th>camera</th><th>location</th><th>present</th>
-      <th>subject</th><th>conditions</th><th>alignment findings</th><th>lint warnings</th>
+      <th>subject</th><th>conditions</th><th>framing</th>
+      <th>alignment findings</th><th>lint warnings</th>
     </tr>
   </thead>
   <tbody>{chunk_rows}

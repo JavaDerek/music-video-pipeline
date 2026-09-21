@@ -45,6 +45,7 @@ from music_video_maker.shot_plan import (
     render_shot_plan_skeleton,
     resolve_camera,
     resolve_conditions,
+    resolve_framing,
     resolve_location,
     resolve_shot,
     resolve_subject,
@@ -3274,3 +3275,140 @@ def test_lint_mouth_direction_is_silent_when_an_instrumental_chunk_names_no_mout
     chunks = [_chunk(chunk_id=31, start=200.0, end=205.0, text="")]
 
     assert lint_mouth_direction_on_instrumental_chunks(plan, chunks) == ()
+
+
+# --------------------------------------------------------------------------- #
+# `framing` field (issue #97)
+#
+# The one field that says anything about delivered face size. #97 measured
+# that `camera` cannot do this job: across 39 voiced "Deathless" chunks
+# authored `close`/`medium close` there, the delivered largest-face fraction
+# runs 0.0000-0.3561, and two chunks both reading "close on her face"
+# rendered at 0.0120 and 0.0460. Unlike `location`/`conditions`, whose
+# vocabularies are song-specific and defined by the concept stage this module
+# never sees, `framing`'s vocabulary is fixed in code -- so the closed-set
+# check lives here, at load time, and an unknown value raises.
+# --------------------------------------------------------------------------- #
+
+
+def test_framing_is_none_by_default(tmp_path):
+    path = _write_plan(
+        tmp_path, '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks"\n'
+    )
+    assert load_shot_plan(path)[0].framing is None
+
+
+def test_framing_is_read_from_the_entry(tmp_path):
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks"\nframing = "close"\n',
+    )
+    assert load_shot_plan(path)[0].framing == "close"
+
+
+def test_framing_is_normalised_to_lowercase_and_stripped(tmp_path):
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks"\nframing = " Close "\n',
+    )
+    assert load_shot_plan(path)[0].framing == "close"
+
+
+def test_a_framing_outside_the_vocabulary_is_refused_not_dropped(tmp_path):
+    """The worst outcome is the silent one: the plan says close-up, the
+    render composes nothing, and the only evidence is a face that came out
+    whatever size H3 felt like. Same rule `subject`/`present` follow."""
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks"\n'
+        'framing = "extreme close-up"\n',
+    )
+    with pytest.raises(ShotPlanError, match="framing"):
+        load_shot_plan(path)
+
+
+def test_a_non_string_framing_is_rejected(tmp_path):
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks"\nframing = 3\n',
+    )
+    with pytest.raises(ShotPlanError):
+        load_shot_plan(path)
+
+
+def test_a_blank_framing_is_rejected_rather_than_treated_as_unset(tmp_path):
+    """Unlike `camera`/`location`/`conditions`, where blank means "not
+    authored", a blank ordinal is a typo: there is no free text here for an
+    empty string to be a degenerate case of."""
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks"\nframing = "   "\n',
+    )
+    with pytest.raises(ShotPlanError, match="framing"):
+        load_shot_plan(path)
+
+
+def test_framing_is_not_reported_as_an_unknown_entry_key(tmp_path, caplog):
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks"\nframing = "wide"\n',
+    )
+
+    with caplog.at_level(logging.WARNING):
+        load_shot_plan(path)
+
+    assert "nothing reads" not in caplog.text
+
+
+def test_every_framing_level_in_the_vocabulary_loads(tmp_path):
+    for level in shot_plan_module.FRAMING_LEVELS:
+        path = _write_plan(
+            tmp_path,
+            f'[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks"\nframing = "{level}"\n',
+        )
+        assert load_shot_plan(path)[0].framing == level
+
+
+def test_resolve_framing_returns_the_authored_level(tmp_path):
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "She walks"\nframing = "face"\n',
+    )
+    plan = load_shot_plan(path)
+
+    assert resolve_framing(plan, _chunk(0, 0.0, 5.167)) == "face"
+
+
+def test_resolve_framing_applies_even_when_shot_is_blank(tmp_path):
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = ""\nframing = "wide"\n',
+    )
+    plan = load_shot_plan(path)
+
+    assert resolve_shot(plan, _chunk(0, 0.0, 5.167)) is None
+    assert resolve_framing(plan, _chunk(0, 0.0, 5.167)) == "wide"
+
+
+def test_resolve_framing_with_no_plan_or_no_entry_returns_none(tmp_path):
+    path = _write_plan(
+        tmp_path, '[[shot]]\nchunk_id = 0\nstart = 0.0\nshot = "only chunk zero"\n'
+    )
+    plan = load_shot_plan(path)
+
+    assert resolve_framing(None, _chunk(0, 0.0, 5.167)) is None
+    assert resolve_framing(plan, _chunk(7, 40.0, 45.0)) is None
+
+
+def test_resolve_framing_refuses_a_drifted_chunk(tmp_path):
+    """`framing` is a claim about a span -- how much of the frame a face
+    fills over these seconds -- so a boundary that has moved must refuse it
+    like every other per-chunk field, not honour it against new audio."""
+    path = _write_plan(
+        tmp_path,
+        '[[shot]]\nchunk_id = 3\nstart = 21.17\nshot = "She walks"\nframing = "close"\n',
+    )
+    plan = load_shot_plan(path)
+
+    with pytest.raises(ShotPlanDriftError):
+        resolve_framing(plan, _chunk(3, 21.17 + TOLERANCE_EXCEEDED, 30.0))

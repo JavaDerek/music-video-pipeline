@@ -100,6 +100,7 @@ from music_video_maker.shot_plan import (
     load_shot_plan,
     resolve_camera,
     resolve_conditions,
+    resolve_framing,
     resolve_location,
     resolve_present,
     resolve_shot,
@@ -831,6 +832,11 @@ def run_pipeline(
                 # light, the aftermath of an event already shown) -- a third
                 # axis alongside location, composed as its own sentence.
                 conditions=resolve_conditions(plan, chunk),
+                # Issue #97: how much of the frame this shot's focus member
+                # should fill. The only field that says anything about
+                # delivered face size -- `camera` is free text and #97
+                # measured "close" there spanning 0.0000-0.3561 of frame.
+                framing=resolve_framing(plan, chunk),
             )
             for chunk in chunks
         }

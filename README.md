@@ -390,6 +390,24 @@ place is identifiable, and the authoring layer checks two things about it
 mechanically: a state that flips for one chunk and comes straight back, and a
 state that regresses after the `consequence` beat that ended it.
 
+**How much of the frame a face fills is a fourth per-chunk field, and it is
+an ordinal.** `framing` (issue #97) takes one of `face`, `close`, `medium`,
+`wide` and composes a fixed sentence naming the shot's focus member. It
+exists because `camera` measurably cannot do this job: of 39 voiced chunks
+on a real render authored `close` or `medium close` there, the delivered
+largest-face fraction ran from 0.0000 to 0.3561, and two chunks both reading
+"close on her face" rendered at 0.0120 and 0.0460. That matters beyond
+composition — across the seven chunks with more than a second of #79 leading
+vocal offset, the four a viewer noticed all carry faces above 0.0778 and the
+three nobody ever reported all sit below 0.0474, so framing wide is the
+cheapest remedy for a desync and nothing could ask for it. Unset (every plan
+written before the field existed) composes nothing at all; an unknown value
+is refused at load rather than dropped. The mechanism is #74's — H3 renders
+the nouns it is given, so the tight levels name eyes and a mouth and the wide
+level names neither — and it is **not yet verified on pixels**: see issue
+#97 for the A/B that settles it, and `docs/shot-writing-guide.md` for how to
+use it meanwhile.
+
 #### Chunk duration window
 
 MiniMax H3's `length` input is a **frame count**, not a duration, quantized
@@ -560,6 +578,29 @@ depends on — at all. That makes a zero inspectable as `detected` /
 of silently trusted. `inconclusive` is the state a plain face-presence count
 could never express: the detector saw something face-shaped, it just was not
 confident enough to act on.
+
+#### Ranking which desyncs a viewer will actually notice
+
+`python -m music_video_maker.desync_risk <facescan.csv> --log render.log`
+joins the two halves of that question. Issue #79's leading vocal offset says
+*which* chunks are out of phase — H3 starts the mouth at frame 0 whatever the
+audio does — and the render log already names every chunk over the one-second
+warning threshold. What it cannot say is which of them anyone will see, and
+on a real render the offset ranking runs backwards: the two largest offsets
+in the song are the two least-noticed chunks. Delivered face size separates
+the two groups perfectly (noticed: 0.0778-0.2101 of frame; never reported:
+0.0120-0.0474), so this reads the offsets out of the log, joins them to
+`facescan`'s `max_face_fraction`, and prints the flagged chunks worst-first.
+
+Two deliberate limits. It reports a **band**, not a threshold: seven
+adjudicated chunks from one render locate the boundary somewhere between
+0.0474 and 0.0778 and say nothing about where inside it, so a chunk that
+lands in the gap is reported `uncertain` rather than assigned to a side.
+And it **refuses** a face CSV with no `facescan` provenance header — the
+join between a face measurement and a timeline is exactly where #93's
+wrong-render CSV got laundered into findings, so the consumer checks. For
+the same reason, a small face on a chunk whose frames came back
+`inconclusive` is reported `unmeasured`, not `hidden`.
 
 #### Conditioning on an isolated vocal stem
 
