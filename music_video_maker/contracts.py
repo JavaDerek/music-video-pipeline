@@ -1060,7 +1060,17 @@ class ChunkResult:
     misread: it can still tell the run started fresh, because *no* chunk in
     it carries a fingerprint mismatch reason and the run's own history (a
     missing ``run_state.json`` from before this run, or the log) is where
-    that fact belongs."""
+    that fact belongs.
+
+    Always ``None`` on a ``CACHED`` result, and that is a guarantee rather
+    than an accident of which paths happen to set it: the field describes
+    *this* run's decision to re-render, and a reused chunk was not
+    re-rendered by this run. ``resilience._as_cached`` is the one place a
+    cached result is built and it clears this field there (it used to carry a
+    previous ``--resume``'s rejection forward, so a reused chunk reported
+    "content_changed" for a comparison this run never made -- see that
+    function's docstring, and note that ``render_seconds`` is deliberately
+    *not* cleared the same way)."""
 
     rerender_reason_fields: tuple[str, ...] = ()
     """The specific ``ChunkFingerprint`` field names behind ``rerender_reason``,

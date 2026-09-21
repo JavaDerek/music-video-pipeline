@@ -314,6 +314,41 @@ class _RerenderReason:
     fields: tuple[str, ...] = ()
 
 
+def _as_cached(existing: ChunkResult) -> ChunkResult:
+    """The prior run's ``ChunkResult``, re-stamped as this run's ``CACHED``
+    one -- the single place ``--resume`` turns a reused chunk into a result.
+
+    Two fields on ``existing`` describe the run that *made* the file and not
+    this one, and they are treated differently on purpose:
+
+    * ``render_seconds`` is **kept**. It remains true of the mp4 that exists
+      (some earlier render really did take that long to produce it), and
+      every consumer already knows it is foreign data: ``progress.py``'s
+      finish projection excludes cached chunks by status for exactly this
+      reason (its D3, and CLAUDE.md's bullet on it). Zeroing it would throw
+      away a real measurement to avoid a misreading that is already guarded.
+    * ``rerender_reason`` / ``rerender_reason_fields`` are **cleared**. They
+      answer "why did *this* run re-render this chunk instead of reusing
+      it", and this run did not re-render it -- it is reusing it right here.
+      Carried forward from a previous ``--resume``, a reused chunk claims a
+      rejection that did not happen this run, and a monitor (issue #36) shows
+      "cached ... content_changed (prompt_hash)" beside a chunk nothing
+      compared or rejected. ``ChunkResult.rerender_reason``'s own docstring
+      already says ``None`` is what a reused chunk carries; before this
+      helper existed, the code did not agree with it.
+
+    Found on the 2026-09-20 real-render acceptance of issue #36 (the run that
+    edited one shot line, re-rendered chunk 42 as ``content_changed`` and
+    reused 41 and 43): the same carry-forward shape as ``render_seconds``,
+    one field over."""
+    return replace(
+        existing,
+        status=ChunkStatus.CACHED,
+        rerender_reason=None,
+        rerender_reason_fields=(),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # RunState (de)serialization -- atomic persistence for --resume
 # --------------------------------------------------------------------------- #
@@ -1058,7 +1093,7 @@ class ResilientRunner:
         if expected is None:
             # No fingerprint to check against -- the caller was warned once, up
             # front, that identity cannot be verified this run.
-            return replace(existing, status=ChunkStatus.CACHED), None
+            return _as_cached(existing), None
 
         stored = existing.fingerprint
         # ``quiet`` demotes the per-chunk detail to DEBUG when a single
@@ -1152,7 +1187,7 @@ class ResilientRunner:
                 # Deliberately keeps ``existing.fingerprint``: the state file
                 # must keep recording what the video was really rendered from,
                 # or a later run without the flag would believe it matches.
-                return replace(existing, status=ChunkStatus.CACHED), None
+                return _as_cached(existing), None
             log(
                 "Chunk %d covers the same span but no longer matches the configured prompt, "
                 "cast or noise seed (%s) -- re-rendering. Set resume_ignore_prompt_changes "
@@ -1162,7 +1197,7 @@ class ResilientRunner:
             )
             return None, _RerenderReason(_REASON_CONTENT_CHANGED, fields=changed)
 
-        return replace(existing, status=ChunkStatus.CACHED), None
+        return _as_cached(existing), None
 
     def _report_stack_census(self, run_state: RunState) -> None:
         """Say which render stack(s) the chunks in ``run_state`` came from
