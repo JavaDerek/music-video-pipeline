@@ -2819,11 +2819,63 @@ def test_rerender_reason_content_changed_names_the_field(tmp_path: Path):
     assert "prompt_hash" in run_state.results[0].rerender_reason_fields
 
 
+def test_a_reused_chunk_reports_no_rerender_reason_even_after_one_was_recorded(
+    tmp_path: Path,
+):
+    """A cached chunk must not carry a *previous* invocation's re-render
+    reason (issue #36, found on the 2026-09-20 real-render acceptance).
+
+    Three invocations, which is the smallest sequence that can show it:
+    render, then resume against a changed prompt (chunk 0 re-renders and
+    records ``content_changed``), then resume again with nothing changed
+    (chunk 0 is reused). Before ``resilience._as_cached`` existed, the third
+    invocation's CACHED result still said ``content_changed (prompt_hash)``
+    -- a rejection this run never made, shown beside a chunk it reused --
+    the same carry-forward shape as ``render_seconds``, one field over.
+
+    ``render_seconds`` is asserted *unchanged* in the same test on purpose:
+    the two fields are treated differently and the asymmetry is the point.
+    A previous run's measured GPU time is still true of the file that
+    exists (and ``progress.py`` already excludes cached chunks from its
+    projection by status); a previous run's resume decision is not true of
+    this one."""
+    output_dir = tmp_path / "chunks"
+    output_dir.mkdir()
+    _complete_a_run(tmp_path, output_dir, {0: _fp(0.0, 6.0, prompt="original prompt")})
+
+    changed = {0: _fp(0.0, 6.0, prompt="a different prompt")}
+    client = StubExecutionClient({0: [_rendered(0, output_dir, name="chunk_0000_new.mp4")]})
+    rerendered = _make_runner(client, tmp_path).render_run(
+        [0], _provider_returning(), output_dir, resume=True, fingerprints=changed
+    )
+    assert rerendered.results[0].status is ChunkStatus.RENDERED
+    assert rerendered.results[0].rerender_reason == "content_changed"
+    assert rerendered.results[0].rerender_reason_fields == ("prompt_hash",)
+    render_seconds_then = rerendered.results[0].render_seconds
+
+    reused = _make_runner(StubExecutionClient({}), tmp_path).render_run(
+        [0], _provider_returning(), output_dir, resume=True, fingerprints=changed
+    )
+
+    assert reused.results[0].status is ChunkStatus.CACHED
+    assert reused.results[0].rerender_reason is None
+    assert reused.results[0].rerender_reason_fields == ()
+    assert reused.results[0].render_seconds == render_seconds_then
+
+    # ...and it is cleared in the file too, not just in memory: a monitor
+    # (mvm-webui) reads the persisted copy, never this RunState.
+    payload = json.loads((tmp_path / "run_state.json").read_text())
+    assert payload["results"]["0"]["status"] == "cached"
+    assert payload["results"]["0"]["rerender_reason"] is None
+    assert payload["results"]["0"]["rerender_reason_fields"] == []
+
+
 def test_rerender_reason_is_not_set_when_ignore_prompt_changes_reuses_the_chunk(tmp_path: Path):
     """resume_ignore_prompt_changes reuses the cached video wholesale -- it
-    is not a rerender, so there is no reason to attach to anything; the
-    reused ChunkResult keeps whatever it already carried (None, for a chunk
-    rendered before this field existed)."""
+    is not a rerender, so there is no reason to attach to anything, and the
+    reused ChunkResult reports ``None`` (``_as_cached`` clears the field
+    rather than carrying a previous invocation's reason forward -- see
+    ``test_a_reused_chunk_reports_no_rerender_reason_even_after_one_was_recorded``)."""
     output_dir = tmp_path / "chunks"
     output_dir.mkdir()
     _complete_a_run(tmp_path, output_dir, {0: _fp(0.0, 6.0, prompt="original prompt")})
