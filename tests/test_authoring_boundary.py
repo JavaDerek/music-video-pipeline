@@ -50,6 +50,10 @@ SUBPROCESS_ALLOWLIST = frozenset(
         "luminance.py",  # ffmpeg frame sampling for the darkness floor (issue #77) -- no model
         "scenecuts.py",  # ffmpeg scene-detection probe (issue #81) -- no model
         "webui.py",  # `tailscale ip -4` bind discovery + ffmpeg thumbnails (issue #36) -- no model
+        # `nvidia-smi` polling for the attended 277-frame VRAM proof (issue #98).
+        # No model, and not in the render path at all: nothing imports it, it is
+        # run by hand from its own terminal (`python -m ...`) beside a render.
+        "vramsample.py",
     }
 )
 

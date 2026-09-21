@@ -61,6 +61,28 @@ Clock = Callable[[], float]
 
 _VIDEO_EXTENSION = ".mp4"
 
+DEFAULT_HTTP_TIMEOUT_SECONDS = 60.0
+"""Socket timeout for every HTTP call this client makes (issue #24).
+
+``requests`` has **no default timeout**: a call without one blocks until the
+peer answers or the kernel gives up, which on a wedged host is never. That is
+not a theoretical problem here -- it is issue #24's own recovery path. When H3
+stages onto a contended card and goes silent, the watchdog fires correctly,
+``resilience.ResilientRunner._recover`` runs, and ``POST /interrupt`` goes to a
+ComfyUI whose worker is stuck inside a driver call below Python. Without a
+timeout the *orchestrator* then blocks forever too: the retry never happens,
+the chunk is never dead-lettered, and GPU custody is never released. One
+unrecoverable failure on the card would have become an unrecoverable failure
+in the process built to survive it.
+
+60 s is generous on purpose, and safe for the big one: ``requests``' timeout
+is a *between-bytes* socket deadline, not a total-duration budget, so a slow
+``GET /view`` of a several-hundred-megabyte mp4 is never cut off for taking a
+long time -- only for going silent for a minute. The genuinely long wait in a
+render is the WebSocket's, which has its own ``ws_timeout`` watchdog and is
+untouched by this.
+"""
+
 # --------------------------------------------------------------------------- #
 # TCP keepalive tuning (issue #43 item 3) -- bounding dead-peer detection.
 #
@@ -164,6 +186,7 @@ class ComfyUIExecutionClient:
         client_id: str | None = None,
         clock: Clock = time.monotonic,
         ws_timeout: float | None = 300.0,
+        http_timeout: float | None = DEFAULT_HTTP_TIMEOUT_SECONDS,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.session = session if session is not None else requests.Session()
@@ -171,6 +194,10 @@ class ComfyUIExecutionClient:
         self.client_id = client_id if client_id is not None else _default_client_id()
         self.clock = clock
         self.ws_timeout = ws_timeout
+        self.http_timeout = http_timeout
+        """Seconds, passed to every ``requests`` call below. ``None`` restores
+        the library default of waiting forever, which issue #24 is about --
+        only a test that wants to prove the kwarg is threaded should set it."""
 
     # -- public API (contracts.ExecutionClient) ------------------------------ #
 
@@ -286,7 +313,7 @@ class ComfyUIExecutionClient:
     def interrupt(self) -> None:
         url = f"{self.base_url}/interrupt"
         try:
-            self.session.post(url)
+            self.session.post(url, timeout=self.http_timeout)
             logger.info("Sent POST /interrupt to %s", self.base_url)
         except requests.RequestException as exc:
             logger.error("POST /interrupt to %s failed: %s", self.base_url, exc)
@@ -295,7 +322,7 @@ class ComfyUIExecutionClient:
         url = f"{self.base_url}/free"
         body = {"unload_models": unload_models, "free_memory": True}
         try:
-            self.session.post(url, json=body)
+            self.session.post(url, json=body, timeout=self.http_timeout)
             logger.info("Sent POST /free to %s (body=%s)", self.base_url, body)
         except requests.RequestException as exc:
             logger.error("POST /free to %s failed (body=%s): %s", self.base_url, body, exc)
@@ -306,7 +333,7 @@ class ComfyUIExecutionClient:
         url = f"{self.base_url}/prompt"
         body = {"prompt": workflow, "client_id": self.client_id}
         try:
-            response = self.session.post(url, json=body)
+            response = self.session.post(url, json=body, timeout=self.http_timeout)
         except requests.RequestException as exc:
             logger.error(
                 "POST /prompt to %s failed for client_id=%s: %s", url, self.client_id, exc
@@ -569,7 +596,7 @@ class ComfyUIExecutionClient:
     def _fetch_history_video(self, prompt_id: str) -> dict[str, Any]:
         url = f"{self.base_url}/history/{prompt_id}"
         try:
-            response = self.session.get(url)
+            response = self.session.get(url, timeout=self.http_timeout)
         except requests.RequestException as exc:
             logger.error("GET %s failed: %s", url, exc)
             raise HistoryError(f"GET /history/{prompt_id} request failed: {exc}") from exc
@@ -612,7 +639,7 @@ class ComfyUIExecutionClient:
         }
         url = f"{self.base_url}/view"
         try:
-            response = self.session.get(url, params=params)
+            response = self.session.get(url, params=params, timeout=self.http_timeout)
         except requests.RequestException as exc:
             logger.error(
                 "GET %s failed for prompt_id=%s params=%s: %s", url, prompt_id, params, exc

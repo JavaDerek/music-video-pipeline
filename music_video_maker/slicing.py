@@ -141,6 +141,7 @@ from music_video_maker.contracts import (
     HardwareProfile,
     WordTiming,
 )
+from music_video_maker.envelope import CALIBRATED_CEILING, MeasuredCeiling
 from music_video_maker.shot_plan import MEASURED_MAX_FRAMES, ShotLength
 
 logger = logging.getLogger(__name__)
@@ -765,9 +766,10 @@ def _instrumental_max_frames(
     if frames > MEASURED_MAX_FRAMES:
         logger.warning(
             "instrumental_shot_seconds asks for instrumental shots up to %d frames (%.3fs), "
-            "above the %d frames ever rendered on this card -- unmeasured territory. Longer "
-            "shots cost no extra wall clock (fewer chunks over the same total frames), but "
-            "VRAM at this frame count has never been measured here.",
+            "above the %d frames MEASURED_MAX_FRAMES is calibrated at -- a constant, not a "
+            "live reading, and renders here have gone past it (issue #98). Longer shots cost "
+            "no extra wall clock (fewer chunks over the same total frames), but VRAM at this "
+            "frame count has never been measured here.",
             frames,
             grid.frames_to_seconds(frames),
             MEASURED_MAX_FRAMES,
@@ -1143,9 +1145,10 @@ def _apply_shot_lengths(
         )
         if target > MEASURED_MAX_FRAMES:
             logger.warning(
-                "Chunk at %.3fs will render %d frames (%.3fs), above the %d frames ever "
-                "rendered on this card -- unmeasured territory. It is inside H3's trained "
-                "range and costs no extra wall clock, but temporal VAE decode memory scales "
+                "Chunk at %.3fs will render %d frames (%.3fs), above the %d frames "
+                "MEASURED_MAX_FRAMES is calibrated at -- a constant, not a live reading, and "
+                "renders here have gone past it (issue #98). It is inside H3's trained range "
+                "and costs no extra wall clock, but temporal VAE decode memory scales "
                 "non-linearly with frame count and an over-committed card here can wedge "
                 "the host instead of raising CUDA OOM (issues #23, #24). Watch this one.",
                 starts[index],
@@ -1453,6 +1456,45 @@ def _voiced_seconds_within(
     )
 
 
+def _log_effective_frame_window(eff_min: float, eff_max: float, grid: FrameGrid) -> None:
+    """Say, once per run, what ``max_chunk_seconds`` actually bought (#98).
+
+    A duration is not a frame count. H3's ``length`` lives on a ``5 + 17k``
+    grid, so the ceiling a run enforces is the largest grid point *at or
+    below* ``max_chunk_seconds`` -- and nothing anywhere says which one that
+    turned out to be. Two consequences, both of which cost real time:
+
+    * ``max_chunk_seconds = 12.0`` is **277** frames (11.542 s), not the 288
+      that ``12.0 * 24`` suggests. 288 is not on the grid at all, so no
+      setting produces it.
+    * A duration written one decimal short silently buys the previous grid
+      point, with no warning, because the value asked for is perfectly legal:
+      ``10.833`` gives **243** frames where ``10.834`` gives 260, and
+      ``15.083`` gives **345** where H3's trained ceiling is 362.
+
+    This is INFO rather than a warning: nothing here is wrong, it is simply
+    the one number an operator planning a long-take run needs and could not
+    read anywhere. See ``docs/runbook-288-frame-proof.md``.
+    """
+    min_frames = _grid_frames_at_or_above(eff_min, grid)
+    max_frames = max(_grid_frames_at_or_below(eff_max, grid), min_frames)
+    logger.info(
+        "Chunk window for this run: %.3f-%.3fs resolves to %d-%d frames on H3's %d+%dk grid "
+        "(the ceiling is the largest grid point at or below max_chunk_seconds, so %.3fs buys "
+        "%d frames = %.3fs -- a duration written one decimal short silently buys the previous "
+        "grid point; issue #98).",
+        eff_min,
+        eff_max,
+        min_frames,
+        max_frames,
+        grid.base_frames,
+        grid.step_frames,
+        eff_max,
+        max_frames,
+        grid.frames_to_seconds(max_frames),
+    )
+
+
 def _log_untenable_segments(
     segments: tuple[AlignedSegment, ...], eff_max: float, grid: FrameGrid
 ) -> None:
@@ -1493,9 +1535,10 @@ def _log_untenable_segments(
                 f"it does fit inside H3's trained range (up to {trained_max_s:.3f}s), so "
                 f"raising max_chunk_seconds to at least "
                 f"{grid.frames_to_seconds(needed_frames):.3f}s ({needed_frames} frames) "
-                "would let one chunk hold it -- but nothing longer than "
-                f"{MEASURED_MAX_FRAMES} frames has ever been rendered on this card, so "
-                "prove the VRAM on a short slice first"
+                "would let one chunk hold it -- but that is past the "
+                f"{MEASURED_MAX_FRAMES} frames MEASURED_MAX_FRAMES is calibrated at, so "
+                "prove the VRAM on an attended one-chunk slice first "
+                "(docs/runbook-288-frame-proof.md)"
             )
         else:
             remedy = (
@@ -2234,6 +2277,7 @@ def slice_audio(
     shot_lengths: Sequence[ShotLength] = (),
     instrumental_shot_seconds: float | None = None,
     instrumental_audio_gain_db: float | None = None,
+    measured_ceiling: MeasuredCeiling = CALIBRATED_CEILING,
 ) -> tuple[AudioChunk, ...]:
     """Slice ``audio_path`` per ``alignment`` into ``AudioChunk``s honoring
     ``hardware``'s min/max chunk-duration window (clamped into H3's trained
@@ -2268,6 +2312,14 @@ def slice_audio(
     Both need the contiguous timeline ``cover_instrumentals`` builds -- there
     is no coherent way to retile a covering that has holes in it -- so they
     are ignored (loudly) when it is off.
+
+    ``measured_ceiling`` (issue #98) is the frame count the
+    "nothing longer has rendered here" warning is allowed to name, plus where
+    that number came from. It defaults to the calibrated constant; a caller
+    with a ``run_state.json`` in reach should pass
+    ``envelope.measured_ceiling(run_state_file)`` instead, which reads the
+    longest chunk a previous run *actually rendered* and so makes the number
+    evidence rather than a memory. It changes nothing but a log line.
     """
     if not alignment.segments and not cover_instrumentals:
         # With cover_instrumentals on, zero segments is not "nothing to
@@ -2292,6 +2344,7 @@ def slice_audio(
         instrumental_shot_seconds = None
 
     eff_min, eff_max, grid = _effective_bounds(hardware)
+    _log_effective_frame_window(eff_min, eff_max, grid)
 
     segments = tuple(sorted(alignment.segments, key=lambda s: s.start))
 
@@ -2560,7 +2613,7 @@ def slice_audio(
         grid.trained_min_frames,
         grid.trained_max_frames,
     )
-    _log_unmeasured_chunks(chunks, grid)
+    _log_unmeasured_chunks(chunks, grid, measured_ceiling)
     return _fold_counterpoint(tuple(chunks), alignment)
 
 
@@ -2628,39 +2681,58 @@ def _fold_counterpoint(
     return tuple(folded)
 
 
-def _log_unmeasured_chunks(chunks: Sequence[AudioChunk], grid: FrameGrid) -> None:
-    """Name, once per run, every chunk longer than anything ever rendered here.
+def _log_unmeasured_chunks(
+    chunks: Sequence[AudioChunk],
+    grid: FrameGrid,
+    ceiling: MeasuredCeiling = CALIBRATED_CEILING,
+) -> None:
+    """Name, once per run, every chunk longer than the best-evidenced frame
+    count available.
 
     Reported rather than refused, deliberately: 362 frames is inside H3's
     trained range and the whole point of issue #27 is that a long take is
-    available. But nothing above
-    :data:`~music_video_maker.shot_plan.MEASURED_MAX_FRAMES` has been rendered
-    on this 4090 at any resolution, and an over-committed card here does not
-    raise CUDA OOM -- it goes silent mid-load and wedges the host past SIGKILL
-    (issues #23, #24). A run that is about to spend hours on frame counts
-    nobody has measured should say so before it starts, not after.
+    available. But VRAM above the measured ceiling is unknown, and an
+    over-committed card here does not raise CUDA OOM -- it goes silent
+    mid-load and wedges the host past SIGKILL (issues #23, #24). A run about
+    to spend hours on frame counts nobody has measured should say so before
+    it starts, not after. (The *refusal* on the same axis is
+    ``envelope.check_render_envelope``, which additionally knows this run's
+    resolution; this stays a warning because it does not.)
+
+    **The message names its own evidence (issue #98).** It used to read
+    "exceed 141 frames -- the longest anything ever rendered on this card",
+    and that was false for months: the finished "Deathless" v13 render holds
+    45 of 80 chunks above 141 frames, 15 of them at 192, confirmed with
+    ``ffprobe -count_frames`` against the mp4s. ``MEASURED_MAX_FRAMES``
+    records the largest frame count measured *when it was written*, and
+    nothing updates it when a render quietly goes past. So the number now
+    arrives as a :class:`~music_video_maker.envelope.MeasuredCeiling` that
+    carries where it came from, and a caller holding a ``run_state.json``
+    (``envelope.measured_ceiling``) can hand over a number that is evidence
+    rather than a memory.
 
     Note this fires for filler chunks too: with ``max_chunk_seconds`` at H3's
     trained ceiling, a long instrumental already tiles into chunks well past
-    141 frames without anyone asking for a long take.
+    the ceiling without anyone asking for a long take.
     """
-    over = [c for c in chunks if (c.frame_count or 0) > MEASURED_MAX_FRAMES]
+    over = [c for c in chunks if (c.frame_count or 0) > ceiling.frames]
     if not over:
         return
     longest = max(over, key=lambda c: c.frame_count or 0)
     logger.warning(
-        "%d of %d chunk(s) exceed %d frames -- the longest anything ever rendered on this "
-        "card. The longest is chunk %d at %d frames (%.3fs). This is inside H3's trained "
-        "range and costs no extra wall clock, but VRAM behaviour above %d frames is "
-        "unmeasured here and a card that runs out can wedge the host rather than raising "
-        "CUDA OOM. Watch the first one.",
+        "%d of %d chunk(s) exceed %d frames, which is %s. The longest is chunk %d at %d "
+        "frames (%.3fs). This is inside H3's trained range and costs no extra wall clock, but "
+        "VRAM behaviour above %d frames is unmeasured here and a card that runs out can wedge "
+        "the host rather than raising CUDA OOM (issues #23, #24). Watch the first one -- "
+        "docs/runbook-288-frame-proof.md is the attended way to measure it.",
         len(over),
         len(chunks),
-        MEASURED_MAX_FRAMES,
+        ceiling.frames,
+        ceiling.provenance,
         longest.chunk_id,
         longest.frame_count,
         longest.duration,
-        MEASURED_MAX_FRAMES,
+        ceiling.frames,
     )
 
 

@@ -678,6 +678,37 @@ def read_text_encoder(workflow: Workflow) -> str | None:
     return name if isinstance(name, str) else None
 
 
+def read_render_dimensions(workflow: Workflow) -> tuple[int | None, int | None]:
+    """Report the ``width``/``height`` this graph would render at, or
+    ``(None, None)`` when the graph does not say.
+
+    ``RunConfig.render_width``/``render_height`` default to ``None``, which
+    means "whatever the template already carries" -- and the committed
+    templates carry ComfyUI's 1344x768 H3 default. So a run that sets neither
+    still *has* a resolution; it is just written down somewhere the config
+    cannot see. Anything reasoning about the size of what is being submitted
+    (``envelope.check_render_envelope``, issues #24/#98) needs the resolved
+    pair, and reading it off the graph is the only way to get it without
+    re-stating the template's default in Python where the two can drift.
+
+    Introspective like :func:`read_text_encoder`, so it never raises: a
+    malformed or unconventional graph answers ``(None, None)`` -- *unknown*,
+    which callers must treat as "cannot judge", never as a number.
+    """
+    try:
+        _, node = _find_h3_conditioning_node(workflow)
+    except (NodeNotFoundError, AmbiguousNodeError):
+        logger.debug("No single H3 node in this workflow -- no render dimensions to report")
+        return None, None
+    inputs = node.get("inputs", {})
+    width = inputs.get("width") if isinstance(inputs, dict) else None
+    height = inputs.get("height") if isinstance(inputs, dict) else None
+    return (
+        width if isinstance(width, int) and not isinstance(width, bool) else None,
+        height if isinstance(height, int) and not isinstance(height, bool) else None,
+    )
+
+
 def find_titled_node(workflow: Workflow, class_type: str, title: str) -> tuple[str, dict]:
     """Locate the one node of ``class_type`` whose ``_meta.title`` is exactly
     ``title``, requiring the title to *match*.

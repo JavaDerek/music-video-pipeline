@@ -657,6 +657,32 @@ class RunConfig:
     Costs one re-stage of H3 per chunk. Turn it off only on a stack where you
     have watched the resident figure clear your between-chunk floor."""
 
+    acknowledge_unproven_envelope: bool = False
+    """Allow this run to submit chunks larger than anything proven on this card
+    (issues #24, #98).
+
+    Off by default, and off is a **refusal**, not a warning:
+    ``envelope.check_render_envelope`` raises before any GPU time when a chunk's
+    frame count or resolution exceeds every point in
+    ``envelope.PROVEN_ENVELOPES`` for this run's hardware profile name. The
+    existing VRAM defences ask what *else* is on the card; this one asks how big
+    the thing being submitted is, which is the axis nothing checked -- and on
+    this host an over-committed card does not raise CUDA OOM, it goes silent and
+    needs a power cycle (issue #24).
+
+    Setting it true is a statement that a human is at the keyboard for this run.
+    It is what ``docs/runbook-288-frame-proof.md`` has you set for the attended
+    one-chunk proof, and the proof's *result* is then recorded as an
+    ``EnvelopePoint`` so the next run passes on evidence instead of on an
+    acknowledgement. Leaving it true afterwards is the same mistake as leaving
+    an assertion disabled.
+
+    Deliberately **not** in ``ChunkFingerprint``: it changes no pixel and gates
+    no output, so a resume must not re-render on account of it. Every
+    pre-existing config means false, which is the behaviour every pre-existing
+    config already had on any run whose chunks are inside the envelope --
+    "Deathless" v13's 192 frames at 864x480 among them."""
+
     alignment_model_size: str = DEFAULT_ALIGNMENT_MODEL_SIZE
     """Which whisper model Stage 1's forced alignment loads.
 
@@ -1709,6 +1735,9 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
         )
     values["alignment_model_size"] = model_size
     values["release_vram_between_chunks"] = _flag(merged, "release_vram_between_chunks", True)
+    values["acknowledge_unproven_envelope"] = _flag(
+        merged, "acknowledge_unproven_envelope", False
+    )
     between_chunk_floor = merged.get("between_chunk_min_free_vram_gb")
     values["between_chunk_min_free_vram_gb"] = (
         _positive_number(merged, "between_chunk_min_free_vram_gb", 0.0)

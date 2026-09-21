@@ -447,3 +447,26 @@ def test_stage_chunk_uploads_stem_sourced_conditioning_audio_unchanged(tmp_path)
 def test_stager_satisfies_asset_stager_protocol():
     stager = ComfyUIAssetStager(session=FakeComfyUISession())
     assert isinstance(stager, contracts.AssetStager)
+
+
+def test_the_upload_is_bounded(tmp_path):
+    """Issue #24: staging runs before the card is loaded, so it is not the
+    wedge path -- but it talks to the same ComfyUI, and one left wedged by a
+    previous run would hang an untimed upload forever."""
+    from music_video_maker import execution
+
+    real = FakeComfyUISession()
+    seen: list[dict] = []
+
+    class _RecordingSession:
+        base_url = real.base_url
+
+        def post(self, url, **kwargs):
+            seen.append(kwargs)
+            return real.post(url, **kwargs)
+
+    stager = ComfyUIAssetStager(base_url=real.base_url, session=_RecordingSession())
+    stager.upload_image(_write_png(tmp_path / "cast.png"))
+
+    assert seen
+    assert all(kw.get("timeout") == execution.DEFAULT_HTTP_TIMEOUT_SECONDS for kw in seen)

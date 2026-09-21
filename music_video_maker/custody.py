@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any
 
 import requests
 
+from music_video_maker import execution
 from music_video_maker.contracts import HardwareProfile
 
 if TYPE_CHECKING:
@@ -50,6 +51,28 @@ logger = logging.getLogger(__name__)
 
 SYSTEM_STATS_PATH = "/system_stats"
 FREE_PATH = "/free"
+
+HTTP_TIMEOUT_SECONDS = execution.DEFAULT_HTTP_TIMEOUT_SECONDS
+"""Socket timeout for this module's ``GET /system_stats`` and ``POST /free``.
+
+Same number and same reason as the execution client's -- see
+:data:`~music_video_maker.execution.DEFAULT_HTTP_TIMEOUT_SECONDS`, which this
+aliases rather than restates so the two cannot drift. It matters twice here,
+and both times on the unhappy path issue #24 describes:
+
+* ``__exit__``'s ``POST /free`` is the **unconditional** custody release. A
+  release that can block forever is not unconditional; it is a try/finally
+  that never finishes, holding the card and the process.
+* ``build_vram_probe``'s reading is what ``ResilientRunner`` waits on between
+  chunks. Its wait is bounded by ``release_wait_seconds`` only if each
+  individual reading returns -- one probe that never answers spends the whole
+  budget in a single call and the runner never gets to stop cleanly.
+
+Note what a timeout buys and what it does not: it un-hangs *us*, not the card.
+A wedged ComfyUI is still wedged, and the reading that comes back is still
+``None``. That is the point -- the orchestrator's job on this path is to stop
+legibly and persist, not to fix the GPU.
+"""
 
 DEFAULT_MIN_FREE_VRAM_GB = 16.0
 """Absolute free-VRAM floor in GB, mirroring ``config.min_free_disk_gb``.
@@ -110,7 +133,7 @@ def _fetch_free_vram_gb(session: Any, base_url: str) -> float | None:
     """
     url = f"{base_url}{SYSTEM_STATS_PATH}"
     try:
-        response = session.get(url)
+        response = session.get(url, timeout=HTTP_TIMEOUT_SECONDS)
     except requests.RequestException as exc:
         logger.warning("VRAM check could not reach %s (%s)", url, exc)
         return None
@@ -196,7 +219,7 @@ def _free_comfyui(session: Any, base_url: str) -> None:
     url = f"{base_url}{FREE_PATH}"
     body = {"unload_models": True, "free_memory": True}
     try:
-        session.post(url, json=body)
+        session.post(url, json=body, timeout=HTTP_TIMEOUT_SECONDS)
         logger.info(
             "Sent POST %s to %s (body=%s) to release VRAM", url, base_url, body
         )
@@ -405,6 +428,7 @@ def prevent_host_sleep(
 __all__ = [
     "CustodyError",
     "DEFAULT_MIN_FREE_VRAM_GB",
+    "HTTP_TIMEOUT_SECONDS",
     "SLEEP_ASSERTION_ARGV",
     "VramCustodyManager",
     "VramProbe",
