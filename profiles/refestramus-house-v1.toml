@@ -1,0 +1,68 @@
+# Refestramus house style, v1 -- the catalogue's locked look (issue #55).
+#
+# STATUS: SKELETON. `cinematography` below is the committed placeholder, not
+# the look. Loading this file RAISES until it is filled in -- deliberately;
+# see profiles/README.md, "Why this file refuses to load".
+#
+# What goes in it: the 631 characters the "Deathless" photography stage
+# produced, which a human approved, which the 2026-09-20 A/B rendered at
+# identical seeds on chunks 16/23/44/64, and which Derek chose. That text
+# lives in ~/mvm-runs/deathless/.authoring/photography.json under
+# "cinematography" -- a run asset, not repo content (CLAUDE.md, "Authoring
+# session state stays out too"), so it is not reproducible from a checkout.
+#
+# Fill it by promoting, never by retyping -- the promote command also carries
+# the provenance block, which is the half a retype silently loses:
+#
+#   python -m music_video_maker.profiles promote \
+#       --run-dir ~/mvm-runs/deathless \
+#       --name refestramus-house --version 1 \
+#       --out profiles/refestramus-house-v1.toml --overwrite
+#
+# Two fragments of the approved text are published in issue #55 and in
+# docs/design-cinematography-profiles.md, and they are here ONLY so whoever
+# promotes can confirm they promoted the right thing -- the elisions are
+# theirs and the middle is not recoverable:
+#
+#   "Shot on 35mm anamorphic, wide-gauge grain left visible; long lenses for
+#    faces at shallow depth so the singer separates from a soft, smoke-veiled
+#    distance [...] Grade is cold and desaturated toward slate, ash and iron,
+#    blacks lifted slightly with atmospheric haze, skin held just warm enough
+#    to stay human against it; no lens flare theatrics, no camp, weight and
+#    patience in every move."
+#
+# ORDER MATTERS: every top-level key must stay ABOVE [provenance]. TOML binds
+# a bare key to whichever table precedes it, so a look field written below
+# that header silently becomes provenance.<key> and never reaches the render.
+# This project has paid for that twice (config.HARDWARE_KEYS,
+# ALIGNMENT_OVERRIDE_KEYS) and once in an experiment where both arms loaded
+# identically (#62).
+
+version     = 1
+name        = "refestramus-house"
+description = "Refestramus catalogue look. SKELETON -- promote the approved Deathless cinematography into it before any run points here."
+
+cinematography = "<TODO: promote the approved cinematography text into this field -- see the header comment. This profile refuses to load until you do.>"
+
+# Deliberately NOT locked in v1, and each absence is a decision:
+#
+#   lora / lora_strength / lora_trigger -- the only measurement this project
+#     has on the realism adapter (#62) is that it FIGHTS a flattering
+#     `appearance` and a de-aged cast band, and that a run must choose. That
+#     is a per-song decision until a second song has made it the same way.
+#   face_treatment -- same trade, same reason, one level up.
+#
+# Adding either later is a one-line edit AND a version bump (v2), never an
+# edit in place: see profiles/README.md, "A profile file is immutable once a
+# run has rendered against it".
+#
+# render_width / render_height are not profile fields at all and cannot be
+# added: 864x480 is ~3.7 min/chunk against 9 m 15 s at 1344x768 on the same
+# 4090, and a look file that silently triples a catalogue's GPU hours is the
+# wrong kind of inheritance.
+
+[provenance]
+source        = "pending-promotion"
+song          = "Deathless"
+promoted_from = "~/mvm-runs/deathless/.authoring/photography.json"
+notes         = "Chosen by Derek from the 2026-09-20 A/B at identical seeds on chunks 16/23/44/64 (issue #55). Committed as a skeleton because the approved text is a run asset and is not part of this repository."

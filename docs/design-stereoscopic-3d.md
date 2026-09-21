@@ -42,6 +42,42 @@ then inpainting the disocclusions. The hard parts are known:
   the screen and occluded by it — and the effect collapses. A popping object
   must come *at* the lens, never across it and out the side.
 
+### The scaffold that exists, and what it is not
+
+**Built (2026-09-21): `music_video_maker/stereo.py`, never run on a real
+frame.** It is the arithmetic and the seams, not the feature: the sign
+convention with the synthetic-depth test this document asks for, a
+convergence-plane parameter, the DIBR forward warp with a z-buffer for
+collisions, nearest-neighbour hole filling, side-by-side and anaglyph output,
+and the ffmpeg probe/decode/encode argv — with the depth model left as an
+**injected callable** so no weights, no GPU and no licence question enter the
+test suite.
+
+What it deliberately is not:
+
+* **Not fast.** numpy is not a dependency of this project and is not in its
+  test environment (checked, not assumed), so the warp is a Python loop per
+  pixel and `decode_frames` buffers a whole chunk. At 12334 frames a song that
+  is not a production path. Treat the arithmetic as the specification and
+  rewrite the loops against numpy or the OpenCV extra that already exists.
+* **Not inpainting.** The hole fill copies the nearest written pixel along the
+  row — the "edge-stretch, for this test only" this document specifies for the
+  *experiment*. The showcase shot is still the worst case, and it is exactly
+  where this will look worst.
+* **Not temporally consistent.** Depth is per frame and will boil. The only
+  numbers that exist are in `docs/pop-beat-corpus.md`.
+* **Not in the render path.** It reads finished chunk mp4s and writes new
+  files. No `ChunkFingerprint` moves, no `run_state.json` is written, and it
+  cannot cause a re-render — a stereo pass able to invalidate a cached chunk
+  would put hours of GPU custody behind a post-process.
+
+One question it answers on the way past: #68 asks whether stereo comfort
+settings belong in a locked house style (#55). **Not yet, and #55's own schema
+constraint is what says so** — every field a profile may set must already be
+recorded in a `ChunkFingerprint`, and a pass that runs *after* the render and
+changes no chunk H3 produced has nothing there to move. They live in
+`stereo.StereoParams` until that stops being true.
+
 ### Where it lands in the pipeline
 
 Stage 5 never re-encodes, on purpose. Stereo conversion is a re-encode.
@@ -133,6 +169,23 @@ the repo.
 
 ## Planning: the measurement that reorders the work
 
+**Status (2026-09-21): steps 1 and 2 are built; step 3 is built in its
+structural half only, and its keyword half is still blocked.** The corpus
+that arrived on 2026-09-20 — three hand-written pop lines that rendered as
+intended, chunks 45/46/66 — is recorded in `docs/pop-beat-corpus.md` with
+every candidate and its reason, and it changes the answer for exactly one
+check. What shipped is `prose.pop_object_named_in_shot_issues`: a pop beat
+whose shot line never names its own `pop_object`. It needs **no vocabulary**,
+which is why it could ship at n=3 — `pop_object` reaches no prompt (it rides
+in the plan's `# beat:` comment like `act`), so the shot line is the only
+channel by which the object a pop beat exists for can reach H3, and correct
+authoring names it while incorrect authoring does not. It fires on 0 of the 3
+known-good lines; it has **no measured true-positive rate**, because no
+authored pop beat has ever been seen omitting its object. A keyword lint
+still may not ship: the three lines' verbatim text is not published, so
+nothing can be scored *on* them, and every candidate still scores zero on the
+only 80-line corpus with per-chunk outcomes.
+
 **Status (2026-09-13): steps 1 and 2 below are built, step 3 is still not.**
 `Beat.pop_object` (not `pop = true`, and not `beat_role = "pop"` -- see the
 field's own docstring in `authoring/beats.py` for why a named motif beats a
@@ -217,7 +270,12 @@ So the build order is the reverse of the issue's own list:
    pop beat's `camera` should push toward the object rather than away from it
    — `pop_object` reaches all three stages' prompts the same way
    `beat_role`/`focus`/`camera` already do.
-3. **The lint last — STILL NOT BUILT.** Scored against a plan that actually
+3. **The lint last — STRUCTURAL HALF BUILT 2026-09-21, KEYWORD HALF STILL
+   NOT.** See the status block at the top of this section and
+   `docs/pop-beat-corpus.md`, which is the register the keyword half will be
+   built from and which records the two other candidates considered and
+   rejected (the object as grammatical subject; the object named in its own
+   plant's prose), each with the reason. Scored against a plan that actually
    contains pop beats. Only then is there a corpus with a known outcome, and
    only then can the excluded candidates be recorded with their reasons the
    way #60 requires. What *is* built in the meantime: `write`'s advisory

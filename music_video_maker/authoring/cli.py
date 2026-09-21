@@ -1025,14 +1025,18 @@ def _cmd_write(args: argparse.Namespace) -> int:
         chunk timeline and could not tell a plant from a payoff without
         guessing, which is the thing this project keeps having to retire.
 
-        Issue #68's pop-distant-staging check joins them for the same reason:
-        it needs to know which beats are pop beats (``Beat.pop_object``),
-        which only the beat sheet carries.
+        Issue #68's two pop checks join them for the same reason: both need
+        to know which beats are pop beats and what each one's object is
+        (``Beat.pop_object``), which only the beat sheet carries. The render
+        never sees that field at all -- it rides in the plan's ``# beat:``
+        comment -- which is precisely what
+        ``pop_object_named_in_shot_issues`` is about.
         """
         return (
             prose_module.advisory_issues(current_shots, camera=camera)
             + prose_module.plant_end_state_issues(current_shots, beats)
             + prose_module.pop_distant_staging_issues(current_shots, beats)
+            + prose_module.pop_object_named_in_shot_issues(current_shots, beats)
             + condition_issues
         )
 

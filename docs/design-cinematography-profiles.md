@@ -257,19 +257,74 @@ the run config's own value is what you want.
 * Nothing promotes automatically. Step 3 of #55's loop is a human saying "that
   one — keep it", and this command is the only way it happens.
 
+## The committed house style: `profiles/`
+
+A run config can point anywhere, but a house style that is only ever a path in
+someone's home directory is not a catalogue's signature. `profiles/` is this
+repo's copy, with `profiles/README.md` carrying the three rules a person needs
+before editing anything in it: lock-vs-vary, versioning, and what proves which
+look made a video.
+
+**Immutability is a rule backed by evidence, not by a gate.** Once any run has
+rendered against `name-vN.toml`, that file does not change again; a new look is
+`name-v(N+1).toml` with `version = N+1`. Nothing can enforce that from a module
+that only reads the file, so what backs it is the sidecar's `profile_sha256`
+(an edit after the fact is *provable*) and `prompt_hash` (a resumed run reports
+every affected chunk as content-changed). The version number is what a human
+reads; the two hashes are what a machine can check.
+
+**The first house profile is committed as a skeleton, and it refuses to load.**
+`profiles/refestramus-house-v1.toml` carries the placeholder
+`cinematography = "<TODO: …>"`, and `load_profile` raises on any look value
+starting with `<TODO`, naming the promote command. The approved 631 characters
+live in `~/mvm-runs/deathless/.authoring/photography.json` — a run asset, not
+repo content, and not reproducible from a checkout.
+
+The choice is about which mistake is cheap, the same question `i2v_require_seed_face`'s
+recognition option answers one module over. A skeleton carrying a *plausible
+but truncated* look renders a catalogue that claims the house style and does
+not have it, with no symptom anywhere — this project's expensive kind of wrong.
+A skeleton that refuses at config load costs a run that never started. So the
+sentinel is a shape no real look has (a leading `<`), it is checked where every
+other profile value is checked, and the message says how to fill it: promote,
+never retype, because the promote carries the `[provenance]` block a retype
+silently loses.
+
+## What #68 asks of this file, and the answer
+
+Issue #68 proposes that stereo comfort settings (convergence, maximum
+disparity) belong in a locked house style, since "comfort settings are a
+signature and a safety limit". **They do not, yet, and the schema constraint
+above is exactly what says so.** `music_video_maker/stereo.py` is a
+post-render pass: it reads finished chunk mp4s and writes new files, changes
+no chunk H3 produced, and moves nothing in a `ChunkFingerprint`. There is
+therefore no fingerprint evidence to admit it on, and it lives in
+`stereo.StereoParams` until that changes. Worth recording as the first time
+the constraint refused something rather than merely describing what was
+already there.
+
 ## Verification status
 
 Everything above is verified offline by `tests/test_profiles.py` (load,
-precedence, record, promote, CLI, and the fingerprint-evidence guard) plus the
-config-integration tests in the same file. **No render has been produced with a
-profile.** When the 4090 is free the cheap confirmation is:
+precedence, record, promote, CLI, the placeholder refusal, the committed
+skeleton, and the fingerprint-evidence guard) plus the config-integration
+tests in the same file.
 
-1. Take `run_v12.toml`, add `cinematography_profile` pointing at a profile
-   whose `cinematography` is the Deathless photography text.
-2. `--prepare` is not enough — this is a prompt change, so seed the chunks
-   directory from `output/chunks_v12` and `--resume --only-chunks 0,20,54`.
-3. Expected: all three re-render (content-tier `prompt_hash` mismatch, named
-   in the resume log), the other 77 are reused, and
-   `output/chunks_v13/cinematography_profile.json` records the profile
-   verbatim. What the *pictures* should show is the first evidence anywhere of
-   what `cinematography` is worth — nothing has ever rendered with it set.
+**A render has now been produced with `cinematography` set (2026-09-20).** The
+confirmation this document specified was run as an A/B at identical seeds on
+chunks 16/23/44/64, differing only in that field:
+
+* mean |A−B| pixel distance **33–51 per chunk** — far more than a ComfyUI
+  version change produces (4–22, #95);
+* colour went cooler in all four (R−B down 4–30);
+* fine detail dropped (Laplacian variance −18% to −52%), the shallow-focus
+  clause softening backgrounds;
+* motion dropped (−1% to −48%);
+* and it **re-stages** shots rather than only re-grading them: a wide
+  silhouette against the sky, an extreme close-up opening, a pull-back with a
+  fire in frame.
+
+Derek watched the A/B and chose it; the next full "Deathless" render sets it.
+So the field is worth what #55 claimed, and the remaining question is the one
+this document's `profiles/` section answers: a look that has been chosen needs
+somewhere durable and versioned to live, or the next song re-rolls it.

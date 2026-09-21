@@ -27,6 +27,7 @@ from music_video_maker.contracts import ChunkFingerprint
 from music_video_maker.profiles import (
     FINGERPRINT_EVIDENCE,
     LOOK_FIELDS,
+    PLACEHOLDER_PREFIX,
     PROVENANCE_KEYS,
     TOP_LEVEL_KEYS,
     Profile,
@@ -40,6 +41,7 @@ from music_video_maker.profiles import (
 )
 
 EXAMPLES_DIR = Path(__file__).parent.parent / "examples" / "profiles"
+PROFILES_DIR = Path(__file__).parent.parent / "profiles"
 
 
 # --------------------------------------------------------------------------- #
@@ -544,6 +546,109 @@ def test_shipped_example_profile_loads():
     assert profile.name == "refestramus-house"
     assert profile.version == 1
     assert "cinematography" in profile.values
+
+
+# --------------------------------------------------------------------------- #
+# profiles/ -- the committed house-style directory, and the placeholder that
+# stops a skeleton from rendering as if it were a look (issue #55)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_placeholder_look_value_is_refused_with_the_promote_command(tmp_path):
+    """Which mistake is cheap: a half-filled house style renders a video
+    that claims the look and does not have it, with no symptom anywhere. A
+    refusal costs a run that never started."""
+    path = tmp_path / "skeleton.toml"
+    path.write_text(
+        'version = 1\nname = "house"\n'
+        f'cinematography = "{PLACEHOLDER_PREFIX}: fill me in>"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ProfileError) as excinfo:
+        load_profile(path)
+
+    message = str(excinfo.value)
+    assert "placeholder" in message
+    assert "promote" in message
+
+
+def test_a_real_look_value_is_not_mistaken_for_a_placeholder(tmp_path):
+    """The sentinel is a shape no real look has (a leading '<'), so nothing
+    that merely mentions a todo trips it."""
+    path = tmp_path / "real.toml"
+    path.write_text(
+        'version = 1\nname = "house"\n'
+        'cinematography = "35mm anamorphic, cold slate grade, TODO nothing"\n',
+        encoding="utf-8",
+    )
+
+    assert "35mm" in load_profile(path).values["cinematography"]
+
+
+def test_the_committed_house_profile_is_a_skeleton_that_refuses_to_load():
+    """`profiles/refestramus-house-v1.toml` is committed WITHOUT the approved
+    cinematography text, which lives in a run directory that is not part of
+    this repo. It must refuse rather than render a truncated look -- see
+    profiles/README.md, "Why this file refuses to load"."""
+    house = PROFILES_DIR / "refestramus-house-v1.toml"
+    assert house.exists(), "profiles/refestramus-house-v1.toml is missing"
+
+    with pytest.raises(ProfileError, match="placeholder"):
+        load_profile(house)
+
+
+def test_the_committed_house_profile_is_otherwise_a_valid_profile():
+    """Everything except the placeholder must already be right, or the
+    promote that fills it in would land on a file that fails for a second,
+    unrelated reason. Parsed as plain TOML so the placeholder check does not
+    hide the rest."""
+    raw = tomllib.loads(
+        (PROFILES_DIR / "refestramus-house-v1.toml").read_text(encoding="utf-8")
+    )
+
+    assert raw["version"] == 1
+    assert raw["name"] == "refestramus-house"
+    assert not set(raw) - TOP_LEVEL_KEYS
+    assert not set(raw.get("provenance", {})) - PROVENANCE_KEYS
+    # The look field must be ABOVE [provenance] -- TOML binds a bare key to
+    # whichever table precedes it, and a look field that landed inside
+    # provenance would be silently dropped (#62's both-arms-identical bug).
+    assert "cinematography" in raw
+    assert "cinematography" not in raw.get("provenance", {})
+
+
+def test_the_house_profile_directory_has_a_readme():
+    """The lock-vs-vary rule, the versioning rule and the reproducibility
+    story are what a person needs before editing anything in that directory,
+    and none of them is inferable from the TOML."""
+    readme = PROFILES_DIR / "README.md"
+    assert readme.exists()
+    text = readme.read_text(encoding="utf-8")
+
+    assert "cinematography_profile.json" in text
+    assert "prompt_hash" in text
+    assert "cinematography_profile_overrides" in text
+    assert "immutable" in text
+
+
+def test_a_profile_that_locks_only_cinematography_leaves_the_lora_per_song(tmp_path):
+    """Partial locking is the field set and costs no machinery (D3) -- the
+    claim profiles/README.md makes, checked. v1 of the house style locks one
+    field precisely because #62 measured the realism LoRA as a trade a run
+    must make for itself."""
+    path = tmp_path / "grade-only.toml"
+    path.write_text(
+        'version = 2\nname = "house"\ncinematography = "cold slate grade"\n', encoding="utf-8"
+    )
+
+    profile = load_profile(path)
+    effective, overridden = resolve_look(profile, {"lora": "some-adapter.safetensors"})
+
+    assert set(profile.values) == {"cinematography"}
+    assert effective["cinematography"] == "cold slate grade"
+    assert effective["lora"] == "some-adapter.safetensors"
+    assert overridden == ()  # the profile never set lora, so nothing was taken back
 
 
 # --------------------------------------------------------------------------- #

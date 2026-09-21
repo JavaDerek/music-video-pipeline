@@ -837,7 +837,14 @@ cinematography_profile = "profiles/refestramus-house-v1.toml"
 ```
 
 See [`examples/profiles/refestramus-house-v1.toml`](examples/profiles/refestramus-house-v1.toml)
-for the annotated format. It may lock only whole-video *look* fields —
+for the annotated format, and [`profiles/`](profiles/README.md) for the
+committed house styles plus the three rules that govern them (lock-vs-vary,
+versioning, and what proves which look made a video). Note that
+`profiles/refestramus-house-v1.toml` is committed as a **skeleton** and
+deliberately refuses to load until the approved look is promoted into it —
+the approved text is a run asset, not repo content, and a half-filled house
+style would render a video that claims the look and does not have it. A
+profile may lock only whole-video *look* fields —
 `cinematography`, `face_treatment`, `lora`, `lora_strength`, `lora_trigger`
 — and **the run config wins on anything it sets for itself**, so pointing at
 a house style never stops one video deviating. Every inherited and every
@@ -1716,5 +1723,9 @@ need to pick it up:
   a spoken prologue as a second timeline (#66), and the four places joining
   two timelines will break.
 - [`docs/design-stereoscopic-3d.md`](docs/design-stereoscopic-3d.md) —
-  stereo output and beats that plant for a pop (#68), plus why the pop-beat
-  lint cannot be scored yet.
+  stereo output and beats that plant for a pop (#68): the conversion
+  scaffold's sign convention, and which half of the pop-beat lint a corpus of
+  three can and cannot support.
+- [`docs/pop-beat-corpus.md`](docs/pop-beat-corpus.md) — the three rendered
+  pop beats, every candidate check that did **not** ship, and what would have
+  to be true to ship a keyword one (#68).
