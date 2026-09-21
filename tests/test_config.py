@@ -2487,3 +2487,15 @@ def test_the_literalness_bands_are_ordered_free_to_literal() -> None:
     from music_video_maker.config import LYRIC_LITERALNESS_BANDS
 
     assert LYRIC_LITERALNESS_BANDS == ("free", "thematic", "literal")
+
+
+def test_release_vram_between_chunks_defaults_on(tmp_path):
+    """Chosen 2026-09-21 as the safer default: on ComfyUI 0.35.1 / torch 2.14
+    no multi-chunk run could pass a between-chunk floor at all (0.82 GB free
+    with no other tenant), so the only honest gate left is the cold one."""
+    assert _load_with(tmp_path).release_vram_between_chunks is True
+
+
+def test_release_vram_between_chunks_can_be_turned_off(tmp_path):
+    config = _load_with(tmp_path, release_vram_between_chunks="false")
+    assert config.release_vram_between_chunks is False

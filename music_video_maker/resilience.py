@@ -136,6 +136,14 @@ DiskUsage = Callable[[str], Any]
 a ``.free`` attribute (bytes)."""
 
 VramProbe = Callable[[], "float | None"]
+VramReleaser = Callable[[], None]
+"""Zero-arg seam that asks ComfyUI to unload its models (``POST /free``) --
+``custody.build_vram_releaser``. Returning is NOT evidence the memory is back:
+measured 2026-09-20, a reading taken one second after it returned still showed
+the old weights. Only a probe reading is."""
+
+DEFAULT_RELEASE_WAIT_SECONDS = 120.0
+DEFAULT_RELEASE_POLL_SECONDS = 2.0
 """A zero-arg seam: call it, get a fresh free-VRAM-in-GB reading, or ``None``
 when the reading can't be trusted (issue #23). Deliberately a plain callable
 rather than a ``(session, base_url)`` pair -- this module owns *what to do*
@@ -586,6 +594,9 @@ class ResilientRunner:
         vram_probe: VramProbe | None = None,
         min_free_vram_gb: float = DEFAULT_MIN_FREE_VRAM_GB,
         between_chunk_min_free_vram_gb: float | None = None,
+        vram_releaser: VramReleaser | None = None,
+        release_wait_seconds: float = DEFAULT_RELEASE_WAIT_SECONDS,
+        release_poll_seconds: float = DEFAULT_RELEASE_POLL_SECONDS,
     ) -> None:
         self.execution_client = execution_client
         self.run_state_file = Path(run_state_file)
@@ -623,6 +634,18 @@ class ResilientRunner:
         your own card hold steadily mid-render -- and note our own workload
         swings several GB between sampler and VAE decode, so a tight
         threshold will fire on us rather than on an intruder."""
+        self.vram_releaser = vram_releaser
+        """``release_vram_between_chunks`` (2026-09-21). When set, every chunk
+        after one that staged weights is preceded by a release and a wait for
+        the card to read back at least :attr:`min_free_vram_gb` -- the cold-card
+        floor, which means something again once our own weights are gone. On
+        ComfyUI 0.35.1 / torch 2.14 H3 resident between chunks leaves under
+        1 GB with no other tenant at all (0.82 GB measured 2026-09-20), so the
+        resident-card floor above cannot tell us from an intruder; after a
+        release, the cold floor can. Costs one re-stage of H3 per chunk."""
+        self.release_wait_seconds = release_wait_seconds
+        self.release_poll_seconds = release_poll_seconds
+        self._staged_since_release = False
 
         if hasattr(execution_client, "ws_timeout"):
             logger.info(
@@ -646,6 +669,7 @@ class ResilientRunner:
         sleeper: Sleeper = time.sleep,
         disk_usage: DiskUsage = shutil.disk_usage,
         vram_probe: VramProbe | None = None,
+        vram_releaser: VramReleaser | None = None,
     ) -> ResilientRunner:
         """Convenience constructor reading the Wave 3 knobs off a loaded
         ``RunConfig`` (issue #2/#10). ``load_config`` always resolves
@@ -678,6 +702,7 @@ class ResilientRunner:
             vram_probe=vram_probe,
             min_free_vram_gb=config.min_free_vram_gb,
             between_chunk_min_free_vram_gb=config.between_chunk_min_free_vram_gb,
+            vram_releaser=vram_releaser,
         )
 
     # -- public entry point -------------------------------------------------- #
@@ -720,6 +745,9 @@ class ResilientRunner:
         )
 
         self._force_chunk_ids = frozenset(force_chunk_ids or ())
+        # The custody pre-flight has just read the card cold; nothing to free
+        # until this run stages something.
+        self._staged_since_release = False
 
         # Issue #28: chunk ids that re-rendered THIS run. A cached chunk whose
         # first frame came from one of these was seeded from footage that no
@@ -751,8 +779,12 @@ class ResilientRunner:
                 # first attempt -- see ChunkResult.free_vram_gb_before's
                 # docstring for why retries inside _render_chunk do not
                 # re-probe.
-                free_vram_gb_before = self._check_vram_before_chunk(chunk_id, run_state)
+                if self.vram_releaser is not None and self._staged_since_release:
+                    free_vram_gb_before = self._release_and_wait(chunk_id, run_state)
+                else:
+                    free_vram_gb_before = self._check_vram_before_chunk(chunk_id, run_state)
                 result = self._render_chunk(chunk_id, provider, run_state, output_dir)
+                self._staged_since_release = True
                 result = replace(result, free_vram_gb_before=free_vram_gb_before)
                 if expected is not None:
                     recorded = (
@@ -1274,16 +1306,92 @@ class ResilientRunner:
             self._persist(run_state)
             message = (
                 f"free VRAM dropped to {free_gb:.2f} GB before chunk {chunk_id} "
-                f"(need >= {floor:.2f} GB) -- another process likely claimed "
-                f"the card mid-run. Refusing to submit chunk {chunk_id}: staging H3's weights "
-                f"onto a contended card can go silent instead of raising CUDA OOM and wedge "
-                f"the host (issue #23). Run state through the last completed chunk has been "
-                f"persisted -- re-run with --resume once the card is free again."
+                f"(need >= {floor:.2f} GB). This reading cannot say whose memory it is: "
+                f"another process may have claimed the card, or this run's own resident "
+                f"weights may leave less than the floor on this stack (0.82 GB with no other "
+                f"tenant, ComfyUI 0.35.1 / torch 2.14, 2026-09-20) -- if so, set "
+                f"release_vram_between_chunks. Refusing to submit chunk {chunk_id}: staging "
+                f"H3's weights onto a contended card can go silent instead of raising CUDA "
+                f"OOM and wedge the host (issue #23). Run state through the last completed "
+                f"chunk has been persisted -- re-run with --resume once the card is free again."
             )
             logger.error("%s", message)
             raise VramBelowFloorError(message)
 
         return free_gb
+
+    def _release_and_wait(self, chunk_id: int, run_state: RunState) -> float | None:
+        """Release ComfyUI's models, then wait for the card to read cold again.
+
+        Returns the reading that cleared :attr:`min_free_vram_gb` (recorded as
+        the chunk's ``free_vram_gb_before``). A release that raises is logged,
+        not fatal -- the reading is the evidence, not the POST. Polls
+        ``/system_stats`` because nothing announces memory coming back; this is
+        not execution tracking, which stays event-driven. If the card has not
+        come back within :attr:`release_wait_seconds`, our own weights are
+        gone and something else holds the memory: stop exactly as the floor
+        check does, with the cold floor recorded as ``floor_gb``.
+        """
+        assert self.vram_releaser is not None
+        try:
+            self.vram_releaser()
+        except Exception as exc:  # noqa: BLE001 -- the reading below decides, not the POST
+            logger.warning(
+                "Releasing ComfyUI's models before chunk %d failed (%s: %s) -- waiting for the "
+                "free-VRAM reading anyway, which is what decides",
+                chunk_id,
+                type(exc).__name__,
+                exc,
+            )
+        self._staged_since_release = False
+        if self.vram_probe is None:
+            return None
+
+        floor = self.min_free_vram_gb
+        waited = 0.0
+        while True:
+            try:
+                free_gb = self.vram_probe()
+            except Exception as exc:  # noqa: BLE001 -- best-effort, as in the floor check
+                logger.exception(
+                    "VRAM reading after release for chunk %d raised %s -- continuing unverified",
+                    chunk_id,
+                    type(exc).__name__,
+                )
+                return None
+            if free_gb is None:
+                logger.info(
+                    "VRAM reading after release for chunk %d unavailable -- continuing unverified",
+                    chunk_id,
+                )
+                return None
+            if free_gb >= floor:
+                logger.info(
+                    "Pre-chunk VRAM check for chunk %d: %.2f GB free after release, %.0fs wait "
+                    "(need >= %.2f GB)",
+                    chunk_id,
+                    free_gb,
+                    waited,
+                    floor,
+                )
+                return free_gb
+            if waited >= self.release_wait_seconds:
+                break
+            self.sleeper(self.release_poll_seconds)
+            waited += self.release_poll_seconds
+
+        run_state.vram_stop = VramStopEvent(chunk_id=chunk_id, free_vram_gb=free_gb, floor_gb=floor)
+        self._persist(run_state)
+        message = (
+            f"only {free_gb:.2f} GB free before chunk {chunk_id}, {waited:.0f}s after releasing "
+            f"this run's own models (need >= {floor:.2f} GB, the cold-card floor) -- another "
+            f"process is holding the card. Refusing to submit chunk {chunk_id}: staging H3's "
+            f"weights onto a contended card can go silent and wedge the host (issue #23). Run "
+            f"state through the last completed chunk has been persisted -- re-run with --resume "
+            f"once the card is free again."
+        )
+        logger.error("%s", message)
+        raise VramBelowFloorError(message)
 
     # -- pre-flight disk check --------------------------------------------------- #
 

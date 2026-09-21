@@ -175,6 +175,19 @@ def build_vram_probe(session: Any, base_url: str) -> VramProbe:
     return _probe
 
 
+def build_vram_releaser(session: Any, base_url: str) -> Callable[[], None]:
+    """Build the zero-arg ``POST /free`` seam ``resilience.ResilientRunner``
+    calls between chunks when ``release_vram_between_chunks`` is on. Never
+    raises (see :func:`_free_comfyui`), and says nothing about whether the
+    memory came back -- the runner waits on a probe reading for that."""
+    base_url = base_url.rstrip("/")
+
+    def _release() -> None:
+        _free_comfyui(session, base_url)
+
+    return _release
+
+
 def _free_comfyui(session: Any, base_url: str) -> None:
     """``POST /free`` (unload models, release VRAM). Never raises -- a
     network failure here is logged and swallowed, matching the "release must
@@ -185,7 +198,7 @@ def _free_comfyui(session: Any, base_url: str) -> None:
     try:
         session.post(url, json=body)
         logger.info(
-            "Sent POST %s to %s (body=%s) to release VRAM after the run", url, base_url, body
+            "Sent POST %s to %s (body=%s) to release VRAM", url, base_url, body
         )
     except requests.RequestException as exc:
         logger.error("POST %s to %s failed (body=%s): %s", url, base_url, body, exc)
@@ -397,5 +410,6 @@ __all__ = [
     "VramProbe",
     "build_custody_manager",
     "build_vram_probe",
+    "build_vram_releaser",
     "prevent_host_sleep",
 ]
