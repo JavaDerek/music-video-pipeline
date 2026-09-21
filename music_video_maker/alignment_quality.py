@@ -145,6 +145,44 @@ real gaps fire, one adjudicated true positive ranked first, two recorded as
 unadjudicated rather than false positives) and for why this is also the
 check that tells an operator their ``alignment_model_size`` is too small for
 the song (issue #80's own point, and #42's).
+
+Voiced-periodicity check (issue #96)
+-------------------------------------
+#71 measures **brightness** -- the share of a window's energy above 3.4kHz --
+and calls a lyric phantom when there is almost none. That works on a tonal
+fadeout and fails on a guitar note, because a plucked string's harmonics live
+in the same band. FINDINGS F43 measured both halves of that failure on
+"Deathless": ``'mushrooms grow.'`` (228.590-230.150s, a guitar note with the
+word "So" at the very end) is not even in the bottom 10 of 57 placed segments,
+and ``'you.'`` (378.470-379.430s, instrumental) has the *lowest* share on the
+whole track and still did not clear #71's threshold. Lowering the threshold
+would catch the second and still miss the first: a consonant-band share
+cannot tell a fricative from a plucked string.
+
+So this check asks a different question -- **is the sound here periodic?** --
+using :mod:`music_video_maker.voicing`, a pure-stdlib NCCF voicing detector
+run over the same single mono-16kHz decode #71 and #80 already make. Same
+shape as both of them: self-calibrated against this track's own median (#71),
+level-gated so a ratio is never computed from two near-silent measurements
+(#80), and degrading to "skip, with a logged reason" on every failure.
+
+It is a **WARNING**, never CRITICAL, and ``--strict-alignment`` never refuses
+on it, for two reasons stated here rather than buried: its threshold has not
+been calibrated against a real master (see VOICING_RATIO_THRESHOLD), and the
+measurement genuinely cannot separate a sung vowel from a sustained pitched
+instrument -- see :mod:`music_video_maker.voicing`'s "What this CANNOT
+distinguish". The two statistics that might (``f0_jitter_pct`` and
+``f0_span_semitones``) are reported in every finding and in the calibration
+table, and are deliberately **not** thresholded: this project has shipped a
+lint scored on a partial corpus twice (#60, #76) and retired it both times.
+
+Calibrate it before trusting the number, in one CPU command on the machine
+that holds the master::
+
+    python -m music_video_maker.calibrate_voicing --config run_v13.toml
+
+-- see :mod:`music_video_maker.calibrate_voicing` and
+``docs/voicing-corpus.md`` for what to look at in its output.
 """
 
 from __future__ import annotations
@@ -160,6 +198,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
 
+from music_video_maker import voicing
 from music_video_maker.contracts import AlignedSegment, AlignmentResult
 
 logger = logging.getLogger(__name__)
@@ -427,6 +466,82 @@ often is also the signal that alignment_model_size is too small for the song
 (issue #80's own point, and #42's) -- today that is otherwise only
 discoverable by ear."""
 
+# Issue #96 -- the voiced-vs-unvoiced axis #71's consonant-band share is blind
+# to. See the module docstring's "Voiced-periodicity check" section for the
+# measured failure these four constants exist to answer, and
+# music_video_maker/voicing.py for what the measurement can and cannot
+# distinguish.
+
+VOICING_FRAME_LEVEL_DROP_DB = 20.0
+"""How far below the track's median placed-segment RMS one 32ms analysis
+frame's own RMS may fall before it is dropped from the voiced-fraction
+statistic entirely -- from the numerator *and* the denominator.
+
+This is #80's gate applied one level down, and it is what makes the statistic
+mean "of what is audible in this span, how much is periodic" rather than "how
+much of this span is loud". Without it a segment whose span happens to
+include a breath or a beat of silence at either edge reads as part-unvoiced
+for a reason that has nothing to do with the aligner, and a phantom placed
+over pure silence reads as a periodicity failure when it is really #71's
+level failure -- two checks reporting one defect, with the noisier one
+arriving first.
+
+20dB rather than #80's 15dB because this gate applies to a single short frame
+inside a span, not to a 4s window: syllable-level dynamics inside one sung
+phrase are wider than the difference between two phrases. Not calibrated
+against a real master -- see VOICING_RATIO_THRESHOLD, which says what to run
+and what to look at."""
+
+VOICING_MIN_MEASURED_FRAMES = 10
+"""Frames that must survive VOICING_FRAME_LEVEL_DROP_DB before a span is
+judged at all -- 10 frames is 200ms at ``voicing.HOP_S``.
+
+Below this the span is recorded as **unmeasured**, not as unvoiced. That is
+#93's rule in this module: a zero from a detector is not evidence of absence
+unless something asked the second question, and a span whose every frame was
+gated out has told us about its level, not about its voice. #71 is the check
+that owns the level question and it has already run on the same span."""
+
+VOICING_RATIO_THRESHOLD = 0.30
+"""How small a placed segment's voiced fraction may be, relative to the
+*median* voiced fraction across this track's other measurable placed
+segments, before it is reported as having no voice in it.
+
+**This number has not been calibrated against a real master, and until it has
+been it is a hypothesis.** Saying so here is the point: #71's neighbouring
+threshold carries four real measurements in its docstring and this one cannot,
+because the machine this was built on does not hold the track. What is
+reasoned rather than measured:
+
+  - The statistic is a ratio against the track's own median, so it inherits
+    #71's self-calibration and needs no absolute level to mean anything --
+    a track mixed brighter or duller moves its own baseline with it.
+  - A real sung segment interleaves vowels with consonants and breaths, so
+    its voiced fraction is well under 1.0 even when nothing is wrong; the
+    median across a song's placed segments is the honest denominator.
+  - 0.30 is chosen on the same cost asymmetry #71 records: a missed phantom
+    costs a viewer-visible defect after hours of GPU, a false positive costs
+    one WARNING line. It is a *looser* fraction than #71's 0.10 because the
+    underlying statistic is bounded in [0, 1] and already gated, so there is
+    less headroom below the real floor to give away.
+
+The synthetic probe this was built against (see ``tests/test_voicing.py``,
+and ``docs/voicing-corpus.md``): a harmonic voice with vibrato scores a
+voiced fraction of 1.00, broadband noise 0.00, near-silence is gated out
+entirely -- and a decaying plucked string also scores 1.00, which is the
+documented limit of the whole approach rather than a threshold problem.
+
+To calibrate, on the machine that holds the master::
+
+    python -m music_video_maker.calibrate_voicing --config run_v13.toml
+
+and read the ``vf_ratio`` column: the three F43 windows (228.590-230.150,
+378.470-379.430 and the 8:19 phantom) against the other ~54 placed segments.
+If the phantoms are not separated by ``vf_ratio``, look at ``jitter%`` and
+``f0_span`` in the same table before moving this number -- a plucked string
+is metronomic where a voice is not, and that is the axis a periodicity
+threshold cannot reach."""
+
 # --------------------------------------------------------------------------- #
 # Finding codes.
 # --------------------------------------------------------------------------- #
@@ -445,6 +560,27 @@ FINDING_COUNTERPOINT_RATE = "counterpoint_delivery_rate"
 FINDING_COUNTERPOINT_SPAN = "counterpoint_degenerate_span"
 FINDING_NO_VOCAL_ENERGY = "no_vocal_energy_in_placed_segment"
 FINDING_VOICE_IN_UNPLACED_GAP = "voice_in_unplaced_gap"
+FINDING_NO_VOICED_PERIODICITY = "no_voiced_periodicity_in_placed_segment"
+
+PHANTOM_SUSPECT_CODES = frozenset(
+    {FINDING_NO_VOCAL_ENERGY, FINDING_NO_VOICED_PERIODICITY, FINDING_ISOLATED}
+)
+"""Finding codes that mean "there may be no voice where this lyric was placed".
+
+Consumed by :func:`suspect_segment_indices`, which is how a *downstream* stage
+gets to know that a segment it is about to reason about is doubted -- see
+``slicing.slice_audio``'s ``suspect_segment_indices`` (issue #92: the merge
+detector reads the aligner's segments as ground truth, so it inherits every
+phantom #96 describes).
+
+``FINDING_ISOLATED`` is in the set because it is the check that caught #42's
+"The Lucky Ones" phantom, which neither acoustic check does; the two acoustic
+ones are #71 (no energy above the consonant band) and #96 (no periodicity).
+Notably absent: ``FINDING_LOW_CONFIDENCE``. Forced alignment places a word
+whether or not the acoustic model is confident, 24% of a *good* track's words
+scored under 0.10 (see :func:`_check_low_confidence_words`), and a set this
+broad would mark most of a real song suspect and tell a downstream consumer
+nothing."""
 
 
 class Severity(IntEnum):
@@ -559,6 +695,9 @@ def evaluate_alignment_quality(
     gap_window_s: float = GAP_WINDOW_S,
     gap_level_drop_db: float = GAP_LEVEL_DROP_DB,
     gap_vocal_energy_ratio_threshold: float = GAP_VOCAL_ENERGY_RATIO_THRESHOLD,
+    voicing_ratio_threshold: float = VOICING_RATIO_THRESHOLD,
+    voicing_frame_level_drop_db: float = VOICING_FRAME_LEVEL_DROP_DB,
+    voicing_min_measured_frames: int = VOICING_MIN_MEASURED_FRAMES,
     ffmpeg_runner: FfmpegRunner | None = None,
 ) -> AlignmentQualityReport:
     """Pure function *by default*: no audio, no model, no I/O. Runs every
@@ -590,6 +729,10 @@ def evaluate_alignment_quality(
       - a voice-like span in a gap where nothing was placed, if
         ``audio_path`` is supplied (issue #80) -- see the module docstring's
         "Voice-in-unplaced-gap check" section
+      - no *periodic* sound where a segment was placed, if ``audio_path`` is
+        supplied (issue #96) -- the voiced-vs-unvoiced axis #71's brightness
+        measure is blind to; see the module docstring's "Voiced-periodicity
+        check" section
     """
     segments = result.segments
     # Duck-typed rather than imported: this module must not depend on the
@@ -640,6 +783,9 @@ def evaluate_alignment_quality(
             gap_window_s=gap_window_s,
             gap_level_drop_db=gap_level_drop_db,
             gap_ratio_threshold=gap_vocal_energy_ratio_threshold,
+            voicing_ratio_threshold=voicing_ratio_threshold,
+            voicing_frame_level_drop_db=voicing_frame_level_drop_db,
+            voicing_min_measured_frames=voicing_min_measured_frames,
             runner=ffmpeg_runner,
         )
     )
@@ -1246,6 +1392,219 @@ def _check_unplaced_gaps(
     return findings
 
 
+@dataclass(frozen=True)
+class TrackVoicing:
+    """Everything one pass of :func:`measure_placed_segment_voicing` produced.
+
+    ``audio`` is carried so a caller that wants to score an *extra* span --
+    a window an operator names by hand while calibrating -- measures it
+    against the same decode and the same ``level_floor_dbfs`` the placed
+    segments were judged with, instead of building a second, subtly different
+    measurement of the same track."""
+
+    audio: voicing.PcmAudio
+    by_segment_index: dict[int, voicing.SegmentVoicing]
+    level_floor_dbfs: float
+
+
+def measure_placed_segment_voicing(
+    decoded_path: str | Path,
+    segments: Sequence[AlignedSegment],
+    *,
+    min_duration_s: float = MIN_SEGMENT_DURATION_FOR_VOCAL_ENERGY_S,
+    frame_level_drop_db: float = VOICING_FRAME_LEVEL_DROP_DB,
+) -> TrackVoicing:
+    """Measure every long-enough placed segment's voicing over an already
+    decoded mono-16kHz WAV (issue #96).
+
+    Split out of the check below so the check and
+    :mod:`music_video_maker.calibrate_voicing` share one implementation of
+    "how this track is measured" -- the same reasoning issue #79 factored
+    ``_words_attributed_to`` out for, and the same reasoning
+    ``authoring.plan.check_plan`` runs the render's own loaders rather than a
+    copy of them. A calibration that measures the track differently from the
+    check it is calibrating is worse than no calibration.
+
+    The level floor is derived from the *median* of the qualifying segments'
+    own RMS, so it self-calibrates per track the way #71's baseline does, and
+    it is returned so a caller can print it beside the numbers it produced.
+    Raises :class:`voicing.VoicingUnavailable` if the decode cannot be read;
+    callers degrade to "skip", never to a crash.
+    """
+    audio = voicing.load_mono_pcm16(decoded_path)
+    candidates = [s for s in segments if s.end - s.start >= min_duration_s]
+    levels = [voicing.span_level_dbfs(audio, s.start, s.end) for s in candidates]
+    finite = [db for db in levels if db > -float("inf")]
+    if not finite:
+        return TrackVoicing(audio=audio, by_segment_index={}, level_floor_dbfs=-float("inf"))
+    level_floor_dbfs = statistics.median(finite) - frame_level_drop_db
+
+    measured: dict[int, voicing.SegmentVoicing] = {}
+    for segment in candidates:
+        result = voicing.measure_span(
+            audio, segment.start, segment.end, level_floor_dbfs=level_floor_dbfs
+        )
+        if result is not None:
+            measured[segment.index] = result
+    return TrackVoicing(
+        audio=audio, by_segment_index=measured, level_floor_dbfs=level_floor_dbfs
+    )
+
+
+def decode_to_mono_16khz_args(audio_path: str | Path, out_path: str | Path) -> list[str]:
+    """The one ffmpeg command line this module decodes a master with.
+
+    Named and shared rather than written twice: the check below and
+    :mod:`music_video_maker.calibrate_voicing` must measure the same samples,
+    and a second copy of this argv is exactly how a calibration comes to be
+    run against a slightly different decode than the check it calibrates."""
+    return [
+        "ffmpeg",
+        "-hide_banner",
+        "-nostdin",
+        "-y",
+        "-i",
+        str(audio_path),
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        str(out_path),
+    ]
+
+
+def _check_voiced_periodicity(
+    segments: tuple[AlignedSegment, ...],
+    decoded_path: Path,
+    *,
+    min_duration_s: float,
+    min_baseline_segments: int,
+    ratio_threshold: float,
+    frame_level_drop_db: float,
+    min_measured_frames: int,
+) -> list[Finding]:
+    """Issue #96: is the sound where this lyric was placed *periodic*?
+
+    #71 asks whether it is bright and #80 asks the same question of the gaps;
+    neither can tell a fricative from a plucked string. See the module
+    docstring's "Voiced-periodicity check" section for the measured failure
+    and for why this is a WARNING that ``--strict-alignment`` never refuses on.
+
+    Every failure mode degrades to "skip this check" with a logged reason --
+    an unreadable decode, too few measurable segments to build a baseline
+    from, a segment whose frames were all gated out. That last one is
+    recorded as *unmeasured*, never as unvoiced (#93).
+    """
+    try:
+        track = measure_placed_segment_voicing(
+            decoded_path,
+            segments,
+            min_duration_s=min_duration_s,
+            frame_level_drop_db=frame_level_drop_db,
+        )
+    except voicing.VoicingUnavailable as exc:
+        logger.warning(
+            "alignment_quality: skipping the voiced-periodicity check (issue #96) -- %s; "
+            "every other alignment-quality check still ran",
+            exc,
+        )
+        return []
+
+    measured = track.by_segment_index
+    judged = {
+        index: m for index, m in measured.items() if m.frames_measured >= min_measured_frames
+    }
+    unmeasured = sorted(set(measured) - set(judged))
+    if unmeasured:
+        logger.info(
+            "alignment_quality: %d placed segment(s) %s had fewer than %d analysis frame(s) "
+            "above the %.1fdBFS level floor, so the voiced-periodicity check (issue #96) "
+            "recorded them as UNMEASURED rather than unvoiced -- their level, not their "
+            "voice, is what that says, and issue #71's check already owns the level question",
+            len(unmeasured),
+            unmeasured,
+            min_measured_frames,
+            track.level_floor_dbfs,
+        )
+    if len(judged) <= min_baseline_segments:
+        logger.info(
+            "alignment_quality: only %d placed segment(s) could be measured for voiced "
+            "periodicity (issue #96); a baseline needs more than %d, so the check is skipped "
+            "rather than compared against noise",
+            len(judged),
+            min_baseline_segments,
+        )
+        return []
+
+    by_index = {segment.index: segment for segment in segments}
+    findings: list[Finding] = []
+    for index in sorted(judged):
+        this = judged[index]
+        others = [m.voiced_fraction for other, m in judged.items() if other != index]
+        if len(others) < min_baseline_segments:
+            continue
+        baseline = statistics.median(others)
+        if baseline <= 0:
+            continue
+        ratio = this.voiced_fraction / baseline
+        if ratio >= ratio_threshold:
+            continue
+        segment = by_index[index]
+        jitter = (
+            f"{this.f0_jitter_pct:.2f}%"
+            if this.f0_jitter_pct is not None
+            else "n/a (no voiced frame)"
+        )
+        f0_span = (
+            f"{this.f0_span_semitones:.2f} semitones"
+            if this.f0_span_semitones is not None
+            else "n/a (no voiced frame)"
+        )
+        findings.append(
+            Finding(
+                segment_index=index,
+                start=segment.start,
+                end=segment.end,
+                severity=Severity.WARNING,
+                code=FINDING_NO_VOICED_PERIODICITY,
+                message=(
+                    f"segment {index} ({segment.start:.3f}s -> {segment.end:.3f}s) carries "
+                    f"audible sound that is not periodic: {this.voiced_fraction:.0%} of its "
+                    f"{this.frames_measured} audible analysis frame(s) are voiced, against "
+                    f"this track's own median of {baseline:.0%} across {len(others)} other "
+                    f"placed segment(s) ({ratio:.0%} of it, threshold {ratio_threshold:.0%}); "
+                    f"median NCCF {this.median_nccf:.3f} ({this.hnr_db:.1f}dB HNR) at "
+                    f"{this.level_dbfs:.1f}dBFS. Brightness (issue #71) cannot see this axis "
+                    "and periodicity cannot see the other one: a sustained pitched instrument "
+                    "reads as voiced here, so a passing score is not evidence of a voice. "
+                    f"For that question this segment's period jitter is {jitter} and its F0 "
+                    f"spread is {f0_span} -- reported, deliberately not thresholded (#96)"
+                ),
+            )
+        )
+    return findings
+
+
+def suspect_segment_indices(report: AlignmentQualityReport) -> frozenset[int]:
+    """Indices of segments this report doubts the *existence of a voice* under.
+
+    The set a downstream stage should consult before treating an aligned
+    segment as ground truth -- issue #92's own "still owed": the cross-
+    character merge detector reads the aligner's segments as truth, so on
+    "Deathless" two of its three "character merges" were really phantoms
+    (#96), and the words it dropped as "the other singer's" were words nobody
+    sings.
+
+    Deliberately narrow: see :data:`PHANTOM_SUSPECT_CODES` for which findings
+    qualify and, more importantly, which one does not.
+    """
+    return frozenset(
+        finding.segment_index
+        for finding in report.findings
+        if finding.code in PHANTOM_SUSPECT_CODES and finding.segment_index is not None
+    )
+
+
 def _check_vocal_energy(
     segments: tuple[AlignedSegment, ...],
     audio_path: str | Path | None,
@@ -1259,6 +1618,9 @@ def _check_vocal_energy(
     gap_window_s: float,
     gap_level_drop_db: float,
     gap_ratio_threshold: float,
+    voicing_ratio_threshold: float,
+    voicing_frame_level_drop_db: float,
+    voicing_min_measured_frames: int,
     runner: FfmpegRunner | None,
 ) -> list[Finding]:
     """See the section docstring above. No-op (no I/O at all) when
@@ -1292,19 +1654,7 @@ def _check_vocal_energy(
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
             tmp_path = Path(tmp_file.name)
 
-        decode_args = [
-            "ffmpeg",
-            "-hide_banner",
-            "-nostdin",
-            "-y",
-            "-i",
-            str(audio_path),
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            str(tmp_path),
-        ]
+        decode_args = decode_to_mono_16khz_args(audio_path, tmp_path)
         try:
             decode_proc = active_runner(decode_args)
         except OSError:
@@ -1391,6 +1741,17 @@ def _check_vocal_energy(
                 gap_window_s=gap_window_s,
                 gap_level_drop_db=gap_level_drop_db,
                 gap_ratio_threshold=gap_ratio_threshold,
+            )
+        )
+        findings.extend(
+            _check_voiced_periodicity(
+                segments,
+                tmp_path,
+                min_duration_s=min_duration_s,
+                min_baseline_segments=min_baseline_segments,
+                ratio_threshold=voicing_ratio_threshold,
+                frame_level_drop_db=voicing_frame_level_drop_db,
+                min_measured_frames=voicing_min_measured_frames,
             )
         )
         return findings
