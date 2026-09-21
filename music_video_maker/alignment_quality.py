@@ -338,7 +338,21 @@ calibration segments run 1.28s-7.29s) -- narrow enough that a single sung
 phrase inside a long instrumental break isn't diluted by averaging across
 silence on either side of it (see GAP_VOCAL_ENERGY_RATIO_THRESHOLD's
 docstring for the measured cost of skipping this step: whole-gap averaging
-was tried and rejected)."""
+was tried and rejected).
+
+This is a *nominal* width, not an exact one, and the difference is worth
+stating because nothing else here does: ``_check_unplaced_gaps`` tiles a gap
+into ``int(gap_len // GAP_WINDOW_S)`` windows of ``gap_len / window_count``
+each, so a window is exactly 4.0s wide only when the gap is an exact multiple
+of 4.0s. A 6.0s gap is measured as ONE 6.0s window; in general a window is
+somewhere in [4.0s, 8.0s). The dilution this constant exists to defeat is
+therefore bounded at 2x rather than removed -- which is a real (small)
+residue of the whole-gap-averaging defect, not an oversight. It is left
+exactly as it is because GAP_VOCAL_ENERGY_RATIO_THRESHOLD's 2.0 was
+calibrated against *this* arithmetic on the real "Deathless" master, so
+re-tiling silently invalidates every number in that docstring. Pinned by
+``tests/test_alignment_quality.py::
+test_a_gap_between_one_and_two_window_widths_is_measured_as_a_single_window``."""
 
 GAP_LEVEL_DROP_DB = 15.0
 """How far below the placed-segment median full-band level (``median_level_db``,

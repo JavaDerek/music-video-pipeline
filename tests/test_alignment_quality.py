@@ -1264,6 +1264,85 @@ def test_the_trailing_span_after_the_last_segment_is_measured_and_can_fire(tmp_p
     assert 18.0 in ss_starts and 22.0 in ss_starts  # the trailing tail WAS measured
 
 
+def test_strict_alignment_never_refuses_on_a_voice_in_unplaced_gap_finding(tmp_path):
+    """Issue #80's central honesty requirement, pinned rather than merely
+    documented. Four docstrings in ``alignment_quality.py`` promise that
+    ``--strict-alignment`` never refuses on this finding, and until this test
+    that promise rested entirely on the finding happening to be built with
+    ``Severity.WARNING`` -- one edited literal away from turning an
+    explicitly-unadjudicated candidate ("a high consonant-band ratio is not
+    proof of a voice; cymbals and a bright lead guitar live in the same
+    band") into a refusal before any GPU time is booked. Same shape as
+    ``test_counterpoint_crammed_into_its_spine_span_is_flagged_but_never_blocking``
+    above.
+    """
+    segments = (
+        make_aligned_segment(0, "real one", 0.0, 6.0, "Dianne"),
+        make_aligned_segment(1, "real two", 6.0, 12.0, "Dianne"),
+        make_aligned_segment(2, "real three", 12.0, 18.0, "Dianne"),
+        make_aligned_segment(3, "real four", 26.0, 32.0, "Dianne"),
+    )
+    result = AlignmentResult(segments=segments, track_duration=32.0)
+    profile = {0.0: 0.02, 6.0: 0.021, 12.0: 0.019, 26.0: 0.02, 22.0: 0.08}
+    runner = _FakeVocalEnergyRunner(profile)
+
+    report = evaluate_alignment_quality(
+        result, audio_path=_write_stub_audio(tmp_path), ffmpeg_runner=runner
+    )
+
+    hits = [f for f in report.findings if f.code == FINDING_VOICE_IN_UNPLACED_GAP]
+    assert hits, "fixture must actually produce the finding for this test to mean anything"
+    assert all(f.severity is Severity.WARNING for f in hits)
+    raise_if_blocking(report, strict=True)  # must not raise
+
+
+def test_a_gap_between_one_and_two_window_widths_is_measured_as_a_single_window(tmp_path):
+    """The tiling is ``int(gap_len // GAP_WINDOW_S)`` windows of
+    ``gap_len / window_count``, so a window is 4.0s wide only when the gap is
+    an exact multiple of 4.0s: a gap of 4.0s-7.99s is measured as ONE window
+    of its own full length, and in general a window can be anything in
+    [4.0s, 8.0s). Every other test in this section sizes its gaps as exact
+    multiples, which hides that -- so this pins the real behaviour against
+    the "~4.0s windows" the constants' docstrings describe.
+
+    It matters in the direction GAP_WINDOW_S exists to guard: a 2s vocal
+    inside a 7.9s gap is averaged across the whole 7.9s, which is the same
+    dilution whole-gap averaging was measured and rejected for, just bounded
+    at 2x instead of unbounded. Left as it is rather than "fixed", because
+    GAP_VOCAL_ENERGY_RATIO_THRESHOLD's 2.0 was calibrated against exactly
+    this arithmetic on the real "Deathless" master, and changing the tiling
+    silently invalidates that calibration.
+    """
+    segments = (
+        make_aligned_segment(0, "real one", 0.0, 6.0, "Dianne"),
+        make_aligned_segment(1, "real two", 6.0, 12.0, "Dianne"),
+        make_aligned_segment(2, "real three", 12.0, 18.0, "Dianne"),
+        make_aligned_segment(3, "real four", 24.0, 30.0, "Dianne"),
+    )
+    result = AlignmentResult(segments=segments, track_duration=30.0)
+    # 18.0 -> 24.0 is 6.0s: one window, 6.0s wide, starting at the gap's own
+    # start. 22.0 -- where a strict 4.0s tiling would put a second window --
+    # is never measured at all.
+    profile = {0.0: 0.02, 6.0: 0.021, 12.0: 0.019, 24.0: 0.02, 18.0: 0.09, 22.0: 0.09}
+    runner = _FakeVocalEnergyRunner(profile)
+
+    report = evaluate_alignment_quality(
+        result, audio_path=_write_stub_audio(tmp_path), ffmpeg_runner=runner
+    )
+
+    hits = [f for f in report.findings if f.code == FINDING_VOICE_IN_UNPLACED_GAP]
+    assert len(hits) == 1
+    starts = {float(c[c.index("-ss") + 1]) for c in runner.calls if "-ss" in c}
+    assert 18.0 in starts
+    assert 22.0 not in starts  # a strict 4.0s tiling would have measured here
+    gap_calls = [
+        c
+        for c in runner.calls
+        if "-ss" in c and 18.0 <= float(c[c.index("-ss") + 1]) < 24.0
+    ]
+    assert {float(c[c.index("-t") + 1]) for c in gap_calls} == {6.0}
+
+
 def test_gap_check_audio_path_none_is_a_pure_noop_and_never_touches_ffmpeg():
     # Regression: an existing pure call must stay unchanged by #80 -- no I/O
     # at all when audio_path is None, same guarantee #71 already gave.
