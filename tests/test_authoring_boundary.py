@@ -30,6 +30,11 @@ pre-#54 code that has nothing to do with calling a model:
   stderr-logging helper, not a render-path concern, and duplicating it
   inside ``authoring/`` to avoid one more name on this list would be pure
   copy-paste for no safety this test would actually be buying.
+* ``authoring/`` is also allowed ``alignment_quality``: it is model-free by
+  construction (it is the module that must never be an inference call), and
+  the already-allowed ``alignment`` imports it anyway, so the name on this
+  list records a dependency that was always there rather than widening the
+  boundary.
 """
 
 from __future__ import annotations
@@ -50,6 +55,9 @@ SUBPROCESS_ALLOWLIST = frozenset(
         "luminance.py",  # ffmpeg frame sampling for the darkness floor (issue #77) -- no model
         "scenecuts.py",  # ffmpeg scene-detection probe (issue #81) -- no model
         "webui.py",  # `tailscale ip -4` bind discovery + ffmpeg thumbnails (issue #36) -- no model
+        # ffmpeg decode of a master for the #96 voicing calibration table -- no model.
+        # It is a diagnostic an operator runs by hand; nothing imports it at render time.
+        "calibrate_voicing.py",
     }
 )
 
@@ -62,6 +70,11 @@ ALLOWED_AUTHORING_IMPORTS = frozenset(
         "slicing",
         "lyrics",
         "logging_setup",  # see module docstring's "considered deviations"
+        # alignment_quality is model-free (pure evaluation + ffmpeg astats) and is
+        # already pulled in transitively by the allowed `alignment`. chunks.py needs
+        # its suspect_segment_indices() so the authoring skeleton logs the same
+        # segment-to-chunk mapping the render does (issues #96, #92).
+        "alignment_quality",
     }
 )
 

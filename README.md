@@ -937,6 +937,32 @@ bright lead guitar, so it ranks candidates and names a four-second window for
 you to listen to. It is also the check that tells you `alignment_model_size` is
 too small for this song, which otherwise only surfaces by ear.
 
+A third check, `no_voiced_periodicity_in_placed_segment` (WARNING), asks a
+question neither of those can: *is the sound under this lyric **periodic***?
+Brightness is not voice — a consonant-band share cannot tell a fricative from a
+plucked string, so a phantom lyric over a single guitar note scores like an
+ordinary segment and a phantom over drums or room tone can score like one too.
+This check runs a small autocorrelation voicing detector (stdlib only, over the
+same decode the other two use) and compares each segment's voiced fraction
+against the track's own median. Read its limits honestly: it separates periodic
+from aperiodic, so it catches a lyric placed over noise or silence — and it
+**cannot** separate a sung vowel from a sustained pitched instrument, because
+both are periodic. The two statistics that might (period jitter and F0 spread:
+a voice is unstable, a plucked string is metronomic) are printed in every
+finding and deliberately not thresholded until a real track says what they do.
+Its threshold is the one number in this module with no measurement behind it,
+which is why it is a WARNING and why there is a command to fix that:
+
+```bash
+python -m music_video_maker.calibrate_voicing --config run.toml \
+    --window 228.590-230.150 --csv voicing.csv
+```
+
+That aligns the song exactly as a render would, prints every placed segment's
+voicing statistics ranked with the most suspicious first, and scores any window
+you name by ear against the same decode. No GPU. Record what you find in
+`docs/voicing-corpus.md`.
+
 It is report-only by default on purpose — a real song always has some odd
 segments, so refusing by default would be wrong. But alignment takes about six
 seconds and a render takes hours, so for an unattended run `--strict-alignment`
