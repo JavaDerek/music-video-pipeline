@@ -55,6 +55,7 @@ SUBPROCESS_ALLOWLIST = frozenset(
         "luminance.py",  # ffmpeg frame sampling for the darkness floor (issue #77) -- no model
         "scenecuts.py",  # ffmpeg scene-detection probe (issue #81) -- no model
         "webui.py",  # `tailscale ip -4` bind discovery + ffmpeg thumbnails (issue #36) -- no model
+        "dome.py",  # ffmpeg/ffprobe only: POST-render domemaster projection + checks -- no model
         # stereo.py (issue #68): ffmpeg probe/decode/encode for a POST-render
         # stereo pass, plus an optional shell-out to a monocular depth model.
         # Listed with the reason spelled out because it is the first entry

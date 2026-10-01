@@ -1802,3 +1802,8 @@ need to pick it up:
 - [`docs/pop-beat-corpus.md`](docs/pop-beat-corpus.md) — the three rendered
   pop beats, every candidate check that did **not** ship, and what would have
   to be true to ship a keyword one (#68).
+- [`docs/design-fulldome.md`](docs/design-fulldome.md) — a fulldome
+  (domemaster) trailer from a flat render: the gap analysis against the
+  venue spec, the routes (window, procedural full-dome, panorama with depth
+  parallax), their verified prototypes, and which to use for the trailer
+  (`music_video_maker/dome.py`).
