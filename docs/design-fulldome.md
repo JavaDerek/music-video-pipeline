@@ -676,6 +676,62 @@ flux about 2× the median onset), spread across the span.
   step 2 is still the lever.
 - **The land is dark by design (exposure 0.2)** and has not been seen large.
 
+### Source resolution: the first custody night (2026-09-30)
+
+A 4096 domemaster spends about 22.8 px on each degree of sky, so the
+question for each layer is how much real detail it brings against that:
+
+| Layer | Before | Shortfall |
+|---|---|---|
+| D1 sky | drawn at 4096 | none |
+| Singer (H3) | 864 px wide, shown 80° across (needs ~1820) | ~2× upscaled |
+| D2 land | 2048-wide panorama, ×4 Real-ESRGAN | ~4× short of real detail |
+
+With the card taken into custody (the resident LLM evicted, per the GPU
+custody protocol), three things were tried:
+
+- **The render envelope gate refused chunk 7** (175 frames at 1344×768;
+  proven here: 141 at 1344×768, 192 at 864×480). `docs/runbook-288-frame-proof.md`
+  says the first render past the envelope is *attended* — "one chunk with
+  a human at the keyboard, not an overnight render" — so it was **not
+  attempted unattended** and the gate was not overridden. Chunk 7 stays at
+  864×480 until an attended proof extends `PROVEN_ENVELOPES`.
+- **Chunks 8 and 9 rendered at 1344×768** (124 frames, inside the proven
+  point): 434 s and 445 s, first attempt each, about 7.3 min per chunk on
+  ComfyUI 0.37.4, against CLAUDE.md's 9 m 15 s at 141 frames on the older
+  stack (not the same frame count, so not a like-for-like speed claim).
+  Same seed, **a different take**: H3 composes differently at a different
+  resolution. Chunk 9 also came out **letterboxed** (black bars top and
+  bottom). Harmless under a cut-out, since the matte removes them and the
+  land hides the straight cut, but it is the model choosing the framing.
+- **Placed at 60° instead of 80°, the singer is about 1:1** (60° × 22.8 ≈
+  1365 px against a 1344 source). At a 1:1 crop of the composite the new
+  shots resolve eyes, mouth and hair strands that the 864 version smears
+  (`…/out/combo1344_deathless_2-82_4096/sing_compare.png`). The re-composite
+  (same sky and land layers, only the singer changed) passed all ten checks.
+- **Negative result: a tiled SDXL img2img detail pass on the land made it
+  worse.** It covered the front band (lon −90..90, lat −40..30), with
+  1024² tiles at strength 0.3, the same MIT sdxl-360 UNet, the tile's own
+  low frequencies kept, and 17 s for 10 tiles. The rocks lost texture,
+  and the valley shows **ghosting**, doubled tree shapes where
+  neighbouring tiles disagreed (`detail_compare.png`). Independent tiles
+  blended in pixel space are not enough. The real version is tile-coupled
+  diffusion (MultiDiffusion-style latent averaging) plus a
+  detail-preserving conditioning such as a tile ControlNet, each with its
+  licence checked. That is a project, not a test. Switching the generator
+  to Qwen-Image-2512 + its 360 LoRA does **not** fix resolution either
+  (it is 2048×1024 native too). It would only improve the base image.
+  The paid 16K route stays open, pending its commercial tier in writing.
+
+Open decisions this adds:
+
+- **D9. Run the attended envelope proof for 175 frames at 1344×768?**
+  Decides whether chunk 7, and every other chunk over 141 frames, can be
+  rendered at 1344×768. It needs a human at doris's keyboard for one chunk.
+- **D10. Which land route: tile-coupled diffusion (days), or a paid 16K
+  panorama (money, licence in writing)?** Decides whether the land ever
+  reaches the dome's resolution.
+
 ### Rights record for these prototypes
 
 Every model and weight file that touched a D1 or D2 pixel:
