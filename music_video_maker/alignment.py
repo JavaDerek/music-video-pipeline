@@ -319,6 +319,11 @@ def align(
     # output segment's words back to the LyricLine(s) they came from even
     # when stable-ts merges or splits relative to our original line breaks.
     word_owner = [line.characters for line in non_empty for _ in line.text.split()]
+    # Issue #101: the same positional walk also carries whether that line's
+    # characters were AUTHORED (a tag was in force) or merely defaulted to the
+    # configured lead. One list comprehension per fact over the same two loops,
+    # so the two can only ever disagree if the lyric lines themselves do.
+    word_authored = [line.characters_authored for line in non_empty for _ in line.text.split()]
 
     # The same positional walk, keyed by LyricLine.index, is what lets a
     # counterpoint stream find the *span* its spine lines were aligned to.
@@ -354,7 +359,11 @@ def align(
         )
 
     segments, segment_word_ranges = _build_segments(
-        raw_result, word_owner, default_characters=non_empty[0].characters
+        raw_result,
+        word_owner,
+        word_authored,
+        default_characters=non_empty[0].characters,
+        default_authored=non_empty[0].characters_authored,
     )
     if overrides:
         # Issue #42: authored corrections, applied BEFORE quality evaluation
@@ -609,6 +618,10 @@ def _build_concurrent_segments(
                     end=seg_end,
                     words=timings,
                     characters=stream.characters,
+                    # A concurrent stream exists only because someone wrote a
+                    # ``[Name]`` sub-block tag for it, so its characters are
+                    # authored by construction (issue #101).
+                    characters_authored=True,
                     spine_segment_indices=tuple(
                         s.index for s in segments if s.start < seg_end and s.end > seg_start
                     ),
@@ -663,8 +676,10 @@ def _extract_word_confidences(
 def _build_segments(
     raw_result: object,
     word_owner: list[tuple[str, ...]],
+    word_authored: list[bool],
     *,
     default_characters: tuple[str, ...],
+    default_authored: bool = False,
 ) -> tuple[tuple[AlignedSegment, ...], tuple[tuple[int, int], ...]]:
     """Convert the raw stable-ts result into ``AlignedSegment``s, and report
     the half-open word-position range each one consumed.
@@ -685,6 +700,7 @@ def _build_segments(
     # stay aligned with the text blob even then.
     range_ptr = 0
     last_characters = default_characters
+    last_authored = default_authored
 
     for i, raw_segment in enumerate(raw_segments):
         raw_words = list(getattr(raw_segment, "words", None) or [])
@@ -700,10 +716,18 @@ def _build_segments(
         if raw_words and word_owner:
             owner_index = min(word_ptr, len(word_owner) - 1)
             characters = word_owner[owner_index]
+            # Issue #101: read at the same index, never recomputed -- a
+            # segment's "was this tagged" answer must come from the same
+            # lyric line its characters came from.
+            authored = (
+                word_authored[owner_index] if owner_index < len(word_authored) else last_authored
+            )
             word_ptr += len(raw_words)
         else:
             characters = last_characters
+            authored = last_authored
         last_characters = characters
+        last_authored = authored
 
         segments.append(
             AlignedSegment(
@@ -713,6 +737,7 @@ def _build_segments(
                 end=float(raw_segment.end),
                 words=word_timings,
                 characters=characters,
+                characters_authored=authored,
             )
         )
 

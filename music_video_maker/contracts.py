@@ -237,6 +237,24 @@ class LyricLine:
     :attr:`character`). It states who is *audible*, never who is *visible* --
     staging two people on screen is the shot plan's call, not the transcript's.
     """
+    characters_authored: bool = False
+    """Whether :attr:`characters` is an **authored fact** or a fallback (issue #101).
+
+    ``True`` when a ``[Name]`` / ``[Name: Role]`` tag was in force for this
+    line -- on the line itself, or earlier in the file, since the format
+    defines a tag as running until the next one. ``False`` when nobody tagged
+    this part of the song at all and ``characters`` is therefore the
+    configured ``default_lead_vocalist``.
+
+    The distinction cannot be recovered from ``characters`` alone: a file that
+    explicitly tags ``[Dianne]`` and a file that tags nothing both come out of
+    the parser carrying ``("Dianne",)`` when Dianne is also the default lead.
+    Automatic vocalist diarization needs to tell those two apart, because its
+    rule is that an authored tag is never overwritten -- a disagreement with
+    one is *reported*, not resolved (see
+    :mod:`music_video_maker.diarization`). Defaults to ``False`` so a
+    hand-built ``LyricLine`` claims nothing it cannot back up.
+    """
     raw: str = ""
     """The original line as written, tag included. Diagnostics only."""
 
@@ -272,6 +290,17 @@ class AlignedSegment:
     characters: tuple[str, ...] = ()
     """Resolved active characters, carried through from the source LyricLine
     (issue #33). Plural for the same reason."""
+    characters_authored: bool = False
+    """Whether :attr:`characters` came from a tag a human wrote (issue #101).
+
+    Carried through from :attr:`LyricLine.characters_authored` by the same
+    positional word-owner walk that carries :attr:`characters` itself, so the
+    two can never disagree about which lyric line a segment came from. Read
+    that field's docstring for why the flag exists at all; the short version
+    is that ``("Dianne",)`` from a tag and ``("Dianne",)`` from the default
+    lead are indistinguishable without it, and automatic diarization must
+    never overwrite the first.
+    """
 
     @property
     def character(self) -> str | None:
