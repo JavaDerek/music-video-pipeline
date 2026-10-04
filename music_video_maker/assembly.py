@@ -69,6 +69,27 @@ compared with tolerance. A mismatch raises :class:`DurationMismatchError`
 *after* the file is already written, deliberately: the file stays on disk to
 inspect, and an operator running a show needs to be told loudly, not have it
 buried in a log line read the next day.
+
+**Discarding the render overrun (issue #100).** A chunk may be *rendered*
+longer than it is *kept*: with Stage 2a's ``boundary_overrun`` on, a chunk's
+boundary is chosen where the content wants it and H3 is asked for the next
+valid length past it, because the grid constrains what can be generated and
+not what can be shown. Such a chunk arrives here with
+``AudioChunk.render_frames > AudioChunk.frame_count``, and the extra tail
+frames must come off before the concat demuxer sees the file --
+:func:`trim_overruns` does it with ``-frames:v`` and ``-c:v copy``, one extra
+stream-copy pass per affected chunk and no re-encoding, so invariant 1 above
+is untouched.
+
+This is **not** opt-in here, and that asymmetry is the point. The opt-in lives
+where the timeline is *planned*; by the time a chunk says it was rendered past
+its own end, concatenating it whole is a desynced video with no error
+anywhere. An invariant enforced as a side effect of a flag somebody else set
+is not enforced (CLAUDE.md's ``-shortest`` lesson), so this module obeys the
+data on the chunk and refuses what it cannot trim. A run that set nothing gets
+byte-for-byte the same two ffmpeg calls it always did: no chunk declares an
+overrun, no trim pass runs, and the concat list names the chunk mp4s
+themselves.
 """
 
 from __future__ import annotations
@@ -90,6 +111,18 @@ logger = logging.getLogger(__name__)
 DEFAULT_OUTPUT_FILENAME = "final_video.mp4"
 CONCAT_LIST_FILENAME = "concat_list.txt"
 INTERMEDIATE_VIDEO_FILENAME = "_concat_intermediate.mp4"
+TRIMMED_CHUNK_TEMPLATE = "_trimmed_{label}{chunk_id:04d}.mp4"
+"""Where :func:`trim_overruns` writes a chunk with its issue-#100 overrun
+removed. Beside the finished video rather than in the chunks directory, which
+is Stage 4's output and must keep holding what was actually rendered -- the
+trimmed file is an assembly artefact, and a ``--resume`` that found a
+shortened mp4 where its fingerprint says a longer one was rendered would be
+reading this module's scratch work as evidence.
+
+``label`` carries the timeline name (empty for the song, issue #66), because
+chunk ids are a separate space per timeline: without it a prologue's chunk 3
+and the song's chunk 3 would trim to the same path and one would overwrite
+the other's frames."""
 
 DEFAULT_DURATION_TOLERANCE_SECONDS = 0.05
 """Issue #22: a starting point, not a measured figure -- roughly one frame at
@@ -223,6 +256,12 @@ class AssemblyResult:
     """The probed container duration of the finished file (issue #22), or
     ``None`` when no duration check was requested (``expected_duration`` not
     given)."""
+    overrun_trims: tuple[OverrunTrim, ...] = ()
+    """Chunks whose issue-#100 render overrun was discarded before concat,
+    with the ffmpeg call used. Empty for every run whose chunks were rendered
+    exactly to length, which is every run without ``boundary_overrun`` -- so
+    a non-empty tuple here is also the record that this run's timeline was cut
+    on content boundaries rather than on the frame grid."""
 
 
 def _escape_concat_path(path: Path) -> str:
@@ -328,6 +367,158 @@ def validate_chunk_availability(
             missing.append(cid)
 
     return available, missing, dead
+
+
+class UntrimmableOverrunError(RuntimeError):
+    """A chunk says it was rendered past its own end and cannot be trimmed
+    (issue #100).
+
+    Raised **before** any ffmpeg call, and never downgraded to a warning:
+    concatenating a chunk whole when it was rendered longer than its span
+    pushes every later chunk out of sync against the master, with nothing
+    downstream able to notice -- exactly the failure ``ChunkFingerprint``
+    exists for, arriving in Stage 5 instead.
+    """
+
+    def __init__(self, chunk_id: int, frame_count: int | None, render_frames: int | None):
+        self.chunk_id = chunk_id
+        self.frame_count = frame_count
+        self.render_frames = render_frames
+        super().__init__(
+            f"chunk {chunk_id} declares render_frames={render_frames!r} against "
+            f"frame_count={frame_count!r}: cannot tell how many frames to keep, so the "
+            f"overrun cannot be discarded (issue #100)"
+        )
+
+
+@dataclass(frozen=True)
+class OverrunTrim:
+    """One chunk's issue-#100 overrun, and what was done about it."""
+
+    chunk_id: int
+    rendered_frames: int
+    kept_frames: int
+    source: Path
+    """The chunk mp4 Stage 4 produced, untouched."""
+    trimmed: Path
+    """The shortened copy the concat list actually names."""
+    args: tuple[str, ...]
+    """The exact ffmpeg call, so a test can assert on it without ffmpeg."""
+
+    @property
+    def discarded_frames(self) -> int:
+        return self.rendered_frames - self.kept_frames
+
+
+def build_trim_args(video_path: Path, output_path: Path, frames_kept: int) -> list[str]:
+    """Args for copying the first ``frames_kept`` frames of ``video_path``
+    (issue #100).
+
+    ``-c:v copy`` -- invariant 1 (never re-encode) applies to this pass as
+    much as to the concat; ``-frames:v`` stops after that many frames rather
+    than seeking to a timestamp, because the number of frames to keep is
+    known exactly and converting it to a duration would re-introduce the
+    rounding the integer arithmetic in Stage 2a exists to avoid. ``-an``
+    because the chunk's own generated audio is discarded here as everywhere.
+    """
+    return [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video_path),
+        "-an",
+        "-c:v",
+        "copy",
+        "-frames:v",
+        str(frames_kept),
+        str(output_path),
+    ]
+
+
+def trim_overruns(
+    chunks: Sequence[AudioChunk],
+    video_paths: Sequence[Path],
+    chunk_ids: Sequence[int],
+    output_dir: Path,
+    runner: SubprocessRunner,
+    *,
+    label: str | None = None,
+) -> tuple[list[Path], tuple[OverrunTrim, ...]]:
+    """Replace every rendered-past-its-end chunk with a trimmed copy
+    (issue #100).
+
+    Returns the concat-ready paths, in the order given, and one
+    :class:`OverrunTrim` per chunk that needed one. A run where no chunk
+    declares an overrun -- every run without ``boundary_overrun``, and every
+    chunk that happened to land on the grid anyway -- gets its own
+    ``video_paths`` back unchanged, no subprocess runs, and the returned
+    tuple is empty. That is what keeps the existing two-call assembly
+    byte-identical.
+
+    Raises :class:`UntrimmableOverrunError`, before any ffmpeg call, for a
+    chunk that claims an overrun it cannot describe.
+    """
+    by_id = {chunk.chunk_id: chunk for chunk in chunks}
+    resolved: list[Path] = []
+    trims: list[OverrunTrim] = []
+    pending: list[tuple[OverrunTrim, int]] = []
+
+    for position, (chunk_id, path) in enumerate(zip(chunk_ids, video_paths, strict=True)):
+        chunk = by_id.get(chunk_id)
+        resolved.append(Path(path))
+        if chunk is None or chunk.render_frames is None:
+            continue
+        if chunk.frame_count is None or chunk.frame_count < 1:
+            raise UntrimmableOverrunError(chunk_id, chunk.frame_count, chunk.render_frames)
+        if chunk.render_frames < chunk.frame_count:
+            raise UntrimmableOverrunError(chunk_id, chunk.frame_count, chunk.render_frames)
+        if chunk.render_frames == chunk.frame_count:
+            continue
+        destination = Path(output_dir) / TRIMMED_CHUNK_TEMPLATE.format(
+            label="" if label is None else f"{label}_", chunk_id=chunk_id
+        )
+        pending.append(
+            (
+                OverrunTrim(
+                    chunk_id=chunk_id,
+                    rendered_frames=chunk.render_frames,
+                    kept_frames=chunk.frame_count,
+                    source=Path(path),
+                    trimmed=destination,
+                    args=tuple(build_trim_args(Path(path), destination, chunk.frame_count)),
+                ),
+                position,
+            )
+        )
+
+    if not pending:
+        return resolved, ()
+
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    where = "" if label is None else f" on timeline {label!r}"
+    logger.info(
+        "Issue #100: %d of %d chunk(s)%s were rendered past their own end; discarding "
+        "%d overrun frame(s) with a stream copy (no re-encode) before concat.",
+        len(pending),
+        len(resolved),
+        where,
+        sum(trim.discarded_frames for trim, _ in pending),
+    )
+    for trim, position in pending:
+        _run_ffmpeg(trim.args, runner, step=f"trim chunk {trim.chunk_id}")
+        logger.info(
+            "Trimmed chunk %d from %d rendered frame(s) to the %d it keeps (%d discarded) "
+            "-> %s",
+            trim.chunk_id,
+            trim.rendered_frames,
+            trim.kept_frames,
+            trim.discarded_frames,
+            trim.trimmed,
+        )
+        resolved[position] = trim.trimmed
+        trims.append(trim)
+
+    return resolved, tuple(trims)
 
 
 def build_duration_probe_args(video_path: Path) -> list[str]:
@@ -451,6 +642,13 @@ def assemble_final_video(
     check the same way, using ``scene_cut_runner`` if given or ``runner``
     otherwise. Also never raises and never blocks assembly; see
     :func:`music_video_maker.scenecuts.check_scene_cuts`.
+
+    Any chunk carrying an issue-#100 render overrun
+    (``AudioChunk.render_frames``) is trimmed to the frames it keeps before
+    the concat list is written -- see :func:`trim_overruns`. There is no flag
+    for that: the chunk says it, and concatenating it whole would desync
+    everything after it. Raises :class:`UntrimmableOverrunError`, before any
+    subprocess, for a chunk that claims an overrun it cannot describe.
     ``master_audio=None`` (issue #22 concert mode) produces a video with no
     audio stream at all: the concat pass writes straight to the final output
     path (there's no mux pass to feed) and :attr:`AssemblyResult.mux_args` is
@@ -545,8 +743,20 @@ def assemble_final_video(
                 [w.chunk_id for w in scene_cut_warnings],
             )
 
+    # Issue #100, and deliberately after the two smell tests above: those
+    # sample what Stage 4 actually rendered, which is the honest subject for
+    # a darkness or scene-cut reading even where the last few frames will not
+    # survive to the finished file.
+    concat_paths, overrun_trims = trim_overruns(
+        chunks,
+        video_paths,  # type: ignore[arg-type]
+        ordered_ids,
+        output_dir,
+        runner,
+    )
+
     concat_file = output_dir / CONCAT_LIST_FILENAME
-    write_concat_file(video_paths, concat_file)  # type: ignore[arg-type]
+    write_concat_file(concat_paths, concat_file)
 
     output_path = output_dir / output_filename
 
@@ -620,6 +830,7 @@ def assemble_final_video(
         scene_cut_warnings=scene_cut_warnings,
         has_audio=has_audio,
         measured_duration=measured_duration,
+        overrun_trims=overrun_trims,
     )
 
 
@@ -756,6 +967,9 @@ class MultiTimelineAssemblyResult:
     video_signature: tuple[tuple[str, str], ...] = ()
     """The signature every timeline agreed on, as sorted key/value pairs --
     evidence that the check ran, not just that it did not raise."""
+    overrun_trims: tuple[OverrunTrim, ...] = ()
+    """Every chunk, across every timeline, whose issue-#100 render overrun was
+    discarded before concat."""
 
 
 def build_stream_signature_args(video_path: Path) -> list[str]:
@@ -1112,6 +1326,21 @@ def assemble_timelines(
         dark_warnings.extend(dark)
         cut_warnings.extend(cuts)
 
+    # Issue #100: discard any render overrun before anything concatenates or
+    # measures these clips. Per timeline, because chunk ids are a separate id
+    # space per timeline and a bare id would name two files.
+    overrun_trims: list[OverrunTrim] = []
+    for timeline in timelines:
+        clips[timeline.name], trims = trim_overruns(
+            timeline.chunks,
+            clips[timeline.name],
+            ids[timeline.name],
+            output_dir,
+            runner,
+            label=timeline.name,
+        )
+        overrun_trims.extend(trims)
+
     # 2. The concat signature, probed from the first chunk of each timeline.
     signatures = {
         timeline.name: probe_video_signature(clips[timeline.name][0], runner)
@@ -1270,4 +1499,5 @@ def assemble_timelines(
         has_audio=has_audio,
         measured_duration=measured_duration,
         video_signature=tuple(sorted(agreed_signature.items())),
+        overrun_trims=tuple(overrun_trims),
     )

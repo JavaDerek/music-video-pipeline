@@ -844,6 +844,8 @@ def _align_and_slice_timeline(
         config.hardware,
         timeline.chunks_dir,
         cover_instrumentals=config.instrumental_coverage,
+        # Issue #100: opt-in, so every existing config slices byte-identically.
+        boundary_overrun=config.boundary_overrun,
         shot_lengths=shot_lengths,
         instrumental_shot_seconds=config.instrumental_shot_seconds,
         instrumental_audio_gain_db=config.instrumental_audio_gain_db,
@@ -1008,7 +1010,12 @@ def _render_one_timeline(
         continuity_enabled=config.i2v_continuity,
         mutator=seeded_mutator,
         subprocess_runner=ffmpeg_runner,
-        chunk_frame_counts={c.chunk_id: c.frame_count for c in chunks},
+        # Issue #100: H3's `length` is what gets RENDERED, which is not a
+        # chunk's own frame_count once an overrun is in play. Handing it the
+        # kept count would render exactly what the trim was meant to avoid
+        # having to do, and the stem (also cut to the rendered length) would
+        # then be longer than the video -- issue #20's drift, reintroduced.
+        chunk_frame_counts={c.chunk_id: c.rendered_frame_count for c in chunks},
         render_width=config.render_width,
         render_height=config.render_height,
         noise_seed=config.noise_seed,

@@ -95,7 +95,21 @@ without making. ``_log_leading_vocal_offset`` then reports whatever offset
 survives, unconditionally, so a leftover offset is visible before GPU time
 even where the refinement had no room to act.
 
-A cross-cutting fix, not a seventh pass, because it moves no boundary (issue
+A seventh, opt-in pass runs last of all and is the only one that changes what
+a boundary *is* (issue #100): **boundary overrun**. Passes 2-6 all treat a
+chunk's length and its boundary as one decision, because H3 renders a chunk at
+exactly its own length and only ``5 + 17k`` lengths exist -- which is why #70
+closed on the finding that quantizing a chunk *moves* its boundary, and why the
+depth preference it asked for cost 4-6 grid steps against neighbours with none
+to give. Another pipeline built on this one took the other side of the trade
+and reported it in issue #100: ask the generator for the next valid length
+*past* the boundary, cut the audio stem to that same length, and discard the
+overrun when the video is assembled. The boundary becomes a content decision,
+the length stays a VRAM decision, and the grid is paid in frames nobody
+watches. ``boundary_overrun`` is off by default -- it re-cuts every chunk in
+the song and has not been rendered here. See ``_overrun_timeline``.
+
+A cross-cutting fix, not a pass at all, because it moves no boundary (issue
 #92): a chunk can merge segments from two singers, and the pipeline picks a
 dominant one to attribute the chunk to but used to hand them the *whole*
 span's text -- including the other singer's words. Measured on "Deathless",
@@ -197,6 +211,12 @@ class _Piece:
     end: float
     is_split_continuation: bool
     frame_count: int | None = None
+    render_frames: int | None = None
+    """The grid-valid length this piece will be *rendered* at, when the
+    issue-#100 overrun pass has decoupled that from ``frame_count`` (which is
+    then the frames the piece *keeps*). ``None`` everywhere else, including
+    every pre-#100 path, and that is what keeps ``frame_count`` grid-valid by
+    default."""
 
 
 # --------------------------------------------------------------------------- #
@@ -1570,6 +1590,7 @@ def _log_final_boundary_segment_cuts(
     min_frames: int,
     max_frames: int,
     filler_max_frames: int,
+    boundary_overrun: bool = False,
 ) -> None:
     """Issue #70, second mechanism: even where pass 2's segment-edge
     preference had nothing to snap to -- or nothing to say at all, since
@@ -1626,6 +1647,12 @@ def _log_final_boundary_segment_cuts(
     middle* than either complaint and was never mentioned in two independent
     viewings.
 
+    **Issue #100 is the reason that cost exists, and the way out of it.** The
+    4-6 steps are the price of the grid deciding the boundary; a run with
+    ``boundary_overrun`` on pays the grid in discarded frames instead and
+    moves these boundaries for nothing. What survives there is only what the
+    duration window itself refuses -- see :func:`_overrun_timeline`.
+
     So what this reports is the number that decided it. Per surviving cut:
     depth in **seconds** as well as percent (a percentage cannot be compared
     across phrases -- 45% of a 9s phrase and 45% of a 1.5s one are 4.0s and
@@ -1641,6 +1668,18 @@ def _log_final_boundary_segment_cuts(
     step = grid.step_frames
     step_seconds = grid.frames_to_seconds(step)
     boundary_count = max(0, len(covered) - 1)
+    # Issue #100 changes what a surviving cut means and what it would cost to
+    # move, so the message must not keep quoting a currency that is no longer
+    # the one being spent: with the overrun paying for the grid, a move costs
+    # no grid steps at all and a cut survives only because the duration
+    # window itself had no room for it.
+    budget_note = (
+        "boundary_overrun is ON (issue #100), so moving this boundary costs no grid "
+        "steps -- it survives because one of the two chunks would fall outside this "
+        "run's own min/max duration window, which the step figures below stand in for"
+        if boundary_overrun
+        else "a move is only possible where the cost is within the budget"
+    )
     cut_count = 0
     deepest: tuple[int, float, float, AlignedSegment] | None = None
 
@@ -1689,9 +1728,9 @@ def _log_final_boundary_segment_cuts(
             "and chunk %d starts here. Cutting a sung phrase mid-utterance; the two halves "
             "will render as independent shots with no error anywhere else. Moving it back "
             "to the phrase start costs %d grid step(s), budget %d; forward to the phrase "
-            "end costs %d, budget %d -- a move is only possible where the cost is within "
-            "the budget. This position was not visible to pass 2's own segment-edge "
-            "preference, which only ever sees pre-retiling boundaries (issue #70).",
+            "end costs %d, budget %d -- %s. This position was not visible to pass 2's own "
+            "segment-edge preference, which only ever sees pre-retiling boundaries "
+            "(issue #70).",
             boundary,
             pct,
             landed.index,
@@ -1705,6 +1744,7 @@ def _log_final_boundary_segment_cuts(
             back_budget,
             forward_cost,
             forward_budget,
+            budget_note,
         )
 
     if deepest is None:
@@ -2106,6 +2146,191 @@ def _prefer_vocal_onset(
     return list(zip(starts, frames, continuations, strict=True))
 
 
+# --------------------------------------------------------------------------- #
+# Pass 7 (opt-in): quantize the work, not the boundary (issue #100)
+# --------------------------------------------------------------------------- #
+
+
+def _overrun_timeline(
+    boundaries: list[tuple[float, int, bool]],
+    segments: tuple[AlignedSegment, ...],
+    track_duration: float,
+    *,
+    min_frames: int,
+    max_frames: int,
+    filler_max_frames: int,
+    grid: FrameGrid,
+) -> list[tuple[int, int, int, bool]]:
+    """Move boundaries onto segment edges and pay the grid in *overrun*
+    instead of in boundary position (issue #100).
+
+    Returns one ``(start_frame, kept_frames, render_frames, is_continuation)``
+    per chunk, in integer frames from the start of the track.
+
+    **The idea, which came from another pipeline built on this one.** Every
+    boundary in this file is a compromise between where the content wants a
+    cut and where the ``5 + 17k`` grid allows a *length*. #70 closed on the
+    finding that those are the same choice: quantizing a chunk moves its
+    boundary, so the depth-threshold preference the issue asked for cost 4-6
+    grid steps of 0.708 s against neighbours sitting at the 124-frame floor
+    with nothing to give, and fired 0 times at every threshold tried.
+
+    They are only the same choice because this pipeline renders a chunk at
+    exactly its own length. Ask H3 for the next valid length *past* the
+    boundary and discard the tail, and the two decisions come apart: the
+    boundary becomes a content decision and the length stays a VRAM one. The
+    4-6 steps a move used to cost become **zero**, because the neighbour is
+    no longer being asked to pay for the grid -- the overrun is.
+
+    So: for every interior boundary that lands inside a sung phrase (the
+    cuts :func:`_log_final_boundary_segment_cuts` has only been able to
+    *report*), try the nearer edge of that phrase first and then the other,
+    accepting whichever keeps both neighbouring chunks inside the run's own
+    duration window. Then shorten the final boundary to the track's own end,
+    which the grid-tiled timeline overshoots by up to one trained-floor
+    chunk -- 44 frames on "Deathless", frames ``-shortest`` throws away today
+    with nothing recording it (CLAUDE.md's ``-shortest`` invariant, #22).
+
+    **Why this is arithmetic on integers and not on seconds.** Boundaries are
+    held as absolute frame positions, so a chunk's kept length is the
+    difference of its two neighbours' positions and the whole timeline
+    telescopes: the frames before boundary *i* sum to exactly ``edges[i]``,
+    whatever moved and by how much. Video offset == audio offset for every
+    chunk by construction, which is this file's one non-negotiable invariant
+    and the thing #70 declined to put at risk. A seconds-based version of
+    this function would have each chunk round its own duration and let the
+    residue accumulate -- see :meth:`FrameGrid.frames_between`.
+
+    The final boundary is only ever moved **earlier**, never later. Growing
+    the last chunk to reach the track end is the F26 defect (the conditioning
+    audio outranks the prompt, so a stretched sung chunk mouths over the
+    outro); ``_cover_instrumentals``' own tail rule already handles an
+    undershoot before this runs, and it does it by appending instrumental
+    filler rather than by stretching anything.
+
+    A boundary this cannot move is left exactly where it was and reported by
+    the existing logger, unchanged -- the window is still the run's
+    ``min_chunk_seconds``/``max_chunk_seconds``, because a chunk that keeps
+    fewer frames than H3's trained floor would be mostly overrun, and one
+    that keeps more than the ceiling cannot be rendered at all.
+    """
+    fps = grid.fps
+    edges: list[int] = [0]
+    for _start, frames, _cont in boundaries:
+        edges.append(edges[-1] + frames)
+
+    # A chunk's ceiling depends on whether it is filler, and that is decided
+    # by span overlap -- read off the pre-move spans, which is what
+    # _cover_instrumentals' own `members` derivation will agree with except
+    # in the rare case where a move changes a chunk's overlap. Getting that
+    # case wrong costs a rejected move, never a bad one.
+    def _ceiling(index: int) -> int:
+        start = edges[index] / fps
+        end = edges[index + 1] / fps
+        return max_frames if _segments_overlapping(segments, start, end) else filler_max_frames
+
+    moved = 0
+    for i in range(1, len(edges) - 1):
+        landed = _segment_containing(edges[i] / fps, segments)
+        if landed is None:
+            continue
+        ceiling_before = _ceiling(i - 1)
+        ceiling_after = _ceiling(i)
+        # The phrase's START first, and its end only as a fallback -- never
+        # whichever is nearer. Both clear the phrase, but they are not equally
+        # good: moving back to the start opens the *later* chunk on the
+        # phrase's first word, which is issue #79's own objective (H3 starts
+        # the mouth at frame 0 regardless of where the voice does), while
+        # moving forward to the end leaves that chunk beginning in a vocal
+        # gap -- the "mouth moving with no vocal, then perfect once the
+        # singing starts" defect a viewer named twice. Issue #100's own
+        # pipeline makes the same choice for the same reason: "a shot can
+        # open on its first word instead of in a vocal gap". The reason this
+        # is now affordable at all is that moving back is the expensive
+        # direction on the grid -- 4-6 steps against a neighbour at the
+        # 124-frame floor -- and the overrun pays it instead of the neighbour.
+        for edge_seconds in (landed.start, landed.end):
+            # Round OUTWARD, never to the nearest frame. A phrase edge is
+            # almost never on a frame boundary, and rounding 72.920s to the
+            # nearest frame gives 72.9166s -- which is still 0.003s inside the
+            # phrase. That is #70's own first mistake arriving by a new road:
+            # its first segment-edge snap "logged six snaps that every one of
+            # them silently landed back inside the segment it claimed to
+            # avoid". Measured here before the fix: Deathless's 24 mid-phrase
+            # cuts went to 23 while the deepest went from 86.0% to 99.9%
+            # through its phrase -- a pass reporting success at clearing a
+            # phrase it had merely moved to the far end of. floor for a start
+            # edge and ceil for an end edge put the boundary at or outside the
+            # phrase by construction.
+            target = (
+                math.floor(edge_seconds * fps)
+                if edge_seconds == landed.start
+                else math.ceil(edge_seconds * fps)
+            )
+            kept_before = target - edges[i - 1]
+            kept_after = edges[i + 1] - target
+            if not min_frames <= kept_before <= ceiling_before:
+                continue
+            if not min_frames <= kept_after <= ceiling_after:
+                continue
+            logger.info(
+                "Issue #100: moving the boundary at %.3fs to %.3fs (segment index=%d's "
+                "%s edge), which cost %d grid step(s) before this pass existed and now "
+                "costs none -- chunks %d and %d keep %d and %d frames and are rendered "
+                "at %d and %d.",
+                edges[i] / fps,
+                target / fps,
+                landed.index,
+                "start" if edge_seconds == landed.start else "end",
+                math.ceil(abs(target - edges[i]) / grid.step_frames),
+                i - 1,
+                i,
+                kept_before,
+                kept_after,
+                grid.cover_frames(kept_before),
+                grid.cover_frames(kept_after),
+            )
+            edges[i] = target
+            moved += 1
+            break
+
+    # The tail. _cover_instrumentals tiles the grid past the track's own end
+    # (up to one trained-floor chunk), and a free boundary can simply stop
+    # where the song does. At least one kept frame, because a chunk with none
+    # is not a chunk.
+    track_frames = round(track_duration * fps)
+    trimmed_tail = 0
+    if len(edges) >= 2 and edges[-1] > track_frames >= edges[-2] + 1:
+        trimmed_tail = edges[-1] - track_frames
+        edges[-1] = track_frames
+
+    planned: list[tuple[int, int, int, bool]] = []
+    for idx, (_start, _frames, is_continuation) in enumerate(boundaries):
+        kept = edges[idx + 1] - edges[idx]
+        planned.append((edges[idx], kept, grid.cover_frames(kept), is_continuation))
+
+    kept_total = sum(kept for _s, kept, _r, _c in planned)
+    overrun_total = sum(render - kept for _s, kept, render, _c in planned)
+    logger.info(
+        "Issue #100 boundary overrun: %d of %d boundar(ies) moved onto a phrase edge, "
+        "%d tail frame(s) given back to the track's own end, and %d of %d chunk(s) now "
+        "render past their own end. Cost: %d frames rendered for %d kept, %+.2f%% extra "
+        "frames (longest overrun %d frames / %.3fs). The overrun is discarded in Stage 5 "
+        "and recorded per chunk, never implied.",
+        moved,
+        max(0, len(edges) - 2),
+        trimmed_tail,
+        sum(1 for _s, kept, render, _c in planned if render > kept),
+        len(planned),
+        kept_total + overrun_total,
+        kept_total,
+        100.0 * overrun_total / kept_total if kept_total else 0.0,
+        max((render - kept for _s, kept, render, _c in planned), default=0),
+        grid.frames_to_seconds(max((render - kept for _s, kept, render, _c in planned), default=0)),
+    )
+    return planned
+
+
 def _cover_instrumentals(
     pieces: list[_Piece],
     segments: tuple[AlignedSegment, ...],
@@ -2115,6 +2340,7 @@ def _cover_instrumentals(
     grid: FrameGrid,
     shot_lengths: Sequence[ShotLength] = (),
     instrumental_shot_seconds: float | None = None,
+    boundary_overrun: bool = False,
 ) -> list[_Piece]:
     """Retile ``pieces`` into a contiguous covering of ``[0, track_duration]``.
 
@@ -2145,6 +2371,13 @@ def _cover_instrumentals(
     *avoids* one (:func:`_snap_to_segment_edge`). See
     :func:`_log_final_boundary_segment_cuts` for why this pass only reports
     that, rather than also avoiding it.
+
+    ``boundary_overrun`` (issue #100, opt-in and off by default) hands the
+    finished tiling to :func:`_overrun_timeline`, which *does* avoid those
+    cuts -- by decoupling where a chunk ends from what length it is rendered
+    at, so a move no longer has to be paid for out of a neighbour's duration.
+    Contiguity is preserved by the same construction either way; see that
+    function's docstring.
     """
     min_frames = _grid_frames_at_or_above(eff_min, grid)
     max_frames = _grid_frames_at_or_below(eff_max, grid)
@@ -2214,8 +2447,29 @@ def _cover_instrumentals(
         boundaries, segments, pinned_indices, min_frames, max_frames, filler_max_frames, grid
     )
 
+    # (start_seconds, kept_frames, render_frames_or_None, is_continuation).
+    # Without issue #100 the third entry is None everywhere, which is what
+    # keeps every pre-#100 timeline byte-identical: `kept` is then the chunk's
+    # own grid-valid length and nothing is rendered past its end.
+    planned: list[tuple[float, int, int | None, bool]]
+    if boundary_overrun:
+        planned = [
+            (start_frame / grid.fps, kept, render if render != kept else None, is_continuation)
+            for start_frame, kept, render, is_continuation in _overrun_timeline(
+                boundaries,
+                segments,
+                track_duration,
+                min_frames=min_frames,
+                max_frames=max_frames,
+                filler_max_frames=filler_max_frames,
+                grid=grid,
+            )
+        ]
+    else:
+        planned = [(start, kept, None, cont) for start, kept, cont in boundaries]
+
     covered: list[_Piece] = []
-    for start, frame_count, is_continuation in boundaries:
+    for start, frame_count, render_frames, is_continuation in planned:
         end = start + grid.frames_to_seconds(frame_count)
         members = _segments_overlapping(segments, start, end)
         if members:
@@ -2236,6 +2490,7 @@ def _cover_instrumentals(
                 end=end,
                 is_split_continuation=is_continuation,
                 frame_count=frame_count,
+                render_frames=render_frames,
             )
         )
 
@@ -2246,6 +2501,7 @@ def _cover_instrumentals(
         min_frames=min_frames,
         max_frames=max_frames,
         filler_max_frames=filler_max_frames,
+        boundary_overrun=boundary_overrun,
     )
     _log_leading_vocal_offset(covered, segments)
 
@@ -2325,6 +2581,7 @@ def slice_audio(
     chunks_dir: Path,
     cover_instrumentals: bool = False,
     *,
+    boundary_overrun: bool = False,
     shot_lengths: Sequence[ShotLength] = (),
     instrumental_shot_seconds: float | None = None,
     instrumental_audio_gain_db: float | None = None,
@@ -2351,6 +2608,25 @@ def slice_audio(
     the returned tuple tiles ``[0, track_duration]`` contiguously. Without
     it, only voiced spans are rendered and Stage 5's concat silently desyncs
     the result against the master track; see that function's docstring.
+
+    ``boundary_overrun`` (issue #100) stops the frame grid deciding where
+    chunks are cut. Every chunk whose boundary the content wants elsewhere
+    keeps the number of frames its own span contains -- which is no longer
+    grid-valid -- and is **rendered** at the next valid length past it
+    (``AudioChunk.render_frames``, also the length its stem is cut to), with
+    the overrun discarded in Stage 5. See :func:`_overrun_timeline`.
+
+    **Opt-in, and off by default, deliberately.** It changes where every
+    boundary in the song falls, so it invalidates every chunk already on disk
+    and every cached chunk a ``--resume`` would reuse, and it has never been
+    rendered on this project's own material -- the cost it trades for is real
+    (a few per cent of extra frames, and up to one grid step of the *next*
+    phrase inside each chunk's conditioning audio) and the benefit is so far
+    an argument, not a measurement. Nothing enters the default path here
+    without a measurement on real pixels. It needs ``cover_instrumentals``
+    for the same reason ``shot_lengths`` does, and because the kept-frame
+    arithmetic is measured from the start of the track: there is no coherent
+    way to do it over a timeline with holes in it.
 
     ``shot_lengths`` (issue #27) are the shot plan's editorial shot-length
     requests -- see :class:`~music_video_maker.shot_plan.ShotLength` and
@@ -2417,6 +2693,16 @@ def slice_audio(
         shot_lengths = ()
         instrumental_shot_seconds = None
 
+    if boundary_overrun and not cover_instrumentals:
+        logger.warning(
+            "Ignoring boundary_overrun (issue #100): it moves boundaries across a "
+            "contiguous timeline and measures every chunk's kept frames from the start "
+            "of the track, and instrumental_coverage is off, so this run only renders "
+            "the voiced spans and has no such timeline. Turn instrumental_coverage on "
+            "(it is the default, and Stage 5 silently desyncs without it)."
+        )
+        boundary_overrun = False
+
     eff_min, eff_max, grid = _effective_bounds(hardware)
     _log_effective_frame_window(eff_min, eff_max, grid)
 
@@ -2459,6 +2745,7 @@ def slice_audio(
             grid,
             shot_lengths=shot_lengths,
             instrumental_shot_seconds=instrumental_shot_seconds,
+            boundary_overrun=boundary_overrun,
         )
 
     chunks_dir = Path(chunks_dir)
@@ -2487,39 +2774,85 @@ def slice_audio(
                 f"chunk {idx} start {piece.start!r} precedes previous chunk end {prev_end!r}"
             )
 
-        if piece.frame_count is None or not grid.is_valid(piece.frame_count):
+        # The length H3 is asked for is the one that has to land on the grid.
+        # Without issue #100 that is the chunk's own frame_count and the two
+        # checks below are exactly what they always were.
+        render_frames = (
+            piece.render_frames if piece.render_frames is not None else piece.frame_count
+        )
+        if piece.frame_count is None or render_frames is None or not grid.is_valid(render_frames):
             logger.error(
-                "Chunk %d (segments=%s) has no valid frame_count (%r) at emission time.",
+                "Chunk %d (segments=%s) has no valid rendered length (frame_count=%r, "
+                "render_frames=%r) at emission time.",
                 idx,
                 tuple(m.index for m in piece.members),
                 piece.frame_count,
+                piece.render_frames,
             )
             raise ChunkFrameMismatchError(
-                f"chunk {idx}: frame_count {piece.frame_count!r} is not a valid H3 grid point "
-                f"(source_segment_indices={tuple(m.index for m in piece.members)!r})"
+                f"chunk {idx}: rendered length {render_frames!r} is not a valid H3 grid point "
+                f"(frame_count={piece.frame_count!r}, "
+                f"source_segment_indices={tuple(m.index for m in piece.members)!r})"
             )
 
-        piece_duration = piece.end - piece.start
-        expected_duration = grid.frames_to_seconds(piece.frame_count)
-        if abs(piece_duration - expected_duration) > 1e-3:
-            logger.error(
-                "Chunk %d (segments=%s): frame_count=%d implies %.6fs but the sliced duration "
-                "is %.6fs -- these must match exactly or Stage 4a's rendered video will drift "
-                "from its own audio stem.",
-                idx,
-                tuple(m.index for m in piece.members),
-                piece.frame_count,
-                expected_duration,
-                piece_duration,
-            )
-            raise ChunkFrameMismatchError(
-                f"chunk {idx}: frame_count {piece.frame_count!r} implies duration "
-                f"{expected_duration!r} but sliced duration is {piece_duration!r} "
-                f"(source_segment_indices={tuple(m.index for m in piece.members)!r})"
-            )
+        if piece.render_frames is None:
+            piece_duration = piece.end - piece.start
+            expected_duration = grid.frames_to_seconds(piece.frame_count)
+            if abs(piece_duration - expected_duration) > 1e-3:
+                logger.error(
+                    "Chunk %d (segments=%s): frame_count=%d implies %.6fs but the sliced "
+                    "duration is %.6fs -- these must match exactly or Stage 4a's rendered "
+                    "video will drift from its own audio stem.",
+                    idx,
+                    tuple(m.index for m in piece.members),
+                    piece.frame_count,
+                    expected_duration,
+                    piece_duration,
+                )
+                raise ChunkFrameMismatchError(
+                    f"chunk {idx}: frame_count {piece.frame_count!r} implies duration "
+                    f"{expected_duration!r} but sliced duration is {piece_duration!r} "
+                    f"(source_segment_indices={tuple(m.index for m in piece.members)!r})"
+                )
+        else:
+            # Issue #100's own version of the same guard, and it is stricter
+            # rather than looser: the frames this chunk KEEPS must be exactly
+            # the frames its span contains, measured from the start of the
+            # track so the timeline telescopes (see FrameGrid.frames_between).
+            # A chunk whose kept count disagrees with its own span by one
+            # frame is a chunk that desyncs everything after it.
+            expected_kept = grid.frames_between(piece.start, piece.end)
+            if piece.frame_count != expected_kept or render_frames < piece.frame_count:
+                logger.error(
+                    "Chunk %d (segments=%s): keeps frame_count=%d of render_frames=%d over "
+                    "%.6f-%.6fs, which contains %d frame(s) -- the kept count must equal the "
+                    "span and must not exceed what was rendered, or Stage 5's trim desyncs "
+                    "every chunk after this one (issue #100).",
+                    idx,
+                    tuple(m.index for m in piece.members),
+                    piece.frame_count,
+                    render_frames,
+                    piece.start,
+                    piece.end,
+                    expected_kept,
+                )
+                raise ChunkFrameMismatchError(
+                    f"chunk {idx}: keeps {piece.frame_count!r} frame(s) of {render_frames!r} "
+                    f"rendered over a span containing {expected_kept!r} "
+                    f"(source_segment_indices={tuple(m.index for m in piece.members)!r})"
+                )
 
         start_ms = round(piece.start * 1000)
-        end_ms = round(piece.end * 1000)
+        # The stem has to cover what H3 renders, not what the chunk keeps:
+        # the overrun frames are generated from this audio and then thrown
+        # away, which is issue #100's stated cost -- up to one grid step of
+        # the next phrase inside this chunk's conditioning.
+        stem_end = (
+            piece.end
+            if piece.render_frames is None
+            else piece.start + grid.frames_to_seconds(render_frames)
+        )
+        end_ms = round(stem_end * 1000)
         sliced = master[start_ms:end_ms]
 
         # A chunk may legitimately run past the end of the master: the outro
@@ -2533,10 +2866,11 @@ def slice_audio(
         if shortfall_ms > 0:
             logger.info(
                 "Chunk %d runs %dms past the end of the master track; padding the stem with "
-                "silence so its duration still matches frame_count=%d exactly.",
+                "silence so its duration still matches the rendered length of %d frame(s) "
+                "exactly.",
                 idx,
                 shortfall_ms,
-                piece.frame_count,
+                render_frames,
             )
             sliced = sliced + AudioSegment.silent(
                 duration=shortfall_ms, frame_rate=master.frame_rate
@@ -2597,6 +2931,7 @@ def slice_audio(
                     source_segment_indices=(),
                     is_split_continuation=piece.is_split_continuation,
                     frame_count=piece.frame_count,
+                    render_frames=piece.render_frames,
                     is_instrumental=True,
                     timeline=timeline,
                 )
@@ -2692,6 +3027,7 @@ def slice_audio(
                 source_segment_indices=tuple(m.index for m in piece.members),
                 is_split_continuation=piece.is_split_continuation,
                 frame_count=piece.frame_count,
+                render_frames=piece.render_frames,
                 timeline=timeline,
             )
         )
@@ -2810,10 +3146,12 @@ def _log_unmeasured_chunks(
     trained ceiling, a long instrumental already tiles into chunks well past
     the ceiling without anyone asking for a long take.
     """
-    over = [c for c in chunks if (c.frame_count or 0) > ceiling.frames]
+    # Issue #100: VRAM is paid on what H3 was asked to render, which is not
+    # the chunk's own length once an overrun is in play.
+    over = [c for c in chunks if (c.rendered_frame_count or 0) > ceiling.frames]
     if not over:
         return
-    longest = max(over, key=lambda c: c.frame_count or 0)
+    longest = max(over, key=lambda c: c.rendered_frame_count or 0)
     logger.warning(
         "%d of %d chunk(s) exceed %d frames, which is %s. The longest is chunk %d at %d "
         "frames (%.3fs). This is inside H3's trained range and costs no extra wall clock, but "
@@ -2825,8 +3163,8 @@ def _log_unmeasured_chunks(
         ceiling.frames,
         ceiling.provenance,
         longest.chunk_id,
-        longest.frame_count,
-        longest.duration,
+        longest.rendered_frame_count,
+        grid.frames_to_seconds(longest.rendered_frame_count or 0),
         ceiling.frames,
     )
 
