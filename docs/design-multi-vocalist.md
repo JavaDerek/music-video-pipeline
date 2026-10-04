@@ -1,10 +1,41 @@
-# Design: automatic vocalist detection (issue #29)
+# Design: automatic vocalist detection (issue #29, built as #101)
 
-Design only — nothing here is implemented. This document exists so the next
-person to pick up #29's automatic-detection half starts from a shape, not a
-blank page. See [`docs/lyrics-format.md`](lyrics-format.md) for the manual
-`[Name]` / `[Name: Role]` tags this is meant to sit beside, which already
-work end to end (`tests/test_multi_vocalist.py`) and are not being replaced.
+**BUILT 2026-10-04.** This was design-only until the licence question below
+was answered; it is now implemented in
+[`music_video_maker/diarization.py`](../music_video_maker/diarization.py), and
+the operator-facing half — the one-time gated-model setup, the per-song
+workflow, the attribution CC-BY-4.0 requires, and exactly what is still
+unverified — lives in
+[`docs/vocalist-diarization.md`](vocalist-diarization.md). **Read that one if
+you are using the feature; read this one for the shape and the reasoning**,
+which the implementation follows and which is worth keeping because it is the
+argument, not the manual.
+
+Every load-bearing decision below was built as written, with two additions
+the prose did not anticipate and one deliberate departure:
+
+- *addition:* a tag's protection needed a field. "An explicit tag always wins"
+  is unimplementable while `("Dianne",)` from a tag and `("Dianne",)` from
+  `default_lead_vocalist` are the same value, so
+  `LyricLine.characters_authored` / `AlignedSegment.characters_authored` record
+  which it was. Same shape as this project's own "a resolved config cannot tell
+  set from defaulted" (#55): a fact only knowable while parsing has to be
+  written down while parsing.
+- *addition:* the fifth open question — how a cluster label becomes a name —
+  is answered as **authored data** (`[diarization_speakers]`), validated
+  against `[cast]` at load, with the cluster table logged so a first run is the
+  thing that produces the mapping. Not reference-clip matching: that is
+  inference where a human's single listen is cheaper and exact.
+- *departure:* the harmony rule. "The dominant voice wins" is implemented for
+  a clear winner, but where nobody clears the share floor the segment is
+  reported `contested` and **left alone** rather than attributed. Slicing must
+  pick someone because it has a chunk to render; diarization can decline, and
+  declining leaves a nameable value behind instead of a coin flip.
+
+See [`docs/lyrics-format.md`](lyrics-format.md) for the manual
+`[Name]` / `[Name: Role]` tags this sits beside, which work end to end
+(`tests/test_multi_vocalist.py`), are not being replaced, and remain the
+recommended workflow until the automatic path has been scored on a real song.
 
 ## The shape: an alternative front-end, not a parallel mechanism
 
@@ -66,7 +97,7 @@ deliberate two-shot (both singers on screen) is not a job for the automatic
 path at all — that is what the shot plan's `present` field is for, and it
 already overrides whatever chose the frame's primary singer.
 
-## Dependency reality: not being added now
+## Dependency reality (resolved: an optional `[diarize]` extra)
 
 The practical route is speaker diarization on an isolated vocal stem:
 `pyannote.audio` for diarization, plus a Demucs-separated vocal stem as its
@@ -82,8 +113,11 @@ costs this project no new dependency — the operator produces the same file
 either way. What is left to decide is only the diarizer itself.
 
 `pyannote.audio` and Demucs are both heavy,
-optional-extra-shaped dependencies with their own model weights, and neither
-is being added by this document. Building the real thing means answering,
+optional-extra-shaped dependencies with their own model weights. **That is how
+it shipped:** `pyannote.audio` is the `[diarize]` extra (never a runtime
+dependency, never imported unless `diarize = true`, and never imported at
+module load even then), and Demucs stays off the render path entirely — the
+operator produces the stem by hand, as issue #25 already defined. Building the real thing means answering,
 up front, the same licensing/redistribution questions this project already
 applies to every other model file (`CLAUDE.md`'s "Everything committed here
 is intended to become public" section) — `pyannote.audio`'s pretrained
@@ -116,16 +150,33 @@ this project does not get to make an exception for its own next feature.
   clips — since diarization alone never produces a name, only a cluster.
 
 A fifth thing is a *decision*, not a measurement, and it is the one that
-actually blocks: **`pyannote.audio`'s pretrained pipelines are gated behind
+actually blocked: **`pyannote.audio`'s pretrained pipelines are gated behind
 accepting their terms on Hugging Face, and this repo is a candidate for open
 sourcing.** That is a one-time human step nobody but the owner can take, it
 cannot be satisfied from inside the render path, and it has to be answered
 before any code is written — not discovered afterwards, the way CLAUDE.md's
 "Check redistribution before committing a third-party binary" rule says.
-Until it is answered, the honest status of this half is *blocked on a
-licence decision*, not *not got round to*.
 
-Until all four are true, hand-tagging with `[Name: Role]` remains the
-correct answer, and it is not a stopgap: it is fully specified, tested, and
-already the recommended workflow in
-[`docs/lyrics-format.md`](lyrics-format.md).
+**Answered 2026-10-04: accepted.** The code is MIT, the pretrained models are
+CC-BY-4.0, and commercial use is permitted *with attribution* — so the terms
+are compatible with publishing this repo, and the obligation is a credit, not
+a restriction. Nothing is committed or redistributed here: the models stay
+gated, the operator accepts the terms with their own account, and the weights
+land in their own cache, which is the arrangement `faces.py` already uses for
+the SFace weights. The attribution is recorded in the README's License section
+*and logged at INFO on every run that loads the pipeline*, because CC-BY asks
+for credit from whoever uses the work, not only from whoever reads the
+repository.
+
+**The other four are still not true, and that is the honest status of the
+built feature.** The mechanism is implemented and tested offline; the *claim*
+that it attributes a real song correctly is not made, because no
+multi-vocalist song has been diarized here and the weights were still
+inaccessible (403 on the files) when it shipped. The two thresholds say so at
+WARNING on every run, and
+[`docs/vocalist-diarization.md`](vocalist-diarization.md)'s "What is still
+unverified" section is the full list.
+
+So hand-tagging with `[Name: Role]` remains the correct answer, and it is not
+a stopgap: it is fully specified, tested, and already the recommended workflow
+in [`docs/lyrics-format.md`](lyrics-format.md).

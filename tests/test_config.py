@@ -2600,3 +2600,129 @@ def test_acknowledge_unproven_envelope_defaults_off(tmp_path):
 def test_acknowledge_unproven_envelope_can_be_set_for_an_attended_proof(tmp_path):
     config = _load_with(tmp_path, acknowledge_unproven_envelope="true")
     assert config.acknowledge_unproven_envelope is True
+
+
+# --------------------------------------------------------------------------- #
+# Issue #101: automatic vocalist diarization, opt-in and stem-only
+# --------------------------------------------------------------------------- #
+
+
+def test_diarize_defaults_to_off_with_no_speaker_mapping(tmp_path: Path) -> None:
+    """A config written before this field existed must load unchanged, and a
+    run that does not ask for diarization must be byte-identical to today's --
+    which starts with the loader not inventing a mapping for it."""
+    _create_default_assets(tmp_path)
+    cfg = load_config(_write_config(tmp_path))
+    assert cfg.diarize is False
+    assert cfg.diarization_speakers is None
+
+
+def test_diarize_true_without_a_vocal_stem_is_refused_at_load(tmp_path: Path) -> None:
+    """Diarizing the full mix is what made this feature not worth attempting
+    (issue #101): a voice-like lead synth clusters as a singer. So asking for
+    diarization with no isolated stem is refused at load, with the demucs line
+    in the message -- a measurement nobody should act on is worse than a no."""
+    _create_default_assets(tmp_path)
+    path = _write_config(tmp_path, extra_toml="diarize = true")
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+    message = str(excinfo.value)
+    assert "vocal_stem" in message
+    assert "demucs" in message
+    assert "ISOLATED VOCAL STEM" in message
+
+
+def test_diarize_true_with_a_stem_loads_and_keeps_the_speaker_mapping(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    (tmp_path / "audio" / "vocals.wav").write_bytes(b"RIFF-fake-wav-data")
+    cfg = load_config(
+        _write_config(
+            tmp_path,
+            extra_toml=(
+                'vocal_stem = "audio/vocals.wav"\n'
+                "diarize = true\n"
+                "[diarization_speakers]\n"
+                'SPEAKER_00 = "Dianne"\n'
+                'SPEAKER_01 = "Rex"\n'
+            ),
+        )
+    )
+    assert cfg.diarize is True
+    assert cfg.diarization_speakers == {"SPEAKER_00": "Dianne", "SPEAKER_01": "Rex"}
+
+
+def test_a_speaker_mapped_to_an_unknown_cast_member_is_refused_at_load(tmp_path: Path) -> None:
+    """Diarization writes this name into the same field a ``[Name: Role]`` tag
+    writes, so an unknown name is the same defect as a typo in the lyrics file
+    -- and it is caught here rather than in Stage 2b, where the symptom is a
+    missing reference photo minutes into a run."""
+    _create_default_assets(tmp_path)
+    (tmp_path / "audio" / "vocals.wav").write_bytes(b"RIFF-fake-wav-data")
+    path = _write_config(
+        tmp_path,
+        extra_toml=(
+            'vocal_stem = "audio/vocals.wav"\n'
+            "diarize = true\n"
+            "[diarization_speakers]\n"
+            'SPEAKER_00 = "Marcus"\n'
+        ),
+    )
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+    assert "Marcus" in str(excinfo.value)
+    assert "not in [cast]" in str(excinfo.value)
+
+
+def test_a_speaker_mapped_to_a_non_string_is_refused_at_load(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    (tmp_path / "audio" / "vocals.wav").write_bytes(b"RIFF-fake-wav-data")
+    path = _write_config(
+        tmp_path,
+        extra_toml=(
+            'vocal_stem = "audio/vocals.wav"\n'
+            "diarize = true\n"
+            "[diarization_speakers]\n"
+            "SPEAKER_00 = 7\n"
+        ),
+    )
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_diarization_speakers_must_be_a_table(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    path = _write_config(tmp_path, extra_toml='diarization_speakers = "Dianne"')
+    with pytest.raises(ConfigError) as excinfo:
+        load_config(path)
+    assert "[diarization_speakers]" in str(excinfo.value)
+
+
+def test_a_speaker_mapping_with_diarize_off_warns_that_it_is_inert(
+    tmp_path: Path, caplog
+) -> None:
+    """Same shape as ``lora_trigger`` without ``lora``: a field that cannot do
+    anything is worth a line, because the operator believes it is doing
+    something."""
+    _create_default_assets(tmp_path)
+    path = _write_config(
+        tmp_path,
+        extra_toml='[diarization_speakers]\nSPEAKER_00 = "Dianne"\n',
+    )
+    with caplog.at_level(logging.WARNING, logger="music_video_maker.config"):
+        cfg = load_config(path)
+    assert cfg.diarize is False
+    assert any("inert" in r.getMessage() for r in caplog.records)
+
+
+def test_diarize_with_no_mapping_says_the_first_pass_will_assign_nothing(
+    tmp_path: Path, caplog
+) -> None:
+    """The designed first run: no mapping can exist before the clusters do."""
+    _create_default_assets(tmp_path)
+    (tmp_path / "audio" / "vocals.wav").write_bytes(b"RIFF-fake-wav-data")
+    path = _write_config(
+        tmp_path, extra_toml='vocal_stem = "audio/vocals.wav"\ndiarize = true\n'
+    )
+    with caplog.at_level(logging.WARNING, logger="music_video_maker.config"):
+        load_config(path)
+    assert any("clusters, never names" in r.getMessage() for r in caplog.records)

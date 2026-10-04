@@ -194,3 +194,96 @@ def test_dotenv_is_ignored():
         ".env is no longer gitignored -- restore it before anything else. "
         "Telethon session files and API keys live there."
     )
+
+
+# --------------------------------------------------------------------------- #
+# Third-party models that are NOT committed still have to be declared (#101)
+# --------------------------------------------------------------------------- #
+
+UNCOMMITTED_MODEL_LICENCES: dict[str, tuple[str, ...]] = {
+    # Issue #101: pyannote's pretrained diarization pipelines. Code MIT,
+    # models CC-BY-4.0 -- which REQUIRES attribution, so the licence note is
+    # an obligation this project carries, not a disclaimer it files away.
+    # Nothing is committed (the weights are gated and fetched by the operator
+    # under the terms they accepted), so ASSET_MANIFEST above cannot see it
+    # and the README's License section is the rights table it lands in.
+    "pyannote": ("pyannote", "CC-BY-4.0", "pyannote/speaker-diarization-3.1", "Bredin"),
+    # Issue #49: the SFace recognition weights, deliberately uncommitted at
+    # 38.7 MB. Listed here so this test is about the *class* of asset rather
+    # than about one dependency.
+    "sface": ("SFace", "Apache-2.0"),
+}
+"""Models this project uses but does not ship, and the words the README's own
+License section must carry for each.
+
+ASSET_MANIFEST only sees files that are *committed*, so it cannot catch a
+third-party model added as a pip extra plus a download instruction -- which is
+precisely how a licence obligation arrives without anyone deciding to accept
+one. CLAUDE.md's rule ("record source, licence and sha256 beside it in code")
+is checked for committed binaries by the tests above and by this one for the
+rest."""
+
+
+def _readme_license_section() -> str:
+    text = (REPO_ROOT / "README.md").read_text()
+    start = text.index("\n## License")
+    end = text.index("\n## ", start + 1)
+    return text[start:end]
+
+
+@pytest.mark.parametrize("key", sorted(UNCOMMITTED_MODEL_LICENCES))
+def test_an_uncommitted_third_party_model_is_declared_in_the_readme_license_section(key):
+    """The failure lands on whoever adds the dependency, which is the only
+    moment the licence question is cheap to answer."""
+    section = _readme_license_section()
+    missing = [term for term in UNCOMMITTED_MODEL_LICENCES[key] if term not in section]
+    assert not missing, (
+        f"README's License section does not mention {missing} for {key}. A model this "
+        "project tells people to download is a licence obligation even though no file is "
+        "committed -- record it there (and, for an attribution licence, where the "
+        "attribution is actually emitted)."
+    )
+
+
+def test_the_cc_by_attribution_is_emitted_at_runtime_not_only_filed_in_the_repo():
+    """CC-BY-4.0 asks for credit from whoever *uses* the work.
+
+    A licence recorded only in a repository file credits the person reading the
+    repository. The run log is where the use happens, so that is where the
+    attribution has to be -- and this test is what stops it being quietly
+    demoted to a comment later."""
+    from music_video_maker import diarization
+
+    assert "CC-BY-4.0" in diarization.ATTRIBUTION
+    assert "pyannote" in diarization.ATTRIBUTION
+
+    source = (REPO_ROOT / "music_video_maker" / "diarization.py").read_text()
+    assert 'logger.info("%s", ATTRIBUTION)' in source, (
+        "the CC-BY attribution is no longer logged when the pipeline loads; a licence "
+        "that only appears in a docs file is not attribution travelling with the use"
+    )
+
+    doc = (REPO_ROOT / "docs" / "vocalist-diarization.md").read_text()
+    assert "CC-BY-4.0" in doc
+    assert "Bredin" in doc
+    assert "No weights are committed here" in doc
+
+
+def test_no_diarization_weights_were_committed_by_accident():
+    """The one mechanical half of "nothing is redistributed".
+
+    ASSET_MANIFEST's extension list already covers ``.bin``/``.pt``/``.onnx``,
+    so a weights file would fail the undeclared-binary test above -- this is
+    the narrower check that no pyannote cache or model directory crept in under
+    a name that list does not know."""
+    tracked = _tracked_files()
+    suspicious = sorted(
+        path
+        for path in tracked
+        if "pyannote" in path.lower() or "huggingface" in path.lower()
+    )
+    assert not suspicious, (
+        "file(s) that look like fetched pyannote/Hugging Face assets are committed: "
+        f"{suspicious}. The models are gated and CC-BY-4.0; this project redistributes "
+        "none of them (issue #101)."
+    )

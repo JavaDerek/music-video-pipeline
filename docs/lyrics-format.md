@@ -32,11 +32,11 @@ render identically as "these names are singing this line."
 ## More than one singer: this is how you do it today
 
 If a song has more than one vocalist, **`[Name]` / `[Name: Role]` tags are
-the only supported way to say so.** There is no automatic detection of who
-is singing — nothing in this project listens to the audio and guesses a
-speaker. Every line's active character comes from the most recent tag above
-it (or `config.default_lead_vocalist` if there has never been one), full
-stop. This is a documented, tested, working feature
+the mechanism you should use, and the only one a default run has.** Every
+line's active character comes from the most recent tag above it (or
+`config.default_lead_vocalist` if there has never been one), full stop.
+Automatic detection exists since 2026-10-04 but is **opt-in, off by default,
+and cannot overrule a tag** — see the end of this section. This is a documented, tested, working feature
 (`tests/test_multi_vocalist.py` walks it end to end, from a two-tag lyrics
 file through alignment and slicing to the composed prompt and the staged
 reference photo) — it is not a fallback or a partial implementation waiting
@@ -55,10 +55,30 @@ story, including the level 3 case where the *lyrics themselves* were
 incomplete). **If a song has more than one voice, tag every handoff, not
 just the first one.**
 
-Automatic diarization (detecting who is singing from the audio itself,
-rather than being told) does not exist yet. See
-[`docs/design-multi-vocalist.md`](design-multi-vocalist.md) for the design
-of that feature and why it is not simply "the same thing but automatic."
+### Automatic detection does not change any of the above
+
+Automatic diarization — detecting who is singing from the audio itself,
+rather than being told — is **built** (issue #101,
+[`docs/vocalist-diarization.md`](vocalist-diarization.md)), and it changes
+nothing in this document. Three reasons it is written here as a footnote
+rather than as an alternative:
+
+- it is **opt-in** (`diarize = true`) and needs an isolated vocal stem. A run
+  that does not ask for it is byte-identical to one from before the feature
+  existed, and these tags are still the whole mechanism;
+- it writes **this same field**. Detection is a second producer of the
+  `characters` a tag produces, never a parallel path, so nothing in this
+  format gains a new meaning;
+- **a tag always wins.** Detection fills only the lines no tag covers, and a
+  tag the detection disagrees with is *reported* and left alone — a silent
+  overwrite of an authored fact is the defect, not the fix. Since a tag runs
+  until the next tag, a file that tags its first verse and nothing else gets
+  no assignments at all; the disagreement report is what tells you so.
+
+Tagging every handoff by hand remains the recommended workflow, because the
+automatic path has never been scored against a real multi-vocalist song. See
+[`docs/design-multi-vocalist.md`](design-multi-vocalist.md) for the design and
+why it is not simply "the same thing but automatic."
 
 ## Plain lines, no tags at all
 
