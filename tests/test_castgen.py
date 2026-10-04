@@ -707,7 +707,10 @@ def test_the_origin_block_is_what_configpy_already_requires(
     its rules -- a second implementation of "what a synthetic cast member
     needs" drifts from the first within a month.
     """
-    import tomllib
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.10, which this project still supports
+        import tomli as tomllib
 
     _session, result = generate(tmp_path, anchor_template, view_template)
     parsed = tomllib.loads(result.origin_toml())
