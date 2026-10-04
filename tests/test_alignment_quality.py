@@ -16,10 +16,12 @@ import logging
 import math
 import shutil
 import subprocess
+from array import array
 from pathlib import Path
 
 import pytest
 
+from music_video_maker import alignment_quality, voicing
 from music_video_maker.alignment_quality import (
     FINDING_ISOLATED,
     FINDING_LOW_CONFIDENCE,
@@ -28,6 +30,7 @@ from music_video_maker.alignment_quality import (
     FINDING_OUT_OF_ORDER,
     FINDING_OVERLAP,
     FINDING_SPLIT_LINE,
+    FINDING_SUSTAINED_TONE,
     FINDING_VOICE_IN_UNPLACED_GAP,
     FINDING_WPS_HIGH,
     FINDING_WPS_LOW,
@@ -1512,6 +1515,111 @@ def test_the_periodicity_finding_is_never_critical_and_never_blocks(tmp_path):
     report = _periodicity_report(tmp_path, ["voice", "voice", "voice", "voice", "noise"])
 
     raise_if_blocking(report, strict=True)  # must not raise
+
+
+# --------------------------------------------------------------------------- #
+# Too harmonic to be a voice (#96, calibrated 2026-10-04).
+#
+# These drive the decision with the numbers the real master produced, rather
+# than with synthetic audio: the harness's "voice" source is a clean harmonic
+# tone and scores 17.8dB HNR, where a real sung line on "Deathless" reaches at
+# most 7.5dB. A fixture that cannot reproduce the property under test cannot
+# test the threshold derived from it -- so the measurement seam is replaced
+# and the real table is played through the check.
+# --------------------------------------------------------------------------- #
+
+# (segment index, HNR dB, what it is) straight off
+# measurements/render_v14_2026-10-04/voicing_calibration.csv.
+_REAL_HNR = [
+    (0, 21.9, "'deathless, Forevermore!' 498.730 -- phantom over silence"),
+    (1, 12.5, "'mushrooms grow.' 228.590 -- phantom over a guitar note"),
+    (2, 7.5, "'past Volokov's mill,' -- the most harmonic SUNG line"),
+    (3, 6.9, "'Dwells Kashay the Deathless,' -- sung"),
+    (4, 2.2, "'you.' 378.470 -- the QUIET phantom this axis cannot see"),
+    (5, -2.7, "'Savoring the madness...' -- sung"),
+]
+
+
+def _real_voicing_report(tmp_path, monkeypatch, **kwargs):
+    segments = tuple(
+        make_aligned_segment(i, f"lyric {i}", i * 3.0, i * 3.0 + 2.0, "Dianne")
+        for i, _, _ in _REAL_HNR
+    )
+    measured = {
+        i: voicing.SegmentVoicing(
+            start=i * 3.0,
+            end=i * 3.0 + 2.0,
+            frames_total=100,
+            frames_measured=100,
+            voiced_fraction=1.0,
+            median_nccf=10 ** (hnr / 10) / (1 + 10 ** (hnr / 10)),
+            hnr_db=hnr,
+            level_dbfs=-18.0,
+            median_f0_hz=110.0,
+            f0_jitter_pct=0.5,
+            f0_span_semitones=4.0,
+        )
+        for i, hnr, _ in _REAL_HNR
+    }
+    track = alignment_quality.TrackVoicing(
+        audio=voicing.PcmAudio(samples=array("f", [0.0] * 16000), sample_rate=16000),
+        by_segment_index=measured,
+        level_floor_dbfs=-35.7,
+    )
+    monkeypatch.setattr(
+        alignment_quality, "measure_placed_segment_voicing", lambda *a, **k: track
+    )
+    result = AlignmentResult(segments=segments, track_duration=len(_REAL_HNR) * 3.0)
+    return evaluate_alignment_quality(
+        result,
+        audio_path=_write_stub_audio(tmp_path),
+        ffmpeg_runner=_FakeDecodingRunner([near_silence_samples(1.0, seed=1)]),
+        **kwargs,
+    )
+
+
+def test_the_two_real_phantoms_are_flagged_as_too_harmonic(tmp_path, monkeypatch):
+    """Both phantoms, and only them: the floor sits in the empty 7.5-12.5dB
+    band this table measured."""
+    report = _real_voicing_report(tmp_path, monkeypatch)
+
+    hits = [f for f in report.findings if f.code == FINDING_SUSTAINED_TONE]
+    assert [f.segment_index for f in hits] == [0, 1]
+    assert hits[0].severity is Severity.WARNING
+    assert "HNR" in hits[0].message
+
+
+def test_no_sung_segment_is_flagged_as_too_harmonic(tmp_path, monkeypatch):
+    """7.5dB is the most harmonic sung line on the track; it must stay clear."""
+    report = _real_voicing_report(tmp_path, monkeypatch)
+
+    flagged = {f.segment_index for f in report.findings if f.code == FINDING_SUSTAINED_TONE}
+    assert flagged.isdisjoint({2, 3, 5})
+
+
+def test_the_quiet_phantom_is_not_claimed_by_this_axis(tmp_path, monkeypatch):
+    """'you.' measures 2.2dB -- inside the sung range, because an instrumental
+    bed is not a clean tone. #71's level axis owns that one, and this check
+    must not be sold as covering all three F43 phantoms."""
+    report = _real_voicing_report(tmp_path, monkeypatch)
+
+    flagged = {f.segment_index for f in report.findings if f.code == FINDING_SUSTAINED_TONE}
+    assert 4 not in flagged
+
+
+def test_the_too_harmonic_finding_never_blocks_a_strict_run(tmp_path, monkeypatch):
+    report = _real_voicing_report(tmp_path, monkeypatch)
+
+    raise_if_blocking(report, strict=True)  # must not raise
+
+
+def test_a_segment_over_a_sustained_tone_is_a_phantom_suspect(tmp_path, monkeypatch):
+    """#92's "still owed" is why this finding exists: the merge detector reads
+    the aligner's segments as ground truth, and on "Deathless" the words it
+    dropped as "the other singer's" were over a guitar note."""
+    report = _real_voicing_report(tmp_path, monkeypatch)
+
+    assert {0, 1} <= suspect_segment_indices(report)
 
 
 def test_a_track_of_real_voices_produces_no_periodicity_finding(tmp_path):

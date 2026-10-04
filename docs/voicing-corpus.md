@@ -5,9 +5,10 @@ The register the voiced-vs-unvoiced lint gets calibrated from. Same role as
 numbers live so the next revision starts from data rather than from a rebuilt
 experiment.
 
-`alignment_quality.VOICING_RATIO_THRESHOLD` currently ships **uncalibrated**.
-Everything below marked "to be filled in" is a hole in the evidence, not an
-omission from the write-up.
+`alignment_quality.VOICING_RATIO_THRESHOLD` still ships uncalibrated, and the
+calibration below is why it stays that way: **it fires on nothing**. The axis
+that works came out of the same run and ships as
+`alignment_quality.SUSTAINED_TONE_HNR_DB`.
 
 ## What the check measures
 
@@ -96,6 +97,41 @@ Three questions the table answers, in order:
 
 Anything the table shows that contradicts the synthetic numbers above is the
 finding, and the synthetic numbers lose.
+
+## The real master, 2026-10-04 — and the synthetic numbers lost
+
+Run over "Deathless" (`calibrate_voicing --config run_v14_cine.toml`, 49 judged
+placed segments plus the three F43 windows). Full table:
+`~/mvm-runs/deathless/measurements/render_v14_2026-10-04/voicing_calibration.csv`.
+
+**1. `vf_ratio` flags 0 of 49, and both judged phantoms sit at the ceiling
+(1.50).** Prediction 2 above was too generous: the guitar note does not merely
+pass, it scores as the *most* voiced material in the song, alongside the pure
+tone at 8:19. A fraction-of-voiced-frames statistic cannot carry this check at
+any threshold, because moving the number down flags sung lines before it
+reaches either phantom.
+
+**2. `jitter%` does not separate either** — the module's own suggested next
+axis. Phantoms 0.10% and 0.12%; three sung segments sit at or below 0.12%.
+
+**3. `hnr_dB` separates perfectly, with a 5 dB gap:**
+
+| rank | `hnr_dB` | segment |
+|---|---|---|
+| 1 | **21.9** | `'deathless, Forevermore!'` 498.730 — phantom over silence (the known #71 one) |
+| 2 | **12.5** | `'mushrooms grow.'` 228.590 — phantom over a guitar note (F43's headline case) |
+| 3 | 7.5 | `'past Volokov's mill,'` — the most harmonic **sung** line |
+| 4… | ≤ 7.5 | the other 46 sung segments |
+
+The direction is the result and it is counter-intuitive: **a phantom is too
+clean, not too quiet.** A voice carries breath, onset noise and vibrato; a
+plucked string and a sustained tone do not. `SUSTAINED_TONE_HNR_DB = 10.0`
+sits at the midpoint of the empty band.
+
+**4. The third phantom is not on this axis.** `'you.'` 378.470–379.430 measures
+**2.2 dB** HNR at −23.8 dBFS — inside the sung range, because an instrumental
+bed is not a clean single tone. It is the quiet case; #71 owns it. Any claim
+that one threshold catches all three F43 phantoms is wrong.
 
 ## Can the aligner be told, instead of only checked?
 

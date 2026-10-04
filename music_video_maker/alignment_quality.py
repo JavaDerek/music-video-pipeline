@@ -516,16 +516,61 @@ unless something asked the second question, and a span whose every frame was
 gated out has told us about its level, not about its voice. #71 is the check
 that owns the level question and it has already run on the same span."""
 
+SUSTAINED_TONE_HNR_DB = 10.0
+"""How harmonic a placed segment may be before it is reported as more likely
+a sustained pitched instrument than a voice.
+
+**Calibrated against the real master on 2026-10-04** (issue #96), which is
+what :data:`VOICING_RATIO_THRESHOLD` below still lacks. Ranking all 49 judged
+placed segments of "Deathless" by HNR:
+
+  ====== ======== ==================================================
+  rank   HNR dB   what it is
+  ====== ======== ==================================================
+  1      21.9     ``'deathless, Forevermore!'`` 498.730 -- over silence
+  2      12.5     ``'mushrooms grow.'`` 228.590 -- over a guitar note
+  3      7.5      ``'past Volokov's mill,'`` -- the most harmonic SUNG line
+  ...    <=7.5    the other 46 sung segments
+  ====== ======== ==================================================
+
+Both phantoms are the top two of 49 and nothing sung comes near them, so this
+threshold sits in the empty 7.5-12.5 dB band, at its midpoint. The direction
+is the finding: **a phantom is too clean, not too quiet.** A voice carries
+breath, onset noise and vibrato; a plucked string and a pure tone do not, so
+the segment that reads *most* like a textbook voice is the one that is not one.
+
+Two limits, both measured rather than assumed:
+
+  - It is a restatement of ``median_nccf`` (Boersma's relation), not
+    independent evidence. Thresholding HNR and thresholding median NCCF are
+    the same act; HNR is used because the issue names it and because decibels
+    have a band a human can reason about.
+  - It does **not** catch the third F43 phantom, and no movement of this
+    number would. ``'you.'`` 378.470-379.430 measures **2.2dB** HNR at
+    -23.8dBFS -- squarely inside the sung range, because an instrumental bed
+    is not a clean single tone. That one is the *quiet* case and #71's axis
+    owns it. A threshold here must not be sold as covering all three.
+
+Re-derive with ``python -m music_video_maker.calibrate_voicing --config
+<run>.toml`` and read the ``hnr_dB`` column against the sung segments of that
+track, as above."""
+
 VOICING_RATIO_THRESHOLD = 0.30
 """How small a placed segment's voiced fraction may be, relative to the
 *median* voiced fraction across this track's other measurable placed
 segments, before it is reported as having no voice in it.
 
-**This number has not been calibrated against a real master, and until it has
-been it is a hypothesis.** Saying so here is the point: #71's neighbouring
-threshold carries four real measurements in its docstring and this one cannot,
-because the machine this was built on does not hold the track. What is
-reasoned rather than measured:
+**Calibrated 2026-10-04, and it flags nothing.** Over "Deathless"'s 49 judged
+placed segments this statistic fires on **0** of them, and both known phantoms
+score at its *ceiling* (voiced fraction 1.00): a plucked string and a sustained
+tone are more periodic than a sung vowel, so the fraction ranks a phantom as
+the most voiced material in the song. The axis that does separate them is
+harmonic-to-noise ratio -- see :data:`SUSTAINED_TONE_HNR_DB`, which is the
+finding that came out of that calibration. This threshold is kept because the
+opposite failure is real too (a lyric placed over broadband noise or a
+non-pitched bed scores low here and nothing else would catch it), but it has
+never fired on real material and should not be read as the phantom check.
+What is reasoned rather than measured:
 
   - The statistic is a ratio against the track's own median, so it inherits
     #71's self-calibration and needs no absolute level to mean anything --
@@ -545,16 +590,16 @@ voiced fraction of 1.00, broadband noise 0.00, near-silence is gated out
 entirely -- and a decaying plucked string also scores 1.00, which is the
 documented limit of the whole approach rather than a threshold problem.
 
-To calibrate, on the machine that holds the master::
+That calibration, run on the machine that holds the master::
 
-    python -m music_video_maker.calibrate_voicing --config run_v13.toml
+    python -m music_video_maker.calibrate_voicing --config run_v14_cine.toml \
+        --window 228.590-230.150 --window 378.470-379.430 --window 498.730-501.630
 
-and read the ``vf_ratio`` column: the three F43 windows (228.590-230.150,
-378.470-379.430 and the 8:19 phantom) against the other ~54 placed segments.
-If the phantoms are not separated by ``vf_ratio``, look at ``jitter%`` and
-``f0_span`` in the same table before moving this number -- a plucked string
-is metronomic where a voice is not, and that is the axis a periodicity
-threshold cannot reach."""
+reported ``vf_ratio`` 1.50 (the ceiling) for both judged phantoms and flagged
+none of the 49. ``jitter%`` was checked as the module's own next suggestion and
+does **not** separate either: the phantoms sit at 0.10-0.12% and three sung
+segments sit at or below that. ``hnr_dB`` separates with a clean 5dB gap, which
+is where :data:`SUSTAINED_TONE_HNR_DB` came from."""
 
 # --------------------------------------------------------------------------- #
 # Finding codes.
@@ -575,9 +620,15 @@ FINDING_COUNTERPOINT_SPAN = "counterpoint_degenerate_span"
 FINDING_NO_VOCAL_ENERGY = "no_vocal_energy_in_placed_segment"
 FINDING_VOICE_IN_UNPLACED_GAP = "voice_in_unplaced_gap"
 FINDING_NO_VOICED_PERIODICITY = "no_voiced_periodicity_in_placed_segment"
+FINDING_SUSTAINED_TONE = "sustained_tone_under_placed_segment"
 
 PHANTOM_SUSPECT_CODES = frozenset(
-    {FINDING_NO_VOCAL_ENERGY, FINDING_NO_VOICED_PERIODICITY, FINDING_ISOLATED}
+    {
+        FINDING_NO_VOCAL_ENERGY,
+        FINDING_NO_VOICED_PERIODICITY,
+        FINDING_SUSTAINED_TONE,
+        FINDING_ISOLATED,
+    }
 )
 """Finding codes that mean "there may be no voice where this lyric was placed".
 
@@ -710,6 +761,7 @@ def evaluate_alignment_quality(
     gap_level_drop_db: float = GAP_LEVEL_DROP_DB,
     gap_vocal_energy_ratio_threshold: float = GAP_VOCAL_ENERGY_RATIO_THRESHOLD,
     voicing_ratio_threshold: float = VOICING_RATIO_THRESHOLD,
+    voicing_sustained_tone_hnr_db: float = SUSTAINED_TONE_HNR_DB,
     voicing_frame_level_drop_db: float = VOICING_FRAME_LEVEL_DROP_DB,
     voicing_min_measured_frames: int = VOICING_MIN_MEASURED_FRAMES,
     ffmpeg_runner: FfmpegRunner | None = None,
@@ -798,6 +850,7 @@ def evaluate_alignment_quality(
             gap_level_drop_db=gap_level_drop_db,
             gap_ratio_threshold=gap_vocal_energy_ratio_threshold,
             voicing_ratio_threshold=voicing_ratio_threshold,
+            voicing_sustained_tone_hnr_db=voicing_sustained_tone_hnr_db,
             voicing_frame_level_drop_db=voicing_frame_level_drop_db,
             voicing_min_measured_frames=voicing_min_measured_frames,
             runner=ffmpeg_runner,
@@ -1494,6 +1547,7 @@ def _check_voiced_periodicity(
     min_duration_s: float,
     min_baseline_segments: int,
     ratio_threshold: float,
+    sustained_tone_hnr_db: float,
     frame_level_drop_db: float,
     min_measured_frames: int,
 ) -> list[Finding]:
@@ -1559,6 +1613,31 @@ def _check_voiced_periodicity(
             continue
         baseline = statistics.median(others)
         if baseline <= 0:
+            continue
+        if this.hnr_db >= sustained_tone_hnr_db:
+            segment = by_index[index]
+            findings.append(
+                Finding(
+                    segment_index=index,
+                    start=segment.start,
+                    end=segment.end,
+                    severity=Severity.WARNING,
+                    code=FINDING_SUSTAINED_TONE,
+                    message=(
+                        f"segment {index} ({segment.start:.3f}s -> {segment.end:.3f}s) is "
+                        f"more harmonic than a voice: {this.hnr_db:.1f}dB HNR (median NCCF "
+                        f"{this.median_nccf:.3f}) across {this.frames_measured} audible "
+                        f"analysis frame(s) at {this.level_dbfs:.1f}dBFS, against a floor of "
+                        f"{sustained_tone_hnr_db:.1f}dB. A sung vowel carries breath, onset "
+                        "noise and vibrato; a plucked string or a sustained tone does not, so "
+                        "the segment reading MOST like a textbook voice is the one least "
+                        "likely to be one. On the master this floor was calibrated against, "
+                        "the two known phantoms scored 21.9 and 12.5dB and the most harmonic "
+                        "sung line reached 7.5 (issue #96). A lyric may be placed here over "
+                        "an instrument that is not singing it"
+                    ),
+                )
+            )
             continue
         ratio = this.voiced_fraction / baseline
         if ratio >= ratio_threshold:
@@ -1633,6 +1712,7 @@ def _check_vocal_energy(
     gap_level_drop_db: float,
     gap_ratio_threshold: float,
     voicing_ratio_threshold: float,
+    voicing_sustained_tone_hnr_db: float,
     voicing_frame_level_drop_db: float,
     voicing_min_measured_frames: int,
     runner: FfmpegRunner | None,
@@ -1764,6 +1844,7 @@ def _check_vocal_energy(
                 min_duration_s=min_duration_s,
                 min_baseline_segments=min_baseline_segments,
                 ratio_threshold=voicing_ratio_threshold,
+                sustained_tone_hnr_db=voicing_sustained_tone_hnr_db,
                 frame_level_drop_db=voicing_frame_level_drop_db,
                 min_measured_frames=voicing_min_measured_frames,
             )
