@@ -328,6 +328,25 @@ class PrepareReport:
     instrumental_chunk_count: int = 0
     voiced_chunk_count: int = 0
     total_frames: int | None = None
+    max_chunk_frames: int | None = None
+    """The largest ``frame_count`` in this timeline, and the one number the
+    issue #98 render-envelope gate needs (``max_chunk_frames_chunk_id`` names
+    the chunk it came from).
+
+    Recorded so that something which is *not* running Stage 1-2 can evaluate
+    that gate from published data instead of recomputing the timeline -- the
+    web monitor's control half (:mod:`music_video_maker.control`) does
+    exactly this before it will start a render. It is sufficient, not a
+    convenience: ``envelope.EnvelopePoint.covers`` is per-axis, so at one
+    fixed resolution the chunk with the most frames decides the whole run.
+    Cover the largest and every shorter chunk is covered; miss it and the run
+    is refused. (Which *other* chunks also miss is reporting, and only the
+    per-chunk check inside the run can enumerate those.)
+
+    ``None`` on a report written before this field existed, which is read as
+    "this report cannot answer the question", never as "nothing is too
+    long" -- the same distinction ``largest_rendered_frame_count`` draws."""
+    max_chunk_frames_chunk_id: int | None = None
     timeline_start: float | None = None
     timeline_end: float | None = None
     track_duration_seconds: float | None = None
@@ -400,6 +419,8 @@ class PrepareReport:
             "instrumental_chunk_count": self.instrumental_chunk_count,
             "voiced_chunk_count": self.voiced_chunk_count,
             "total_frames": self.total_frames,
+            "max_chunk_frames": self.max_chunk_frames,
+            "max_chunk_frames_chunk_id": self.max_chunk_frames_chunk_id,
             "timeline_start": self.timeline_start,
             "timeline_end": self.timeline_end,
             "track_duration_seconds": self.track_duration_seconds,
@@ -437,6 +458,8 @@ class PrepareReport:
             instrumental_chunk_count=int(raw.get("instrumental_chunk_count", 0)),  # type: ignore[arg-type]
             voiced_chunk_count=int(raw.get("voiced_chunk_count", 0)),  # type: ignore[arg-type]
             total_frames=_opt_int(raw.get("total_frames")),
+            max_chunk_frames=_opt_int(raw.get("max_chunk_frames")),
+            max_chunk_frames_chunk_id=_opt_int(raw.get("max_chunk_frames_chunk_id")),
             timeline_start=_opt_float(raw.get("timeline_start")),
             timeline_end=_opt_float(raw.get("timeline_end")),
             track_duration_seconds=_opt_float(raw.get("track_duration_seconds")),
@@ -550,6 +573,11 @@ def build_prepare_report(
         for finding in quality_report.at_least(Severity.WARNING)
     )
     frames = [chunk.frame_count for chunk in chunks if chunk.frame_count is not None]
+    longest = max(
+        (chunk for chunk in chunks if chunk.frame_count is not None),
+        key=lambda chunk: chunk.frame_count,
+        default=None,
+    )
     instrumental = sum(1 for chunk in chunks if chunk.is_instrumental)
     drift_frames = (
         timeline_drift_seconds * fps
@@ -566,6 +594,8 @@ def build_prepare_report(
         instrumental_chunk_count=instrumental,
         voiced_chunk_count=len(chunks) - instrumental,
         total_frames=sum(frames) if frames else None,
+        max_chunk_frames=longest.frame_count if longest is not None else None,
+        max_chunk_frames_chunk_id=longest.chunk_id if longest is not None else None,
         timeline_start=min((chunk.start for chunk in chunks), default=None),
         timeline_end=max((chunk.end for chunk in chunks), default=None),
         track_duration_seconds=track_duration_seconds,

@@ -1,4 +1,4 @@
-"""Read-only HTTP progress monitor for one run (issue #36).
+"""HTTP progress monitor for one run, and (opt-in) its start/stop control.
 
 ``python -m music_video_maker.webui --config run.toml`` (or the ``mvm-webui``
 console script) serves a browser-facing view of a run that is already in
@@ -8,27 +8,42 @@ this module's own job is the socket, the routes, and the one constraint nothing
 else in this project enforces for you: **what this process is allowed to bind
 to**.
 
-Scope: read-only, deliberately. What is NOT here
---------------------------------------------------
-There is no way to start, configure, resume, or reseed a run from this
-server -- no form, no POST route, nothing that touches ``run.toml`` or calls
-into ``cli.run_pipeline``/``resilience.ResilientRunner``. Two reasons, and
-neither is "ran out of time":
+Read-only by default; ``--enable-control`` adds two POST routes
+-----------------------------------------------------------------
+Until 2026-10-04 this server had no write route at all, and the reason was
+not "ran out of time": starting a render means exclusive GPU custody and the
+host-wedge failure mode, and nobody had decided what a button may do. The
+owner decided on 2026-10-04 that **the page may start and stop a run, with
+guards** -- and nothing else. So:
 
-1. **GPU custody is exclusive** (see ``custody.py``'s module docstring and
-   CLAUDE.md's "GPU custody protocol"). Starting a render safely means
-   refusing a second one in flight, running the issue #19 pre-flight, and
-   respecting that a wedge under VRAM contention can strand the host --
-   ``docs/design-web-ui.md``'s whole "Custody and resume" section is about
-   exactly this, and the owner has not yet reviewed how a *server* (as
-   opposed to the CLI, which already gets all of this) should gate it.
-2. Any control surface that can start a render can write files and load
-   custom nodes *by proxy through ComfyUI* (ComfyUI has no auth of its own).
-   A read-only monitor that only ever reads ``run_state.json`` and serves
-   pre-existing files cannot become that, no matter what address it is
-   reachable from. A start/configure half would have to clear a much higher
-   bar than this module does, and is out of scope here on purpose -- see
-   ``docs/design-web-ui.md``.
+* The control routes are **opt-in** (``--enable-control``). Without the flag
+  this process is exactly the read-only monitor it has always been: ``GET``
+  and ``HEAD`` only, every other method a flat ``405``, and no form in the
+  page. An existing deployment does not acquire a write surface by being
+  upgraded.
+* The *write surface is two paths*, ``POST /start`` and ``POST /stop``, and
+  neither takes anything from the request but a CSRF token and a ``resume``
+  flag. Nothing configures a run from here: issue #36's "what the page
+  collects" half is still not built, ``run.toml`` is still the source of
+  truth, and a human still edits it.
+* Every gate the CLI runs, the start runs -- because the start **is** the
+  CLI (``python -m music_video_maker.cli --config ...``, spawned in its own
+  session). The custody pre-flight, the issue #10 disk check, the issues
+  #24/#98 render-envelope refusal, ``prevent_host_sleep`` and the
+  unconditional ``POST /free`` in a ``finally`` are all the pipeline's own
+  and are not reimplemented here. :mod:`music_video_maker.control` holds the
+  pre-spawn gate (which calls the same functions), the one-claim lock, and
+  the stop; read its module docstring before changing any of this.
+* A stop is a SIGINT to the child's process group, which is what Ctrl-C is.
+  There is no second shutdown path.
+
+What a *request* can reach is therefore: read a run's own data, start the run
+this config already describes, or interrupt it. It cannot name a path, a
+chunk, a resolution or a config value. That matters because anything able to
+start a render can write files and load custom nodes *by proxy through
+ComfyUI*, which has no auth of its own -- so the control half is defended as
+a write route in its own right (see "Reaching the control routes" below) and
+not merely by the bind list.
 
 Why this module never recomputes the chunk timeline
 ------------------------------------------------------
@@ -107,22 +122,55 @@ Two deliberate choices in it:
   authorities is a request-smuggling shape, not something a client this
   server should answer produces by accident.
 
+Reaching the control routes
+------------------------------
+The Host check above stops a *rebound name*. It does not stop a form on a
+page the operator is simply visiting: a cross-site ``POST`` of
+``application/x-www-form-urlencoded`` needs no CORS preflight, so "the
+browser is pointed at loopback" is all an attacker's page would need if the
+only check were the bind list. :func:`control_request_refusal` is the
+defence, and it is three checks that must all pass, deliberately layered
+rather than picked:
+
+1. **A per-process CSRF token**, generated at startup
+   (:func:`new_control_token`), embedded in the page's forms and compared
+   with ``secrets.compare_digest``. This is the load-bearing one: the token
+   is only obtainable by *reading* ``GET /``, which a cross-origin script
+   cannot do (no CORS headers are ever sent, and a rebound name is refused
+   by the Host check before any handler runs).
+2. **``Sec-Fetch-Site`` must be ``same-origin`` or ``none``** when present.
+   Every current browser sends it and script cannot forge it; ``none`` is a
+   typed navigation. ``same-site`` is refused too -- a sibling host is not
+   this origin. Absent (``curl``, an old client) falls through to the token.
+3. **``Origin``, when present, must be this server's own origin** -- the
+   bound literal, ``localhost``, or an ``--allow-host`` name, on this port,
+   over ``http``. ``null`` (a sandboxed iframe, a ``file://`` page) is
+   refused rather than treated as absent.
+
+Two smaller rules in the same spirit: only
+``application/x-www-form-urlencoded`` is accepted (so a cross-origin
+``fetch`` would need a content type requiring a preflight, and ``OPTIONS``
+is a flat ``405`` with no CORS headers), and the index carries
+``Cache-Control: no-store`` when control is on so the token is not stored by
+anything on the way.
+
+A refusal says which check failed and never echoes the value it rejected.
+
 Testing (issue #36's day-one list)
 -------------------------------------
 The design doc names two tests that must exist on day one for a server like
-this. Both are here:
+this. Both exist:
 
 * the bind-address assertion -- :func:`resolve_bind_addresses` and
   :func:`validate_bind_address` are pure and covered directly; a handful of
   tests also build real ``ThreadingHTTPServer`` instances on loopback with
   port 0 and assert ``server.server_address``, per the task's own
   instruction, rather than trusting the pure function alone.
-* "starting a run while one is in flight is refused" -- **does not apply**
-  to this server. There is no start route to refuse a second run from, by
-  the scope decision above. See
-  ``test_starting_a_run_while_one_is_in_flight_is_refused_does_not_apply``
-  in ``tests/test_webui.py`` for the same statement as an executable test,
-  so nobody reading the suite concludes it was forgotten.
+* "starting a run while one is in flight is refused" -- this used to be
+  recorded as *not applicable*, there being no start route. It applies now:
+  ``tests/test_control.py::TestOneRunAtATime`` covers the gate and the
+  cross-process claim, and ``tests/test_webui.py::TestControlStart`` covers
+  the ``409`` a browser gets.
 """
 
 from __future__ import annotations
@@ -132,6 +180,7 @@ import html
 import ipaddress
 import logging
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -142,10 +191,20 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from music_video_maker.config import ConfigError, load_config
 from music_video_maker.contracts import RunState
+from music_video_maker.control import (
+    ControlError,
+    RenderController,
+    RenderState,
+    RenderStatus,
+    StartGate,
+    StartRefused,
+    StopRefused,
+    read_log_tail,
+)
 from music_video_maker.logging_setup import configure_logging
 from music_video_maker.prepare_report import (
     PrepareReport,
@@ -414,6 +473,98 @@ def host_header_allowed(
 
 
 # --------------------------------------------------------------------------- #
+# Reaching the control routes -- the write-route defence (see the module
+# docstring's "Reaching the control routes")
+# --------------------------------------------------------------------------- #
+
+CONTROL_PATHS = ("/start", "/stop")
+"""The entire write surface. Two paths, no parameters that reach a file."""
+
+CONTROL_FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
+
+MAX_CONTROL_BODY_BYTES = 4096
+"""A control form is two short fields. Anything larger is not one of ours."""
+
+SAFE_FETCH_SITES = frozenset({"same-origin", "none"})
+"""``Sec-Fetch-Site`` values this server will act on. ``none`` is a typed
+navigation or a bookmark; ``same-site`` is deliberately **not** here -- a
+sibling host is not this origin."""
+
+
+def new_control_token() -> str:
+    """A fresh CSRF token for one server process.
+
+    Per process, never persisted: restarting ``mvm-webui`` invalidates every
+    form a browser is still holding, which is the right direction for a
+    token whose only job is to prove the submitter had read a page served by
+    *this* process."""
+    return secrets.token_urlsafe(32)
+
+
+def _origin_is_own(
+    raw: str,
+    *,
+    bound_address: str,
+    port: int,
+    extra_allowed: frozenset[str],
+) -> bool:
+    """Whether an ``Origin`` header names this server's own origin.
+
+    Reuses :func:`host_header_allowed` for the authority so there is one
+    definition of "a host this server answers for", and adds the two things
+    an origin has that a ``Host`` does not: a scheme (``http`` only -- this
+    server speaks no TLS, so an ``https`` origin on its port is not it) and
+    the literal value ``null``, which a sandboxed iframe or a ``file://``
+    page sends and which must be refused rather than read as absent."""
+    parsed = urlsplit(raw.strip())
+    if parsed.scheme != "http" or not parsed.netloc:
+        return False
+    return host_header_allowed(
+        parsed.netloc,
+        bound_address=bound_address,
+        port=port,
+        extra_allowed=extra_allowed,
+    )
+
+
+def control_request_refusal(
+    *,
+    origin: str | None,
+    sec_fetch_site: str | None,
+    token: str | None,
+    expected_token: str,
+    bound_address: str,
+    port: int,
+    extra_allowed: frozenset[str] = frozenset(),
+) -> str | None:
+    """``None`` when a control POST may be acted on, else the reason it may
+    not -- operator-facing text, naming the check rather than the value.
+
+    See the module docstring's "Reaching the control routes" for why all
+    three checks are here and which one is load-bearing."""
+    if not expected_token:
+        return "this server was not started with --enable-control"
+    if sec_fetch_site is not None and sec_fetch_site.strip().lower() not in SAFE_FETCH_SITES:
+        return (
+            "the browser's own Sec-Fetch-Site header says this request did not come from "
+            "this page, so it is refused without looking at anything else in it"
+        )
+    if origin is not None and not _origin_is_own(
+        origin, bound_address=bound_address, port=port, extra_allowed=extra_allowed
+    ):
+        return (
+            "the Origin header is not this server's own origin. If you reach this monitor "
+            "by a name, start it with --allow-host <name>"
+        )
+    if not token or not secrets.compare_digest(token, expected_token):
+        return (
+            "the control token in the submitted form is missing or does not match this "
+            "server's. Reload the page (a token belongs to one server process) and try again"
+        )
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # What "the run's known chunks" means here -- see the module docstring's
 # "Why this module never recomputes the chunk timeline"
 # --------------------------------------------------------------------------- #
@@ -669,6 +820,14 @@ th { background: #eee; }
           background: #fff; border: 1px solid #ddd; }
 .banner-bad { background: #ffecec; border-color: #e88; }
 .msg { font-family: ui-monospace, monospace; font-size: 0.82rem; white-space: pre-wrap; }
+.control { background: #fff; border: 1px solid #ddd; border-radius: 6px;
+           padding: 8px 12px; margin: 12px 0; }
+.control form { display: inline-block; margin-right: 16px; }
+.gate-ok { background: #eaffea; }
+.gate-bad { background: #ffecec; }
+.logtail { background: #111; color: #eee; border-radius: 6px; padding: 8px 12px;
+           font-family: ui-monospace, monospace; font-size: 0.78rem;
+           white-space: pre-wrap; overflow-x: auto; }
 """
 
 _SSE_SCRIPT = """
@@ -693,8 +852,147 @@ try {
 """
 
 
+def _render_gate(gate: StartGate) -> str:
+    rows = "\n".join(
+        '<tr class="{css}"><td>{name}</td><td>{verdict}</td><td class="msg">{detail}</td></tr>'
+        .format(
+            css="gate-ok" if check.passed else "gate-bad",
+            name=_e(check.name),
+            verdict="ok" if check.passed else "REFUSED",
+            detail=_e(check.detail),
+        )
+        for check in gate.checks
+    )
+    return (
+        "<table><tr><th>pre-flight check</th><th></th><th>what it found</th></tr>"
+        + rows
+        + "</table>"
+    )
+
+
+def _render_log_tail(status: RenderStatus) -> str:
+    if status.log_path is None:
+        return ""
+    tail = read_log_tail(status.log_path)
+    if not tail:
+        return (
+            f'<p class="note">Nothing written to <code>{_e(status.log_path)}</code> yet.</p>'
+        )
+    return (
+        f'<p class="note">The last lines of <code>{_e(status.log_path)}</code> -- this is '
+        "where a refusal from inside the run itself appears (a per-chunk envelope miss, a "
+        "config error, a strict-alignment stop):</p>"
+        f'<div class="logtail">{_e(tail)}</div>'
+    )
+
+
+def render_control_section(
+    status: RenderStatus, *, gate: StartGate | None, token: str
+) -> str:
+    """The control half of ``GET /``: what the run is doing, every pre-flight
+    check with its reading, and the one or two buttons that are honest right
+    now.
+
+    ``gate`` is ``None`` while a render is in flight: there is nothing useful
+    to say about free VRAM during a render that is using it, and probing
+    ComfyUI once per page load while it renders is noise. Called only when
+    ``--enable-control`` is on -- without it this never appears and there is
+    no form in the page at all."""
+    if status.state is RenderState.RUNNING and status.claim is not None:
+        claim = status.claim
+        started = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(claim.started_at))
+        lines = [
+            f'<div class="banner"><strong>Rendering</strong> &mdash; pid {_e(claim.pid)}, '
+            f"started {_e(started)}"
+            + (" (resumed)" if claim.resume else "")
+            + ". This process holds exclusive GPU custody.</div>"
+        ]
+        if claim.stop_requested_at is not None:
+            asked = time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(claim.stop_requested_at)
+            )
+            lines.append(
+                f'<p class="note">A stop was requested at {_e(asked)}. The run finishes the '
+                "chunk it is on, persists its state and releases the card in a "
+                "<code>finally</code> &mdash; the same stop as Ctrl-C. Nothing here escalates "
+                "to SIGKILL, because killing a render inside its <code>POST /free</code> is "
+                "how the card gets left holding 17 GB.</p>"
+            )
+        if status.owned:
+            lines.append(
+                '<form method="post" action="/stop">'
+                f'<input type="hidden" name="token" value="{_e(token)}">'
+                "<button type=\"submit\">Stop this run (SIGINT, like Ctrl-C)</button>"
+                "</form>"
+            )
+        else:
+            lines.append(
+                '<p class="note">This server did not start the run in flight, so it will not '
+                "signal it: a pid read out of a file this process did not write could have "
+                "been reused by something unrelated. Stop it with Ctrl-C in its own terminal, "
+                f"or <code>kill -INT {_e(status.claim.pgid)}</code> once you have confirmed "
+                "what it is.</p>"
+            )
+        lines.append(_render_log_tail(status))
+        return '<h2>Control</h2><div class="control">' + "\n".join(lines) + "</div>"
+
+    lines = []
+    if status.state is RenderState.EXITED and status.claim is not None:
+        code = (
+            f"exit code {status.exit_code}"
+            if status.exit_code is not None
+            else "exit code unknown (this server did not spawn it, or was restarted)"
+        )
+        lines.append(
+            f'<div class="banner"><strong>The last run this page started has exited</strong> '
+            f"&mdash; pid {_e(status.claim.pid)}, {_e(code)}.</div>"
+        )
+    allowed = gate is not None and gate.allowed
+    if gate is not None:
+        lines.append(_render_gate(gate))
+    lines.append(
+        '<form method="post" action="/start">'
+        f'<input type="hidden" name="token" value="{_e(token)}">'
+        '<label><input type="checkbox" name="resume" value="1"> --resume '
+        "(reuse chunks whose fingerprint still matches)</label> "
+        f'<button type="submit"{"" if allowed else " disabled"}>Start this run</button>'
+        "</form>"
+    )
+    if not allowed:
+        lines.append(
+            '<p class="note">At least one pre-flight check above refuses this run, so there '
+            "is nothing to start yet. A start is refused, never queued &mdash; GPU custody is "
+            "exclusive.</p>"
+        )
+    lines.append(
+        '<p class="note">Starting here runs the same CLI you would run by hand '
+        "(<code>music-video-maker --config &lt;run.toml&gt;</code>), so the custody "
+        "pre-flight, the disk check, the render-envelope refusal and the unconditional "
+        "<code>POST /free</code> are all the pipeline's own. This page cannot change what "
+        "the run does &mdash; edit <code>run.toml</code> for that &mdash; and it does not "
+        "stop the card's other tenants: that is still yours to do by hand.</p>"
+    )
+    lines.append(_render_log_tail(status))
+    return '<h2>Control</h2><div class="control">' + "\n".join(lines) + "</div>"
+
+
+def render_control_refusal_html(title: str, detail: str) -> bytes:
+    """The page a refused ``POST /start``/``/stop`` returns: why, in words,
+    with a way back. Every piece of it is escaped -- a gate's detail carries
+    file paths and a shot plan's own error text."""
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<title>refused</title><style>{_PAGE_CSS}</style></head>
+<body><h1>{_e(title)}</h1>
+<div class="banner banner-bad msg">{_e(detail)}</div>
+<p><a href="/">&larr; run monitor</a></p>
+</body></html>""".encode()
+
+
 def render_index_html(
-    progress: RunProgress | None, *, not_ready_reason: str | None = None
+    progress: RunProgress | None,
+    *,
+    not_ready_reason: str | None = None,
+    control_section: str = "",
 ) -> bytes:
     """Render ``GET /``. Renders a full, correct snapshot with no JavaScript
     required (issue #36's design doc: "the page must render its initial
@@ -710,6 +1008,7 @@ def render_index_html(
 <title>music-video-pipeline run monitor</title><style>{_PAGE_CSS}</style></head>
 <body><h1>Run monitor</h1><p class="note">Not ready yet: {reason}.
 This page will start showing chunks once <code>run_state.json</code> exists.</p>
+{control_section}
 </body></html>"""
         return body.encode("utf-8")
 
@@ -735,6 +1034,7 @@ timeline (it would write chunk audio into the live run's own directory). See
 <p class="note"><a href="/prepare">Pre-render checks</a> &mdash; what the last
 <code>--prepare</code> found for this run (alignment quality, Stage-2 warnings, timeline
 drift, shot-plan drift). Read from disk; this monitor never runs Stage 1-2 itself.</p>
+{control_section}
 <h2>Dead-lettered chunks</h2>
 {_render_dead_letters(progress)}
 <h2>Chunks</h2>
@@ -973,6 +1273,15 @@ class MonitorContext:
     without anything being configured, so the usual case needs no entry at
     all -- this is for a name, typically a Tailscale MagicDNS one, that no
     literal covers."""
+    controller: RenderController | None = None
+    """The control half, from ``--enable-control``. ``None`` -- the default
+    -- means this process has no write route at all: ``POST /start`` and
+    ``POST /stop`` are a flat ``405`` like every other method, and the page
+    contains no form. Control is opt-in because an existing deployment must
+    not acquire a write surface by being upgraded."""
+    control_token: str = ""
+    """The CSRF token for this process, non-empty exactly when
+    :attr:`controller` is set (:func:`new_control_token`)."""
 
 
 _CHUNK_THUMBNAIL_RE = re.compile(r"^/chunks/(\d+)/thumbnail\.png$")
@@ -1056,12 +1365,172 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
     def _method_not_allowed(self) -> None:
         if self._reject_unless_host_allowed():
             return
+        self._send_method_not_allowed()
+
+    def _send_method_not_allowed(self) -> None:
         self.send_response(405)
         self.send_header("Allow", "GET, HEAD")
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    do_POST = _method_not_allowed
+    # -- the control half -------------------------------------------------- #
+
+    def do_POST(self) -> None:
+        """``/start`` and ``/stop`` when ``--enable-control`` is on; a flat
+        ``405`` otherwise, which is what every POST got before 2026-10-04.
+
+        The Host check runs first, as it does for every other method, so a
+        rebound name never reaches the cross-site checks below -- let alone
+        the controller."""
+        if self._reject_unless_host_allowed():
+            return
+        ctx: MonitorContext = self.server.ctx  # type: ignore[attr-defined]
+        path = urlsplit(self.path).path
+        if ctx.controller is None or path not in CONTROL_PATHS:
+            self._send_method_not_allowed()
+            return
+
+        form = self._read_control_form()
+        if form is None:
+            return
+        refusal = control_request_refusal(
+            origin=self.headers.get("Origin"),
+            sec_fetch_site=self.headers.get("Sec-Fetch-Site"),
+            token=form.get("token"),
+            expected_token=ctx.control_token,
+            bound_address=str(self.server.server_address[0]),
+            port=int(self.server.server_address[1]),
+            extra_allowed=ctx.allowed_hosts,
+        )
+        if refusal is not None:
+            # Logged without the rejected value: an Origin and a token are
+            # both attacker-chosen text, and the operator debugging a real
+            # misconfiguration needs the check's name, not the string.
+            logger.warning(
+                "Refusing %s from %s: %s", path, self.address_string(), refusal
+            )
+            self._send_bytes(
+                403,
+                "text/html; charset=utf-8",
+                render_control_refusal_html("Refused", refusal),
+                write_body=True,
+            )
+            return
+
+        if path == "/start":
+            self._do_start(ctx, resume=form.get("resume") == "1")
+        else:
+            self._do_stop(ctx)
+
+    def _read_control_form(self) -> dict[str, str] | None:
+        """The POST body as a flat mapping, or ``None`` having already sent
+        the refusal.
+
+        Only ``application/x-www-form-urlencoded`` is accepted: a
+        cross-origin ``fetch`` with any other content type needs a CORS
+        preflight, and this server answers ``OPTIONS`` with a flat ``405``
+        carrying no CORS headers at all."""
+        content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if content_type != CONTROL_FORM_CONTENT_TYPE:
+            self._send_plain(
+                415,
+                f"this route accepts {CONTROL_FORM_CONTENT_TYPE} only\n",
+                write_body=True,
+            )
+            return None
+        raw_length = self.headers.get("Content-Length")
+        try:
+            length = int(raw_length)  # type: ignore[arg-type]
+            if length < 0:
+                raise ValueError("a negative Content-Length")
+        except (TypeError, ValueError):
+            self._send_plain(
+                411,
+                "a control POST must carry a non-negative Content-Length\n",
+                write_body=True,
+            )
+            return None
+        if length > MAX_CONTROL_BODY_BYTES:
+            # Drained first, up to a hard cap, so the client gets the status
+            # line rather than a reset connection while it is still writing.
+            self.rfile.read(min(length, MAX_CONTROL_BODY_BYTES * 16))
+            self.close_connection = True
+            self._send_plain(
+                413,
+                f"a control form is at most {MAX_CONTROL_BODY_BYTES} bytes\n",
+                write_body=True,
+            )
+            return None
+        raw = self.rfile.read(length)
+        parsed = parse_qs(raw.decode("utf-8", errors="replace"), keep_blank_values=True)
+        return {key: values[0] for key, values in parsed.items() if values}
+
+    def _do_start(self, ctx: MonitorContext, *, resume: bool) -> None:
+        assert ctx.controller is not None  # checked by do_POST
+        try:
+            ctx.controller.start(resume=resume)
+        except StartRefused as refused:
+            only_in_flight = {check.name for check in refused.gate.failures} == {
+                "one_run_at_a_time"
+            }
+            self._send_bytes(
+                # 409 for the one refusal that is about *timing* ("not now"),
+                # 412 for a pre-condition the run itself does not meet.
+                409 if only_in_flight else 412,
+                "text/html; charset=utf-8",
+                render_control_refusal_html(
+                    "A render is already in flight"
+                    if only_in_flight
+                    else "This run is not ready to start",
+                    refused.gate.summary(),
+                ),
+                write_body=True,
+            )
+            return
+        except ControlError as exc:
+            logger.exception("Could not start a render")
+            self._send_bytes(
+                500,
+                "text/html; charset=utf-8",
+                render_control_refusal_html("Could not start the render", str(exc)),
+                write_body=True,
+            )
+            return
+        self._redirect_to_index()
+
+    def _do_stop(self, ctx: MonitorContext) -> None:
+        assert ctx.controller is not None  # checked by do_POST
+        try:
+            ctx.controller.stop()
+        except StopRefused as refused:
+            self._send_bytes(
+                409,
+                "text/html; charset=utf-8",
+                render_control_refusal_html("Nothing to stop", str(refused)),
+                write_body=True,
+            )
+            return
+        except ControlError as exc:  # pragma: no cover - stop() raises only StopRefused today
+            logger.exception("Could not stop the render")
+            self._send_bytes(
+                500,
+                "text/html; charset=utf-8",
+                render_control_refusal_html("Could not stop the render", str(exc)),
+                write_body=True,
+            )
+            return
+        self._redirect_to_index()
+
+    def _redirect_to_index(self) -> None:
+        """303 back to the page, so a reload does not re-submit the form."""
+        self._send_bytes(
+            303,
+            "text/plain; charset=utf-8",
+            b"",
+            write_body=True,
+            extra_headers=(("Location", "/"),),
+        )
+
     do_PUT = _method_not_allowed
     do_DELETE = _method_not_allowed
     do_PATCH = _method_not_allowed
@@ -1094,13 +1563,46 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
     # -- routes ------------------------------------------------------------ #
 
     def _serve_index(self, ctx: MonitorContext, *, write_body: bool) -> None:
+        control_section = self._control_section(ctx)
         try:
             run_state = read_run_state(ctx.run_state_path)
         except ProgressError as exc:
-            body = render_index_html(None, not_ready_reason=str(exc))
+            body = render_index_html(
+                None, not_ready_reason=str(exc), control_section=control_section
+            )
         else:
-            body = render_index_html(current_progress(run_state))
-        self._send_bytes(200, "text/html; charset=utf-8", body, write_body=write_body)
+            body = render_index_html(
+                current_progress(run_state), control_section=control_section
+            )
+        # The token lives in this page, so nothing on the way may keep a copy
+        # of it. Only when control is on: the read-only page is unchanged.
+        headers = (
+            (("Cache-Control", "no-store"),) if ctx.controller is not None else ()
+        )
+        self._send_bytes(
+            200,
+            "text/html; charset=utf-8",
+            body,
+            write_body=write_body,
+            extra_headers=headers,
+        )
+
+    def _control_section(self, ctx: MonitorContext) -> str:
+        """The control markup for this request, or ``""`` when control is off.
+
+        The gate is evaluated only when no render is in flight -- see
+        :func:`render_control_section`. A gate evaluation reads the prepare
+        report, stats a directory and asks ComfyUI for ``/system_stats``, so
+        it is a page load's worth of work, not a render's."""
+        if ctx.controller is None:
+            return ""
+        status = ctx.controller.status()
+        gate = (
+            None
+            if status.state is RenderState.RUNNING
+            else ctx.controller.evaluate_start()
+        )
+        return render_control_section(status, gate=gate, token=ctx.control_token)
 
     def _serve_events(self, ctx: MonitorContext, *, write_body: bool) -> None:
         self.send_response(200)
@@ -1195,10 +1697,20 @@ class MonitorRequestHandler(BaseHTTPRequestHandler):
             status, "text/plain; charset=utf-8", text.encode("utf-8"), write_body=write_body
         )
 
-    def _send_bytes(self, status: int, content_type: str, body: bytes, *, write_body: bool) -> None:
+    def _send_bytes(
+        self,
+        status: int,
+        content_type: str,
+        body: bytes,
+        *,
+        write_body: bool,
+        extra_headers: Sequence[tuple[str, str]] = (),
+    ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        for name, value in extra_headers:
+            self.send_header(name, value)
         # Every response here has a content type this module chose itself, so
         # a browser has no reason to guess at one -- and the one place a guess
         # could matter is a text/plain error carrying operator-facing text.
@@ -1253,9 +1765,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mvm-webui",
         description=(
-            "Read-only HTTP monitor for one music-video-pipeline run (issue #36). "
-            "No start/configure route exists -- see music_video_maker/webui.py's module "
-            "docstring for why."
+            "HTTP monitor for one music-video-pipeline run (issue #36). Read-only unless "
+            "--enable-control is passed, which adds POST /start and POST /stop for this "
+            "config's run and nothing else -- it never configures a run; run.toml stays the "
+            "source of truth. See music_video_maker/webui.py's and control.py's module "
+            "docstrings."
         ),
     )
     parser.add_argument("--config", required=True, help="the run.toml this run was started from")
@@ -1295,6 +1809,16 @@ def build_parser() -> argparse.ArgumentParser:
         f"(default: {DEFAULT_THUMBNAIL_CACHE_DIR})",
     )
     parser.add_argument(
+        "--enable-control",
+        action="store_true",
+        help="also serve POST /start and POST /stop for THIS config's run (issue #36). Off "
+        "by default: without it this process has no write route at all. A start runs the "
+        "same CLI you would run by hand, through the same custody/disk/render-envelope "
+        "gates, and is refused -- never queued -- while a run is in flight or any gate "
+        "fails; a stop is a SIGINT to the run's process group, exactly as Ctrl-C is. See "
+        "music_video_maker/control.py's module docstring.",
+    )
+    parser.add_argument(
         "--poll-interval-seconds",
         type=float,
         default=2.0,
@@ -1331,6 +1855,22 @@ def main(argv: list[str] | None = None) -> int:
         logger.exception("Refusing to start: invalid --allow-host value")
         return 1
 
+    controller: RenderController | None = None
+    control_token = ""
+    if args.enable_control:
+        controller = RenderController(config, Path(args.config))
+        control_token = new_control_token()
+        logger.warning(
+            "Control routes are ON: this server can START and STOP a render of %s "
+            "(POST /start, POST /stop). Every start goes through the CLI's own custody "
+            "pre-flight, disk check and render-envelope gate and is refused -- never queued "
+            "-- if any of them fails or a run is already in flight. The claim file is %s and "
+            "the run's own output goes to %s.",
+            args.config,
+            controller.lock_path,
+            controller.log_path,
+        )
+
     ctx = MonitorContext(
         run_state_path=config.run_state_file,
         # Issue #36: the same path --prepare writes, taken from the same
@@ -1340,6 +1880,8 @@ def main(argv: list[str] | None = None) -> int:
         thumbnail_cache_dir=args.thumbnail_cache_dir or DEFAULT_THUMBNAIL_CACHE_DIR,
         poll_interval_seconds=args.poll_interval_seconds,
         allowed_hosts=allowed_hosts,
+        controller=controller,
+        control_token=control_token,
     )
 
     servers = make_servers(bind_addresses, args.port, ctx)
@@ -1379,6 +1921,8 @@ if __name__ == "__main__":
 
 __all__ = [
     "ALWAYS_ALLOWED_HOST_NAMES",
+    "CONTROL_PATHS",
+    "MAX_CONTROL_BODY_BYTES",
     "BindAddressError",
     "DEFAULT_THUMBNAIL_CACHE_DIR",
     "HostAllowlistError",
@@ -1387,15 +1931,19 @@ __all__ = [
     "TAILSCALE_IPV4_RANGE",
     "TAILSCALE_IPV6_RANGE",
     "ThumbnailError",
+    "control_request_refusal",
     "current_progress",
     "default_tailscale_ipv4",
     "get_or_render_thumbnail",
     "host_header_allowed",
     "is_valid_chunk_id",
+    "new_control_token",
     "normalise_allowed_host",
     "main",
     "make_server",
     "make_servers",
+    "render_control_refusal_html",
+    "render_control_section",
     "render_index_html",
     "render_prepare_html",
     "resolve_bind_addresses",

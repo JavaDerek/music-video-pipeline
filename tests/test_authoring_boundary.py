@@ -55,6 +55,16 @@ SUBPROCESS_ALLOWLIST = frozenset(
         "luminance.py",  # ffmpeg frame sampling for the darkness floor (issue #77) -- no model
         "scenecuts.py",  # ffmpeg scene-detection probe (issue #81) -- no model
         "webui.py",  # `tailscale ip -4` bind discovery + ffmpeg thumbnails (issue #36) -- no model
+        # control.py (issue #36, 2026-10-04): spawns THIS project's own CLI
+        # (`python -m music_video_maker.cli`) so a browser can start and stop
+        # a render. The one entry on this list whose subprocess is neither
+        # ffmpeg nor a probe -- and it is the strongest "no model" case here,
+        # not the weakest: the thing it spawns is the render binary, which
+        # pyproject.toml already guarantees calls no model at all. The point
+        # of spawning rather than calling in-process is that the custody
+        # pre-flight, the disk check, the render-envelope refusal and the
+        # unconditional `POST /free` stay the CLI's own.
+        "control.py",
         "dome.py",  # ffmpeg/ffprobe only: POST-render domemaster projection + checks -- no model
         # stereo.py (issue #68): ffmpeg probe/decode/encode for a POST-render
         # stereo pass, plus an optional shell-out to a monocular depth model.

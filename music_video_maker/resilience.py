@@ -637,6 +637,52 @@ def _first_existing_ancestor(path: Path) -> Path:
     return Path(path.anchor) if path.anchor else Path(".")
 
 
+def preflight_disk_check(
+    output_dir: Path | str,
+    *,
+    min_free_disk_gb: float,
+    disk_usage: DiskUsage = shutil.disk_usage,
+) -> float:
+    """The issue #10 pre-flight, as a function: free space at the first
+    existing ancestor of ``output_dir``, refused below ``min_free_disk_gb``.
+
+    Returns the reading in GB; raises :class:`DiskPreflightError` when the
+    directory cannot be stat'ed or the space is short.
+    :meth:`ResilientRunner._preflight_disk_check` is now a call to this, and
+    so is the web monitor's control gate
+    (:mod:`music_video_maker.control`) -- one copy of the check, so a start
+    from a browser cannot be gated more loosely than a start from the CLI."""
+    check_path = _first_existing_ancestor(Path(output_dir))
+    try:
+        usage = disk_usage(str(check_path))
+    except OSError as exc:
+        logger.exception("Pre-flight disk check could not stat %s", check_path)
+        raise DiskPreflightError(
+            f"could not determine free disk space at {check_path}: {exc}"
+        ) from exc
+
+    free_gb = usage.free / (1024**3)
+    if free_gb < min_free_disk_gb:
+        logger.error(
+            "Pre-flight disk check FAILED: only %.2f GB free at %s, need >= %.2f GB -- "
+            "refusing to start the run",
+            free_gb,
+            check_path,
+            min_free_disk_gb,
+        )
+        raise DiskPreflightError(
+            f"only {free_gb:.2f} GB free at {check_path} "
+            f"(need >= {min_free_disk_gb:.2f} GB)"
+        )
+    logger.info(
+        "Pre-flight disk check OK: %.2f GB free at %s (>= %.2f GB required)",
+        free_gb,
+        check_path,
+        min_free_disk_gb,
+    )
+    return free_gb
+
+
 # --------------------------------------------------------------------------- #
 # The state machine
 # --------------------------------------------------------------------------- #
@@ -1599,33 +1645,10 @@ class ResilientRunner:
     # -- pre-flight disk check --------------------------------------------------- #
 
     def _preflight_disk_check(self, output_dir: Path) -> None:
-        check_path = _first_existing_ancestor(Path(output_dir))
-        try:
-            usage = self.disk_usage(str(check_path))
-        except OSError as exc:
-            logger.exception("Pre-flight disk check could not stat %s", check_path)
-            raise DiskPreflightError(
-                f"could not determine free disk space at {check_path}: {exc}"
-            ) from exc
-
-        free_gb = usage.free / (1024**3)
-        if free_gb < self.min_free_disk_gb:
-            logger.error(
-                "Pre-flight disk check FAILED: only %.2f GB free at %s, need >= %.2f GB -- "
-                "refusing to start the run",
-                free_gb,
-                check_path,
-                self.min_free_disk_gb,
-            )
-            raise DiskPreflightError(
-                f"only {free_gb:.2f} GB free at {check_path} "
-                f"(need >= {self.min_free_disk_gb:.2f} GB)"
-            )
-        logger.info(
-            "Pre-flight disk check OK: %.2f GB free at %s (>= %.2f GB required)",
-            free_gb,
-            check_path,
-            self.min_free_disk_gb,
+        preflight_disk_check(
+            output_dir,
+            min_free_disk_gb=self.min_free_disk_gb,
+            disk_usage=self.disk_usage,
         )
 
 
@@ -1669,4 +1692,5 @@ __all__ = [
     "WorkflowProvider",
     "dump_run_state",
     "load_run_state",
+    "preflight_disk_check",
 ]
