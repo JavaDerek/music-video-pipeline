@@ -727,14 +727,20 @@ def test_a_gated_403_says_which_pages_to_accept_and_with_which_account(raised):
     assert "owns the token" in message
 
 
-def test_all_three_gated_repositories_are_named_not_just_the_pipeline():
-    """``speaker-diarization-3.1`` loads a segmentation model and an embedding
-    model, each gated separately. Accepting only the pipeline produces a 403
-    naming a repository the operator never asked for, which is the difference
-    between a fixable error and a confusing one."""
-    assert len(PYANNOTE_GATED_PAGES) == 3
+def test_every_gated_repository_is_named_and_no_ungated_one_is():
+    """``speaker-diarization-3.1`` also loads a segmentation model, gated
+    separately, and accepting only the pipeline produces a 403 naming a
+    repository the operator never asked for.
+
+    The embedding model is deliberately NOT listed. Checked against the live
+    Hub with a real token on 2026-10-04: the pipeline and the segmentation
+    model answer 403 on their files until accepted, while
+    ``wespeaker-voxceleb-resnet34-LM`` reports ``gated: False`` and serves
+    them. Naming it would send an operator to click a button that is not
+    there, which is the same class of defect as not naming a gate that is."""
+    assert len(PYANNOTE_GATED_PAGES) == 2
     assert any("segmentation-3.0" in page for page in PYANNOTE_GATED_PAGES)
-    assert any("wespeaker" in page for page in PYANNOTE_GATED_PAGES)
+    assert not any("wespeaker" in page for page in PYANNOTE_GATED_PAGES)
 
 
 def test_a_pipeline_that_loads_as_none_is_the_access_case():

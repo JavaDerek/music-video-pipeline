@@ -42,20 +42,22 @@ attribution).
 
 ## One-time setup
 
-### 1. Accept the terms — all three pages
+### 1. Accept the terms — two pages
 
-`pyannote/speaker-diarization-3.1` is a *pipeline* that loads a segmentation
-model and an embedding model, **each gated separately**. Sign in as the account
-that will own the token and accept on every one of:
+`pyannote/speaker-diarization-3.1` is a *pipeline* that also loads a
+segmentation model, **gated separately**. Sign in as the account that will own
+the token and accept on both:
 
 - <https://huggingface.co/pyannote/speaker-diarization-3.1>
 - <https://huggingface.co/pyannote/segmentation-3.0>
-- <https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM>
 
 Accepting only the first produces a 403 on the second, with a message naming a
 repository you never asked for. The metadata API answers `200` for an
 unaccepted repo and the **files** answer `403`, so "I can see the model page"
-is not evidence of access.
+is not evidence of access — that was checked here with a real token on
+2026-10-04, which is also how the third model this pipeline loads,
+`wespeaker-voxceleb-resnet34-LM`, turned out **not** to be gated: it reports
+`gated: False` and serves its files, so there is no button to click on it.
 
 ### 2. Set the token
 
