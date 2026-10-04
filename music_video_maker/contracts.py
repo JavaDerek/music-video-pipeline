@@ -367,7 +367,35 @@ class AudioChunk:
     duration was snapped to (issue #20), so Stage 4a injects it directly rather
     than recomputing a frame count from ``duration`` and risking a different
     rounding. ``None`` means the chunk predates frame-grid quantization; a
-    caller must then fall back to quantizing ``duration`` itself."""
+    caller must then fall back to quantizing ``duration`` itself.
+
+    With ``boundary_overrun`` on (issue #100) this is the number of frames the
+    chunk **keeps**, and it is no longer grid-valid; what H3 was asked for is
+    :attr:`render_frames`. Either way it is the number of frames this chunk
+    contributes to the finished video, which is what every timeline
+    calculation in this project wants from it."""
+
+    render_frames: int | None = None
+    """The grid-valid H3 ``length`` this chunk was actually rendered at, when
+    that differs from :attr:`frame_count` (issue #100).
+
+    ``None`` means "rendered exactly to length" -- no overrun, nothing to
+    trim -- which is every chunk this project has produced to date and every
+    chunk a run without ``boundary_overrun`` produces. It is normalised to
+    ``None`` rather than restated as ``== frame_count``, deliberately: a
+    chunk with no overrun is then indistinguishable from a pre-#100 one,
+    which is honest (the pixels are identical) and keeps ``--resume`` from
+    spending GPU hours re-rendering chunks to record a redundant number.
+
+    Set, it is strictly greater than :attr:`frame_count`, it lands on the
+    frame grid, and it is also the length this chunk's own audio stem was cut
+    to -- H3's conditioning has to cover what H3 renders, which is the cost
+    issue #100 names: the stem includes up to one grid step (0.708 s) of the
+    *next* phrase. The extra frames are discarded in Stage 5
+    (:func:`music_video_maker.assembly.trim_overruns`), which is why this has
+    to be *recorded* rather than implied -- nothing about the mp4 on disk
+    says whether it was rendered-and-trimmed or rendered to length, and a
+    resumed run must be able to tell those apart."""
 
     is_instrumental: bool = False
     """True for a chunk that covers an unvoiced span of the master track --
@@ -412,6 +440,25 @@ class AudioChunk:
     @property
     def duration(self) -> float:
         return self.end - self.start
+
+    @property
+    def rendered_frame_count(self) -> int | None:
+        """How many frames H3 was asked for -- what the card actually pays
+        for, and what a VRAM warning has to read (issue #100).
+
+        :attr:`render_frames` when there is an overrun, :attr:`frame_count`
+        otherwise, so every caller that wants the rendered length has one
+        place to ask and no caller has to know the ``None``-means-no-overrun
+        convention."""
+        return self.render_frames if self.render_frames is not None else self.frame_count
+
+    @property
+    def overrun_frames(self) -> int:
+        """Frames rendered past this chunk's own end and discarded at
+        assembly (issue #100). ``0`` for a chunk rendered to length."""
+        if self.render_frames is None or self.frame_count is None:
+            return 0
+        return max(0, self.render_frames - self.frame_count)
 
 
 @dataclass(frozen=True)
@@ -577,6 +624,29 @@ class ChunkFingerprint:
     an old file and a song chunk compare equal and nothing re-renders. That
     coincidence is why this needed no ``schema_version`` bump."""
     frame_count: int | None = None
+    render_frames: int | None = None
+    """The grid-valid ``length`` this chunk was rendered at when that differs
+    from the ``frame_count`` it keeps (issue #100); ``None`` is "rendered
+    exactly to length".
+
+    **Conditioning tier, not timeline**, and the distinction is the whole
+    reason this field exists. A rendered-and-trimmed chunk is in exactly the
+    right *place*: it keeps ``frame_count`` frames, starting at ``start``,
+    and the timeline tier already proves that. What differs is what H3 was
+    conditioned on -- the stem it was handed is one grid step longer than its
+    own span and carries up to 0.708 s of the next phrase, so the kept frames
+    are not the frames a render *to* ``frame_count`` would have produced.
+    Same shape as :attr:`conditioning_source` and
+    :attr:`instrumental_audio_gain_db`: the clip is where it belongs, and
+    reusing it inside a run that chose the other arm hands the comparison its
+    control twice. That matters more here than anywhere else on this list,
+    because ``boundary_overrun`` has never been rendered on real material --
+    the first thing anyone does with it is an A/B against a run without it.
+
+    ``None`` is also what every pre-#100 state file says, and a run with
+    ``boundary_overrun`` off records ``None`` too, so an old file and a
+    present-day default run compare equal and nothing re-renders. Exactly the
+    coincidence that let :attr:`timeline` skip a ``schema_version`` bump."""
     render_width: int | None = None
     render_height: int | None = None
     prompt_hash: str | None = None
@@ -804,6 +874,7 @@ class ChunkFingerprint:
     CONDITIONING_FIELDS: ClassVar[tuple[str, ...]] = (
         "conditioning_source",
         "instrumental_audio_gain_db",
+        "render_frames",
         "text_encoder",
         "template_hash",
         "lora",
@@ -811,9 +882,10 @@ class ChunkFingerprint:
     )
     """Fields whose change is never escapable yet not a timeline move: the
     clip is in the right place, but reusing it would corrupt the comparison
-    the run exists to make (issues #25, #39, #45). Each names a *component* of
-    the conditioning -- the audio that drove the mouth, the encoder that read
-    the sentence, and the graph they were fed into."""
+    the run exists to make (issues #25, #39, #45, #100). Each names a
+    *component* of the conditioning -- the audio that drove the mouth, how
+    much of it there was, the encoder that read the sentence, and the graph
+    they were fed into."""
 
     STACK_FIELDS: ClassVar[tuple[str, ...]] = (
         "comfyui_version",
@@ -905,6 +977,12 @@ class ChunkFingerprint:
             # timeline here is a caller that could mislabel one.
             timeline=chunk.timeline,
             frame_count=chunk.frame_count,
+            # Issue #100: read off the chunk for the same reason ``timeline``
+            # is -- the overrun is a property of what Stage 2 planned and
+            # Stage 4 submitted, and a caller that could name a different
+            # number here is a caller that could claim a chunk was rendered
+            # to length when it was trimmed.
+            render_frames=chunk.render_frames,
             render_width=render_width,
             render_height=render_height,
             prompt_hash=cls.hash_prompt(prompt.prompt) if prompt is not None else None,
@@ -1193,6 +1271,45 @@ class FrameGrid:
         grid-valid.
         """
         return max(self.trained_min_frames, min(self.trained_max_frames, frames))
+
+    def cover_frames(self, frames: int) -> int:
+        """The shortest length this model can render that **covers**
+        ``frames`` (issue #100).
+
+        The grid constrains what can be *rendered*, which is not the same
+        constraint as what can be *kept*: a generator that only produces
+        ``5 + 17k`` frames can still be asked for the next valid length past
+        a boundary, with the overrun discarded downstream. That is the whole
+        of issue #100's proposal -- quantize the work, not the boundary --
+        and this is the arithmetic half of it.
+
+        Both trained bounds are grid points, so clamping cannot land off the
+        grid, and for any ``frames <= trained_max_frames`` the result is
+        ``<= trained_max_frames`` too (362 is itself ``5 + 17*21``).
+        """
+        return self.clamp_to_trained(self.quantize_up(frames))
+
+    def frames_between(self, start: float, end: float) -> int:
+        """How many frames a chunk spanning ``start``-``end`` **keeps**, with
+        both ends rounded from the start of the track (issue #100).
+
+        Deliberately ``round(end) - round(start)`` and never
+        ``round(end - start)``: rounding the *difference* lets each chunk's
+        own residue survive into the next one, and a few hundred of those
+        accumulate into exactly the drift issue #20 exists to eliminate.
+        Rounding each absolute position instead makes the whole timeline
+        telescope -- the frames kept before boundary *i* sum to
+        ``round(b_i * fps)`` no matter how the boundaries were chosen -- so
+        video offset == audio offset for every chunk by construction, which
+        is this project's one non-negotiable invariant and the reason this
+        lives on the grid rather than being open-coded twice.
+
+        Whatever ``round`` does at an exact half-frame (Python rounds to
+        even) is irrelevant to that guarantee: it only has to be a function
+        of the absolute position, and both sides of every interior boundary
+        call it with the same argument.
+        """
+        return round(end * self.fps) - round(start * self.fps)
 
     def frames_to_seconds(self, frames: int) -> float:
         return frames / self.fps

@@ -75,6 +75,12 @@ def load_chunk_skeleton(
         config.hardware,
         config.chunks_dir,
         cover_instrumentals=config.instrumental_coverage,
+        # Issue #100, for the reason the alignment-model comment above gives:
+        # this is the timeline a plan's anchors are authored against, so it
+        # has to be the one the render will emit. A plan authored against
+        # grid-cut boundaries and rendered with boundary_overrun on describes
+        # chunks that do not exist, which is ShotPlanDriftError's whole job.
+        boundary_overrun=config.boundary_overrun,
         instrumental_shot_seconds=config.instrumental_shot_seconds,
         shot_lengths=shot_lengths,
         suspect_segment_indices=(
