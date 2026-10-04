@@ -51,9 +51,11 @@ music-video-maker = "music_video_maker.cli:main"
 # by reading this table. Needs zero new pip dependencies in phase 1 (stdlib
 # subprocess + json only); it does need the `claude` CLI itself on PATH.
 mvm-author = "music_video_maker.authoring.cli:main"
-# Issue #36: read-only progress monitor. Never starts or configures a run --
-# see music_video_maker/webui.py's module docstring for why that half is
-# deliberately not built here.
+# Issue #36: the run monitor. Read-only unless started with
+# --enable-control, which adds exactly two write routes (start and stop this
+# config's run, through the CLI's own custody/disk/envelope gates). It never
+# *configures* a run: run.toml stays the source of truth. See
+# music_video_maker/webui.py and control.py's module docstrings.
 mvm-webui = "music_video_maker.webui:main"
 
 [tool.setuptools.packages.find]
