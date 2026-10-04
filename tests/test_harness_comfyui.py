@@ -422,6 +422,35 @@ def test_ws_noise_messages_carry_foreign_prompt_id_for_client_to_ignore():
 
 
 # --------------------------------------------------------------------------- #
+# GET /object_info/{class_type} -- the installed-weights enums (issue #56)
+# --------------------------------------------------------------------------- #
+
+
+def test_object_info_returns_the_seeded_enum():
+    session = FakeComfyUISession()
+    session.seed_object_info("UNETLoader", {"unet_name": ["a.safetensors", "b.safetensors"]})
+
+    response = session.get(f"{session.base_url}/object_info/UNETLoader")
+
+    assert response.status_code == 200
+    required = response.json()["UNETLoader"]["input"]["required"]
+    assert required["unet_name"][0] == ["a.safetensors", "b.safetensors"]
+
+
+def test_object_info_for_an_unseeded_class_is_200_with_an_empty_body():
+    """Real ComfyUI answers an unknown class with ``200 {}``, not a 404
+    (verified against v0.37.4 on doris, 2026-10-04). A client has to be able
+    to tell "cannot read this" from "the file is missing", so the fake must
+    reproduce the status as well as the body."""
+    session = FakeComfyUISession()
+
+    response = session.get(f"{session.base_url}/object_info/NoSuchNode")
+
+    assert response.status_code == 200
+    assert response.json() == {}
+
+
+# --------------------------------------------------------------------------- #
 # Logging sanity (global standard: every module has a logger)
 # --------------------------------------------------------------------------- #
 

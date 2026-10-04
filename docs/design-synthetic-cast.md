@@ -10,6 +10,11 @@ licence question and an unsolved consistency problem — the wrong version of
 this feature is a one-off script that makes a pretty portrait and leaves the
 hard part untouched. That decision is still nobody's to make here.
 
+> **The model decision was made on 2026-10-04: Krea 2.** Everything from
+> "Part 2: generating the imagery" below is built; the sections before it are
+> the design as it was written, kept because the reasoning is what the build
+> follows. Where the two differ, the later section says so and why.
+
 ## Status (2026-09-13)
 
 Built, in the work package that does not depend on the model decision:
@@ -24,16 +29,19 @@ Built, in the work package that does not depend on the model decision:
   proposed, with the mode-collapse caveat printed in every report rather than
   left to be remembered.
 
-Still open, exactly as this doc left them — nothing below changed by the
-above:
+Still open as of 2026-09-13 — **and the first two were closed on 2026-10-04**;
+see "Part 2: generating the imagery" below:
 
-* The model decision itself (SDXL+IP-Adapter / Flux / hosted API / reuse),
-  and its licence.
-* Actually generating a character, or committing any generated image.
+* ~~The model decision itself (SDXL+IP-Adapter / Flux / hosted API / reuse),
+  and its licence.~~ **Krea 2**, already on the host, under the Krea 2
+  Community License.
+* ~~Actually generating a character~~ — `castgen.py` generates one; **no
+  generated image is committed here**, by design (run assets).
 * Re-deriving the 0.34 floor on synthetic pairs (the check enforces the
   caveat; it cannot do the re-derivation for you before synthetic material
-  exists to measure).
+  exists to measure). **Still open**, and now possible.
 * The cross-video / profile question in "What 'done' looks like" item 4.
+  **Still open.**
 
 ## What it actually solves
 
@@ -262,6 +270,223 @@ minutes of video.
    config fields, while a character is *binary assets plus text*. The profile
    mechanism does not extend to that for free, and forcing it to would make the
    simple half worse. **Still open**, unchanged by this work package.
+
+## Part 2: generating the imagery (2026-10-04, built)
+
+`music_video_maker/castgen.py` (`python -m music_video_maker.castgen`) is the
+generator this doc deferred. It is authoring-time, outside the render path, and
+nothing in the package imports it — a test enforces that
+(`tests/test_authoring_boundary.py::test_nothing_in_the_package_imports_the_image_generator`),
+which is how "does the render binary ever call a model?" stays answerable by
+reading an import graph rather than this paragraph.
+
+### The model: Krea 2, because it is already on the host
+
+Decided by Derek on 2026-10-04. It answers the disk constraint by being
+already present (`/data/huggingface/hub/models--krea--Krea-2-Raw/snapshots/*/raw.safetensors`,
+26.28 GB, plus a `Krea-2-Turbo` of the same size), and ComfyUI v0.37.4 on
+doris supports it natively — `comfy/ldm/krea2/model.py`,
+`comfy/text_encoders/krea2.py`, a `krea2` entry in `comfy/model_detection.py`
+and `comfy.supported_models.Krea2`. No custom node is involved.
+
+**Krea 2 Community License**, recorded in the repo's rights table (README's
+own `## License` section) and in `castgen.KNOWN_IMAGE_MODELS` beside the code
+that loads the weights, the way `faces.py` records YuNet's and
+`workflow_graph.KNOWN_LORAS` records the realism adapter's:
+
+| Term | What it obliges here |
+|---|---|
+| Commercial use free under **$1M annual revenue and under 50 seats** | Beyond either, the deployer needs Krea's commercial terms. Written into every manifest, so a published asset carries the condition it was made under. |
+| A **derivative model's name must begin with "Krea"** | Nothing here trains or merges a model, so nothing here can breach it — but a cast LoRA ever trained on this output must be named `krea2-…`. |
+| **No classifiers ship with the open weights**, so filtering is explicitly the deployer's responsibility | No classifier ships here either, and the provenance says so rather than being silent: every manifest records `filtering = "none — …"` and every generate run logs it at WARNING. A human looks at every image. |
+
+That third term is why `castgen` does not pretend to a verdict it has not
+earned. A provenance record that says nothing about filtering reads, later, as
+"something checked this".
+
+### The method: one anchor, then img2img views
+
+This doc's "do not generate a set by re-rolling one prompt at different seeds"
+is now **mechanical**, not advisory: a spec whose second view has no `from`, or
+whose derived view sets `denoise >= 1.0` (which replaces the anchor latent
+entirely — a re-roll with extra steps), is refused by `load_character_spec`
+before anything is submitted. So is a set of one view, because `castcheck`
+calls that `insufficient` and finding that out before the GPU time is the whole
+point.
+
+Of the three identity-holding methods named above, **img2img from the anchor is
+the only one available with core nodes and the weights installed on doris**:
+
+* ComfyUI's own shipped blueprint `Text to Image (Krea-2 Turbo)` gave the graph
+  shape the committed templates follow (`UNETLoader` → `KSampler`,
+  `CLIPLoader type="krea2"` → `CLIPTextEncode` → positive,
+  `ConditioningZeroOut` → negative, `EmptyLatentImage`, `VAELoader` →
+  `VAEDecode`). Its defaults for `sampler_name`, `scheduler` and 1024×1024 are
+  taken from there rather than chosen here; `steps` and `cfg` are **required**
+  in the spec, because the blueprint's 8 / 1.0 are *Turbo's* and applying them
+  to Raw would be a generation nobody authored.
+* The sibling blueprint `Image Style Reference (Krea-2 Turbo)` is the
+  reference-conditioning route (`TextEncodeQwenImageEditPlus` +
+  `FluxKontextMultiReferenceLatentMethod`), and it needs
+  `krea2_style_reference.safetensors` — **not installed**. The full list of
+  LoRAs on the host on 2026-10-04 was `Flux_2-Turbo-LoRA_comfyui`,
+  `h3-realism-people-t2v-i2v-r2v`, `krea2_darkbrush`,
+  `minimax_h3_fl2v_turbo_8step_v1.0`. **List the directory rather than trusting
+  that list** (`ls /data/ComfyUI-models/loras/`) — the only Krea 2 entry in it
+  is `krea2_darkbrush`, whose trigger phrase in ComfyUI's own blueprint is
+  "muted minimalist sketch style": a style adapter, exactly the wrong thing for
+  a photoreal cast portrait, and #62 already measured a LoRA and the prompt
+  fighting over a face. Neither committed template carries a LoRA node, and a
+  test records that as a decision rather than an omission.
+
+So: view 1 is text-to-image, every other view is
+`LoadImage → VAEEncode → KSampler(denoise < 1)` from an **earlier view's
+rendered file**. Two committed templates, never one rewritten —
+`workflow_cast_api.json` and `workflow_cast_view_api.json`, the same split
+`docs/workflow-template-guide.md` describes for base vs I2V. Node ids are never
+hardcoded; everything is located through `workflow_graph`'s `find_one_node`,
+and a test renumbers every node in both templates and expects identical output.
+
+There is **no default `denoise`**. What value holds a face while turning a head
+is unmeasured for this model, and a default that looks calibrated is this
+project's most-repeated bug in a new place.
+
+### Prerequisites on doris, which are not yet satisfied
+
+Read from the live server's own `GET /object_info` on 2026-10-04 (metadata
+only — it loads no weights and touches no GPU):
+
+1. **The DiT is invisible to `UNETLoader`.** `raw.safetensors` lives only in
+   the HuggingFace cache, and the loader's enum lists no Krea 2 file at all.
+   Link it into `models/diffusion_models/` (the templates name
+   `krea2_raw_bf16.safetensors`) and restart or refresh ComfyUI. Reading the
+   safetensors header says why nothing else will do: the file is the **DiT
+   only** — 364 `blocks.*` tensors at 24.32 GB, plus `txtfusion`/`tproj`/`tmlp`,
+   and no `vae.` or `text_encoders.` keys — so it cannot be loaded as a
+   checkpoint.
+2. **The text encoder is missing.** Krea 2 conditions on Qwen3-VL-**4B** at a
+   12-layer tap (`comfy/text_encoders/krea2.py`), loaded by
+   `CLIPLoader type="krea2"`. `models/text_encoders/` has the 8B and 32B H3
+   encoders and no 4B; the HF cache holds `Qwen/Qwen3-VL-4B-Instruct` only as
+   two diffusers shards, which that single-file loader cannot read. Download
+   the single-file encoder ComfyUI's blueprint names,
+   `qwen3vl_4b_fp8_scaled.safetensors`.
+3. **The VAE is present**: `qwen_image_vae.safetensors`
+   (`supported_models.Krea2` uses the Wan 2.1 latent format).
+
+`castgen` checks all three *before* taking custody, by reading each loader's
+own enum (`GET /object_info/{class_type}`) and comparing it with what the
+templates name. A missing file is refused with its name and the directory it
+belongs in — rather than arriving as a `node_errors` blob after the operator
+has already stopped everything else on the card. An unreadable answer degrades
+to a warning (the same decision `custody._fetch_free_vram_gb` makes about an
+unreadable VRAM reading), never a refusal.
+
+### Running it
+
+Both commands write into a *run's* own cast directory, never this repository.
+
+```bash
+# offline: validate the spec, build one workflow per view, write nothing to the card
+python -m music_video_maker.castgen plan cast/nobody.castgen.toml \
+    --out-dir ~/mvm-runs/<song>/cast/plan
+
+# on doris, with GPU custody taken by hand first
+python -m music_video_maker.castgen generate cast/nobody.castgen.toml \
+    --out-dir ~/mvm-runs/<song>/cast --comfyui-url http://doris:8188
+```
+
+A spec is small:
+
+```toml
+character = "Nobody"
+prompt = "studio portrait photograph of a woman in her thirties, short dark hair"
+seed = 4242
+model = "krea2-raw"      # resolves the licence record in KNOWN_IMAGE_MODELS
+steps = 28
+cfg = 4.0
+
+[[views]]                # the anchor: text-to-image, no `from`, no `denoise`
+name = "frontal"
+prompt = "looking straight into the lens, neutral expression, even soft light"
+
+[[views]]                # img2img from the anchor's own rendered file
+name = "three_quarter"
+from = "frontal"
+denoise = 0.45
+prompt = "head turned thirty degrees to camera left, same person, same face"
+
+[[views]]                # the reference is a lighting reference too
+name = "graded"
+from = "frontal"
+denoise = 0.35
+prompt = "lit by hard low side light, deep shadows, same person"
+```
+
+`generate` writes the images plus three records: a human-readable report, a
+JSON manifest (per-image sha256, seed, denoise, prompt, `prompt_id`, server
+filename, the weights it checked, the free-VRAM reading, ComfyUI and torch
+versions, the licence, the filtering disclosure, and the consistency numbers),
+and a `[cast.<name>]` block ready to paste into a run config — `synthetic =
+true` with the `origin` table part 1 already requires. A test parses that block
+and validates it through `config`'s own origin builder, so the two cannot
+drift.
+
+Exit code 0 only when every view generated **and** `castcheck` passed.
+`unchecked` (no SFace weights, or `--skip-check`) is not a pass.
+
+### VRAM and custody
+
+**The DiT alone is 24.32 GB of bf16 weights against a 24 GB card.** ComfyUI
+will offload rather than hold it resident, together with the ~4.5 GB fp8 text
+encoder and the VAE. **No Krea 2 generation has been measured on doris**, so
+there is no Krea-2-specific floor and `castgen` invents none (`envelope.py`'s
+rule: no evidence means no gate, not a refusal). What it does run is the
+existing `custody.preflight_free_vram` — H3's measured 16.0 GB floor, used here
+as the *is the card actually free* check it has always been — and
+`POST /free` in a `finally`, so a character that fails halfway does not leave
+the model resident on a shared 4090.
+
+The operator steps are the same as a render's and are deliberately not
+automated (see `custody.py`'s docstring): enumerate the card's tenants
+(`nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv`),
+stop them by hand, confirm the VRAM actually freed, generate, then restart what
+you stopped. A shared card with an LLM resident is the normal state of this
+host, and one request pulls 15 GB back.
+
+### Does the 0.34 floor transfer to generated faces? Still unknown
+
+`castgen` calls `castcheck` — it does not score anything itself — and records
+the status, the floor, and the floor's calibration *as a sentence*: real
+photographs, 16 pairs, **not re-derived on synthetic pairs**. It additionally
+reports the pairwise min/mean/max as numbers with no verdict attached, because
+the one thing `castcheck`'s own docstring says it cannot see is mode collapse:
+views authored to differ in angle and light that all score near-identical may
+be one face three times, and no threshold separates that from success. Both
+caveats are printed in every report.
+
+So the honest reading of a `pass` from `castgen` today is "nothing here
+contradicts this being one person", not "this is one person". Re-deriving the
+floor is the work this part finally makes possible: generate several characters,
+score genuine pairs (views of one character) against impostor pairs (views of
+two different characters), and put the measurement in
+`docs/seed-face-recognition.md` beside the real-photograph one.
+
+### What cannot be known until a real generation runs
+
+* Whether Krea 2 Raw at 1024² fits a 24 GB card in practice, how far ComfyUI
+  has to offload, and what a view costs in wall clock.
+* What `denoise` band holds a face while changing its angle — and whether
+  img2img holds identity *at all* on this model, or only holds composition.
+* Whether the 0.34 floor transfers, and what an impostor pair of *generated*
+  faces scores.
+* Whether a generated reference conditions H3 as well as a photograph does —
+  the second half of the acceptance criterion ("frames rendered from it score
+  ≥ the floor against the reference the render was conditioned on"), which
+  needs a rendered chunk.
+* Whether `EmptyLatentImage` is the right canvas node for a Wan21-format
+  latent. ComfyUI's own Krea 2 blueprint uses it, which is why the template
+  does; nothing here has run it.
 
 ## The trap to avoid
 
