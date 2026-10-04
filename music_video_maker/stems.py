@@ -177,6 +177,21 @@ class StemSliceResult:
     report: StemQualityReport
 
 
+def _rendered_end(chunk: AudioChunk, grid: FrameGrid) -> float:
+    """Where this chunk's *rendered* footage ends (issue #100).
+
+    ``chunk.end`` for everything without an overrun, which is every chunk this
+    project has produced to date; ``chunk.start`` plus the rendered length
+    otherwise. One helper so the stem's reach check, its slice and its
+    duration guard cannot disagree about which end they mean -- three copies
+    of that decision is how a 0.7 s mismatch gets into one of them.
+    """
+    rendered = chunk.rendered_frame_count
+    if chunk.render_frames is None or rendered is None:
+        return chunk.end
+    return chunk.start + grid.frames_to_seconds(rendered)
+
+
 def _audio_duration_seconds(path: Path, *, what: str) -> tuple[AudioSegment, float]:
     """Load ``path`` with pydub and return it alongside its duration in seconds."""
     if not path.exists() or not path.is_file():
@@ -300,7 +315,10 @@ def slice_stem_for_chunks(
         report.log_summary()
         return StemSliceResult(chunks=(), report=report)
 
-    timeline_end = max(chunk.end for chunk in chunks)
+    # Issue #100: a chunk may be RENDERED longer than its own span, and the
+    # conditioning stem has to cover what is rendered -- so the stem's reach
+    # is judged against the rendered end, not the chunk's end.
+    timeline_end = max(_rendered_end(chunk, grid) for chunk in chunks)
     if timeline_end - stem_duration > max_tail_pad_seconds:
         logger.error(
             "Vocal stem refused: %s is only %.3fs but the chunk timeline runs to %.3fs "
@@ -327,7 +345,13 @@ def slice_stem_for_chunks(
 
     for chunk in chunks:
         start_ms = round(chunk.start * 1000)
-        end_ms = round(chunk.end * 1000)
+        # Issue #100: the rendered end, which is the chunk's own end for every
+        # chunk without an overrun. H3 is handed the rendered length as
+        # `length`, so a stem cut to the chunk's span would be shorter than
+        # the video it conditions -- issue #20's drift arriving from the other
+        # side. The overrun seconds are generated and then discarded at
+        # assembly, which is the cost issue #100 names.
+        end_ms = round(_rendered_end(chunk, grid) * 1000)
         sliced = stem[start_ms:end_ms]
 
         # Same tail case slicing.py handles on the master: a grid-quantized
@@ -352,38 +376,47 @@ def slice_stem_for_chunks(
             )
 
         sliced_duration = len(sliced) / 1000.0
-        if abs(sliced_duration - chunk.duration) > _DURATION_MATCH_TOLERANCE_SECONDS:
+        rendered_duration = _rendered_end(chunk, grid) - chunk.start
+        if abs(sliced_duration - rendered_duration) > _DURATION_MATCH_TOLERANCE_SECONDS:
             logger.error(
-                "Chunk %d: stem slice is %.6fs but the chunk spans %.6fs (%.3f-%.3f). The "
-                "conditioning audio must be exactly as long as the chunk it renders, or "
-                "Stage 4a's video drifts from its own audio.",
+                "Chunk %d: stem slice is %.6fs but the chunk renders %.6fs (%.3f-%.3f, "
+                "rendered end %.3f). The conditioning audio must be exactly as long as what "
+                "it conditions, or Stage 4a's video drifts from its own audio.",
                 chunk.chunk_id,
                 sliced_duration,
-                chunk.duration,
+                rendered_duration,
                 chunk.start,
                 chunk.end,
+                _rendered_end(chunk, grid),
             )
             raise StemSliceError(
                 f"chunk {chunk.chunk_id}: stem slice duration {sliced_duration!r} does not "
-                f"match chunk duration {chunk.duration!r}"
+                f"match the rendered duration {rendered_duration!r}"
             )
 
-        if chunk.frame_count is not None:
-            frame_duration = grid.frames_to_seconds(chunk.frame_count)
+        # Issue #100: the length H3 is asked for, not the length the chunk
+        # keeps. They are the same number for every run without
+        # ``boundary_overrun``; where they differ it is the RENDERED one that
+        # has to match the conditioning audio, because that is what goes into
+        # the graph's `length`.
+        rendered_frames = chunk.rendered_frame_count
+        if rendered_frames is not None:
+            frame_duration = grid.frames_to_seconds(rendered_frames)
             if abs(sliced_duration - frame_duration) > _DURATION_MATCH_TOLERANCE_SECONDS:
                 logger.error(
-                    "Chunk %d: stem slice is %.6fs but frame_count=%d implies %.6fs. Stage 4a "
-                    "injects that frame count as H3's `length`, so the conditioning audio and "
-                    "the rendered video would be different lengths -- exactly the per-chunk "
-                    "drift issue #20 eliminated for the mix.",
+                    "Chunk %d: stem slice is %.6fs but its rendered length of %d frame(s) "
+                    "implies %.6fs. Stage 4a injects that frame count as H3's `length`, so "
+                    "the conditioning audio and the rendered video would be different "
+                    "lengths -- exactly the per-chunk drift issue #20 eliminated for the mix.",
                     chunk.chunk_id,
                     sliced_duration,
-                    chunk.frame_count,
+                    rendered_frames,
                     frame_duration,
                 )
                 raise StemSliceError(
                     f"chunk {chunk.chunk_id}: stem slice duration {sliced_duration!r} does not "
-                    f"match the {frame_duration!r} implied by frame_count {chunk.frame_count!r}"
+                    f"match the {frame_duration!r} implied by its rendered length of "
+                    f"{rendered_frames!r} frame(s)"
                 )
 
         out_path = stems_dir / f"chunk_{chunk.chunk_id:03d}_vocal.wav"

@@ -391,6 +391,7 @@ def _serialize_fingerprint(fingerprint: ChunkFingerprint) -> dict[str, Any]:
         "end": fingerprint.end,
         "timeline": fingerprint.timeline,
         "frame_count": fingerprint.frame_count,
+        "render_frames": fingerprint.render_frames,
         "render_width": fingerprint.render_width,
         "render_height": fingerprint.render_height,
         "prompt_hash": fingerprint.prompt_hash,
@@ -425,6 +426,13 @@ def _deserialize_fingerprint(raw: dict[str, Any] | None) -> ChunkFingerprint | N
         # RUN_STATE_SCHEMA_VERSION for the general rule.
         timeline=raw.get("timeline"),
         frame_count=raw.get("frame_count"),
+        # Absent in a file written before issue #100, and absent in every file
+        # a run without ``boundary_overrun`` writes -- both mean "rendered
+        # exactly to length", which is the same thing, so an old file and a
+        # default run compare equal and neither re-renders. The same
+        # coincidence as ``timeline`` above, and the same reason this needed no
+        # schema_version bump.
+        render_frames=raw.get("render_frames"),
         render_width=raw.get("render_width"),
         render_height=raw.get("render_height"),
         prompt_hash=raw.get("prompt_hash"),

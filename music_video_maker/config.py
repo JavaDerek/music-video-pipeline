@@ -34,6 +34,7 @@ against the *config file's* directory, not the process cwd)::
     render_width             = 864       # optional; both or neither, multiples of 32
     render_height            = 480       # biggest lever on run time -- see RunConfig
     instrumental_coverage    = true      # render the unvoiced spans too
+    boundary_overrun         = false     # issue #100; cut on content, render past it
     silent_output            = false     # issue #22; no audio stream at all
     duration_tolerance_seconds = 0.05    # issue #22; only consulted when silent_output=true
     i2v_continuity           = false     # issue #12
@@ -861,6 +862,24 @@ class RunConfig:
     vocals, which means a short video whose every chunk after the first
     instrumental plays against the wrong moment of the song. Turn it off only
     to reproduce the old voiced-spans-only behaviour."""
+
+    boundary_overrun: bool = False
+    """Issue #100: choose each chunk boundary where the content wants it and
+    render the next valid H3 length *past* it, discarding the overrun at
+    assembly -- quantize the work, not the boundary.
+
+    Off by default, and one of the flags that has to stay that way until
+    something has rendered. It re-cuts every boundary in the song, which
+    invalidates every mp4 already on disk and every chunk a ``--resume`` would
+    otherwise reuse; it costs a few per cent of extra rendered frames; and it
+    puts up to one grid step (0.708 s) of the *next* phrase into each chunk's
+    own conditioning audio, which is an audio-driven lip-sync model being told
+    about a line it is not showing. The argument for it is strong and the
+    measurement on this project's own material does not exist: the pipeline
+    that proposed it measured 3.7% extra frames on a 22-shot clip of theirs.
+
+    Requires ``instrumental_coverage`` (ignored, loudly, without it), and is
+    refused alongside ``i2v_continuity`` -- see :func:`load_config`."""
 
     i2v_continuity: bool = False
     """Issue #12: enable seed-and-feed I2V bridging between chunks."""
@@ -1702,6 +1721,29 @@ def _validate(config: RunConfig) -> None:
                 "twice and concatenate both copies.",
             )
 
+    if config.boundary_overrun and config.i2v_continuity:
+        # Issue #100 x issue #12. On the chained path a chunk's identity
+        # conditioning is its predecessor's ACTUAL last frame
+        # (``continuity.extract_last_frame`` probes the file and never trusts
+        # a requested length, by design). With an overrun that frame is in the
+        # discarded region -- up to 0.708 s past where this chunk begins -- so
+        # every chain would be seeded from footage nobody will ever see,
+        # silently, with the project's own "the seed frame IS the identity
+        # conditioning" invariant quietly pointing at the wrong frame.
+        #
+        # Refused at config load rather than degraded at render time, the same
+        # split #49 draws: the expensive mistake is discovering it hours in,
+        # and threading "keep only N frames" through chaining is real work
+        # that should be done when somebody wants both, not guessed at now.
+        _fail(
+            "boundary_overrun",
+            "cannot be combined with i2v_continuity: a chained chunk's identity "
+            "conditioning is its predecessor's last RENDERED frame, which with an "
+            "overrun sits in the frames Stage 5 discards -- so every chain would be "
+            "seeded from footage that is never shown, and nothing downstream could "
+            "tell (issues #100, #12, #47). Turn one of the two off",
+        )
+
     if config.i2v_continuity and config.i2v_workflow_template is None:
         _fail(
             "i2v_workflow_template",
@@ -1809,6 +1851,7 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
     values["min_free_vram_gb"] = _positive_number(merged, "min_free_vram_gb", 16.0)
     values["render_width"], values["render_height"] = _render_dimensions(merged)
     values["instrumental_coverage"] = _flag(merged, "instrumental_coverage", True)
+    values["boundary_overrun"] = _flag(merged, "boundary_overrun", False)
     values["silent_output"] = _flag(merged, "silent_output", False)
     values["duration_tolerance_seconds"] = _positive_number(
         merged, "duration_tolerance_seconds", DEFAULT_DURATION_TOLERANCE_SECONDS

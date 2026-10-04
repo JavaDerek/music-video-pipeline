@@ -454,6 +454,49 @@ def test_wave3_knobs_have_defaults_when_the_file_omits_them(tmp_path: Path) -> N
 
 
 # --------------------------------------------------------------------------- #
+# Boundary overrun (#100)
+# --------------------------------------------------------------------------- #
+
+
+def test_boundary_overrun_defaults_off(tmp_path: Path) -> None:
+    """Off unless asked for. It re-cuts every boundary in the song, so a
+    default-on version would invalidate every existing render and every cached
+    chunk of every config in the wild -- and nothing has rendered with it."""
+    _create_default_assets(tmp_path)
+    assert load_config(_write_config(tmp_path)).boundary_overrun is False
+
+
+def test_boundary_overrun_is_read(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path, extra_toml="boundary_overrun = true")
+    assert load_config(config_path).boundary_overrun is True
+
+
+def test_boundary_overrun_is_refused_alongside_i2v_continuity(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Issue #100 x issue #12, refused at load rather than degraded at render.
+
+    A chained chunk's whole identity conditioning is its predecessor's last
+    *rendered* frame, and with an overrun that frame is in the discarded
+    region -- so every chain would be seeded from footage the finished video
+    never shows, silently. The expensive mistake is finding that out hours
+    into a run."""
+    _create_default_assets(tmp_path)
+    config_path = _write_config(
+        tmp_path,
+        extra_toml=(
+            "boundary_overrun = true\n"
+            "i2v_continuity = true\n"
+            f'i2v_workflow_template = "{tmp_path / "workflow_api.json"}"'
+        ),
+    )
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError, match="boundary_overrun"):
+        load_config(config_path)
+    assert any("i2v_continuity" in record.getMessage() for record in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
 # Cross-video continuity fields (#31, #32) and alignment strictness (#35).
 #
 # Each of these is a property that must hold across the WHOLE video but was
