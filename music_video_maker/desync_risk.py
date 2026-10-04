@@ -101,20 +101,42 @@ class DesyncRiskError(ValueError):
     """
 
 
-VISIBLE_FACE_FRACTION = 0.0778
-"""At or above this largest-face fraction, a chunk with a leading vocal
+VISIBLE_FACE_FRACTION = 0.0557
+"""At or above this **median** face fraction, a chunk with a leading vocal
 offset is predicted **visible** (issue #97).
 
-The smallest face among the four chunks a viewer noticed on "Deathless" v13
-(chunk 74, which was predicted before being shown and then named unprompted).
-Deliberately the observed value rather than a rounded one: 0.08 would be a
-number nobody measured sitting where a measurement is."""
+The smallest median among the four chunks a viewer noticed on "Deathless" v13
+(chunk 38). Deliberately the observed value rather than a rounded one: 0.06
+would be a number nobody measured sitting where a measurement is.
 
-HIDDEN_FACE_FRACTION = 0.0474
-"""At or below this largest-face fraction, a chunk with a leading vocal
-offset is predicted **hidden** -- the largest face among the three offset
+**Re-derived on medians 2026-10-04**, when the max statistic was shown to
+invert a framing A/B on one frame in twelve. Rescanning the same v13 render
+with `facescan`'s new median column keeps F42's separation intact on all
+seven adjudicated chunks, with a tighter band:
+
+  ========= ======== ======== ==========
+  chunk     label    max      median
+  ========= ======== ======== ==========
+  35        noticed  0.2101   0.1982
+  41        noticed  0.1656   0.1405
+  74        noticed  0.0778   0.0711
+  38        noticed  0.0887   0.0557
+  73        not      0.0474   0.0441
+  58        not      0.0460   0.0109
+  20        not      0.0120   0.0090
+  ========= ======== ======== ==========
+
+n=7, no overlap on either statistic. The median is used because it answers
+how the shot is *framed*, which is what perceptibility was found to depend
+on; chunk 58 is the case that moves most (0.0460 -> 0.0109), and it is the
+one a viewer did not notice."""
+
+HIDDEN_FACE_FRACTION = 0.0441
+"""At or below this **median** face fraction, a chunk with a leading vocal
+offset is predicted **hidden** -- the largest median among the three offset
 chunks nobody has ever reported (chunk 73), two of which carry the two
-largest offsets in the whole song.
+largest offsets in the whole song. Re-derived on medians 2026-10-04; see
+:data:`VISIBLE_FACE_FRACTION` for the table.
 
 Between this and :data:`VISIBLE_FACE_FRACTION` is :data:`UNCERTAIN`: seven
 observations cannot locate a boundary inside their own gap, and this module
@@ -158,10 +180,37 @@ class FaceRow:
     chunk_id: int
     face_pct: float
     max_face_fraction: float
+    median_face_fraction: float | None
+    """``None`` for a CSV written before #97's median column existed. The
+    ranking falls back to the max there and says so, rather than refusing a
+    scan that is otherwise valid -- but the two statistics disagree, and the
+    fallback is the one that can be inverted by a single frame."""
     inconclusive: int
     source_path: str
     """The file that row actually scanned -- the field whose absence is the
     whole of issue #93."""
+
+
+def _ranking_fraction(row: FaceRow) -> float:
+    """The statistic perceptibility is judged on: the median where the scan
+    recorded one, the max for scans written before #97's fix.
+
+    Measured 2026-10-04: a max over sampled frames answers "was there ever a
+    big face", and one frame in twelve inverted a framing A/B that the medians
+    and the frames themselves agreed on. The thresholds in this module were
+    re-derived on medians at the same time, so a pre-#97 CSV is being judged
+    against a band that was not calibrated for its statistic -- which is why
+    the fallback is logged rather than silent."""
+    if row.median_face_fraction is None:
+        logger.warning(
+            "desync_risk: chunk %d's row has no median_face_fraction -- this scan predates "
+            "issue #97's column, so it is ranked on max_face_fraction against thresholds "
+            "re-derived on medians. Re-run `python -m music_video_maker.facescan <dir>` to "
+            "remove the mismatch.",
+            row.chunk_id,
+        )
+        return row.max_face_fraction
+    return row.median_face_fraction
 
 
 @dataclass(frozen=True)
@@ -241,6 +290,11 @@ def read_facescan_report(path: Path) -> FaceReport:
                 chunk_id=chunk_id,
                 face_pct=float(record["face_pct"]),
                 max_face_fraction=float(record["max_face_fraction"]),
+                median_face_fraction=(
+                    float(record["median_face_fraction"])
+                    if (record.get("median_face_fraction") or "").strip()
+                    else None
+                ),
                 inconclusive=int(record.get("inconclusive") or 0),
                 source_path=(record.get("source_path") or "").strip(),
             )
@@ -357,7 +411,7 @@ def rank_chunks(
     ranked: list[ChunkDesyncRisk] = []
     for chunk_id, offset in offsets.items():
         row = report.rows.get(chunk_id)
-        fraction = row.max_face_fraction if row is not None else None
+        fraction = _ranking_fraction(row) if row is not None else None
         inconclusive = row.inconclusive if row is not None else 0
         verdict, reason = classify(fraction, inconclusive)
         ranked.append(

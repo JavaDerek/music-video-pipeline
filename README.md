@@ -704,13 +704,15 @@ audio does — and the render log already names every chunk over the one-second
 warning threshold. What it cannot say is which of them anyone will see, and
 on a real render the offset ranking runs backwards: the two largest offsets
 in the song are the two least-noticed chunks. Delivered face size separates
-the two groups perfectly (noticed: 0.0778-0.2101 of frame; never reported:
-0.0120-0.0474), so this reads the offsets out of the log, joins them to
-`facescan`'s `max_face_fraction`, and prints the flagged chunks worst-first.
+the two groups perfectly (noticed: 0.0557-0.1982 of frame; never reported:
+0.0090-0.0441), so this reads the offsets out of the log, joins them to
+`facescan`'s `median_face_fraction`, and prints the flagged chunks worst-first.
+The median, not the max: a max answers "was there ever a big face", and on a
+measured framing A/B one frame in twelve inverted the ranking (#97).
 
 Two deliberate limits. It reports a **band**, not a threshold: seven
 adjudicated chunks from one render locate the boundary somewhere between
-0.0474 and 0.0778 and say nothing about where inside it, so a chunk that
+0.0441 and 0.0557 and say nothing about where inside it, so a chunk that
 lands in the gap is reported `uncertain` rather than assigned to a side.
 And it **refuses** a face CSV with no `facescan` provenance header — the
 join between a face measurement and a timeline is exactly where #93's
