@@ -822,3 +822,67 @@ def test_alignment_overrides_validate_the_final_sequence_not_each_step(tmp_path)
 
     assert result.segments[1].end == pytest.approx(14.0)
     assert result.segments[2].start == pytest.approx(14.5)
+
+
+# --------------------------------------------------------------------------- #
+# Issue #101: "was this tagged" rides the same word-owner walk as "by whom"
+# --------------------------------------------------------------------------- #
+
+
+def test_align_carries_whether_each_line_was_tagged_onto_its_segments(tmp_path):
+    """``characters`` and ``characters_authored`` are read at the same word
+    position, so a segment can never be told it was tagged by one lyric line
+    while taking its characters from another."""
+    audio = write_silent_wav(tmp_path / "master.wav", seconds=20.0)
+    lines = parse_lyrics_text(
+        "Nobody tagged this one\n[Marcus: Backup]\nBut this one is his\n", CAST, DEFAULT_LEAD
+    )
+    assert [line.characters_authored for line in lines] == [False, True]
+
+    raw = _raw_result(_segment(lines[0].text, 0.0, 4.0), _segment(lines[1].text, 5.0, 9.0))
+
+    result = align(audio, lines, model=_fake_model(raw))
+
+    assert [s.characters for s in result.segments] == [("Dianne",), ("Marcus",)]
+    assert [s.characters_authored for s in result.segments] == [False, True]
+
+
+def test_align_defaults_segments_without_word_timings_to_the_preceding_authored_state(tmp_path):
+    """A timing-less segment inherits the previous segment's characters (long
+    established behaviour), so it must inherit that segment's *authored-ness*
+    too -- otherwise a tagged passage acquires an untagged hole that diarization
+    would then be free to overwrite."""
+    audio = write_silent_wav(tmp_path / "master.wav", seconds=20.0)
+    lines = parse_lyrics_text("[Marcus: Backup]\nHis tagged line\n", CAST, DEFAULT_LEAD)
+    timed = _segment(lines[0].text, 0.0, 4.0)
+    untimed = SimpleNamespace(text="an echo", start=4.0, end=5.0, words=[])
+
+    result = align(audio, lines, model=_fake_model(_raw_result(timed, untimed)))
+
+    assert [s.characters for s in result.segments] == [("Marcus",), ("Marcus",)]
+    assert [s.characters_authored for s in result.segments] == [True, True]
+
+
+def test_align_marks_counterpoint_segments_as_authored(tmp_path):
+    """A concurrent stream exists only because somebody wrote a ``[Name]``
+    sub-block tag for it, so its derived segments are authored by
+    construction -- and diarization leaves them alone anyway, since the aligner
+    never heard those voices separately."""
+    audio = write_silent_wav(tmp_path / "master.wav", seconds=20.0)
+    doc = parse_lyrics_text(
+        "[simultaneously]\n"
+        "  [Dianne]\n"
+        "  There was a time\n"
+        "  [Marcus]\n"
+        "  I know when it is people like you\n"
+        "[/simultaneously]\n",
+        CAST,
+        DEFAULT_LEAD,
+    )
+    raw = _raw_result(_segment(doc[0].text, 0.0, 4.0))
+
+    result = align(audio, doc, model=_fake_model(raw))
+
+    assert isinstance(result, CounterpointAlignmentResult)
+    assert result.concurrent_segments
+    assert all(s.characters_authored for s in result.concurrent_segments)

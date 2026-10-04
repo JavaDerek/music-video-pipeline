@@ -33,6 +33,7 @@ else:
     import tomli as tomllib
 
 from music_video_maker import cli, contracts, resilience
+from music_video_maker import diarization as cli_diarization
 from music_video_maker.assembly import DEFAULT_OUTPUT_FILENAME
 from music_video_maker.contracts import ChunkFingerprint
 from music_video_maker.envelope import UnprovenEnvelopeError
@@ -312,11 +313,13 @@ class Rig:
         reseed_chunk_ids: tuple[int, ...] | None = None,
         reseed_generation: int = cli.DEFAULT_RESEED_GENERATION,
         seed_face_gate: Any = _ALLOW_ANY_SEED,
+        diarizer: Any = None,
     ) -> cli.RunReport:
         self.run_report = cli.run_pipeline(
             self.config,
             resume=resume,
             align_model=self.align_model,
+            diarizer=diarizer,
             comfyui_session=self.session,
             ws_factory=SequencedWSFactory(ws_sequences),
             ffmpeg_runner=self.ffmpeg,
@@ -2694,3 +2697,83 @@ def test_a_slice_of_small_chunks_is_not_refused_for_a_long_chunk_elsewhere(tmp_p
     assert len(rig.submitted) == 1
     state = resilience.load_run_state(rig.config.run_state_file)
     assert state.results[1].fingerprint.frame_count <= 192
+
+
+# --------------------------------------------------------------------------- #
+# Issue #101: diarization wired through run_pipeline, opt-in and stem-only
+# --------------------------------------------------------------------------- #
+
+
+def test_run_pipeline_does_not_diarize_unless_asked(tmp_path: Path):
+    """The opt-in half, asserted the only way that means anything: a diarizer
+    that fails the test if it is ever called.
+
+    A run that does not ask for diarization must be byte-identical to one from
+    before the feature existed -- which means the seam is not merely ignored,
+    it is never reached."""
+    rig = Rig(tmp_path)
+    stem = write_silent_wav(tmp_path / "audio" / "vocals.wav", seconds=25.0)
+    # The stem is configured (so conditioning still uses it) but diarize is not.
+    rig.config = replace(rig.config, vocal_stem=stem, diarize=False)
+    sequences = [build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)]
+
+    def _must_not_run(_audio_path):
+        raise AssertionError("diarization ran on a run that did not ask for it")
+
+    report = rig.run(sequences, diarizer=_must_not_run)
+
+    assert report.dead_lettered == ()
+    assert report.rendered == 3
+
+
+def test_run_pipeline_diarizes_the_stem_and_not_the_master(tmp_path: Path):
+    """With ``diarize = true`` the injected seam is called exactly once, with
+    the **vocal stem**, never the master.
+
+    Diarizing the full mix is what made this feature not worth attempting
+    (issue #101), so which file reaches the diarizer is the load-bearing fact
+    at this layer."""
+    rig = Rig(tmp_path)
+    stem = write_silent_wav(tmp_path / "audio" / "vocals.wav", seconds=25.0)
+    rig.config = replace(
+        rig.config,
+        vocal_stem=stem,
+        diarize=True,
+        diarization_speakers={"SPEAKER_00": "Dianne"},
+    )
+    sequences = [build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)]
+
+    seen: list[Path] = []
+
+    def _diarizer(audio_path):
+        seen.append(audio_path)
+        return [cli_diarization.SpeakerSpan(start=0.0, end=25.0, speaker="SPEAKER_00")]
+
+    report = rig.run(sequences, diarizer=_diarizer)
+
+    assert report.dead_lettered == ()
+    assert seen == [stem], "diarization must read the isolated stem, never the master"
+
+
+def test_a_diarizer_that_cannot_load_its_weights_does_not_end_the_run(tmp_path: Path, caplog):
+    """The degrade path, end to end through ``run_pipeline``.
+
+    A render is hours of GPU custody; ending one over an unaccepted licence or
+    an unset environment variable is the expensive mistake. The run completes
+    on the manual-tag behaviour and the remedy is on the log at ERROR."""
+    rig = Rig(tmp_path)
+    stem = write_silent_wav(tmp_path / "audio" / "vocals.wav", seconds=25.0)
+    rig.config = replace(rig.config, vocal_stem=stem, diarize=True)
+    sequences = [build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)]
+
+    def _gated(_audio_path):
+        raise cli_diarization.DiarizerAccessError(
+            "the weights are GATED: accept the terms at https://huggingface.co/..."
+        )
+
+    with caplog.at_level(logging.ERROR, logger="music_video_maker.diarization"):
+        report = rig.run(sequences, diarizer=_gated)
+
+    assert report.dead_lettered == ()
+    assert report.rendered == 3
+    assert any("GATED" in r.getMessage() for r in caplog.records)

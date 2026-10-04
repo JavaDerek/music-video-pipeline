@@ -732,6 +732,46 @@ being asked to follow. The file is produced off the render path (e.g.
 inference call inside the pipeline. See
 [`docs/vocal-stem-workflow.md`](docs/vocal-stem-workflow.md) (issue #25).
 
+#### Detecting who is singing, instead of tagging it
+
+`diarize = true` reads that same vocal stem and fills
+`AlignedSegment.characters` — **the field a manual `[Name: Role]` tag fills** —
+on the lines nobody tagged, so everything downstream (the composed prompt, the
+staged reference photo, #92's attribution) is unchanged by construction.
+Off by default; a run that does not ask for it is byte-identical to one from
+before the feature existed, and the tags stay the whole mechanism.
+
+```toml
+vocal_stem = "stems/htdemucs/master/vocals.wav"   # required: never the mix
+diarize = true
+
+[diarization_speakers]       # authored: diarization yields clusters, not names
+SPEAKER_00 = "Dianne"
+SPEAKER_01 = "Marcus"
+```
+
+Run `--prepare` with no mapping first and read the cluster table it logs
+(duration, turn count, first onset, an example lyric per cluster) — that is
+what you write the mapping from. **An authored tag always wins**, and a
+disagreement with one is reported at WARNING with both names and the numbers
+behind the detection, never silently resolved: a silent overwrite of an
+authored fact is the defect, not the fix. It degrades rather than crashing on
+every way of not having the weights, each with its own message naming the
+remedy.
+
+The diarizer is `pyannote.audio` (code MIT, **pretrained models CC-BY-4.0** —
+see [License](#license); the attribution is logged on every run that loads
+them). Nothing is committed or redistributed here: the operator accepts the
+gated terms with their own Hugging Face account. Install with
+`pip install -e ".[diarize]"`.
+
+**The mechanism is built and tested; the claim is not.** No multi-vocalist song
+has been diarized here and the two thresholds are unmeasured, which the report
+says at WARNING every run. Read
+[`docs/vocalist-diarization.md`](docs/vocalist-diarization.md) — especially its
+"What is still unverified" section — before trusting a number it produces
+(issue #101).
+
 #### Correcting the alignment by hand
 
 When no alignment model gets a passage right, `[[alignment_override]]` tables
@@ -1741,6 +1781,25 @@ terms of:
   which the `[faces]` extra installs to run this model, is never committed
   here and carries its own (separate, Apache-2.0) licence that only reaches
   someone who opts into that extra.
+- `pyannote.audio` and its pretrained pipelines, used by the `[diarize]` extra
+  for automatic vocalist detection (issue #101). The **code** is MIT by its own
+  authors; the **pretrained models are CC-BY-4.0**, which requires attribution:
+
+  > Speaker diarization by pyannote.audio (code: MIT) using the pretrained
+  > pipeline `pyannote/speaker-diarization-3.1` (models: CC-BY-4.0), by Hervé
+  > Bredin and contributors — <https://github.com/pyannote/pyannote-audio>.
+  > Cite: H. Bredin, *"pyannote.audio 2.1 speaker diarization pipeline:
+  > principle, benchmark, and recipe"*, Interspeech 2023.
+
+  Terms accepted 2026-10-04 (commercial use permitted with attribution). No
+  weights are committed here and none are fetched by this project on anyone's
+  behalf: the models are **gated**, and the operator accepts the terms with
+  their own Hugging Face account and fetches them into their own cache — the
+  same arrangement as the SFace weights above. The attribution text is
+  `music_video_maker.diarization.ATTRIBUTION` and is logged at INFO on every
+  run that loads the pipeline, because CC-BY asks for credit from whoever uses
+  the work and not only from whoever reads this file. Details and the one-time
+  setup: [`docs/vocalist-diarization.md`](docs/vocalist-diarization.md).
 - Any H3-generated frame derived from a real cast member's reference photo —
   including the regression fixtures under `tests/fixtures/seed_frames/` —
   which depict a real, identifiable person. Publishing or reusing them is
@@ -1756,9 +1815,12 @@ terms of:
   open gaps.
 - [`docs/lyrics-format.md`](docs/lyrics-format.md) — the lyrics file format
   and `[Character: Role]` tag syntax.
-- [`docs/design-multi-vocalist.md`](docs/design-multi-vocalist.md) — design
-  (not yet built) for automatic vocalist detection, and why hand-tagging with
-  `[Name: Role]` is the correct answer until it lands.
+- [`docs/design-multi-vocalist.md`](docs/design-multi-vocalist.md) — the design
+  for automatic vocalist detection, now built; read it for the shape and the
+  reasoning.
+- [`docs/vocalist-diarization.md`](docs/vocalist-diarization.md) — the built
+  feature (issue #101): the one-time gated-model setup, the per-song workflow,
+  the tag-wins disagreement rule, and exactly what is still unverified.
 - [`docs/shot-writing-guide.md`](docs/shot-writing-guide.md) — how to write
   the `shot` lines themselves so cause and effect read as connected: the
   three-beat rule, one beat per shot, naming the contact. Written from what
