@@ -4,7 +4,7 @@
 # the look. Loading this file RAISES until it is filled in -- deliberately;
 # see profiles/README.md, "Why this file refuses to load".
 #
-# What goes in it: the 631 characters the "Deathless" photography stage
+# What goes in it: the 562 characters the "Deathless" photography stage
 # produced, which a human approved, which the 2026-09-20 A/B rendered at
 # identical seeds on chunks 16/23/44/64, and which Derek chose. That text
 # lives in ~/mvm-runs/deathless/.authoring/photography.json under

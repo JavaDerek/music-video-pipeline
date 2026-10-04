@@ -11,7 +11,7 @@ generates currently has **nowhere durable to live**.
 ## The measured motivation
 
 "Deathless", the only full 80-chunk render this project has, was authored with
-`mvm-author`. Its Stage-3 photography run produced 631 characters of film
+`mvm-author`. Its Stage-3 photography run produced 562 characters of film
 direction and a human approved it:
 
 > *(The approved text is a run asset and is not reproduced here.)*
@@ -271,7 +271,7 @@ reads; the two hashes are what a machine can check.
 **The first house profile is committed as a skeleton, and it refuses to load.**
 `profiles/refestramus-house-v1.toml` carries the placeholder
 `cinematography = "<TODO: …>"`, and `load_profile` raises on any look value
-starting with `<TODO`, naming the promote command. The approved 631 characters
+starting with `<TODO`, naming the promote command. The approved 562 characters
 live in `~/mvm-runs/deathless/.authoring/photography.json` — a run asset, not
 repo content, and not reproducible from a checkout.
 
