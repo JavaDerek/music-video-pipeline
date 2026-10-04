@@ -15,6 +15,7 @@ sleep, and nothing ever binds to a non-loopback, non-Tailscale address.
 from __future__ import annotations
 
 import http.client
+import inspect
 import json
 import socket
 import threading
@@ -23,9 +24,9 @@ from pathlib import Path
 
 import pytest
 
+from music_video_maker import control, webui
 from music_video_maker import prepare_report as prepare_report_module
 from music_video_maker import resilience as resilience_module
-from music_video_maker import webui
 from music_video_maker.contracts import ChunkResult, ChunkStatus, RunState, VramStopEvent
 
 
@@ -1142,30 +1143,33 @@ class TestHostHeaderOverHTTP:
 
 
 # --------------------------------------------------------------------------- #
-# The design doc's second day-one test does not apply here
+# The design doc's second day-one test, which now applies
 # --------------------------------------------------------------------------- #
 
 
-def test_starting_a_run_while_one_is_in_flight_is_refused_does_not_apply() -> None:
+def test_a_server_without_control_can_still_mutate_nothing() -> None:
     """docs/design-web-ui.md's "Testing" section names two day-one tests for
     a server like this: the bind-address assertion (covered exhaustively
     above) and 'starting a run while one is in flight is refused'.
 
-    The second one is an acceptance criterion for the *start/configure* half
-    of issue #36, which this work package deliberately does not build -- see
-    music_video_maker/webui.py's module docstring, "Scope: read-only,
-    deliberately". There is no start route here to refuse a second run from:
-    ``MonitorRequestHandler`` only ever reads run_state.json and serves
-    static/derived files. This test exists so a reader of the suite sees
-    that gap was a decision, not an oversight, and can find the reasoning
-    in one place.
+    The second used to be recorded here as *not applicable*, because there
+    was no start route to refuse a second run from. There is one now
+    (2026-10-04), and it is tested for real -- in
+    ``tests/test_control.py::TestOneRunAtATime`` for the gate itself, and in
+    ``TestControlStart`` below for the 409 a browser gets. What survives in
+    this test is the other half of that decision: the control routes are
+    **opt-in**, so a server started the way every existing deployment starts
+    it can still mutate nothing at all.
     """
-    assert not hasattr(webui.MonitorRequestHandler, "do_start")
-    # No route in the dispatch table can mutate a run's state at all --
-    # every POST/PUT/DELETE/PATCH is a flat 405 (see TestRouteDispatch), and
-    # do_GET only ever reads run_state.json or serves a file the operator
-    # named at startup.
-    assert webui.MonitorRequestHandler.do_POST is webui.MonitorRequestHandler._method_not_allowed
+    ctx = webui.MonitorContext(run_state_path=Path("/nonexistent/run_state.json"))
+    assert ctx.controller is None
+    assert ctx.control_token == ""
+    # Every other method stays a flat 405 whatever control is set to: the
+    # write surface is exactly two POST paths, and nothing else.
+    for method in ("do_PUT", "do_DELETE", "do_PATCH", "do_OPTIONS", "do_TRACE"):
+        assert getattr(webui.MonitorRequestHandler, method) is (
+            webui.MonitorRequestHandler._method_not_allowed
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1288,3 +1292,567 @@ class TestCliMain:
             ["--config", str(config_path), "--bind", "192.168.1.5", "--port", "0"]
         )
         assert exit_code == 1
+
+
+# --------------------------------------------------------------------------- #
+# The control half (issue #36, 2026-10-04): start and stop, with guards
+# --------------------------------------------------------------------------- #
+
+
+class _SpyController:
+    """Stands in for ``control.RenderController`` at the route boundary.
+
+    The controller's own gates have their own suite (tests/test_control.py);
+    what these tests are about is whether a *write route* can be reached
+    cross-site, whether it refuses rather than queues, and whether the
+    refusal reaches the browser. So this records calls and raises whatever
+    it is told to."""
+
+    def __init__(self, *, gate=None, status=None, start_error=None, stop_error=None) -> None:
+        self.starts: list[bool] = []
+        self.stops = 0
+        self._gate = gate or control.StartGate(
+            (control.GateCheck("one_run_at_a_time", True, "no render is in flight."),)
+        )
+        self._status = status or control.RenderStatus(
+            state=control.RenderState.IDLE, log_path=Path("/tmp/nonexistent-webui-test.log")
+        )
+        self._start_error = start_error
+        self._stop_error = stop_error
+        self.config_path = Path("run.toml")
+
+    def status(self):
+        return self._status
+
+    def evaluate_start(self, *, resume: bool = False):
+        return self._gate
+
+    def start(self, *, resume: bool = False):
+        self.starts.append(resume)
+        if self._start_error is not None:
+            raise self._start_error
+        return self._status
+
+    def stop(self):
+        self.stops += 1
+        if self._stop_error is not None:
+            raise self._stop_error
+        return self._status
+
+
+def _serve_with_controller(tmp_path: Path, controller):
+    ctx = webui.MonitorContext(
+        run_state_path=tmp_path / "chunks" / "run_state.json",
+        thumbnail_cache_dir=tmp_path / "thumbcache",
+        controller=controller,
+        control_token="token-for-the-test",
+    )
+    server = webui.make_server("127.0.0.1", 0, ctx)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address[0], server.server_address[1]
+    return f"http://{host}:{port}", server, thread
+
+
+def _shutdown(server, thread) -> None:
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=5)
+
+
+@pytest.fixture
+def control_server(tmp_path: Path):
+    """A monitor with the control half enabled, on a real loopback socket.
+    Yields (base_url, ctx, controller)."""
+    controller = _SpyController()
+    base_url, server, thread = _serve_with_controller(tmp_path, controller)
+    try:
+        yield base_url, server.ctx, controller
+    finally:
+        _shutdown(server, thread)
+
+
+def _post(
+    base_url: str,
+    path: str,
+    *,
+    token: str | None = "token-for-the-test",
+    resume: bool = False,
+    origin: str | None = None,
+    sec_fetch_site: str | None = "same-origin",
+    content_type: str = "application/x-www-form-urlencoded",
+    host: str | None = None,
+    body: str | None = None,
+    omit_content_length: bool = False,
+) -> http.client.HTTPResponse:
+    authority = base_url.split("://")[1]
+    if body is None:
+        fields = []
+        if token is not None:
+            fields.append(f"token={token}")
+        if resume:
+            fields.append("resume=1")
+        body = "&".join(fields)
+    conn = http.client.HTTPConnection(authority, timeout=5)
+    try:
+        conn.putrequest("POST", path, skip_host=True, skip_accept_encoding=True)
+        conn.putheader("Host", host if host is not None else authority)
+        if content_type:
+            conn.putheader("Content-Type", content_type)
+        if not omit_content_length:
+            conn.putheader("Content-Length", str(len(body.encode("utf-8"))))
+        if origin is not None:
+            conn.putheader("Origin", origin)
+        if sec_fetch_site is not None:
+            conn.putheader("Sec-Fetch-Site", sec_fetch_site)
+        conn.endheaders()
+        conn.send(body.encode("utf-8"))
+        resp = conn.getresponse()
+        resp.read_body = resp.read()  # type: ignore[attr-defined]
+        return resp
+    finally:
+        conn.close()
+
+
+class TestControlIsOptIn:
+    """A server started without ``--enable-control`` is the read-only
+    monitor it has always been -- which is why none of the read-only tests
+    above needed to change."""
+
+    def test_start_and_stop_are_405_when_control_is_not_enabled(
+        self, running_server
+    ) -> None:
+        base_url, _, _ = running_server
+        for path in ("/start", "/stop"):
+            resp = _post(base_url, path)
+            assert resp.status == 405
+            assert resp.getheader("Allow") == "GET, HEAD"
+
+    def test_the_index_has_no_form_when_control_is_not_enabled(self, running_server) -> None:
+        base_url, _, run_state_path = running_server
+        _write_run_state(run_state_path, RunState(run_id="r", results={}))
+        resp = _get(base_url, "/")
+        body = resp.read_body.decode("utf-8")
+        assert "<form" not in body
+        assert "/start" not in body
+
+    def test_build_parser_defaults_control_off(self) -> None:
+        args = webui.build_parser().parse_args(["--config", "run.toml"])
+        assert args.enable_control is False
+        assert webui.build_parser().parse_args(
+            ["--config", "run.toml", "--enable-control"]
+        ).enable_control
+
+
+class TestControlCrossSiteDefence:
+    """A write route is a bigger target than a read route. The Host check
+    already stops a rebound *name*; these are the defences against a form on
+    a page the operator happens to be visiting."""
+
+    def test_a_cross_site_form_post_is_refused_even_with_a_right_looking_body(
+        self, control_server
+    ) -> None:
+        base_url, _, controller = control_server
+        resp = _post(base_url, "/start", sec_fetch_site="cross-site")
+        assert resp.status == 403
+        assert controller.starts == []
+
+    def test_a_same_site_subdomain_post_is_refused_too(self, control_server) -> None:
+        base_url, _, controller = control_server
+        resp = _post(base_url, "/start", sec_fetch_site="same-site")
+        assert resp.status == 403
+        assert controller.starts == []
+
+    def test_a_foreign_origin_is_refused(self, control_server) -> None:
+        base_url, _, controller = control_server
+        resp = _post(
+            base_url, "/start", origin="http://evil.example", sec_fetch_site=None
+        )
+        assert resp.status == 403
+        assert controller.starts == []
+
+    def test_a_null_origin_is_refused(self, control_server) -> None:
+        """What a sandboxed iframe or a ``file://`` page sends."""
+        base_url, _, controller = control_server
+        resp = _post(base_url, "/start", origin="null", sec_fetch_site=None)
+        assert resp.status == 403
+        assert controller.starts == []
+
+    def test_the_servers_own_origin_is_accepted(self, control_server) -> None:
+        base_url, _, controller = control_server
+        resp = _post(base_url, "/start", origin=base_url, sec_fetch_site="same-origin")
+        assert resp.status == 303
+        assert controller.starts == [False]
+
+    def test_a_missing_token_is_refused(self, control_server) -> None:
+        base_url, _, controller = control_server
+        resp = _post(base_url, "/start", token=None)
+        assert resp.status == 403
+        assert controller.starts == []
+
+    def test_a_wrong_token_is_refused(self, control_server) -> None:
+        base_url, _, controller = control_server
+        resp = _post(base_url, "/start", token="not-the-token")
+        assert resp.status == 403
+        assert controller.starts == []
+
+    def test_a_rebound_host_is_refused_before_the_token_is_even_looked_at(
+        self, control_server
+    ) -> None:
+        base_url, _, controller = control_server
+        resp = _post(base_url, "/start", host="evil.example")
+        assert resp.status == 421
+        assert controller.starts == []
+
+    def test_the_token_is_never_echoed_back(self, control_server) -> None:
+        base_url, _, _ = control_server
+        resp = _post(base_url, "/start", token="not-the-token")
+        body = resp.read_body
+        assert b"not-the-token" not in body
+        assert b"token-for-the-test" not in body
+
+    def test_the_page_carrying_the_token_is_not_cacheable(self, control_server) -> None:
+        base_url, _, _ = control_server
+        resp = _get(base_url, "/")
+        assert "no-store" in (resp.getheader("Cache-Control") or "")
+
+
+class TestControlRequestBody:
+    def test_a_body_with_no_content_length_is_refused(self, control_server) -> None:
+        base_url, _, controller = control_server
+        resp = _post(base_url, "/start", omit_content_length=True)
+        assert resp.status == 411
+        assert controller.starts == []
+
+    def test_an_oversized_body_is_refused(self, control_server) -> None:
+        base_url, _, controller = control_server
+        resp = _post(base_url, "/start", body="token=x&pad=" + "a" * 9000)
+        assert resp.status == 413
+        assert controller.starts == []
+
+    def test_a_json_body_is_refused(self, control_server) -> None:
+        """Only a form post is accepted, so a cross-origin ``fetch`` would
+        need a content type the browser must preflight -- and the preflight
+        gets a flat 405 (below)."""
+        base_url, _, controller = control_server
+        resp = _post(
+            base_url,
+            "/start",
+            content_type="application/json",
+            body='{"token": "token-for-the-test"}',
+        )
+        assert resp.status == 415
+        assert controller.starts == []
+
+    def test_options_is_still_a_flat_405_so_no_cors_preflight_succeeds(
+        self, control_server
+    ) -> None:
+        base_url, _, _ = control_server
+        resp = _get(base_url, "/start", method="OPTIONS")
+        assert resp.status == 405
+        assert resp.getheader("Access-Control-Allow-Origin") is None
+
+    def test_an_unknown_post_path_is_still_405(self, control_server) -> None:
+        base_url, _, _ = control_server
+        resp = _post(base_url, "/")
+        assert resp.status == 405
+
+
+class TestControlStart:
+    def test_a_good_start_redirects_to_the_page(self, control_server) -> None:
+        base_url, _, controller = control_server
+        resp = _post(base_url, "/start")
+        assert resp.status == 303
+        assert resp.getheader("Location") == "/"
+        assert controller.starts == [False]
+
+    def test_resume_is_passed_through(self, control_server) -> None:
+        base_url, _, controller = control_server
+        resp = _post(base_url, "/start", resume=True)
+        assert resp.status == 303
+        assert controller.starts == [True]
+
+    def test_a_start_while_one_is_in_flight_is_409_and_says_why(self, tmp_path: Path) -> None:
+        gate = control.StartGate(
+            (
+                control.GateCheck(
+                    "one_run_at_a_time",
+                    False,
+                    "a render is already in flight (pid 321) and GPU custody is exclusive -- "
+                    "this is refused, not queued.",
+                ),
+            )
+        )
+        controller = _SpyController(start_error=control.StartRefused(gate))
+        base_url, server, thread = _serve_with_controller(tmp_path, controller)
+        try:
+            resp = _post(base_url, "/start")
+            body = resp.read_body.decode("utf-8")
+            assert resp.status == 409
+            assert "refused, not queued" in body
+            assert "pid 321" in body
+        finally:
+            _shutdown(server, thread)
+
+    def test_a_failed_gate_is_412_and_lists_every_refusal(self, tmp_path: Path) -> None:
+        gate = control.StartGate(
+            (
+                control.GateCheck("one_run_at_a_time", True, "no render is in flight."),
+                control.GateCheck("prepared", False, "nothing has been prepared for this run"),
+                control.GateCheck("vram", False, "only 0.93 GB free on http://doris:8188"),
+            )
+        )
+        controller = _SpyController(start_error=control.StartRefused(gate))
+        base_url, server, thread = _serve_with_controller(tmp_path, controller)
+        try:
+            resp = _post(base_url, "/start")
+            body = resp.read_body.decode("utf-8")
+            assert resp.status == 412
+            assert "nothing has been prepared" in body
+            assert "0.93 GB free" in body
+        finally:
+            _shutdown(server, thread)
+
+    def test_a_control_error_is_a_500_with_the_reason(self, tmp_path: Path) -> None:
+        controller = _SpyController(
+            start_error=control.ControlError("could not write the claim file")
+        )
+        base_url, server, thread = _serve_with_controller(tmp_path, controller)
+        try:
+            resp = _post(base_url, "/start")
+            assert resp.status == 500
+            assert b"could not write the claim file" in resp.read_body
+        finally:
+            _shutdown(server, thread)
+
+    def test_the_refusal_page_escapes_what_a_gate_said(self, tmp_path: Path) -> None:
+        gate = control.StartGate(
+            (control.GateCheck("prepared", False, "<script>alert(1)</script>"),)
+        )
+        controller = _SpyController(start_error=control.StartRefused(gate))
+        base_url, server, thread = _serve_with_controller(tmp_path, controller)
+        try:
+            body = _post(base_url, "/start").read_body.decode("utf-8")
+            assert "<script>alert(1)</script>" not in body
+            assert "&lt;script&gt;" in body
+        finally:
+            _shutdown(server, thread)
+
+
+class TestControlStop:
+    def test_stop_redirects_and_calls_the_controller_once(self, control_server) -> None:
+        base_url, _, controller = control_server
+        resp = _post(base_url, "/stop")
+        assert resp.status == 303
+        assert controller.stops == 1
+
+    def test_stop_with_nothing_to_stop_is_409_with_the_reason(self, tmp_path: Path) -> None:
+        controller = _SpyController(
+            stop_error=control.StopRefused("no render is in flight, so there is nothing to stop")
+        )
+        base_url, server, thread = _serve_with_controller(tmp_path, controller)
+        try:
+            resp = _post(base_url, "/stop")
+            assert resp.status == 409
+            assert b"nothing to stop" in resp.read_body
+        finally:
+            _shutdown(server, thread)
+
+
+class TestControlSectionRendering:
+    def test_an_idle_run_offers_start_with_the_gate_spelled_out(self) -> None:
+        status = control.RenderStatus(state=control.RenderState.IDLE)
+        gate = control.StartGate(
+            (
+                control.GateCheck("one_run_at_a_time", True, "no render is in flight."),
+                control.GateCheck("prepared", False, "nothing has been prepared"),
+            )
+        )
+        html_text = webui.render_control_section(status, gate=gate, token="tok")
+        assert 'action="/start"' in html_text
+        assert 'value="tok"' in html_text
+        assert "nothing has been prepared" in html_text
+        # A refused gate must not present a button as though it would work.
+        assert "disabled" in html_text
+
+    def test_a_passing_gate_offers_an_enabled_button(self) -> None:
+        status = control.RenderStatus(state=control.RenderState.IDLE)
+        gate = control.StartGate(
+            (control.GateCheck("one_run_at_a_time", True, "no render is in flight."),)
+        )
+        html_text = webui.render_control_section(status, gate=gate, token="tok")
+        assert 'action="/start"' in html_text
+        assert "disabled" not in html_text
+
+    def test_a_running_run_offers_stop_and_no_gate(self) -> None:
+        status = control.RenderStatus(
+            state=control.RenderState.RUNNING,
+            claim=control.RenderClaim(pid=99, pgid=99, started_at=0.0),
+            owned=True,
+        )
+        html_text = webui.render_control_section(status, gate=None, token="tok")
+        assert 'action="/stop"' in html_text
+        assert 'action="/start"' not in html_text
+        assert "99" in html_text
+
+    def test_a_run_this_server_did_not_start_says_stop_will_refuse(self) -> None:
+        status = control.RenderStatus(
+            state=control.RenderState.RUNNING,
+            claim=control.RenderClaim(pid=99, pgid=99, started_at=0.0),
+            owned=False,
+        )
+        html_text = webui.render_control_section(status, gate=None, token="tok")
+        assert "kill -INT 99" in html_text
+        assert 'action="/stop"' not in html_text
+
+    def test_an_exited_run_shows_the_exit_code_and_the_log_path(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "webui_render.log"
+        log_path.write_text("Traceback: UnprovenEnvelopeError\n", encoding="utf-8")
+        status = control.RenderStatus(
+            state=control.RenderState.EXITED,
+            claim=control.RenderClaim(pid=99, pgid=99, started_at=0.0),
+            exit_code=3,
+            owned=True,
+            log_path=log_path,
+        )
+        gate = control.StartGate(
+            (control.GateCheck("one_run_at_a_time", True, "the previous run has exited."),)
+        )
+        html_text = webui.render_control_section(status, gate=gate, token="tok")
+        assert "exit code 3" in html_text
+        assert "UnprovenEnvelopeError" in html_text
+        assert str(log_path) in html_text
+
+    def test_a_stop_already_requested_is_said_so_beside_the_button(self) -> None:
+        status = control.RenderStatus(
+            state=control.RenderState.RUNNING,
+            claim=control.RenderClaim(
+                pid=99, pgid=99, started_at=0.0, stop_requested_at=1_000.0
+            ),
+            owned=True,
+        )
+        html_text = webui.render_control_section(status, gate=None, token="tok")
+        assert "stop was requested" in html_text
+
+    def test_a_log_tail_is_escaped(self, tmp_path: Path) -> None:
+        log_path = tmp_path / "webui_render.log"
+        log_path.write_text("<script>alert(1)</script>\n", encoding="utf-8")
+        status = control.RenderStatus(
+            state=control.RenderState.EXITED,
+            claim=control.RenderClaim(pid=1, pgid=1, started_at=0.0),
+            log_path=log_path,
+        )
+        html_text = webui.render_control_section(status, gate=None, token="tok")
+        assert "<script>alert(1)</script>" not in html_text
+        assert "&lt;script&gt;" in html_text
+
+
+class TestControlRequestRefusal:
+    """The pure predicate, over the table of shapes a browser can produce."""
+
+    def _refusal(self, **overrides) -> str | None:
+        kwargs: dict[str, object] = dict(
+            origin=None,
+            sec_fetch_site="same-origin",
+            token="tok",
+            expected_token="tok",
+            bound_address="127.0.0.1",
+            port=8787,
+        )
+        kwargs.update(overrides)
+        return webui.control_request_refusal(**kwargs)  # type: ignore[arg-type]
+
+    def test_a_same_origin_form_post_with_the_token_is_allowed(self) -> None:
+        assert self._refusal() is None
+
+    def test_an_absent_sec_fetch_site_falls_through_to_the_token(self) -> None:
+        """``curl`` sends no ``Sec-Fetch-*``; so does a very old browser. The
+        token is the load-bearing check and the headers corroborate it."""
+        assert self._refusal(sec_fetch_site=None) is None
+        assert self._refusal(sec_fetch_site=None, token="wrong") is not None
+
+    @pytest.mark.parametrize("site", ["cross-site", "same-site", "nonsense"])
+    def test_every_non_same_origin_fetch_site_is_refused(self, site: str) -> None:
+        assert self._refusal(sec_fetch_site=site) is not None
+
+    def test_a_typed_navigation_is_allowed(self) -> None:
+        assert self._refusal(sec_fetch_site="none") is None
+
+    @pytest.mark.parametrize(
+        "origin",
+        [
+            "http://evil.example",
+            "http://127.0.0.1:9999",
+            "https://127.0.0.1:8787",
+            "null",
+            "",
+            "file://",
+            "http://192.168.1.5:8787",
+        ],
+    )
+    def test_a_foreign_or_malformed_origin_is_refused(self, origin: str) -> None:
+        assert self._refusal(origin=origin) is not None
+
+    @pytest.mark.parametrize("origin", ["http://127.0.0.1:8787", "http://localhost:8787"])
+    def test_this_servers_own_origins_are_allowed(self, origin: str) -> None:
+        assert self._refusal(origin=origin) is None
+
+    def test_an_allow_host_origin_is_allowed(self) -> None:
+        assert (
+            self._refusal(origin="http://doris:8787", extra_allowed=frozenset({"doris"}))
+            is None
+        )
+
+    def test_no_token_configured_refuses_everything(self) -> None:
+        assert self._refusal(expected_token="") is not None
+
+    def test_the_token_comparison_is_constant_time(self) -> None:
+        """Not a timing claim a test can make directly -- what it pins is
+        that the comparison goes through ``secrets.compare_digest`` rather
+        than ``==``, which is the part that can regress silently."""
+        source = inspect.getsource(webui.control_request_refusal)
+        assert "compare_digest" in source
+        assert "token ==" not in source
+
+
+def test_a_new_control_token_is_long_random_and_per_process() -> None:
+    first, second = webui.new_control_token(), webui.new_control_token()
+    assert first != second
+    assert len(first) >= 32
+
+
+class TestControlCliWiring:
+    """``main`` is wired here, but nothing is served: the real-socket tests
+    above cover the serving loop, and starting it would leave a thread
+    running past the test."""
+
+    def _run_main(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str]):
+        def _no_tailscale(args):
+            raise FileNotFoundError("tailscale not installed in this sandbox")
+
+        monkeypatch.setattr(webui, "_default_subprocess_runner", _no_tailscale)
+        built: list[webui.MonitorContext] = []
+
+        def _fake_make_servers(addresses, port, ctx):
+            built.append(ctx)
+            raise KeyboardInterrupt  # unwind main() before it serves anything
+
+        monkeypatch.setattr(webui, "make_servers", _fake_make_servers)
+        config_path = _write_minimal_run_config(tmp_path)
+        with pytest.raises(KeyboardInterrupt):
+            webui.main(["--config", str(config_path), "--port", "0", *argv])
+        return built
+
+    def test_enable_control_builds_a_controller_and_a_token(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        built = self._run_main(tmp_path, monkeypatch, ["--enable-control"])
+        assert built and built[0].controller is not None
+        assert built[0].control_token
+
+    def test_without_the_flag_there_is_no_controller_at_all(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        built = self._run_main(tmp_path, monkeypatch, [])
+        assert built and built[0].controller is None
+        assert built[0].control_token == ""

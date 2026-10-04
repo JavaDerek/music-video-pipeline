@@ -5,17 +5,21 @@ There is no UI. A run today is hand-edited TOML, a CLI, and `grep` over
 for anyone else — and it hides the two things that decide whether a run is
 worth starting.
 
-This document is the design. Four pieces of it are built:
+This document is the design. Five pieces of it are built:
 `music_video_maker/progress.py` (the reader-plus-differ underneath the server),
 `music_video_maker/review.py` (the read-only pre-render review page, `--review`;
 see "The next slice — built", below), `music_video_maker/prepare_report.py`
 (what `--prepare` found, written down so something other than a terminal can
-read it; see "The pre-render gate, in the monitor — built") and
-`music_video_maker/webui.py` (the server itself — a **read-only** HTTP monitor;
-see "What's built: the read-only monitor" below). **The start/configure half
-described in "What the page collects" is not built** — see "What is
-deliberately not here" for why, and read that section before assuming it was
-merely forgotten.
+read it; see "The pre-render gate, in the monitor — built"),
+`music_video_maker/webui.py` (the server itself — the HTTP monitor; see
+"What's built: the read-only monitor" below) and, since 2026-10-04,
+`music_video_maker/control.py` (**start and stop one run, with guards** — see
+"The control half — built" below, and read it before changing any of it).
+
+**The *configure* half described in "What the page collects" is still not
+built.** `run.toml` remains the source of truth and a human edits it; the page
+can start the run that file already describes and interrupt it, and nothing
+else.
 
 ## What is built, and why that piece first
 
@@ -110,8 +114,9 @@ directory, not this server's to write into).
 `music_video_maker/webui.py` — plus a console script and `python -m
 music_video_maker.webui`, following `pyproject.toml`'s existing
 `[project.scripts]` pattern — is the server the rest of this document used to
-say did not exist. It is read-only: see "What is deliberately not here"
-below for the boundary and why it stops there.
+say did not exist. It is read-only unless started with `--enable-control`:
+see "The control half — built" below for what that flag adds, what it
+refuses, and why the boundary sits exactly there.
 
 Run it against a config already driving a render, or a finished one:
 
@@ -130,6 +135,15 @@ If you reach it by a *name* rather than an address — a Tailscale MagicDNS
 name, typically — add `--allow-host <name>`, or the request is refused with
 `421` by the Host check below. The server's own bound address and `localhost`
 need no flag.
+
+To be able to start and stop this run from the page, add `--enable-control`:
+
+```bash
+mvm-webui --config run.toml --enable-control
+```
+
+Without it there is no write route at all. With it there are exactly two, and
+the startup log says so in a WARNING naming the claim file and the child's log.
 
 ### Bind addresses
 
@@ -271,39 +285,158 @@ double slash) at that route and asserts a flat 404 for every one, the same
   ever serves whatever file is put there, never generates one, and never
   imports `review.py` — which is what keeps `webui.py` free of any import of
   `alignment`/`slicing`.
-* Everything else 404s. Only `GET` and `HEAD` are accepted; every other
-  method (`POST` included) gets a flat 405 with an `Allow: GET, HEAD` header.
+* **`POST /start`** and **`POST /stop`** — only with `--enable-control`; see
+  "The control half — built" immediately below.
+* Everything else 404s. Only `GET`, `HEAD` and (with `--enable-control`) a
+  `POST` to those two paths are accepted; every other method — `PUT`,
+  `DELETE`, `PATCH`, `OPTIONS`, `TRACE`, and `POST` to any other path — gets
+  a flat 405 with an `Allow: GET, HEAD` header and no CORS headers at all.
 
-### What is deliberately not here
+### The control half — built (issue #36, 2026-10-04)
 
-No start, configure, resume, or reseed route exists anywhere in this
-server — no form, no POST handler, nothing that touches `run.toml` or calls
-into `cli.run_pipeline` / `resilience.ResilientRunner`. Two reasons, matching
-"Custody and resume" below:
+This section used to be called "What is deliberately not here" and said that
+no start route existed, for two reasons: GPU custody, and the fact that
+anything able to start a render can write files and load custom nodes *by
+proxy through ComfyUI*. Both reasons are still true. What changed on
+2026-10-04 is that the owner decided what a button may do: **start a run and
+stop it, with guards, and nothing else.** So the scope sentence is now
+narrower rather than absent — the page cannot configure a run, cannot name a
+path, a chunk, a resolution or a config value, and cannot pass any flag but
+`--resume`.
 
-1. **GPU custody is exclusive** (`custody.py`'s module docstring; CLAUDE.md's
-   "GPU custody protocol"). Starting a render safely means refusing a second
-   one in flight, running the issue #19 pre-flight, and respecting that a
-   wedge under VRAM contention can strand the host. The CLI already has all
-   of this; how a *server* should gate it has not been reviewed by the owner,
-   and this work package is not the place to decide that unreviewed.
-2. Anything that can start a render can write files and load custom nodes
-   *by proxy through ComfyUI* — the same threat model as an open bind, one
-   layer up (see "The constraint that shapes everything else"). A read-only
-   monitor that only ever reads `run_state.json` and serves pre-existing,
-   operator-named files cannot become that regardless of what address it is
-   reachable from; a start/configure half would have to clear a materially
-   higher bar than this module does.
+`music_video_maker/control.py` is that half, and it imports no `http` and no
+`socket` for the same reason `progress.py` does not: the module holding the
+gates should not also be holding a connection.
 
-This document's "Testing" section (below) names two tests that must exist on
-day one for a server like this: the bind-address assertion, and "starting a
-run while one is in flight is refused". The first is built and tested
-exhaustively above. The second **does not apply** to this server — there is
-no start route to refuse a second run from — and
-`tests/test_webui.py::test_starting_a_run_while_one_is_in_flight_is_refused_does_not_apply`
-says so explicitly, as an executable test with that reasoning in its own
-docstring, so a reader of the suite sees a decision rather than a gap nobody
-noticed.
+**A start is the CLI, spawned.** `python -m music_video_maker.cli --config
+<the same file>`, in its own session. Not `run_pipeline` in a thread — that
+would put the custody pre-flight, `prevent_host_sleep`, the between-chunk
+VRAM re-check and the unconditional `POST /free` behind a shutdown path
+nobody has tested, and would make "stop the render" mean "raise an exception
+in a worker thread", which Python does not offer honestly. Spawning buys
+three things:
+
+* the gates are the CLI's own, not a second copy that drifts from them;
+* a **stop is a SIGINT to the child's process group, which is literally what
+  Ctrl-C is** (a terminal signals the whole foreground group, which is also
+  how any ffmpeg the run has spawned goes down with it). The pipeline already
+  persists run state before every chunk and releases custody in a `finally`,
+  so there is no second shutdown path — and `start_new_session=True` also
+  means Ctrl-C on `mvm-webui` itself does *not* take a 100-minute render with
+  it;
+* a render that wedges the host takes the server's child, not the server, and
+  `run_state.json` is still the source of truth about what rendered.
+
+**Opt-in.** Without `--enable-control` the process is the read-only monitor
+it has always been — no POST route, no form in the page, and none of the
+read-only tests needed to change. An existing deployment does not acquire a
+write surface by being upgraded.
+
+**The gate: five checks, all refusals, never a queue.** Four are the run's
+own, called through the run's own functions so there is exactly one copy of
+each rule — which is why this work refactored three of them into public
+functions rather than re-deriving them:
+
+| check | what runs | refuses when |
+|---|---|---|
+| `one_run_at_a_time` | a claim file beside the run state | a live pid holds the claim |
+| `prepared` | `prepare_report.read_prepare_report` + `stale_inputs` | see below |
+| `disk` | `resilience.preflight_disk_check` (issue #10) | short of `min_free_disk_gb` |
+| `vram` | `custody.preflight_free_vram` (issue #19) | a usable reading below `min_free_vram_gb` |
+| `envelope` | `envelope.check_render_envelope` (issues #24/#98) | the longest chunk is outside the proven table |
+
+Every check's reading is shown on the page whether it passed or not, and a
+refusal names the number and the remedy. Four notes on the shape of it:
+
+* **`one_run_at_a_time` is a file, not memory.** A restarted server must not
+  start a second render over the first one, so the claim (pid, process-group
+  id, start time) lives in `webui_render.lock` beside the run state. It is
+  created with `O_CREAT|O_EXCL` *after* the gate passes, which is the second
+  of two different races: the in-process mutex stops two requests to this
+  server, the exclusive create stops two servers. A claim whose pid is gone
+  is cleared automatically; a claim file that exists and cannot be parsed is
+  a **refusal**, because starting a second render over a live one is the
+  unrecoverable direction. One thing worth writing down: the custody floor is
+  itself a cross-process exclusion, measured — on this stack H3 resident
+  leaves under 1 GB free (CLAUDE.md's between-chunk bullet), so a render
+  started from a terminal makes the `vram` check refuse at ~0.8 GB against a
+  16 GB floor. The lock is the fast, legible guard; the floor is the one that
+  does not depend on a file.
+* **`vram` degrades rather than refusing when ComfyUI cannot be read**,
+  because that is what the CLI's own pre-flight decides (logged, non-fatal),
+  and a gate stricter than the thing it gates is a policy nobody reviewed.
+  The page says the card could not be read. This is the one asymmetry in the
+  table and it is deliberate; a run that cannot reach ComfyUI fails in
+  seconds without touching the card.
+* **`envelope` is evaluated from published data, not a recomputed timeline.**
+  The monitor must never run Stage 1-2 (it writes chunk audio into the live
+  run's own directory), so the gate needs the longest chunk's frame count
+  from somewhere else — and the lesson in the repos' shared CLAUDE.md is to
+  check whether the other side already publishes what you were about to
+  mirror. It nearly did: `--prepare` had `total_frames` but not the maximum.
+  `PrepareReport.max_chunk_frames` / `max_chunk_frames_chunk_id` (optional on
+  read, no schema bump — an old report reads as `None`) is that one number,
+  and it is *sufficient* rather than convenient: `EnvelopePoint.covers` is
+  per axis, so at one fixed resolution the longest chunk decides the whole
+  run. Cover it and every shorter chunk is covered; miss it and the run is
+  refused. Which *other* chunks also miss is reporting, and only the
+  per-chunk check inside the run can enumerate those — it still runs, before
+  any GPU work. The config's own ceiling was considered for this and
+  rejected: `hardware.max_chunk_seconds` defaults to H3's trained maximum
+  (362 frames), so a ceiling check would refuse *every* default config,
+  which is a gate that cries wolf.
+* **`prepared` is the one check with no CLI equivalent**, and it is
+  deliberately stricter: a start is refused unless a prepare report exists,
+  this build can read it, it records a frame count, and every input it was
+  computed from is unchanged on disk. Reasons, in order: it is the half of
+  issue #36 that matters more ("a 100-minute mistake turned into a 10-second
+  one" is the whole argument for the page, and a button that skips the review
+  is that mistake with a shorter path to it); it is what makes the `envelope`
+  check above possible without recomputing the timeline; and the remedy is
+  ~50 s of CPU and no GPU, with the page printing the command. A shot-plan
+  refusal fails this check too, and a CRITICAL alignment finding fails it
+  **only under `strict_alignment`** — mirroring the CLI exactly, because a
+  page that refuses what the CLI accepts teaches operators to go round it.
+
+**What the control half will not do**, each a refusal with words rather than
+an omission:
+
+* **It will not stop a claim it did not create.** A pid read out of a file
+  this process did not write could have been reused by something unrelated,
+  and SIGINT to a stranger's process group is not a recoverable mistake. The
+  page says `kill -INT <pid>` instead. The cost is real and accepted: a
+  server restarted during a 100-minute render shows a stop that refuses.
+* **It will not escalate.** A second stop sends another SIGINT, the way
+  pressing Ctrl-C twice does. Nothing sends SIGKILL: killing a render inside
+  its `POST /free` is how the card gets left holding 17 GB, which is the
+  incident recorded under "Custody and resume" below.
+* **It will not touch the card.** Stopping the GPU's other tenants stays
+  manual (`custody.py`'s module docstring). A button that paused somebody's
+  inference server is the exact automation this project decided never to
+  build.
+* **It will not write `run.toml`.**
+
+**Two files, beside the run state** (`run_state.json`'s own directory, where
+`--prepare` already writes its report): `webui_render.lock`, the claim, and
+`webui_render.log`, the child's stdout and stderr. That log is how a refusal
+from *inside* the run reaches the page — a per-chunk envelope miss, a config
+error, a strict-alignment stop — and the page shows its tail with the exit
+code. This is the deliberate exception to "the monitor never writes into the
+run's directory", and it is exactly why it is a separate module: the
+read-only half still writes nothing at all.
+
+**Defending a write route** (and why the bind list is not that defence) is in
+`webui.py`'s module docstring under "Reaching the control routes". In short: a
+cross-site `POST` of `application/x-www-form-urlencoded` needs no CORS
+preflight, so three checks must all pass — a per-process CSRF token compared
+with `secrets.compare_digest` (load-bearing: it is only obtainable by
+*reading* `GET /`, which a cross-origin script cannot do and a rebound name
+cannot reach), `Sec-Fetch-Site` in `{same-origin, none}` when present
+(`same-site` refused — a sibling host is not this origin), and `Origin`
+matching this server's own origin when present (`null` refused rather than
+treated as absent). Plus: form content type only, a 4 KiB body cap, a `303`
+redirect so a reload does not re-submit, `Cache-Control: no-store` on the
+page carrying the token, and nothing ever echoed back into a response.
 
 ## Open questions, and the answers this design assumes
 
@@ -504,22 +637,27 @@ makes every finding in this project checkable.
 
 ## Custody and resume, which must be visible rather than hidden
 
-The first two bullets below are requirements for a future *start/configure*
-half — not built here, see "What is deliberately not here" above — and are
-kept in this document unchanged so whoever eventually builds that half
-inherits them rather than rediscovering them. The last two are about
-*displaying* resume semantics, which the built read-only monitor already
-does.
+The first two bullets below were written as requirements for a future
+*start/configure* half and are now **satisfied** by the control half above;
+they are kept in their original words, with what satisfies them noted, because
+the requirement is what the next change has to keep true. The last two are
+about *displaying* resume semantics, which the monitor already does.
 
 * **GPU custody is exclusive.** A UI that can start a render must refuse to
   start a second one while one is in flight, and must not bypass the #19
   pre-flight. The stopping of the card's other tenants is deliberately manual
   and stays manual — see `custody.py`'s module docstring. A UI button that
   stops the Ollama container would be the exact automation this project
-  decided never to build.
+  decided never to build. **Satisfied:** the `one_run_at_a_time` claim file
+  plus the `vram` check calling `custody.preflight_free_vram` itself, and no
+  button anywhere touches another tenant.
 * **Release is unconditional.** Any path that renders releases ComfyUI's VRAM
   in a `finally`. A direct-library test script that skipped it once left 17 GB
-  held and starved every other tenant on the card.
+  held and starved every other tenant on the card. **Satisfied by not being
+  reimplemented:** the control half spawns the CLI, so the `finally` that
+  releases the card is the same one every hand-run render uses — which is
+  also why stopping is a SIGINT (the `KeyboardInterrupt` path runs it) and
+  why nothing here ever sends SIGKILL.
 * **Resume semantics must be surfaced, not hidden.** When a chunk is
   re-rendered the page must say *why*: a `schema_version` rejection, or a
   fingerprint mismatch **naming the field that changed**. `ChunkFingerprint`
@@ -546,12 +684,16 @@ does.
   still true of the mp4 that exists and `progress.py` already excludes cached
   chunks from its projection by status; `rerender_reason` answers "why did
   *this* run re-render this chunk", and this run did not.
-* **Dead-lettered chunks** are called out with their error history. **Built,
-  with one adjustment:** the read-only monitor shows the errors
-  (`ProgressEvent("chunk_dead_lettered")` carries the full `errors` tuple)
-  but does not *offer* a resume button — resuming means starting a render,
-  which is the half this server does not do; `--resume` on the CLI is still
-  how a dead-lettered chunk actually gets retried.
+* **Dead-lettered chunks** are called out with their error history.
+  **Built:** the monitor shows the errors
+  (`ProgressEvent("chunk_dead_lettered")` carries the full `errors` tuple),
+  and since 2026-10-04 the resume this bullet originally wanted exists — the
+  start form's `--resume` checkbox, through the same five gates as any other
+  start. It is a checkbox rather than a per-chunk "retry this one" button on
+  purpose: `--resume` reuses every chunk whose fingerprint still matches and
+  re-renders the rest, which is what retrying a dead letter actually means,
+  and a per-chunk control would be `--only-chunks` — a flag that widens what
+  a run does and therefore one a browser does not get.
 
 ## Closed since this document was first written (issue #36)
 
@@ -622,17 +764,32 @@ rediscover:
 
 ## Testing
 
-The existing mock ComfyUI harness (#16) should drive a future start/configure
-half's backend, exactly as it drives the pipeline: no GPU, no network, no live
-server in CI — nothing about the read-only monitor built here needed it,
-since it never renders anything.
+The existing mock ComfyUI harness (#16) drives the control half's `vram`
+check — `FakeComfyUISession.set_vram_free` is where every free-VRAM reading
+in `tests/test_control.py` comes from — exactly as it drives the pipeline: no
+GPU, no network, no live server in CI. Nothing about the read-only monitor
+needed it, since it never renders anything, and the control half still never
+renders anything either: every controller test but two injects a spawner that
+starts nothing.
+
+Those two exceptions are the one claim in this design that cannot be faked,
+so they spawn a **real** child — eight lines of python, no ffmpeg, no
+ComfyUI, no network — and assert that it is its own process-group leader and
+that `killpg(…, SIGINT)` reaches it and runs its handler. "Stopping is
+exactly what Ctrl-C does" is the whole safety argument for the stop button,
+and a mock cannot support it.
 
 For the server itself the two tests that must exist on day one are the
 bind-address assertion and "starting a run while one is in flight is
-refused". **Both are addressed in `tests/test_webui.py`:** the first is
-built and tested exhaustively (see "What's built: the read-only monitor" →
-"Bind addresses"); the second is a documented non-applicability (see "What is
-deliberately not here"), not a gap. Route dispatch, SSE diffing, thumbnail
+refused". **Both are built:** the first is tested exhaustively (see "What's
+built: the read-only monitor" → "Bind addresses"); the second was recorded
+here as *not applicable* until 2026-10-04 and now exists for real, in
+`tests/test_control.py::TestOneRunAtATime` (the gate, and a second controller
+seeing the claim through the lock file) and
+`tests/test_webui.py::TestControlStart` (the 409 a browser gets, refused and
+not queued). The control routes' own cross-site defences are tested both ways
+the Host check is: the pure predicate over a table of origins, fetch-site
+values and tokens, and real loopback POSTs carrying each shape. Route dispatch, SSE diffing, thumbnail
 caching, and HTML escaping are tested the way this project tests everything
 else offline: pure functions directly where possible
 (`resolve_bind_addresses`, `stream_progress_events`, `render_index_html`),

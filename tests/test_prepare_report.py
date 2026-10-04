@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -352,6 +353,41 @@ class TestBuildPrepareReport:
         assert report.timeline_start == 0.0
         assert report.timeline_end == 9.0
         assert report.total_frames == 282
+
+    def test_records_the_longest_chunk_and_which_one_it_was(self) -> None:
+        """The one number the issue #24/#98 render-envelope gate needs, so
+        something that is not running Stage 1-2 can evaluate that gate from
+        published data instead of recomputing the timeline (the web monitor's
+        control half does exactly this). Sufficient rather than convenient:
+        ``EnvelopePoint.covers`` is per axis, so at one fixed resolution the
+        longest chunk decides the whole run."""
+        report = build_prepare_report(
+            generated_at="2026-10-04",
+            config_path="run.toml",
+            inputs=[],
+            alignment_model_size=None,
+            strict_alignment=False,
+            chunks=[
+                _chunk(0, 0.0, 6.0),
+                replace(_chunk(1, 6.0, 14.0), frame_count=192),
+                replace(_chunk(2, 14.0, 20.0), frame_count=124),
+            ],
+            quality_report=_quality_report(),
+            track_duration_seconds=20.0,
+            timeline_drift_seconds=0.0,
+            fps=24,
+            duration_tolerance_seconds=0.042,
+        )
+        assert report.max_chunk_frames == 192
+        assert report.max_chunk_frames_chunk_id == 1
+
+    def test_an_old_report_reads_the_frame_evidence_as_absent_not_as_zero(self) -> None:
+        """``None`` means "this report cannot answer the envelope question",
+        never "nothing is too long" -- the same distinction
+        ``envelope.largest_rendered_frame_count`` draws."""
+        report = PrepareReport.from_dict({"schema_version": PREPARE_REPORT_SCHEMA_VERSION})
+        assert report.max_chunk_frames is None
+        assert report.max_chunk_frames_chunk_id is None
 
     def test_lists_findings_at_warning_and_above_but_counts_all_of_them(self) -> None:
         report = _report()
