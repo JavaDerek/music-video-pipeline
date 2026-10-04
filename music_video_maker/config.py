@@ -44,6 +44,14 @@ against the *config file's* directory, not the process cwd)::
 
     strict_alignment         = false     # issue #35; --strict-alignment overrides
 
+    # Issue #101, optional and off. Reads the vocal stem and fills
+    # AlignedSegment.characters on the lines nobody tagged; needs vocal_stem.
+    diarize = false
+
+    [diarization_speakers]               # cluster label -> cast name, authored
+    SPEAKER_00 = "Dianne"                # run once with no mapping to see the table
+    SPEAKER_01 = "Marcus"
+
     # Issue #39, optional. A file in ComfyUI's own models/text_encoders/ on the
     # render host -- NOT a local path. Unset = whatever the template names.
     text_encoder = "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
@@ -93,6 +101,7 @@ import logging
 import os
 import re
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import fields as dc_fields
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -249,6 +258,35 @@ class RunConfig:
     the render path (e.g. ``python -m demucs --two-stems=vocals``) and
     inspected before use -- never an inference call inside the pipeline.
     ``None`` means today's behaviour: condition on the mix."""
+
+    diarize: bool = False
+    """Issue #101: detect which cast member is singing from the vocal stem.
+
+    Off by default, and a run that leaves it off is byte-identical to one from
+    before this field existed -- nothing is imported, no environment variable is
+    read, and the manual ``[Name: Role]`` tags remain the whole mechanism.
+
+    With it on, :mod:`music_video_maker.diarization` reads :attr:`vocal_stem`
+    (required, and refused at load if absent -- diarizing a full mix is what
+    made this not worth attempting) and writes
+    ``AlignedSegment.characters`` on the segments **no tag covers**. An
+    authored tag always wins; a disagreement with one is reported and never
+    resolved. See that module's docstring and
+    ``docs/vocalist-diarization.md``."""
+
+    diarization_speakers: Mapping[str, str] | None = None
+    """Issue #101: which cast member each detected speaker cluster is.
+
+    Authored data, like the shot plan and ``[[alignment_override]]``: diarization
+    produces clusters (``"SPEAKER_00"``), never names, so this mapping is the
+    only thing that can turn one into a face -- and it is a human's statement
+    after one listen, not an inference.
+
+    ``None`` or empty with ``diarize = true`` is a legitimate **first run**:
+    nothing is assigned and the run logs the cluster table (duration, turn
+    count, first onset, an example lyric) to write this mapping from. Values
+    are validated against ``cast`` at load, because a typo here attributes a
+    whole verse to nobody."""
 
     text_encoder: str | None = None
     """Issue #39: the ``CLIPLoader.clip_name`` every chunk of this run is
@@ -1654,6 +1692,79 @@ def _h3_dimension(merged: dict, key: str) -> int:
     return int(value)
 
 
+def _build_diarization_speakers(
+    merged: dict, cast: Mapping[str, CastMember]
+) -> dict[str, str] | None:
+    """Validate ``[diarization_speakers]`` into a label -> cast-name mapping.
+
+    Issue #101. Every value is checked against ``cast`` here rather than at use
+    time, for the reason every other anchor in this project is checked at load:
+    a typo attributes a whole verse to a character that does not exist, and the
+    symptom arrives in Stage 2b as a missing reference photo, minutes in.
+    """
+    raw = merged.get("diarization_speakers")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        _fail(
+            "diarization_speakers",
+            f"must be a table of speaker label -> cast name, got {type(raw).__name__}. "
+            'Write it as [diarization_speakers] with lines like SPEAKER_00 = "Dianne"',
+        )
+    mapping: dict[str, str] = {}
+    for label, name in raw.items():
+        if not isinstance(name, str) or not name.strip():
+            _fail(
+                "diarization_speakers",
+                f"speaker {label!r} must map to a non-empty cast member name, got {name!r}",
+            )
+        if name not in cast:
+            _fail(
+                "diarization_speakers",
+                f"speaker {label!r} maps to {name!r}, which is not in [cast] "
+                f"(known: {sorted(cast)}). Diarization writes this name into the same field "
+                "a [Name: Role] tag writes, so an unknown name is the same defect as a typo "
+                "in the lyrics file -- caught here rather than in Stage 2b",
+            )
+        mapping[str(label)] = name
+    return mapping
+
+
+def _validate_diarization(values: dict) -> None:
+    """Refuse ``diarize = true`` without a stem; warn about an inert mapping.
+
+    The refusal is the load-bearing half. The design this implements
+    (``docs/design-multi-vocalist.md``) names diarizing the full mix as the
+    thing that made the feature not worth attempting -- a voice-like lead synth
+    is indistinguishable from a singer there -- so a run that asks for
+    diarization with no isolated stem is asking for a measurement nobody should
+    act on, and getting one anyway is worse than being told no.
+    """
+    if values["diarize"] and values["vocal_stem"] is None:
+        raise ConfigError(
+            "diarize = true requires vocal_stem: diarization runs on the ISOLATED VOCAL "
+            "STEM, never the full mix, where a voice-like lead synth clusters as a singer "
+            "(issue #101). Produce one off the render path -- python -m demucs "
+            "--two-stems=vocals -o stems/ audio/master.wav -- listen to it, then point "
+            "vocal_stem at stems/htdemucs/master/vocals.wav. See "
+            "docs/vocal-stem-workflow.md"
+        )
+    if values["diarization_speakers"] and not values["diarize"]:
+        logger.warning(
+            "diarization_speakers maps %d speaker cluster(s) but diarize is false, so the "
+            "mapping is inert and this run uses the manual [Name: Role] tags only (issue "
+            "#101)",
+            len(values["diarization_speakers"]),
+        )
+    if values["diarize"] and not values["diarization_speakers"]:
+        logger.warning(
+            "diarize = true with no [diarization_speakers] mapping: diarization yields "
+            "clusters, never names, so nothing will be assigned this run. That is the "
+            "intended first pass -- read the cluster table it logs (duration, turn count, "
+            "first onset, an example lyric per cluster), listen, and write the mapping."
+        )
+
+
 def _flag(merged: dict, key: str, default: bool) -> bool:
     if key not in merged or merged[key] is None:
         return default
@@ -2186,6 +2297,10 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
         values["vocal_stem"] = resolved_stem
     else:
         values["vocal_stem"] = None
+
+    values["diarize"] = _flag(merged, "diarize", False)
+    values["diarization_speakers"] = _build_diarization_speakers(merged, values["cast"])
+    _validate_diarization(values)
 
     i2v_template = merged.get("i2v_workflow_template")
     values["i2v_workflow_template"] = (

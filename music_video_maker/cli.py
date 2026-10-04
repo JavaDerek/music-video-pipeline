@@ -85,6 +85,7 @@ from music_video_maker.custody import (
     prevent_host_sleep,
     read_render_stack,
 )
+from music_video_maker.diarization import Diarizer, assign_characters, lazy_pyannote_diarizer
 from music_video_maker.envelope import check_render_envelope, measured_ceiling
 from music_video_maker.execution import ComfyUIExecutionClient
 from music_video_maker.faces import build_seed_face_gate
@@ -762,6 +763,7 @@ def _align_and_slice_timeline(
     timeline: Timeline,
     *,
     align_model: object | None,
+    diarizer: Diarizer | None = None,
     from_plan: str | Path | None = None,
     load_plan: bool = True,
     on_quality_report: Callable[[AlignmentQualityReport], None] | None = None,
@@ -783,7 +785,9 @@ def _align_and_slice_timeline(
       segment would attach the song's shot 3 to the prologue's shot 3 with
       nothing raising.
     * the **vocal stem is song-only** -- it is an isolated vocal cut from the
-      master (issue #25), and there is no such thing for a dialogue take.
+      master (issue #25), and there is no such thing for a dialogue take. So
+      is the **diarization** that reads it (issue #101): a prologue has no
+      stem to diarize and no singers to tell apart.
 
     ``from_plan`` is ``--prepare --from-plan``'s re-anchoring, applied to the
     timeline whose plan it is. ``load_plan=False`` is what
@@ -826,6 +830,23 @@ def _align_and_slice_timeline(
             timeline.name,
             len(config.alignment_overrides),
         )
+
+    if timeline.is_song and config.diarize and config.vocal_stem is not None:
+        # Issue #101: an alternative FRONT-END to the manual [Name: Role]
+        # tags, run here -- after align(), before slice_audio() -- because
+        # AlignedSegment.characters is the field slicing derives
+        # AudioChunk.characters from, so writing it here leaves every stage
+        # after Stage 2a innocent of where the attribution came from. Reads
+        # the isolated stem, never the master. Degrades rather than crashing:
+        # a missing token or an unaccepted licence logs an ERROR naming the
+        # remedy and leaves the alignment exactly as the tags left it.
+        alignment = assign_characters(
+            alignment,
+            diarizer=diarizer if diarizer is not None else lazy_pyannote_diarizer(),
+            audio_path=config.vocal_stem,
+            speakers=config.diarization_speakers,
+            default_lead_vocalist=config.default_lead_vocalist,
+        ).alignment
 
     plan = (
         load_shot_plan(timeline.shot_plan, setting=config.setting, cast_names=config.cast)
@@ -1162,6 +1183,7 @@ def run_pipeline(
     *,
     resume: bool = False,
     align_model: object | None = None,
+    diarizer: Diarizer | None = None,
     comfyui_session: Any = None,
     ws_factory: Callable[..., Any] | None = None,
     ffmpeg_runner: Callable[[Sequence[str]], Any] | None = None,
@@ -1314,7 +1336,7 @@ def run_pipeline(
         renders: list[TimelineRender] = []
         for timeline in rendered_timelines:
             alignment, chunks, plan = _align_and_slice_timeline(
-                config, timeline, align_model=align_model
+                config, timeline, align_model=align_model, diarizer=diarizer
             )
             if timeline.is_song and config.vocal_stem:
                 # Issue #25: condition H3 on the isolated vocal stem, cut at
@@ -1488,6 +1510,7 @@ def prepare_timeline(
     config: RunConfig,
     *,
     align_model: object | None = None,
+    diarizer: Diarizer | None = None,
     from_plan: str | Path | None = None,
 ) -> PreparedTimeline:
     """Run Stages 1-2 only for the **song** -- alignment + slicing, no GPU, no
@@ -1523,7 +1546,9 @@ def prepare_timeline(
     what it has always returned.
     """
     song = next(t for t in plan_timelines(config) if t.is_song)
-    return _prepare_one_timeline(config, song, align_model=align_model, from_plan=from_plan)
+    return _prepare_one_timeline(
+        config, song, align_model=align_model, diarizer=diarizer, from_plan=from_plan
+    )
 
 
 def _prepare_one_timeline(
@@ -1531,6 +1556,7 @@ def _prepare_one_timeline(
     timeline: Timeline,
     *,
     align_model: object | None = None,
+    diarizer: Diarizer | None = None,
     from_plan: str | Path | None = None,
 ) -> PreparedTimeline:
     quality_reports: list[AlignmentQualityReport] = []
@@ -1538,6 +1564,7 @@ def _prepare_one_timeline(
         config,
         timeline,
         align_model=align_model,
+        diarizer=diarizer,
         from_plan=from_plan,
         # --prepare deliberately does not read the config's own shot plan at
         # all; only --from-plan names one. Preserved from before issue #66's
@@ -1565,6 +1592,7 @@ def prepare_timelines(
     config: RunConfig,
     *,
     align_model: object | None = None,
+    diarizer: Diarizer | None = None,
     from_plan: str | Path | None = None,
 ) -> tuple[tuple[Timeline, PreparedTimeline], ...]:
     """Stages 1-2 for **every** timeline this run would render, in playback
@@ -1595,6 +1623,7 @@ def prepare_timelines(
                     config,
                     timeline,
                     align_model=align_model,
+                    diarizer=diarizer,
                     from_plan=from_plan if timeline.is_song else None,
                 ),
             )

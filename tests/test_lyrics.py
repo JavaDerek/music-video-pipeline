@@ -620,3 +620,79 @@ def test_lines_after_a_block_inherit_the_pre_block_voice_not_a_block_voice():
         "the post-block line inherited a voice from inside the block instead of "
         "restoring the pre-block tag"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Issue #101: a tag is recorded as AUTHORED, so detection can never overwrite one
+# --------------------------------------------------------------------------- #
+
+
+def test_an_untagged_file_reports_its_characters_as_not_authored():
+    """Nobody tagged ``plain.txt``, so every line's ``characters`` is the
+    configured default lead showing through -- a fallback, not a fact. The flag
+    is what lets diarization (issue #101) fill exactly these lines without
+    being allowed to argue with a real tag."""
+    lines = parse_lyrics(LYRICS_PLAIN_PATH, CAST, DEFAULT_LEAD)
+
+    assert all(line.characters == ("Dianne",) for line in lines)
+    assert not any(line.characters_authored for line in lines)
+
+
+def test_a_tagged_line_and_the_lines_a_tag_covers_are_all_authored():
+    """The lyrics format defines a tag as running until the next one, so the
+    tag's whole scope is authored -- not only the line it sits on. A handoff
+    nobody tagged *inside* that scope is the documented silent failure mode
+    (``docs/lyrics-format.md``), and diarization reports it rather than
+    silently resolving it."""
+    text = "[Dianne: Lead]\nFirst line under the tag\nSecond line under the tag\n"
+
+    lines = parse_lyrics_text(text, CAST, DEFAULT_LEAD)
+
+    assert [line.characters_authored for line in lines] == [True, True]
+    assert all(line.characters == ("Dianne",) for line in lines)
+
+
+def test_an_untagged_default_and_an_explicit_tag_of_the_same_name_differ_only_by_the_flag():
+    """The distinction that cannot be recovered from ``characters`` alone.
+
+    Both halves of this file carry ``("Dianne",)``; only the flag says which
+    one a human wrote down. Without it either every default is protected from
+    detection (making diarization inert) or every tag is overwritable (making
+    it dangerous)."""
+    text = "Untagged opening line\n[Dianne: Lead]\nTagged line\n"
+
+    lines = parse_lyrics_text(text, CAST, DEFAULT_LEAD)
+
+    assert [line.characters for line in lines] == [("Dianne",), ("Dianne",)]
+    assert [line.characters_authored for line in lines] == [False, True]
+
+
+def test_a_tag_with_its_lyric_on_the_same_line_is_authored():
+    text = "[Dianne: Lead] A line sharing its own tag's line\n"
+
+    lines = parse_lyrics_text(text, CAST, DEFAULT_LEAD)
+
+    assert lines[0].characters_authored is True
+
+
+def test_a_simultaneously_sub_block_line_is_authored_by_its_own_tag():
+    """A sub-block exists only because somebody wrote a ``[Name]`` tag for it,
+    so its spine lines are authored by construction."""
+    text = (
+        "[simultaneously]\n"
+        "  [Dianne]\n"
+        "  There was a time\n"
+        "  [Marcus]\n"
+        "  I know when it's people like you\n"
+        "[/simultaneously]\n"
+    )
+
+    doc = parse_lyrics_text(text, CAST, DEFAULT_LEAD)
+
+    assert [line.characters_authored for line in doc] == [True]
+
+
+def test_a_hand_built_lyric_line_claims_nothing_it_cannot_back_up():
+    """The default is ``False``: a ``LyricLine`` built in code has no tag
+    behind it, and the safe reading of "no tag" is "not authored"."""
+    assert LyricLine(index=0, text="a line", characters=("Dianne",)).characters_authored is False

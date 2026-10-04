@@ -330,12 +330,18 @@ class _ParseState:
 
         self._active_characters = names
         if rest:
-            self._emit(rest, names, raw)
+            self._emit(rest, names, raw, authored=True)
 
     def _content(self, stripped: str) -> None:
         if self._block_subs is not None:
             self._block_content(stripped)
             return
+        # Issue #101: whether a tag is in force is recorded, not inferred
+        # later. ``_active_characters`` empty means nobody has tagged this
+        # part of the file, so the names below are the configured default
+        # lead -- a fallback, not an authored fact, even though the resulting
+        # tuple looks identical to an explicit ``[Dianne]``.
+        authored = bool(self._active_characters)
         characters = (
             self._active_characters
             if self._active_characters
@@ -343,12 +349,20 @@ class _ParseState:
         )
         for name in characters:
             _validate_character(name, self._cast)
-        self._emit(stripped, characters, stripped)
+        self._emit(stripped, characters, stripped, authored=authored)
 
-    def _emit(self, content: str, characters: tuple[str, ...], raw: str) -> int:
+    def _emit(
+        self, content: str, characters: tuple[str, ...], raw: str, *, authored: bool
+    ) -> int:
         line_index = self._index
         self.lines.append(
-            LyricLine(index=line_index, text=content, characters=characters, raw=raw)
+            LyricLine(
+                index=line_index,
+                text=content,
+                characters=characters,
+                characters_authored=authored,
+                raw=raw,
+            )
         )
         self._index += 1
         return line_index
@@ -380,7 +394,11 @@ class _ParseState:
         if len(self._block_subs) == 1:
             # First sub-block == the alignment spine: it *is* the transcript
             # for this span, so it goes into the ordinary line index space.
-            sub.line_indices.append(self._emit(stripped, sub.characters, stripped))
+            # A sub-block's names come from its own ``[Name]`` tag, which is
+            # as authored as a flat tag (issue #101).
+            sub.line_indices.append(
+                self._emit(stripped, sub.characters, stripped, authored=True)
+            )
         else:
             sub.texts.append(stripped)
 
