@@ -379,40 +379,71 @@ class VramCustodyManager:
     # -- pre-flight -------------------------------------------------------- #
 
     def _preflight_vram_check(self) -> None:
-        free_gb = _fetch_free_vram_gb(self.session, self.base_url)
-        if free_gb is None:
-            logger.warning(
-                "Pre-flight VRAM check against %s could not get a usable reading -- skipping "
-                "(degraded, not fatal for the no-op custody manager)",
-                self.base_url,
-            )
-            return
-
-        required_gb = self.min_free_vram_gb
-        if free_gb < required_gb:
-            logger.error(
-                "Pre-flight VRAM check FAILED: only %.2f GB free on %s, need >= %.2f GB "
-                "(profile %r, %.2f GB nominal) -- refusing to start the run. Is something "
-                "else still holding the GPU? Check with "
-                "'nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv', "
-                "and note that a previous run's models stay resident until POST /free.",
-                free_gb,
-                self.base_url,
-                required_gb,
-                self.hardware.name,
-                self.hardware.vram_gb,
-            )
-            raise CustodyError(
-                f"only {free_gb:.2f} GB free on {self.base_url} "
-                f"(need >= {required_gb:.2f} GB; hardware profile {self.hardware.name!r})"
-            )
-
-        logger.info(
-            "Pre-flight VRAM check OK: %.2f GB free on %s (>= %.2f GB required)",
-            free_gb,
+        preflight_free_vram(
+            self.session,
             self.base_url,
-            required_gb,
+            min_free_vram_gb=self.min_free_vram_gb,
+            hardware=self.hardware,
         )
+
+
+def preflight_free_vram(
+    session: Any,
+    base_url: str,
+    *,
+    min_free_vram_gb: float,
+    hardware: HardwareProfile,
+) -> float | None:
+    """The issue #19 pre-flight, as a function: one ``GET /system_stats``
+    reading compared against ``min_free_vram_gb``.
+
+    Returns the reading (``None`` when no usable one could be taken) and
+    raises :class:`CustodyError` when a usable reading is below the floor.
+    ``VramCustodyManager.__enter__`` calls exactly this, and so does the web
+    monitor's control half (:mod:`music_video_maker.control`) before it
+    spawns a render -- so there is one copy of the comparison, one copy of
+    the refusal message and one copy of the "unreadable is degraded, not
+    fatal" decision rather than a second gate that drifts from this one.
+
+    The degradation is deliberate and is this function's, not each caller's:
+    an unreachable or unparseable ComfyUI is logged and returns ``None``
+    rather than refusing, because a render that cannot reach ComfyUI fails in
+    seconds without touching the card, and a gate stricter than the thing it
+    gates is a policy nobody reviewed."""
+    free_gb = _fetch_free_vram_gb(session, base_url)
+    if free_gb is None:
+        logger.warning(
+            "Pre-flight VRAM check against %s could not get a usable reading -- skipping "
+            "(degraded, not fatal for the no-op custody manager)",
+            base_url,
+        )
+        return None
+
+    if free_gb < min_free_vram_gb:
+        logger.error(
+            "Pre-flight VRAM check FAILED: only %.2f GB free on %s, need >= %.2f GB "
+            "(profile %r, %.2f GB nominal) -- refusing to start the run. Is something "
+            "else still holding the GPU? Check with "
+            "'nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv', "
+            "and note that a previous run's models stay resident until POST /free.",
+            free_gb,
+            base_url,
+            min_free_vram_gb,
+            hardware.name,
+            hardware.vram_gb,
+        )
+        raise CustodyError(
+            f"only {free_gb:.2f} GB free on {base_url} "
+            f"(need >= {min_free_vram_gb:.2f} GB; hardware profile {hardware.name!r})"
+        )
+
+    logger.info(
+        "Pre-flight VRAM check OK: %.2f GB free on %s (>= %.2f GB required)",
+        free_gb,
+        base_url,
+        min_free_vram_gb,
+    )
+    return free_gb
 
 
 # --------------------------------------------------------------------------- #
@@ -540,6 +571,7 @@ __all__ = [
     "build_custody_manager",
     "build_vram_probe",
     "build_vram_releaser",
+    "preflight_free_vram",
     "prevent_host_sleep",
     "read_render_stack",
 ]
