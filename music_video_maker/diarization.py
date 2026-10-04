@@ -169,15 +169,25 @@ messages below name. A different pipeline name is a parameter, not an edit."""
 PYANNOTE_GATED_PAGES = (
     "https://huggingface.co/pyannote/speaker-diarization-3.1",
     "https://huggingface.co/pyannote/segmentation-3.0",
-    "https://huggingface.co/pyannote/wespeaker-voxceleb-resnet34-LM",
 )
 """Every page whose terms must be accepted, by the account owning the token.
 
-Three, not one: ``speaker-diarization-3.1`` is a *pipeline* that loads a
-segmentation model and an embedding model, each gated separately, and
-accepting only the first produces a 403 on the second with a message that
-names a repository the operator never asked for. Listing all three is the
-difference between a fixable error and a confusing one."""
+Two, not one: ``speaker-diarization-3.1`` is a *pipeline* that also loads a
+segmentation model, gated separately, and accepting only the first produces a
+403 on the second naming a repository the operator never asked for.
+
+Checked against the live Hub on 2026-10-04 with a real token rather than
+inferred from the model cards: both of these answer 403 on their files until
+the account accepts, while the third model the pipeline loads --
+``wespeaker-voxceleb-resnet34-LM``, the embedding model -- reports
+``gated: False`` and serves its files, so naming it here would send an
+operator to click a button that does not exist. If a future pyannote release
+gates it, this list is where that goes.
+
+``pyannote/speaker-diarization-community-1`` is pyannote's newer recommended
+pipeline and is gated the same way; it is not the default here only because
+nothing in this project has run it. Switching is this constant plus
+:data:`PYANNOTE_PIPELINE`."""
 
 PYANNOTE_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HUGGING_FACE_HUB_TOKEN")
 """Environment variables consulted for the Hugging Face token, in order.
