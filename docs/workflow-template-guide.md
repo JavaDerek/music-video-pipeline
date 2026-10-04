@@ -28,6 +28,46 @@ canvas and exported. That's a legitimate, more reproducible alternative to
 the Dev-mode "Save (API Format)" workflow described below, which remains the
 right approach if you're iterating on the graph interactively in the browser.
 
+## Two more committed templates, and they are not H3 at all
+
+`workflow_cast_api.json` and `workflow_cast_view_api.json` (issue #56, part 2)
+are **Krea 2 image** graphs, driven only by
+`python -m music_video_maker.castgen` at authoring time to generate an
+invented cast member's reference photos. Nothing in the render path loads
+them, and no module imports `castgen` (a test enforces that). They are
+described here because this is the file a human opens when a template needs
+changing.
+
+They repeat two decisions from the pair above, for the same reasons:
+
+* **Two templates, never one rewritten.** The anchor template is
+  text-to-image (`EmptyLatentImage`, no `LoadImage`); the view template is
+  img2img (`LoadImage` → `VAEEncode` → `KSampler.latent_image`, `denoise < 1`).
+  `castgen.plan_views` checks each template for the shape its role requires,
+  so passing them in the wrong order is a loud refusal rather than a set of
+  portraits that silently ignored the anchor — the same class of mistake as
+  the I2V seed frame overwriting the cast photo, below.
+* **Nothing is located by node id**, and `steps`/`cfg`/`seed`/`denoise`/the
+  prompt/the filename prefix are all injected per view, so the values the
+  files carry are inert. `sampler_name`, `scheduler` and 1024×1024 come from
+  ComfyUI's own shipped `Text to Image (Krea-2 Turbo)` blueprint; `steps` and
+  `cfg` are required in the character spec because that blueprint's are
+  *Turbo's*.
+
+Three things about these graphs are worth knowing before editing them:
+
+* `CLIPLoader.type` must be `"krea2"`. Krea 2 conditions on a 12-layer tap of
+  Qwen3-VL-4B flattened to 12×2560 features, and
+  `comfy/ldm/krea2/model.py` raises with exactly that advice if the
+  conditioning width is wrong. A test asserts it in both files.
+* The negative conditioning is `ConditioningZeroOut` of the positive, as the
+  blueprint does it — there is no second text encode to author a negative
+  prompt into.
+* **Neither file carries a LoRA node**, deliberately: the only Krea 2 adapter
+  installed on doris is a sketch-style one, and the reference-conditioning
+  adapter that would help identity is not. `docs/design-synthetic-cast.md`
+  has the reasoning and the measurement it leans on (#62).
+
 ## Exporting API-format JSON from ComfyUI
 
 The orchestrator only understands ComfyUI's **API format** — a flat JSON

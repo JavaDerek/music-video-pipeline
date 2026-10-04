@@ -9,7 +9,9 @@ the resilience state machine (issue #10) drive: ``.post(url, ...)`` and
 
 It fakes ``POST /upload/image`` (the universal image+audio ingest point),
 ``POST /prompt``, ``GET /history/{prompt_id}``, ``GET /view``,
-``POST /interrupt``, ``POST /free``, and ``GET /system_stats``.
+``POST /interrupt``, ``POST /free``, ``GET /system_stats``, and
+``GET /object_info/{class_type}`` (the installed-weights enums issue #56's
+``castgen`` pre-flight reads before it spends GPU custody).
 
 Every request is recorded (method, url, kwargs, and derived metadata) on
 ``.requests`` so tests can assert call sequences -- including that a client's
@@ -247,6 +249,7 @@ class FakeComfyUISession:
         self._prompt_counter = 0
         self._system_stats = system_stats or default_system_stats()
         self._auto_history: dict[str, Any] | None = None
+        self._object_info: dict[str, dict[str, Any]] = {}
 
     # -- requests.Session surface -------------------------------------------- #
     def post(self, url: str, **kwargs: Any) -> FakeResponse:
@@ -272,6 +275,8 @@ class FakeComfyUISession:
             return self._handle_view(url, kwargs.get("params"))
         if path == "/system_stats":
             return self._handle_system_stats()
+        if path.startswith("/object_info/"):
+            return self._handle_object_info(path)
         logger.error("FakeComfyUISession: unhandled GET path %s", path)
         return FakeResponse(404, json_data={"error": f"unhandled path {path}"})
 
@@ -370,6 +375,23 @@ class FakeComfyUISession:
         """Make the *next* ``/prompt`` submission come back with validation
         errors instead of a ``prompt_id`` (ComfyUI's graph-validation-failed shape)."""
         self._node_errors_queue.append(node_errors)
+
+    def seed_object_info(self, class_type: str, enums: dict[str, list[str]]) -> None:
+        """Declare which files a loader node's enum offers, in the shape real
+        ComfyUI's ``GET /object_info/{class_type}`` returns.
+
+        Nothing is seeded by default, and an unseeded class answers exactly
+        the way the real server does for a class it does not have: HTTP 200
+        with an empty object (verified against ComfyUI v0.37.4 on doris,
+        2026-10-04 -- *not* a 404). That difference is load-bearing for
+        ``castgen``: "cannot read the enum" and "the file is not installed"
+        are different answers, and it degrades on the first while refusing
+        on the second.
+        """
+        self._object_info[class_type] = {
+            "input": {"required": {name: [list(values), {}] for name, values in enums.items()}},
+            "output": [],
+        }
 
     def set_vram_free(self, vram_free: int, *, vram_total: int | None = None) -> None:
         stats = default_system_stats(
@@ -550,6 +572,13 @@ class FakeComfyUISession:
 
     def _handle_system_stats(self) -> FakeResponse:
         return FakeResponse(200, json_data=self._system_stats)
+
+    def _handle_object_info(self, path: str) -> FakeResponse:
+        class_type = path[len("/object_info/") :].strip("/")
+        node = self._object_info.get(class_type)
+        if node is None:
+            return FakeResponse(200, json_data={})
+        return FakeResponse(200, json_data={class_type: node})
 
     # -- bookkeeping ------------------------------------------------------------------ #
     def _path(self, url: str) -> str:

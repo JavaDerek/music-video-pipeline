@@ -14,6 +14,19 @@ executing untrusted-shaped code):
    which is exactly the seam ``mvm-author`` being a separate binary
    (``authoring/cli.py``'s own docstring) depends on staying one-way.
 
+3. **Nothing anywhere in the package may import
+   ``music_video_maker.castgen``** -- the issue #56 image generator, the only
+   other module here that calls a model. It lives at the top level rather than
+   in ``authoring/`` on purpose (it needs ``workflow_graph``, ``staging`` and
+   ``custody``, and widening :data:`ALLOWED_AUTHORING_IMPORTS` by three
+   render-side modules to host one authoring tool would blur exactly the
+   boundary that list draws). So its boundary is enforced from the other
+   side: it is a leaf. It is run by hand, once per character, like
+   ``python -m music_video_maker.vramsample`` -- and the day something in the
+   render path imports it, "does the render binary ever call a model?" stops
+   being answerable by reading an import graph, which is the property all of
+   this exists to protect.
+
 Same trick ``tests/test_repo_assets.py`` plays for issue #51: the rule that
 matters is the one a machine re-checks on every commit.
 
@@ -170,6 +183,25 @@ def test_no_module_outside_authoring_shells_out_via_subprocess():
         "file to SUBPROCESS_ALLOWLIST with a one-line reason, the same way the three "
         "existing entries are justified. If it calls a model, it belongs in "
         "authoring/ instead:\n  " + "\n  ".join(violations)
+    )
+
+
+def test_nothing_in_the_package_imports_the_image_generator():
+    violations = []
+    for path in _python_files(PACKAGE_ROOT):
+        if path.name == "castgen.py":
+            continue
+        for name, lineno in _dotted_imports(path):
+            if name == "music_video_maker.castgen" or name.startswith(
+                "music_video_maker.castgen."
+            ):
+                violations.append(f"{path.relative_to(REPO_ROOT)}:{lineno} imports {name!r}")
+
+    assert not violations, (
+        "music_video_maker.castgen calls an image model (issue #56), so it must stay a "
+        "leaf nothing imports -- it is run by hand, once per character, at authoring "
+        "time. If a render-path module needs something from it, that something belongs "
+        "in a module neither of them calls a model from:\n  " + "\n  ".join(violations)
     )
 
 
