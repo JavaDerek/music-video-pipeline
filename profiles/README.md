@@ -109,7 +109,7 @@ thing to log, not a reason to lose a render.
 `cinematography` is the placeholder `<TODO: …>`, and `load_profile` raises on
 any look value starting with `<TODO`, naming the promote command.
 
-The approved text — the 631 characters the "Deathless" photography stage
+The approved text — the 562 characters the "Deathless" photography stage
 produced, which the 2026-09-20 A/B rendered at identical seeds on chunks
 16/23/44/64 and which Derek chose — lives in
 `~/mvm-runs/deathless/.authoring/photography.json`. That is a run asset, not
