@@ -39,7 +39,13 @@ from music_video_maker.contracts import AlignedSegment, WordTiming
 # --------------------------------------------------------------------------- #
 
 
-def _row(chunk_id: int, fraction: float, *, inconclusive: int = 0) -> facescan.ChunkFaceScan:
+def _row(
+    chunk_id: int,
+    fraction: float,
+    *,
+    inconclusive: int = 0,
+    median: float | None = None,
+) -> facescan.ChunkFaceScan:
     return facescan.ChunkFaceScan(
         chunk_id=chunk_id,
         frames=141,
@@ -49,6 +55,7 @@ def _row(chunk_id: int, fraction: float, *, inconclusive: int = 0) -> facescan.C
         carries_identity=1 if fraction >= 0.02 else 0,
         inconclusive=inconclusive,
         max_face_fraction=fraction,
+        median_face_fraction=fraction if median is None else median,
         source_path=Path(f"/renders/chunks_v13/chunk_{chunk_id:04d}.mp4"),
         source_size_bytes=1234,
         source_mtime="2026-09-03T00:00:00+00:00",
@@ -221,24 +228,26 @@ def test_a_log_with_no_offset_warnings_parses_to_nothing():
 
 
 def test_the_band_is_the_two_observed_values_not_a_rounded_pair():
-    """0.0778 is the smallest face a viewer noticed; 0.0474 is the largest
+    """0.0557 is the smallest median a viewer noticed; 0.0441 is the largest
     they did not. Rounding either would put a number nobody measured where a
-    measurement is."""
-    assert pytest.approx(0.0778) == desync_risk.VISIBLE_FACE_FRACTION
-    assert pytest.approx(0.0474) == desync_risk.HIDDEN_FACE_FRACTION
+    measurement is. Re-derived on medians 2026-10-04 (#97) after the max was
+    shown to invert a framing A/B on one frame in twelve; the same seven
+    adjudicated chunks, rescanned."""
+    assert pytest.approx(0.0557) == desync_risk.VISIBLE_FACE_FRACTION
+    assert pytest.approx(0.0441) == desync_risk.HIDDEN_FACE_FRACTION
     assert desync_risk.HIDDEN_FACE_FRACTION < desync_risk.VISIBLE_FACE_FRACTION
 
 
 @pytest.mark.parametrize(
     ("fraction", "expected"),
     [
-        (0.2101, desync_risk.VISIBLE),  # chunk 35, noticed
-        (0.1656, desync_risk.VISIBLE),  # chunk 41, noticed
-        (0.0887, desync_risk.VISIBLE),  # chunk 38, noticed
-        (0.0778, desync_risk.VISIBLE),  # chunk 74, noticed -- the boundary itself
-        (0.0474, desync_risk.HIDDEN),  # chunk 73, not noticed -- the other boundary
-        (0.0460, desync_risk.HIDDEN),  # chunk 58, not noticed
-        (0.0120, desync_risk.HIDDEN),  # chunk 20, not noticed
+        (0.1982, desync_risk.VISIBLE),  # chunk 35, noticed
+        (0.1405, desync_risk.VISIBLE),  # chunk 41, noticed
+        (0.0711, desync_risk.VISIBLE),  # chunk 74, noticed
+        (0.0557, desync_risk.VISIBLE),  # chunk 38, noticed -- the boundary itself
+        (0.0441, desync_risk.HIDDEN),  # chunk 73, not noticed -- the other boundary
+        (0.0109, desync_risk.HIDDEN),  # chunk 58, not noticed
+        (0.0090, desync_risk.HIDDEN),  # chunk 20, not noticed
     ],
 )
 def test_every_adjudicated_chunk_of_issue_97_classifies_as_the_viewer_reported(
@@ -252,7 +261,7 @@ def test_every_adjudicated_chunk_of_issue_97_classifies_as_the_viewer_reported(
 
 
 def test_a_face_inside_the_band_is_uncertain_rather_than_guessed():
-    verdict, reason = desync_risk.classify(0.0626)
+    verdict, reason = desync_risk.classify(0.0500)
 
     assert verdict == desync_risk.UNCERTAIN
     assert "band" in reason
@@ -292,13 +301,13 @@ def test_inconclusive_frames_do_not_downgrade_a_clearly_visible_face():
 
 def _issue_97_report(tmp_path) -> desync_risk.FaceReport:
     rows = [
-        _row(74, 0.0778),
-        _row(38, 0.0887),
-        _row(41, 0.1656),
-        _row(35, 0.2101),
-        _row(73, 0.0474),
-        _row(58, 0.0460),
-        _row(20, 0.0120),
+        _row(74, 0.0778, median=0.0711),
+        _row(38, 0.0887, median=0.0557),
+        _row(41, 0.1656, median=0.1405),
+        _row(35, 0.2101, median=0.1982),
+        _row(73, 0.0474, median=0.0441),
+        _row(58, 0.0460, median=0.0109),
+        _row(20, 0.0120, median=0.0090),
     ]
     return desync_risk.read_facescan_report(_write_facescan(tmp_path, rows))
 
@@ -447,3 +456,71 @@ def test_cli_reports_a_missing_log_without_raising(tmp_path, caplog):
 
     assert rc == 1
     assert "render log" in caplog.text
+
+
+# --------------------------------------------------------------------------- #
+# The statistic the ranking is built on (#97, measured 2026-10-04).
+# --------------------------------------------------------------------------- #
+
+# The seven chunks a viewer adjudicated on "Deathless" v13, rescanned with
+# facescan's median column: (chunk, label, max, median).
+_ADJUDICATED = [
+    (35, "noticed", 0.2101, 0.1982),
+    (41, "noticed", 0.1656, 0.1405),
+    (74, "noticed", 0.0778, 0.0711),
+    (38, "noticed", 0.0887, 0.0557),
+    (73, "not", 0.0474, 0.0441),
+    (58, "not", 0.0460, 0.0109),
+    (20, "not", 0.0120, 0.0090),
+]
+
+
+def test_every_adjudicated_chunk_classifies_as_the_viewer_labelled_it_on_medians(tmp_path):
+    """F42's separation survives the change of statistic: n=7, no overlap.
+    Chunk 58 moves most (0.0460 max -> 0.0109 median) and is one a viewer did
+    not notice, which is the direction that makes the median the better
+    statistic rather than merely a different one."""
+    path = _write_facescan(
+        tmp_path, [_row(c, mx, median=med) for c, _, mx, med in _ADJUDICATED]
+    )
+    report = desync_risk.read_facescan_report(path)
+
+    for chunk, label, _, _ in _ADJUDICATED:
+        verdict, _ = desync_risk.classify(
+            desync_risk._ranking_fraction(report.rows[chunk]),
+            report.rows[chunk].inconclusive,
+        )
+        expected = desync_risk.VISIBLE if label == "noticed" else desync_risk.HIDDEN
+        assert verdict == expected, f"chunk {chunk} ({label}) classified {verdict}"
+
+
+def test_the_median_is_what_is_ranked_not_the_max(tmp_path):
+    """The measured inversion: a wide shot that ends on a close-up scores a
+    higher max than the close arm of the same chunk, while the medians -- and
+    the frames -- say the opposite."""
+    path = _write_facescan(tmp_path, [_row(20, 0.1060, median=0.0098)])
+    report = desync_risk.read_facescan_report(path)
+
+    assert desync_risk._ranking_fraction(report.rows[20]) == 0.0098
+
+
+def test_a_scan_written_before_the_median_column_falls_back_and_says_so(tmp_path, caplog):
+    """A pre-#97 CSV is still usable, but it is being judged against a band
+    re-derived on medians, so the mismatch is logged rather than silent."""
+    path = _write_facescan(tmp_path, [_row(41, 0.1656)])
+    text = path.read_text(encoding="utf-8").splitlines()
+    header_index = next(i for i, line in enumerate(text) if line.startswith("chunk_id,"))
+    columns = text[header_index].split(",")
+    drop = columns.index("median_face_fraction")
+    text[header_index] = ",".join(c for i, c in enumerate(columns) if i != drop)
+    for i in range(header_index + 1, len(text)):
+        if text[i].strip():
+            cells = text[i].split(",")
+            text[i] = ",".join(c for j, c in enumerate(cells) if j != drop)
+    path.write_text("\n".join(text) + "\n", encoding="utf-8")
+
+    report = desync_risk.read_facescan_report(path)
+    with caplog.at_level(logging.WARNING):
+        assert desync_risk._ranking_fraction(report.rows[41]) == 0.1656
+
+    assert any("predates issue #97" in r.getMessage() for r in caplog.records)

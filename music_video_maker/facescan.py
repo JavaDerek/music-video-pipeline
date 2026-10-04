@@ -62,6 +62,7 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import statistics
 import sys
 import tempfile
 from collections.abc import Callable, Sequence
@@ -87,6 +88,7 @@ FIELDNAMES: tuple[str, ...] = (
     "carries_identity",
     "inconclusive",
     "max_face_fraction",
+    "median_face_fraction",
     "source_path",
     "source_size_bytes",
     "source_mtime",
@@ -291,6 +293,23 @@ class ChunkFaceScan:
     carries_identity: int
     inconclusive: int
     max_face_fraction: float
+    median_face_fraction: float
+    """Median ``largest_fraction`` across the frames that were *examined*,
+    counting a frame with no face as 0.0 (issue #97, measured 2026-10-04).
+
+    The max answers "was there ever a big face in this chunk"; this answers
+    "how is this chunk framed", which is the question an analysis of framing
+    or of desync perceptibility is actually asking. They disagree, and the
+    disagreement is not academic: in a `framing` A/B at identical seeds, a
+    wide shot that swung into a close-up for its last frames scored a *higher*
+    max than the close arm of the same chunk (0.1060 vs 0.0821) while its
+    median ran the other way (0.0098 vs 0.0572), and the frames themselves
+    agreed with the median.
+
+    ``inconclusive`` frames are excluded rather than counted as zero -- #93's
+    rule: a detector that could not decide has told us nothing about framing.
+    A chunk whose every examined frame was inconclusive reports 0.0 here and
+    says so through ``inconclusive``/``sampled``."""
     source_path: Path
     """Resolved absolute path of the file this row actually scanned -- the
     field #93's run-local script never recorded, which is why a stale
@@ -328,6 +347,7 @@ def scan_chunk(
     inconclusive = 0
     max_fraction = 0.0
     checked = 0
+    examined_fractions: list[float] = []
 
     for frame_path in extracted.sample_paths:
         try:
@@ -349,6 +369,8 @@ def scan_chunk(
         if observation.verdict == "inconclusive":
             inconclusive += 1
         max_fraction = max(max_fraction, observation.largest_fraction)
+        if observation.verdict != "inconclusive":
+            examined_fractions.append(observation.largest_fraction)
 
     sampled = len(extracted.sample_paths)
     face_pct = round(100.0 * with_face / sampled, 1) if sampled else 0.0
@@ -363,6 +385,9 @@ def scan_chunk(
         carries_identity=carries_identity,
         inconclusive=inconclusive,
         max_face_fraction=round(max_fraction, 4),
+        median_face_fraction=(
+            round(statistics.median(examined_fractions), 4) if examined_fractions else 0.0
+        ),
         source_path=video_path.resolve(),
         source_size_bytes=stat.st_size,
         source_mtime=_format_mtime(stat.st_mtime),
@@ -415,6 +440,7 @@ def write_report(
                 row.carries_identity,
                 row.inconclusive,
                 row.max_face_fraction,
+                row.median_face_fraction,
                 row.source_path,
                 row.source_size_bytes,
                 row.source_mtime,

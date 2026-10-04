@@ -118,6 +118,69 @@ class _FakeDetector:
         return outcome
 
 
+def test_scan_chunk_reports_the_median_face_fraction_not_only_the_max(tmp_path):
+    """Measured 2026-10-04 (#97): a max over sampled frames answers "was there
+    ever a big face", which is not the question an analysis of *framing* asks.
+    In a face-vs-wide A/B at identical seeds, chunk 20's wide arm swung into a
+    close-up for its last frames, so the max called it 0.1060 against the face
+    arm's 0.0821 -- while the medians ran the other way, 0.0098 against 0.0572,
+    and the contact sheet agreed with the medians. One frame in twelve inverted
+    the ranking that `desync_risk` consumes."""
+    video = tmp_path / "chunk_0020.mp4"
+    video.write_bytes(b"fake video bytes")
+    frames = tuple(tmp_path / f"w{i}.png" for i in range(5))
+
+    extractor = _FakeExtractor(
+        {video: facescan.SampledFrames(total_frames=124, sample_paths=frames)}
+    )
+    # A wide shot that ends on a close-up: four small faces, then one large.
+    detector = _FakeDetector(
+        {
+            frames[0]: faces.FaceObservation(1, 0.004, 0.95),
+            frames[1]: faces.FaceObservation(1, 0.008, 0.95),
+            frames[2]: faces.FaceObservation(1, 0.010, 0.95),
+            frames[3]: faces.FaceObservation(1, 0.012, 0.95),
+            frames[4]: faces.FaceObservation(1, 0.106, 0.95),
+        }
+    )
+
+    row = facescan.scan_chunk(video, samples=5, extractor=extractor, detector=detector)
+
+    assert row.max_face_fraction == 0.106
+    assert row.median_face_fraction == 0.01
+
+
+def test_median_face_fraction_counts_frames_with_no_face_as_zero(tmp_path):
+    """A shot that only shows a face occasionally is not a close-up, and the
+    median is what says so. Frames whose verdict is `absent` are real evidence
+    of framing and belong in the sample; `inconclusive` frames are not, and
+    #93's rule is that they say nothing either way."""
+    video = tmp_path / "chunk_0064.mp4"
+    video.write_bytes(b"fake video bytes")
+    frames = tuple(tmp_path / f"n{i}.png" for i in range(4))
+
+    extractor = _FakeExtractor(
+        {video: facescan.SampledFrames(total_frames=124, sample_paths=frames)}
+    )
+    detector = _FakeDetector(
+        {
+            frames[0]: faces.FaceObservation(
+                0, 0.0, 0.0, candidate_scores=(), inspection_floor=0.7
+            ),
+            frames[1]: faces.FaceObservation(
+                0, 0.0, 0.0, candidate_scores=(), inspection_floor=0.7
+            ),
+            frames[2]: faces.FaceObservation(1, 0.02, 0.95),
+            frames[3]: faces.FaceObservation(1, 0.06, 0.95),
+        }
+    )
+
+    row = facescan.scan_chunk(video, samples=4, extractor=extractor, detector=detector)
+
+    assert row.median_face_fraction == 0.01
+    assert row.max_face_fraction == 0.06
+
+
 def test_scan_chunk_counts_face_presence_identity_and_inconclusive(tmp_path):
     video = tmp_path / "chunk_0007.mp4"
     video.write_bytes(b"fake video bytes")
@@ -222,6 +285,7 @@ def test_write_report_header_carries_provenance_once():
         carries_identity=1,
         inconclusive=0,
         max_face_fraction=0.01,
+        median_face_fraction=0.01,
         source_path=Path("/abs/chunk_0001.mp4"),
         source_size_bytes=123,
         source_mtime="2026-08-22T12:00:00+00:00",
@@ -268,6 +332,7 @@ def test_write_report_rows_are_a_superset_of_the_run_local_script_columns():
         carries_identity=5,
         inconclusive=2,
         max_face_fraction=0.093,
+        median_face_fraction=0.093,
         source_path=Path("/abs/chunk_0076.mp4"),
         source_size_bytes=999,
         source_mtime="2026-08-22T08:25:00+00:00",
