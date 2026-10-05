@@ -63,16 +63,18 @@ What is deliberately naive, and will show
   problem (#68) and nothing here addresses it. The 2026-09-20 measurements in
   ``docs/pop-beat-corpus.md`` are the only numbers that exist: a *held* object
   at the lens boiled 0.0035, an *arriving* one 0.0271.
-* **It is pure Python and buffers whole chunks in memory.** numpy is not a
-  dependency of this project and is not present in its test environment
-  (checked, not assumed), so the warp is a Python loop over every pixel and
-  :func:`decode_frames` holds a whole chunk's raw RGB in a ``bytes``. At
-  864x480 that is ~1.2 MB a frame and ~240 MB for a 192-frame chunk, and the
-  warp is several hundred thousand Python-level iterations per eye per frame
-  against 12334 frames in one song. **The production path needs numpy (or
-  OpenCV, already an optional extra) and a streaming ``Popen`` pipe.** This
-  module is written to be correct and checkable, not to be fast; treat its
-  arithmetic as the specification and rewrite the loops.
+* **The warp is vectorised only when numpy is importable, and the chunk is
+  still buffered whole.** numpy is not a declared dependency of this project
+  and CI does not install it; it arrives with the ``faces`` extra (OpenCV
+  requires it) and with any environment that can run a depth model. With it,
+  :func:`warp_eye` runs :func:`_warp_eye_numpy`; without it, the original
+  per-pixel loop, :func:`_warp_eye_reference`, which stays as the
+  specification and as the oracle the fast path is tested against --
+  **byte-identical output either way**, pinned by digest in
+  ``tests/test_stereo.py`` from the loop as it stood before the rewrite
+  (#68). :func:`decode_frames` still holds a whole chunk's raw RGB in a
+  ``bytes`` (~1.2 MB a frame, ~240 MB for a 192-frame chunk at 864x480);
+  **a streaming ``Popen`` pipe is still owed** before this runs over a song.
 
 Where it sits in the pipeline
 -----------------------------
@@ -315,6 +317,105 @@ def warp_eye(frame: Frame, depth: DepthMap, *, eye: str, params: StereoParams) -
         )
 
     direction = 1 if eye == "left" else -1
+    np = _numpy()
+    if np is not None:
+        values = np.asarray(depth.values, dtype=np.float64)
+        if not np.isnan(values).any():
+            return _warp_eye_numpy(
+                np, frame, depth, direction=direction, params=params, values=values
+            )
+        logger.warning(
+            "Stereo: depth map contains NaN -- warping this frame with the slow "
+            "reference loop, whose (order-dependent) NaN behaviour the vectorised "
+            "path does not reproduce. A depth source should never emit NaN."
+        )
+    return _warp_eye_reference(frame, depth, direction=direction, params=params)
+
+
+def _numpy():
+    """``numpy`` if it is importable, else ``None``.
+
+    numpy is **not** a declared dependency of this project: it arrives with
+    the ``faces`` extra (``opencv-python-headless`` requires it) and with
+    every depth-model environment, and CI installs neither. So the
+    vectorised warp is used whenever numpy is present and the reference loop
+    otherwise -- same bytes either way, which the pinned tests assert. A
+    function rather than a module-level import so a test can take it away.
+    """
+    try:
+        import numpy
+    except ImportError:
+        return None
+    return numpy
+
+
+def _warp_eye_numpy(np, frame: Frame, depth: DepthMap, *, direction: int, params, values=None):
+    """:func:`_warp_eye_reference`, vectorised, **byte-identical** to it on
+    any depth map without NaN (tests/test_stereo.py proves it against the
+    loop on 400 random cases and pins both to the same digests).
+
+    Each step reproduces one rule of the loop exactly, not approximately:
+
+    * the shift is the same float64 expression in the same order, and
+      ``np.rint`` rounds half to even exactly as Python's ``round`` does, so
+      every destination column is the loop's;
+    * the z-buffer: the loop keeps a candidate only if its **unclamped**
+      depth is strictly greater than what is already there (initially -1.0),
+      visiting x left to right -- so each destination ends up holding the
+      maximum depth, the *leftmost* source on a tie, and nothing at all if
+      every candidate was <= -1.0. One ``lexsort`` by (destination, -depth,
+      x) picks exactly that;
+    * the hole fill copies from the nearest position whose written depth is
+      >= 0.0, the **right-hand** one on a tie (the loop's ``<=`` advance), in
+      rows that have at least one; a written depth in (-1, 0) still counts as
+      a hole, as it does in the loop.
+    """
+    width, height = frame.width, frame.height
+    src = np.frombuffer(frame.pixels, dtype=np.uint8).reshape(height, width, 3)
+    if values is None:
+        values = np.asarray(depth.values, dtype=np.float64)
+    inv = values.reshape(height, width)
+
+    clamped = np.minimum(1.0, np.maximum(0.0, inv))
+    shift = (clamped - params.convergence) * params.max_disparity_fraction * width * direction
+    dest = np.rint(np.arange(width, dtype=np.float64) + shift)
+    candidate = (dest >= 0) & (dest < width) & (inv > -1.0)
+
+    ys, xs = np.nonzero(candidate)  # row-major: x ascending within a row
+    dest_x = dest[ys, xs].astype(np.intp)
+    depth_v = inv[ys, xs]
+    slot = ys * width + dest_x
+    order = np.lexsort((xs, -depth_v, slot))
+    first = np.ones(order.size, dtype=bool)
+    first[1:] = slot[order[1:]] != slot[order[:-1]]
+    win = order[first]
+
+    out = np.zeros_like(src)
+    written = np.full((height, width), -1.0)
+    out[ys[win], dest_x[win]] = src[ys[win], xs[win]]
+    written[ys[win], dest_x[win]] = depth_v[win]
+
+    filled = written >= 0.0
+    holes = ~filled & filled.any(axis=1, keepdims=True)
+    if holes.any():
+        columns = np.arange(width)
+        left = np.maximum.accumulate(np.where(filled, columns, -1), axis=1)
+        right = np.minimum.accumulate(np.where(filled, columns, width)[:, ::-1], axis=1)[:, ::-1]
+        use_right = (right < width) & ((left < 0) | (right - columns <= columns - left))
+        source = np.where(use_right, right, left)
+        hy, hx = np.nonzero(holes)
+        out[hy, hx] = out[hy, source[hy, hx]]
+
+    return Frame(width=width, height=height, pixels=out.tobytes())
+
+
+def _warp_eye_reference(frame: Frame, depth: DepthMap, *, direction: int, params) -> Frame:
+    """The original per-pixel loop -- **the specification** of the warp, kept
+    verbatim as the fallback when numpy is absent and as the oracle
+    :func:`_warp_eye_numpy` is tested against. Several hundred thousand
+    Python-level iterations per eye per frame at 864x480; see
+    ``~/mvm-runs/deathless/measurements/stereo68_2026-10-05/FINDINGS.md``
+    for what that costs on a real frame."""
     width, height = frame.width, frame.height
     src = frame.pixels
     out = bytearray(len(src))
@@ -639,9 +740,15 @@ def external_depth_source(
                 f"depth command returned {len(raw)} bytes for frame {frame_index}; a "
                 f"{frame.width}x{frame.height} gray16le map is {expected}"
             )
-        values = [
-            int.from_bytes(raw[i : i + 2], "little") / 65535.0 for i in range(0, len(raw), 2)
-        ]
+        np = _numpy()
+        if np is not None:
+            # Same IEEE division per sample as the loop below, so equal values.
+            values = (np.frombuffer(raw, dtype="<u2").astype(np.float64) / 65535.0).tolist()
+        else:
+            values = [
+                int.from_bytes(raw[i : i + 2], "little") / 65535.0
+                for i in range(0, len(raw), 2)
+            ]
         return DepthMap(width=frame.width, height=frame.height, values=values)
 
     return source
