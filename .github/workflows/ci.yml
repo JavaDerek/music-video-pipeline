@@ -37,3 +37,11 @@ jobs:
       # in pyproject.toml. Both self-skip if run directly without their
       # binary present, but deselecting keeps the CI run's intent explicit.
       - run: pytest -m "not integration"
+
+      # Issue #68: the stereo warp's 400 byte-for-byte equivalence cases need
+      # numpy, which the core run above deliberately lacks. Install the
+      # [stereo] extra only now, AFTER the core run has proven nothing else
+      # needs it, and run only the stereo tests (no coverage floor: a single
+      # file cannot meet the package-wide 80%).
+      - run: pip install -e ".[stereo]"
+      - run: pytest tests/test_stereo.py -m "not integration" --no-cov

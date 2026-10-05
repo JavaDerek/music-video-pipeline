@@ -58,8 +58,8 @@ What it deliberately is not:
 
 * **Not streaming.** `decode_frames` still buffers a whole chunk (~240 MB at
   192 frames). The warp itself was the other half of this bullet and is done
-  (2026-10-05): with numpy importable — it comes with the `faces` extra and
-  with any depth-model environment, and is still not a declared dependency —
+  (2026-10-05): with numpy importable — declared as the `stereo` extra, and
+  also arriving with the `faces` extra and any depth-model environment —
   `warp_eye` runs a vectorised path that is **byte-identical** to the
   original per-pixel loop, which stays as the fallback and as the test
   oracle. On 18 real 864x480 warps of the v14 render it measured ~35 ms per

@@ -72,9 +72,11 @@ What is deliberately naive, and will show
   ``docs/pop-beat-corpus.md`` are the only numbers that exist: a *held* object
   at the lens boiled 0.0035, an *arriving* one 0.0271.
 * **The warp is vectorised only when numpy is importable, and the chunk is
-  still buffered whole.** numpy is not a declared dependency of this project
-  and CI does not install it; it arrives with the ``faces`` extra (OpenCV
-  requires it) and with any environment that can run a depth model. With it,
+  still buffered whole.** numpy is optional: the ``stereo`` extra declares it
+  (``pip install -e ".[stereo]"``), and it also arrives with the ``faces``
+  extra (OpenCV requires it) and with any environment that can run a depth
+  model. CI runs the core suite without it, then installs ``[stereo]`` and
+  runs ``tests/test_stereo.py`` again so the equivalence cases execute. With it,
   :func:`warp_eye` runs :func:`_warp_eye_numpy`; without it, the original
   per-pixel loop, :func:`_warp_eye_reference`, which stays as the
   specification and as the oracle the fast path is tested against --
