@@ -1037,6 +1037,108 @@ def test_write_works_with_no_photography_at_all(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# Issue #97: photography's `framing` reaches photography.json and the plan.
+# --------------------------------------------------------------------------- #
+
+
+def _framed_photography_reply(config_path: Path, look: str = "35mm") -> dict:
+    reply = _photography_reply(config_path, look)
+    return {**reply, "framing": [{"chunk_id": 0, "framing": "face"}]}
+
+
+def test_photography_persists_framing(tmp_path, monkeypatch, capsys):
+    config_path = _write_config(tmp_path, lyrics_text="")
+    _run_concept(config_path, monkeypatch)
+    _run_beats(config_path, monkeypatch)
+    monkeypatch.setattr(
+        auth_cli,
+        "ClaudeCliDriver",
+        lambda: ScriptedDriver([_framed_photography_reply(config_path)]),
+    )
+
+    assert auth_cli.main(["--config", str(config_path), "photography"]) == auth_cli.EXIT_SUCCESS
+
+    payload = json.loads((config_path.parent / ".authoring" / "photography.json").read_text())
+    assert payload["framing"] == {"0": "face"}
+    assert "framing" in capsys.readouterr().out
+
+
+def test_photography_without_framing_writes_no_framing_key(tmp_path, monkeypatch):
+    """A reply that frames nothing writes the same file it always did."""
+    config_path = _write_config(tmp_path, lyrics_text="")
+    _run_concept(config_path, monkeypatch)
+    _run_beats(config_path, monkeypatch)
+    monkeypatch.setattr(
+        auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([_photography_reply(config_path)])
+    )
+
+    auth_cli.main(["--config", str(config_path), "photography"])
+
+    payload = json.loads((config_path.parent / ".authoring" / "photography.json").read_text())
+    assert "framing" not in payload
+
+
+def test_pick_carries_the_chosen_candidates_framing(tmp_path, monkeypatch, capsys):
+    config_path = _write_config(tmp_path, lyrics_text="")
+    _run_concept(config_path, monkeypatch)
+    _run_beats(config_path, monkeypatch)
+    monkeypatch.setattr(
+        auth_cli,
+        "ClaudeCliDriver",
+        lambda: ScriptedDriver(
+            [_photography_reply(config_path, "look 0"), _framed_photography_reply(config_path)]
+        ),
+    )
+    auth_cli.main(["--config", str(config_path), "photography", "--candidates", "2"])
+    capsys.readouterr()
+
+    assert (
+        auth_cli.main(["--config", str(config_path), "photography", "--pick", "2"])
+        == auth_cli.EXIT_SUCCESS
+    )
+
+    payload = json.loads((config_path.parent / ".authoring" / "photography.json").read_text())
+    assert payload["framing"] == {"0": "face"}
+
+
+def test_write_puts_the_generated_framing_into_the_plan(tmp_path, monkeypatch, capsys):
+    from music_video_maker.shot_plan import load_shot_plan
+
+    config_path = _write_config(tmp_path, lyrics_text="")
+    _run_concept(config_path, monkeypatch)
+    _run_beats(config_path, monkeypatch)
+    monkeypatch.setattr(
+        auth_cli,
+        "ClaudeCliDriver",
+        lambda: ScriptedDriver([_framed_photography_reply(config_path)]),
+    )
+    auth_cli.main(["--config", str(config_path), "photography"])
+    monkeypatch.setattr(
+        auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver(_prose_replies(config_path))
+    )
+    auth_cli.main(["--config", str(config_path), "prose"])
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([]))
+    capsys.readouterr()
+
+    assert auth_cli.main(["--config", str(config_path), "write"]) == auth_cli.EXIT_SUCCESS
+
+    plan = load_shot_plan(config_path.parent / "shot_plan.toml")
+    assert plan[0].framing == "face"
+    assert "1 with framing" in capsys.readouterr().out
+
+
+def test_write_with_no_photography_writes_no_framing(tmp_path, monkeypatch):
+    from music_video_maker.shot_plan import load_shot_plan
+
+    config_path = _author_through_prose(tmp_path, monkeypatch)
+    monkeypatch.setattr(auth_cli, "ClaudeCliDriver", lambda: ScriptedDriver([]))
+
+    assert auth_cli.main(["--config", str(config_path), "write"]) == auth_cli.EXIT_SUCCESS
+
+    assert load_shot_plan(config_path.parent / "shot_plan.toml")[0].framing is None
+
+
+# --------------------------------------------------------------------------- #
 # Issue #87 item 3: `--revise-warnings` (default off) reaches `build_plan`.
 # --------------------------------------------------------------------------- #
 

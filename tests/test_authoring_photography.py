@@ -508,3 +508,130 @@ def test_input_hashes_include_song_facts_when_set_and_change_with_it(tmp_path):
 
     assert "song_facts" in before
     assert before["song_facts"] != after["song_facts"]
+
+
+# --------------------------------------------------------------------------- #
+# Issue #97: `framing` -- the one per-shot field measured to set face size.
+# `camera` could not (39 voiced chunks authored close: 0.0000-0.3561 of frame);
+# a hand-set `framing` A/B at identical seeds moved the median face fraction
+# 3 of 3 (15.6x, 5.8x, and 0/12 frames with a face under `wide`). This stage
+# is the one that already decides how each shot is framed, so it proposes it.
+# --------------------------------------------------------------------------- #
+
+
+def _framed(reply: dict, *pairs) -> dict:
+    return {**reply, "framing": [{"chunk_id": cid, "framing": level} for cid, level in pairs]}
+
+
+def test_framing_is_optional_and_absent_means_empty():
+    """Every reply written before #97 carries no `framing` key at all, and
+    must still validate -- to an empty mapping, never a fabricated level."""
+    result = validate_photography(_reply((1, GOOD)), _chunks(), config_cinematography=None)
+
+    assert result.framing == {}
+
+
+def test_a_framed_reply_validates_and_is_independent_of_camera():
+    """A shot can want a size without wanting a camera move, and vice versa:
+    chunk 2 is framed with no `camera` at all."""
+    result = validate_photography(
+        _framed(_reply((1, GOOD)), (1, "face"), (2, "wide")),
+        _chunks(),
+        config_cinematography=None,
+    )
+
+    assert result.framing == {1: "face", 2: "wide"}
+    assert set(result.camera) == {1}
+
+
+def test_framing_is_normalised_the_way_the_loader_reads_it():
+    """`shot_plan._parse_framing` is case- and whitespace-tolerant; the
+    authoring stage writes the canonical form so the plan reads cleanly."""
+    result = validate_photography(
+        _framed(_reply(), (1, " Close ")), _chunks(), config_cinematography=None
+    )
+
+    assert result.framing == {1: "close"}
+
+
+@pytest.mark.parametrize("bad", ["extreme close-up", "medium close", "", "   ", 3])
+def test_a_framing_outside_the_closed_vocabulary_is_an_error(bad):
+    """The render path raises on an unknown ordinal at load time; catching it
+    here buys a retry with feedback instead of a plan that will not load."""
+    with pytest.raises(PhotographyValidationError, match="framing") as excinfo:
+        validate_photography(_framed(_reply(), (1, bad)), _chunks(), config_cinematography=None)
+
+    for level in ("face", "close", "medium", "wide"):
+        assert level in str(excinfo.value)
+
+
+def test_framing_vocabulary_is_the_render_paths_own():
+    """Never a copy: the schema's enum IS `prompting.FRAMING_LEVELS`, so a
+    level added to the render path reaches the authoring stage for free."""
+    from music_video_maker.authoring.photography import PHOTOGRAPHY_SCHEMA
+    from music_video_maker.prompting import FRAMING_LEVELS
+
+    framing = PHOTOGRAPHY_SCHEMA["properties"]["framing"]
+    assert framing["items"]["properties"]["framing"]["enum"] == list(FRAMING_LEVELS)
+    assert "framing" not in PHOTOGRAPHY_SCHEMA["required"]
+
+
+def test_a_framing_on_an_invented_chunk_is_dropped(caplog):
+    with caplog.at_level("WARNING"):
+        result = validate_photography(
+            _framed(_reply(), (1, "face"), (99, "wide")), _chunks(), config_cinematography=None
+        )
+
+    assert result.framing == {1: "face"}
+    assert "99" in caplog.text
+
+
+def test_a_duplicate_framing_is_an_error():
+    with pytest.raises(PhotographyValidationError, match="more than once"):
+        validate_photography(
+            _framed(_reply(), (1, "face"), (1, "wide")), _chunks(), config_cinematography=None
+        )
+
+
+@pytest.mark.parametrize("bad_entry", ["face", {"chunk_id": "1", "framing": "face"}])
+def test_a_malformed_framing_entry_is_an_error(bad_entry):
+    reply = {**_reply(), "framing": [bad_entry]}
+
+    with pytest.raises(PhotographyValidationError, match="framing"):
+        validate_photography(reply, _chunks(), config_cinematography=None)
+
+
+def test_a_framing_that_is_not_a_list_is_an_error():
+    reply = {**_reply(), "framing": {"1": "face"}}
+
+    with pytest.raises(PhotographyValidationError, match="framing"):
+        validate_photography(reply, _chunks(), config_cinematography=None)
+
+
+def test_the_preamble_offers_framing_with_its_measured_reason():
+    from music_video_maker.authoring.prompts import PHOTOGRAPHY_PREAMBLE
+    from music_video_maker.prompting import FRAMING_LEVELS
+
+    assert '"framing"' in PHOTOGRAPHY_PREAMBLE
+    for level in FRAMING_LEVELS:
+        assert f'"{level}"' in PHOTOGRAPHY_PREAMBLE
+    assert "#97" in PHOTOGRAPHY_PREAMBLE
+    # Optional per shot, like `camera` -- the old worry was a stage that
+    # re-frames all 80 chunks at an unmeasured cost.
+    tail = PHOTOGRAPHY_PREAMBLE.split("`framing`", 1)[1].lower()
+    assert "optional per shot" in tail
+
+
+def test_generate_photography_retries_a_bad_framing_with_feedback(tmp_path):
+    driver = ScriptedDriver(
+        [
+            _framed(_reply((1, GOOD)), (1, "extreme close-up")),
+            _framed(_reply((1, GOOD)), (1, "face")),
+        ]
+    )
+
+    result = generate_photography(_config(tmp_path), CONCEPT, (_beat(1),), _chunks(), driver)
+
+    assert result.photography.framing == {1: "face"}
+    assert len(driver.calls) == 2
+    assert "extreme close-up" in driver.calls[1]["prompt"]

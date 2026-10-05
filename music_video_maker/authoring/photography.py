@@ -22,6 +22,18 @@ composes ``", camera <value>"``, so a value that starts with "camera" or "the
 camera" renders as "..., camera the camera pushes in". The model is told the
 word is supplied for it, and then it is checked -- prohibitions in a prompt
 are advisory; this is what holds the line.
+
+**``framing`` (issue #97)** is the stage's second per-shot output, and the
+one that measurably sets delivered face size. ``camera`` could not: of 39
+voiced "Deathless" chunks authored close or medium close in ``camera``, the
+delivered face fraction ran 0.0000-0.3561. A hand-set ``framing`` A/B at
+identical seeds moved the median face fraction 3 of 3 (``face`` vs ``wide``:
+15.6x, 5.8x, and a face in 0 of 12 sampled frames under ``wide``). This
+stage already decides how each shot is framed, so it is the one that proposes
+it -- sparse and optional per shot exactly like ``camera``, never a level
+on every chunk, and validated against the render path's own
+``prompting.FRAMING_LEVELS`` (imported through ``shot_plan``, never copied)
+so a reply the loader would refuse is retried here with feedback instead.
 """
 
 from __future__ import annotations
@@ -30,7 +42,7 @@ import json
 import logging
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from music_video_maker.authoring.beats import Beat
@@ -40,6 +52,7 @@ from music_video_maker.authoring.hashing import sha256_text
 from music_video_maker.authoring.prompts import photography_system_prompt, song_facts_block
 from music_video_maker.config import RunConfig
 from music_video_maker.contracts import AudioChunk
+from music_video_maker.shot_plan import FRAMING_LEVELS
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +97,20 @@ PHOTOGRAPHY_SCHEMA: dict[str, Any] = {
                 },
             },
         },
+        # Issue #97. Optional -- not in `required` -- so a reply that frames
+        # nothing is as valid as every reply before this field existed.
+        "framing": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["chunk_id", "framing"],
+                "properties": {
+                    "chunk_id": {"type": "integer"},
+                    "framing": {"type": "string", "enum": list(FRAMING_LEVELS)},
+                },
+            },
+        },
     },
 }
 
@@ -102,6 +129,12 @@ class Photography:
 
     camera: dict[int, str]
     """Sparse by design: only the chunks that actually want direction."""
+
+    framing: dict[int, str] = field(default_factory=dict)
+    """Issue #97: ``{chunk_id: level}``, each level one of
+    ``prompting.FRAMING_LEVELS`` in canonical lower case. Sparse by design,
+    like ``camera`` and independent of it: a shot can want a size and no
+    move, or a move and no size."""
 
 
 @dataclass(frozen=True)
@@ -187,11 +220,63 @@ def validate_photography(
 
         camera[chunk_id] = value
 
+    framing = _validate_framing(data.get("framing"), known, problems)
+
     if problems:
         raise PhotographyValidationError(
             f"photography reply has {len(problems)} problem(s):\n- " + "\n- ".join(problems)
         )
-    return Photography(cinematography=look, camera=camera)
+    return Photography(cinematography=look, camera=camera, framing=framing)
+
+
+def _validate_framing(raw: object, known: set[int], problems: list[str]) -> dict[int, str]:
+    """Issue #97: the optional per-shot ``framing`` array. Appends to
+    ``problems`` rather than raising, so one retry round sees everything.
+
+    Matching is case- and whitespace-tolerant, the same as
+    ``shot_plan._parse_framing``, and the canonical lower-case level is what
+    gets written. Anything outside the closed vocabulary is a problem, never
+    a dropped key: the render's loader raises on it, so letting it through
+    would only move the failure to ``write``."""
+    if raw is None:
+        return {}
+    vocabulary = ", ".join(repr(level) for level in FRAMING_LEVELS)
+    if not isinstance(raw, list):
+        problems.append(
+            f"framing must be an array of {{chunk_id, framing}} objects, got "
+            f"{type(raw).__name__}"
+        )
+        return {}
+
+    framing: dict[int, str] = {}
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            problems.append(f"framing[{index}] is not an object")
+            continue
+        chunk_id = entry.get("chunk_id")
+        if isinstance(chunk_id, bool) or not isinstance(chunk_id, int):
+            problems.append(f"framing[{index}] chunk_id must be an integer, got {chunk_id!r}")
+            continue
+        if chunk_id not in known:
+            logger.warning(
+                "Photography frames chunk_id=%d, which is not in this song's timeline; "
+                "dropping it.",
+                chunk_id,
+            )
+            continue
+        if chunk_id in framing:
+            problems.append(f"chunk_id={chunk_id} framing appears more than once")
+            continue
+        value = entry.get("framing")
+        level = value.strip().lower() if isinstance(value, str) else None
+        if level not in FRAMING_LEVELS:
+            problems.append(
+                f"chunk_id={chunk_id} framing={value!r} is not one of {vocabulary}. It is "
+                "an ordinal from a closed vocabulary, tightest first -- not free text."
+            )
+            continue
+        framing[chunk_id] = level
+    return framing
 
 
 # --------------------------------------------------------------------------- #
@@ -308,6 +393,11 @@ def build_photography_prompt(
         'holding there is fine only on an "instrumental" chunk (a voiced chunk with no '
         "mouth on screen has no lip-sync for that whole chunk).",
         f'Write each one the way it reads after the word "camera" -- e.g. "{CAMERA_EXAMPLE}".',
+        # Issue #97: the closed vocabulary, restated beside the table it
+        # applies to and taken from the render path, so it cannot drift.
+        "Give a `framing` only where the shot's size matters; it must be exactly one of "
+        + ", ".join(f'"{level}"' for level in FRAMING_LEVELS)
+        + ".",
     ]
     if notes and notes.strip():
         parts += ["", f"## Notes from the person reviewing this: {notes.strip()}"]
@@ -364,8 +454,10 @@ def generate_photography(
             )
             continue
         logger.info(
-            "Photography accepted: %d chunk(s) given a camera direction out of %d",
+            "Photography accepted: %d chunk(s) given a camera direction and %d a framing, "
+            "out of %d",
             len(photography.camera),
+            len(photography.framing),
             len(chunks),
         )
         return PhotographyResult(
