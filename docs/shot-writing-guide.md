@@ -757,8 +757,9 @@ positive, so treat it as a prompt to look rather than a verdict.
 
 ## Framing choices on a voiced chunk, re-scored against the full render (issue #76)
 
-`lint_voiced_framing`'s keyword sets (above, and the ones covering "camera
-too far from the face") were scored mid-render, on a partial "Deathless"
+`lint_voiced_framing`'s keyword sets (above, and the ones that read "camera
+too far from the face" out of `camera` wording -- since retired, see the
+issue #97 section below) were scored mid-render, on a partial "Deathless"
 corpus. The finished 80-chunk render — 41 voiced chunks, corpus mean face
 presence 53.3% — does not support them as originally shipped. This is #60's
 own lesson arriving one level up: a generalisation from a partial sample is
@@ -862,6 +863,22 @@ Three things to know before using it:
   stage that re-framed all 80 shots would pay an unmeasured cost across a
   whole video to fix a handful of them. Review it like any other proposal,
   and set or remove it by hand where you disagree.
+- **A sung chunk wants `framing = "face"` or `"close"` (`"medium"` at most),
+  and that rule replaced an older one about `camera` (decided 2026-10-05).**
+  The photography stage used to be told every sung chunk must get a `camera`
+  value framing the singer close or medium, and `lint_voiced_framing` warned
+  on a sung chunk with no `camera` or a wide-sounding one. Both are retired:
+  by the evidence above, that rule asked for words that do not set size.
+  `camera` on a sung chunk is now optional and about movement and angle.
+  `lint_voiced_framing` warns instead on a sung chunk with **no `framing`**
+  and on one framed **`wide`** — advisory, since a deliberate wide over a
+  sung line is an editorial choice (the desync-visibility finding above is
+  one reason to make it). The head still has to be in frame: a framing
+  anchored on boots is "close" and has no face. Both warnings are written
+  into the plan as `# lint:` comments and are **never** handed to the
+  prose revision round, because `framing` is photography's field and a
+  reworded shot line cannot fix it. The orientation warnings (gaze-away,
+  following camera, in profile) are unchanged.
 - **The shot line's own words do not do this job either (measured
   2026-10-05, no GPU).** Over the 80 rendered v14 chunks, neither a
   pre-registered keyword rubric nor a blind coder's reading of each `shot`
@@ -1158,6 +1175,9 @@ Run down this list before committing a shot plan:
 - [ ] Does any idiom or figure of speech in the line happen to name a
       physical object you don't want on screen ("holds her line", "draws
       the line")? H3 has no idiom dictionary and will render the noun.
+- [ ] Does every voiced chunk set `framing = "face"` or `"close"` (`"medium"`
+      at most) on the singer — and is any `"wide"` on a sung line a
+      deliberate choice? `camera` wording does not set size (issue #97).
 - [ ] Is a voiced chunk's `camera` framed "in profile"? Measured with no
       counter-example on a real render (issue #76) — prefer facing the lens
       more directly, or move the profile framing to an instrumental chunk.

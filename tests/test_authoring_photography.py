@@ -438,30 +438,47 @@ def test_the_global_style_reaches_the_prompt(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# A sung chunk's framing is not optional, and it has to be close enough to
-# read a mouth.
+# A sung chunk needs the singer big enough to read a mouth -- and the lever
+# for that is `framing`, not `camera` (issue #97, decided 2026-10-05).
 #
-# The preamble already asks the model to keep her face available to the lens.
-# That is about DIRECTION (don't crane away); it says nothing about SCALE, and
-# it sits next to "camera is OPTIONAL PER SHOT ... an absent direction is the
-# right answer for most shots". On the first machine-authored plan to reach a
-# GPU that combination produced 41 voiced chunks of which 29 had no `camera`
-# at all and only 11 were close or medium -- and a face was detectable in
-# 0-33% of sampled frames. Wide is the better image and the model has every
-# reason to choose it; the exception for sung chunks has to be explicit.
+# On the first machine-authored plan to reach a GPU, 29 of 41 voiced chunks
+# had no `camera` and a face was detectable in 0-33% of sampled frames; the
+# preamble's answer was to REQUIRE a close-or-medium `camera` on every sung
+# chunk. #97 then measured that camera wording does not set delivered face
+# size (39 sung chunks whose camera said close/medium: no face to a third of
+# the frame), while `framing` moved it 3 of 3. A 2026-10-05 measurement found
+# shot-line wording does not set it either. The rule moved to `framing`.
 # --------------------------------------------------------------------------- #
 
 
-def test_the_preamble_requires_a_close_framing_on_sung_chunks():
+def _preamble() -> str:
     from music_video_maker.authoring.prompts import PHOTOGRAPHY_PREAMBLE
 
-    lowered = PHOTOGRAPHY_PREAMBLE.lower()
-    assert "close or medium" in lowered
-    # The scale rule must not be phrased as optional the way the general
-    # camera guidance is.
-    assert "not optional" in lowered
+    return PHOTOGRAPHY_PREAMBLE
+
+
+def test_the_preamble_no_longer_requires_a_camera_on_sung_chunks():
+    lowered = " ".join(_preamble().lower().split())
+    assert "close or medium" not in lowered.replace("said close or medium", "")
+    assert "gets a `camera` value" not in lowered
+    assert "not optional" not in lowered
+
+
+def test_the_preamble_puts_the_sung_chunk_size_on_framing():
+    text = " ".join(_preamble().split())
+    lowered = text.lower()
+    assert 'set `framing` to "face" or "close"' in text
+    assert "does not set size" in lowered
+    assert "#97" in text
     # Measured, so it reads as evidence rather than taste.
-    assert "0-33%" in PHOTOGRAPHY_PREAMBLE
+    assert "0-33%" in text
+
+
+def test_the_preamble_keeps_the_head_in_frame_and_the_wides_on_instrumentals():
+    lowered = " ".join(_preamble().lower().split())
+    assert "boots" in lowered  # a framing anchored on boots has no face
+    assert "instrumental" in lowered
+    assert "editorial" in lowered  # a deliberate wide over a sung line
 
 
 # --------------------------------------------------------------------------- #

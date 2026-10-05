@@ -213,6 +213,19 @@ the constants themselves for the full per-word accounting, and
 these calls, including the "does the camera clause name the face" hypothesis
 tested and rejected at n=41 -- it runs backward from the hypothesis, not
 merely absent.
+
+**Size moved from** ``camera`` **to** ``framing`` **(issue #97, 2026-10-05).**
+The re-score above left the lint's SIZE half -- "a sung chunk sets no
+``camera``" plus close/wide keyword sets read out of ``camera`` -- untouched,
+and #97 then measured that half as wrong: camera wording does not set
+delivered face size (39 voiced chunks whose camera said close or medium
+close ran 0.0000-0.3561 of frame), shot-line wording does not either
+(2026-10-05), and ``framing`` does (3 of 3 at identical seeds, up to 15x).
+The camera-size keyword sets are retired; the size check reads ``framing``
+and its warnings are marked non-revisable, because ``framing`` is the
+photography stage's field and a prose revision round must not be asked to
+fix it. The orientation checks above (gaze-away, behind-camera, in-profile)
+are untouched -- #97 did not test them.
 """
 
 from __future__ import annotations
@@ -1402,13 +1415,24 @@ park while chunk 11's shot -- the immediately preceding one -- establishes the
 park it is standing in."""
 
 
-_WIDE_FRAMING_KEYWORDS: frozenset[str] = frozenset({
-    # Chosen by reading the 79 camera values a real generated plan produced,
-    # not by imagination. Every one of these appeared there; each describes a
-    # frame in which a person is small.
-    "wide", "extreme wide", "very wide", "aerial", "locked off", "high above",
-    "high and wide", "from a distance", "establishing",
-})
+# _WIDE_FRAMING_KEYWORDS and _CLOSE_FRAMING_KEYWORDS are RETIRED (issue #97,
+# decided 2026-10-05). They read SIZE out of `camera` wording -- "wide",
+# "aerial", "establishing" against "close", "medium", "head and shoulders" --
+# and #97 measured that camera wording does not set delivered face size: of
+# 39 voiced "Deathless" chunks whose camera said close or medium close, the
+# face fraction ran 0.0000-0.3561, and two chunks both reading "close on her
+# face" rendered at 0.0120 and 0.0460. `framing` sets it (3 of 3 at
+# identical seeds, up to 15x), so :func:`lint_voiced_framing` reads size from
+# `framing` and reads `camera` only for orientation.
+
+_NOT_PROSE_REVISABLE = {"revisable": False}
+"""``extra=`` for a warning the prose stage cannot fix by rewording a shot
+line. ``authoring.plan.check_plan`` reads the attribute off the log record
+into :attr:`PlanIssue.revisable`, so the finding is annotated into the
+written plan and never handed to the prose reviser as an objection. Stated
+here, by the lint that knows what it is about, rather than recognised by
+message text downstream -- a reworded message must not quietly make a
+finding revisable again."""
 
 # _FOOT_LEVEL_KEYWORDS is RETIRED (issue #76). It shipped as: "boots",
 # "boot", "feet", "ankles", "underfoot", "knees", "hem", "at his feet",
@@ -1493,9 +1517,9 @@ _IN_PROFILE_KEYWORDS: frozenset[str] = frozenset({
     # counter-example across all 5 occurrences -- chunks 18, 21, 37, 43, 59,
     # face presence 8%/8%/42%/33%/25%, worst case 8%, best case 42%, every
     # one below the 53.3% corpus mean. Scores 23.3% avg / 0.41x vs the rest
-    # of the corpus. Checked on `camera`, ahead of the close-framing check:
-    # all 5 real occurrences also contain "close" or "medium close", so a
-    # profile shot IS a close shot and would otherwise pass silently.
+    # of the corpus. Checked on `camera`. All 5 real occurrences also
+    # contain "close" or "medium close": a profile shot IS a close shot, so
+    # this is about ORIENTATION, and fires whatever `framing` says (#97).
     "in profile",
 })
 
@@ -1523,113 +1547,122 @@ _BEHIND_CAMERA_KEYWORDS: frozenset[str] = frozenset({
     "following him", "behind her shoulder", "over her shoulder from behind",
 })
 
-_CLOSE_FRAMING_KEYWORDS: frozenset[str] = frozenset({
-    # If any of these is present the framing is close enough to read a mouth,
-    # even when a width word also appears ("medium wide on her face").
-    "close", "tight", "macro", "medium", "three-quarter", "over the shoulder",
-    "portrait", "head and shoulders",
-})
-
-
 def lint_voiced_framing(
     plan: Mapping[int, ShotPlanEntry],
     chunks: Sequence[AudioChunk],
 ) -> None:
-    """Warn (never raise) when a chunk that carries a lyric is not framed
-    close enough to read a mouth.
+    """Warn (never raise) when a chunk that carries a lyric is not set up to
+    show a mouth: too small in frame (``framing``), or turned away from the
+    lens (shot line and ``camera``).
 
     Lip-sync is the whole reason this pipeline exists, and it needs a face
     big enough in frame to see. Nothing else in the authoring layer knows
     that: the photography stage optimises for the image, and for most of a
     song the better image genuinely is the wide one.
 
-    Measured on the first machine-authored plan to reach a GPU. Of its 41
-    voiced chunks, **11** had a close or medium framing; 1 was explicitly
-    wide and 29 carried no ``camera`` value at all. Across the chunks
-    rendered from it a face was detectable (YuNet, the #47 detector) in
-    0-33% of sampled frames. One chunk was re-rendered four ways -- the
-    second character bound with ``present`` and not, the shot line rewritten
-    to make the singer the subject, the camera pointed at her -- and every
-    variant lost the face, because the plan around it was landscape.
+    **Size reads** ``framing`` **only (issue #97).** This lint used to demand
+    a ``camera`` value reading close or medium on every sung chunk -- the
+    first machine-authored plan to reach a GPU had 29 of 41 voiced chunks
+    with no ``camera`` and a face detectable in 0-33% of sampled frames. #97
+    then measured that camera wording does not set delivered face size (39
+    voiced chunks whose camera said close or medium close: 0.0000-0.3561 of
+    frame), while ``framing`` moved it 3 of 3 at identical seeds, up to 15x;
+    a 2026-10-05 measurement found shot-line wording does not set it either.
+    So: a sung chunk with no ``framing`` warns (it hands the size to H3), and
+    a sung chunk framed ``"wide"`` warns. ``"face"``, ``"close"`` and
+    ``"medium"`` are quiet. Both size warnings are logged with
+    :data:`_NOT_PROSE_REVISABLE`: the photography stage sets ``framing``, so
+    a prose revision round must never be asked to fix them.
 
-    Absent is warned about as loudly as wide, deliberately: ``camera`` is
-    optional per shot, and an omitted framing on a sung chunk is not a
-    neutral default. It hands the decision to H3, which measured wide.
+    **Orientation reads the shot line and** ``camera`` **(#58, #76)**, which
+    #97 did not test and which stay: a gaze verb in the shot line, a
+    following camera, an in-profile camera. At most one of those per chunk,
+    and each runs whether or not the other field is set. These remain
+    ordinary (revisable) warnings, as they have always been.
 
     Warning only, like every lint here: a wide shot over a sung line is a
     real editorial choice (a held establishing shot under the first line of a
-    verse), and a false positive must never be able to block a run.
+    verse, or a desync #97 found nobody notices at a small face), and a
+    false positive must never be able to block a run.
     """
     voiced = {c.chunk_id for c in chunks if not c.is_instrumental and (c.text or "").strip()}
     for chunk_id in sorted(plan):
         if chunk_id not in voiced:
             continue
-        camera = (plan[chunk_id].camera or "").strip().lower()
-        if not camera:
-            logger.warning(
-                "Shot plan: chunk_id=%d carries a lyric but sets no `camera`, so nothing "
-                "asks for the singer to be close enough to read a mouth -- the framing is "
-                "left to H3, which measured wide. Lip-sync needs a face in frame; give a "
-                "sung chunk a close or medium framing on whoever is singing it.",
-                chunk_id,
-            )
-            continue
-        # A gaze verb in the shot line settles the head away from the lens
-        # regardless of what `camera` asks for -- the sentence outranks the
-        # field. See _GAZE_AWAY_KEYWORDS for the full re-scored list.
-        shot_lower = plan[chunk_id].shot.lower()
-        gaze = next((k for k in sorted(_GAZE_AWAY_KEYWORDS) if k in shot_lower), None)
-        if gaze:
-            logger.warning(
-                "Shot plan: chunk_id=%d carries a lyric but its shot line says %r, which "
-                "settles the singer's gaze on something in the scene and turns the head "
-                "away from the lens -- the sentence outranks the camera field, so no "
-                "framing recovers it. Put what she is looking at near her, or move the "
-                "looking to an instrumental chunk.",
-                chunk_id,
-                gaze,
-            )
-            continue
-        behind = next((k for k in sorted(_BEHIND_CAMERA_KEYWORDS) if k in camera), None)
-        if behind:
-            logger.warning(
-                "Shot plan: chunk_id=%d carries a lyric but the camera is %r -- a "
-                "following shot is the back of a head. A moving camera is fine: the "
-                "same run measured 89%% face presence on \"ahead of her\" and 0%% on "
-                "\"travelling with her\". Put the lens in front of the singer.",
-                chunk_id,
-                behind,
-            )
-            continue
-        # Checked before the close-framing check below: every one of this
-        # song's 5 real "in profile" occurrences also contains "close" or
-        # "medium close", so a profile shot IS a close shot and would
-        # otherwise pass silently. Measured at 23.3% avg face presence / 0.41x
-        # vs the rest of the voiced corpus, no counter-example (issue #76).
-        profile = next((k for k in sorted(_IN_PROFILE_KEYWORDS) if k in camera), None)
-        if profile:
-            logger.warning(
-                "Shot plan: chunk_id=%d carries a lyric but the camera is %r -- a "
-                "profile framing loses the face far more often than a close shot "
-                "generally does (23%% avg face presence across every measured "
-                "occurrence on a real render, vs 53%% overall). Face the lens more "
-                "directly, or move the profile framing to an instrumental chunk.",
-                chunk_id,
-                profile,
-            )
-            continue
-        if any(k in camera for k in _CLOSE_FRAMING_KEYWORDS):
-            continue
-        hit = next((k for k in sorted(_WIDE_FRAMING_KEYWORDS) if k in camera), None)
-        if hit:
-            logger.warning(
-                "Shot plan: chunk_id=%d carries a lyric but is framed %r, which puts the "
-                "singer too small to read a mouth. Wide shots are what a music video is "
-                "for -- spend them on the instrumental chunks, where no mouth has to "
-                "match anything.",
-                chunk_id,
-                hit,
-            )
+        entry = plan[chunk_id]
+        _warn_voiced_size(chunk_id, entry.framing)
+        _warn_voiced_orientation(chunk_id, entry)
+
+
+def _warn_voiced_size(chunk_id: int, framing: str | None) -> None:
+    """The size half of :func:`lint_voiced_framing` -- ``framing`` only."""
+    if framing is None:
+        logger.warning(
+            "Shot plan: chunk_id=%d carries a lyric but sets no `framing`, so the singer's "
+            "size in frame is left to H3, which measured wide. Lip-sync needs a face big "
+            'enough to read a mouth: set framing = "face" or "close" ("medium" at most) on '
+            "the singer. `camera` wording does not set size (issue #97).",
+            chunk_id,
+            extra=_NOT_PROSE_REVISABLE,
+        )
+    elif framing == "wide":
+        logger.warning(
+            'Shot plan: chunk_id=%d carries a lyric but sets `framing` to "wide", which puts '
+            "the singer too small to read a mouth (issue #97: under \"wide\" one measured "
+            "chunk had no face in any sampled frame). Advisory -- a deliberate wide over a "
+            "sung line is an editorial choice; otherwise spend wide on instrumental chunks.",
+            chunk_id,
+            extra=_NOT_PROSE_REVISABLE,
+        )
+
+
+def _warn_voiced_orientation(chunk_id: int, entry: ShotPlanEntry) -> None:
+    """The orientation half of :func:`lint_voiced_framing`: at most one of
+    gaze-away (shot line), behind-camera, in-profile (``camera``)."""
+    # A gaze verb in the shot line settles the head away from the lens
+    # regardless of what `camera` asks for -- the sentence outranks the
+    # field. See _GAZE_AWAY_KEYWORDS for the full re-scored list.
+    shot_lower = entry.shot.lower()
+    gaze = next((k for k in sorted(_GAZE_AWAY_KEYWORDS) if k in shot_lower), None)
+    if gaze:
+        logger.warning(
+            "Shot plan: chunk_id=%d carries a lyric but its shot line says %r, which "
+            "settles the singer's gaze on something in the scene and turns the head "
+            "away from the lens -- the sentence outranks the camera field, so no "
+            "framing recovers it. Put what she is looking at near her, or move the "
+            "looking to an instrumental chunk.",
+            chunk_id,
+            gaze,
+        )
+        return
+    camera = (entry.camera or "").strip().lower()
+    if not camera:
+        return
+    behind = next((k for k in sorted(_BEHIND_CAMERA_KEYWORDS) if k in camera), None)
+    if behind:
+        logger.warning(
+            "Shot plan: chunk_id=%d carries a lyric but the camera is %r -- a "
+            "following shot is the back of a head. A moving camera is fine: the "
+            "same run measured 89%% face presence on \"ahead of her\" and 0%% on "
+            "\"travelling with her\". Put the lens in front of the singer.",
+            chunk_id,
+            behind,
+        )
+        return
+    # Measured at 23.3% avg face presence / 0.41x vs the rest of the voiced
+    # corpus, no counter-example (issue #76). Every real occurrence was also
+    # a close shot, so this fires whatever `framing` says.
+    profile = next((k for k in sorted(_IN_PROFILE_KEYWORDS) if k in camera), None)
+    if profile:
+        logger.warning(
+            "Shot plan: chunk_id=%d carries a lyric but the camera is %r -- a "
+            "profile framing loses the face far more often than a close shot "
+            "generally does (23%% avg face presence across every measured "
+            "occurrence on a real render, vs 53%% overall). Face the lens more "
+            "directly, or move the profile framing to an instrumental chunk.",
+            chunk_id,
+            profile,
+        )
 
 
 _STAGED_ELSEWHERE_MESSAGE = (
