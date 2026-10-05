@@ -50,6 +50,14 @@ diarize = [
     "pyannote.audio>=3.1",
     "torch>=2.1",
 ]
+# Issue #68: the vectorised stereo warp. Optional for the same reason `faces`
+# is: without numpy, stereo.py runs its original per-pixel loop and produces
+# byte-identical output, just ~13x slower. CI installs this in a SEPARATE step
+# after the core run, so the core [dev]-only run keeps catching any test that
+# silently needs an extra.
+stereo = [
+    "numpy>=1.24",
+]
 dev = [
     "pytest>=8.0",
     "pytest-cov>=5.0",

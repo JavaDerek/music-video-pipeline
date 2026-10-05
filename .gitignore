@@ -240,3 +240,8 @@ run.local.*
 # entry is belt-and-braces (design section 11): the real boundary is that
 # nothing here ever gets created inside a repo checkout in the first place.
 .authoring/
+
+# SFace face-recognition weights: fetched by the operator, NEVER committed
+# (docs/seed-face-recognition.md -- unlike YuNet, its redistribution terms were
+# not worth shipping by default). Ignored so a local copy can't be added by accident.
+models/face_recognition_sface_2021dec.onnx
