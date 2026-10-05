@@ -463,9 +463,10 @@ warns (advisory, never handed to a prose revision round) when a sung chunk
 leaves it unset or sets `wide`; `camera` on a sung chunk is optional and
 about movement and angle. The mechanism is #74's — H3 renders
 the nouns it is given, so the tight levels name eyes and a mouth and the wide
-level names neither — and it is **not yet verified on pixels**: see issue
-#97 for the A/B that settles it, and `docs/shot-writing-guide.md` for how to
-use it meanwhile.
+level names neither — and it is **verified on pixels**: set to `face` and to
+`wide` on the same three chunks at identical seeds (2026-10-04, #97), it moved
+the delivered face 3 of 3 times, up to 15x larger under `face`. See
+`docs/shot-writing-guide.md` for how to use it.
 
 #### Real people and invented ones
 
