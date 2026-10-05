@@ -848,13 +848,32 @@ a prohibition to subtract in).
 
 Three things to know before using it:
 
-- **The field is a mechanism, not yet a measured result.** That it composes
-  correctly is not evidence H3 honours it; the A/B that settles it is in
-  issue #97. Until then, treat `framing` the way this guide treats any
-  unverified lever: use it where you have a reason to, and check the pixels.
-- **It is not emitted by the authoring layer.** Set it by hand, on the chunks
-  where it matters. A generating stage that re-framed all 80 shots would be
-  paying an unmeasured cost across a whole video to fix a handful of them.
+- **It moves the pixels, measured 3 of 3 (2026-10-04).** Chunks 15/20/64 of
+  "Deathless", all authored "close"/"medium close" in `camera` and delivered
+  small, were rendered `face` vs `wide` at identical seeds: median face
+  fraction 0.0343 vs 0.0022, 0.0572 vs 0.0098, and 0.0133 vs a face in 0 of
+  12 sampled frames. Read it on the **median** over sampled frames, not the
+  max — the max inverted chunk 20, whose `wide` take swings into a close-up
+  for its last frames.
+- **The photography stage proposes it, sparsely.** `mvm-author photography`
+  emits `framing` beside `camera`, optional per shot and validated against
+  the same four values the loader accepts; `write` puts it in the plan. It is
+  told to spend it where size matters and leave the rest to the renderer — a
+  stage that re-framed all 80 shots would pay an unmeasured cost across a
+  whole video to fix a handful of them. Review it like any other proposal,
+  and set or remove it by hand where you disagree.
+- **The shot line's own words do not do this job either (measured
+  2026-10-05, no GPU).** Over the 80 rendered v14 chunks, neither a
+  pre-registered keyword rubric nor a blind coder's reading of each `shot`
+  line's implied scale predicted median face size (Spearman rho -0.13 and
+  -0.11, replicated on v13). Within one singer's 24 voiced chunks, lines
+  directing attention to the face came out the same size as wide ones
+  (0.87x), and "her mouth still parted on the last unsung word" rendered at
+  her median of 0.016. What did separate the chunks was who sings (Jan's
+  voiced median 0.096 against Dianne's 0.016) and whether anyone does
+  (instrumental chunks are about 0). Still untested: posture. He stands
+  still in every line and she climbs, so this plan cannot separate the
+  character from what the line has the character doing.
 - **It is an endpoint, not a displacement.** "Framed head and shoulders" is a
   state; the chained I2V path applies every per-chunk instruction to its own
   previous output, and anything that displaces rather than specifies drifts.

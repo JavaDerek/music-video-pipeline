@@ -579,12 +579,15 @@ class ShotPlanEntry:
     default level: a run that does not use this field gets exactly the
     framing behaviour it had, which is H3's own, uncontrolled.
 
-    **Not emitted by the authoring layer yet, deliberately.** The prompt
-    mechanism is measured only indirectly (#74's demeanour arms), and
-    generating a framing intent onto all 80 chunks would re-frame shots the
-    photography stage already authored, at a cost nobody has measured. #97's
-    A/B is three hand-set chunks at identical seeds; the generating stage
-    comes after it, not before."""
+    **Emitted by the photography stage since the A/B came back (2026-10-04).**
+    Held back until the mechanism was measured; #97's A/B then moved the
+    median face fraction 3 of 3 at identical seeds (``face`` vs ``wide``:
+    15.6x, 5.8x, and a face in 0 of 12 sampled frames under ``wide``).
+    ``authoring.photography`` proposes it **sparse and optional per shot**,
+    like ``camera`` -- never a level on all 80 chunks, which was the cost
+    this paragraph used to warn about -- and validates it against
+    :data:`~music_video_maker.prompting.FRAMING_LEVELS` before
+    ``authoring.plan`` writes it beside ``camera``."""
 
 
 def load_shot_plan(
