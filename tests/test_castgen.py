@@ -25,6 +25,7 @@ and no ComfyUI:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 from pathlib import Path
@@ -717,7 +718,7 @@ def test_the_origin_block_is_what_configpy_already_requires(
 
     entry = parsed["cast"]["Nobody"]
     assert entry["synthetic"] is True
-    assert entry["image"].startswith("cast/")
+    assert entry["image"] == result.images[0].path.as_posix()
     origin = config._build_cast_origin("Nobody", entry["origin"])
     assert origin.seed == 4242
     assert origin.created
@@ -725,6 +726,63 @@ def test_the_origin_block_is_what_configpy_already_requires(
     assert extras["steps"] == 28
     assert "img2img" in str(extras["method"])
     assert "$1M" in str(extras["licence"])
+
+
+@pytest.mark.parametrize("character", ["The Dead", 'Odd "Quoted" One', "Nobody.Else"])
+def test_the_origin_block_quotes_a_name_that_is_not_a_bare_key(
+    tmp_path, anchor_template, view_template, character
+):
+    """``[cast.The Dead]`` is not TOML. A name outside ``[A-Za-z0-9_-]`` must
+    be a quoted key, or the block the operator pastes refuses to load
+    (seen for real on 2026-10-05). Round-tripped through the TOML parser *and*
+    config's own origin builder, not checked by string shape."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.10
+        import tomli as tomllib
+
+    spec = dataclasses.replace(
+        castgen.load_character_spec(write_spec(tmp_path)), character=character
+    )
+    _session, result = generate(tmp_path, anchor_template, view_template, spec=spec)
+    text = result.origin_toml()
+    parsed = tomllib.loads(text)
+
+    assert list(parsed["cast"]) == [character]
+    entry = parsed["cast"][character]
+    assert entry["synthetic"] is True
+    origin = config._build_cast_origin(character, entry["origin"])
+    assert origin.seed == 4242
+
+
+def test_a_bare_key_name_stays_unquoted(tmp_path, anchor_template, view_template):
+    _session, result = generate(tmp_path, anchor_template, view_template)
+    text = result.origin_toml()
+    assert "[cast.Nobody]\n" in text
+    assert "[cast.Nobody.origin]\n" in text
+
+
+def test_the_origin_image_is_the_anchor_as_actually_written(
+    tmp_path, anchor_template, view_template
+):
+    """``image`` was hard-coded to ``cast/<file>`` while the files went to
+    ``--out-dir`` (``cast/the_dead_turbo_v2/`` for real) -- a path to nothing.
+    It must be the written anchor's path, as the output directory was given."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.10
+        import tomli as tomllib
+
+    out_dir = tmp_path / "cast" / "the_dead_turbo_v2"
+    out_dir.mkdir(parents=True)
+    _session, result = generate(tmp_path, anchor_template, view_template, output_dir=out_dir)
+    entry = tomllib.loads(result.origin_toml())["cast"]["Nobody"]
+
+    anchor = result.images[0]
+    assert anchor.from_view is None
+    assert entry["image"] == anchor.path.as_posix()
+    assert Path(entry["image"]).exists()
+    assert Path(entry["image"]).parent == out_dir
 
 
 def test_write_character_record_writes_three_files(tmp_path, anchor_template, view_template):

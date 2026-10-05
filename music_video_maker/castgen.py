@@ -147,6 +147,7 @@ import requests
 from music_video_maker import castcheck, config, custody, execution, faces, hardware, staging
 from music_video_maker import workflow_graph as wg
 from music_video_maker.contracts import HardwareProfile, Workflow
+from music_video_maker.profiles import _toml_string
 
 logger = logging.getLogger(__name__)
 
@@ -936,16 +937,30 @@ class CharacterResult:
         anchor every other view was generated from; the whole set goes into
         ``ref_images`` by the usual config means, which is not this block's
         business.
+
+        The character's name is the table key, so a name that is not a TOML
+        bare key (anything outside ``[A-Za-z0-9_-]`` -- "The Dead") is written
+        quoted: ``[cast."The Dead"]``, or the pasted block would not parse.
+
+        ``image`` is the anchor's path *exactly as it was written*: the
+        ``--out-dir`` as given on the command line joined with the file name
+        (``cast/the_dead_turbo_v2/The_Dead_frontal.png``). castgen never learns
+        which run directory the config will live in, so it does not guess one;
+        a config resolves a relative ``image`` against its own directory, which
+        means the path is right as-is when castgen was run from the run
+        directory with a relative ``--out-dir`` (the documented usage), and an
+        absolute ``--out-dir`` yields an absolute path that is right anywhere.
         """
         spec = self.spec
         anchor = self.images[0] if self.images else None
-        lines = [f"[cast.{spec.character}]"]
+        key = _toml_key(spec.character)
+        lines = [f"[cast.{key}]"]
         lines.append('role = "<describe what they are doing, not how they look>"')
         if anchor is not None:
-            lines.append(f'image = "cast/{anchor.path.name}"')
+            lines.append(f"image = {_toml_string(anchor.path.as_posix())}")
         lines.append("synthetic = true")
         lines.append("")
-        lines.append(f"[cast.{spec.character}.origin]")
+        lines.append(f"[cast.{key}.origin]")
         model_name = spec.model or (spec.unet_name or "krea2")
         lines.append(f'model = "{model_name}"')
         lines.append(f'prompt = "{_toml_escape(spec.prompt)}"')
@@ -1061,6 +1076,20 @@ class CharacterResult:
 
 def _toml_escape(text: str) -> str:
     return text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+
+
+_BARE_KEY_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+)
+
+
+def _toml_key(name: str) -> str:
+    """``name`` as a TOML key: bare when it may be (``[A-Za-z0-9_-]+``),
+    otherwise a quoted basic string, escaped by the same helper the profile
+    writer uses so there is one TOML-string encoder in the package."""
+    if name and set(name) <= _BARE_KEY_CHARS:
+        return name
+    return _toml_string(name)
 
 
 # --------------------------------------------------------------------------- #
