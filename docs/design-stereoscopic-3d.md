@@ -45,7 +45,8 @@ then inpainting the disocclusions. The hard parts are known:
 ### The scaffold that exists, and what it is not
 
 **Built (2026-09-21): `music_video_maker/stereo.py`, never run on a real
-frame.** It is the arithmetic and the seams, not the feature: the sign
+chunk** (its warp ran on 9 real frames on 2026-10-05; see "Not streaming"
+below). It is the arithmetic and the seams, not the feature: the sign
 convention with the synthetic-depth test this document asks for, a
 convergence-plane parameter, the DIBR forward warp with a z-buffer for
 collisions, nearest-neighbour hole filling, side-by-side and anaglyph output,
@@ -55,11 +56,18 @@ test suite.
 
 What it deliberately is not:
 
-* **Not fast.** numpy is not a dependency of this project and is not in its
-  test environment (checked, not assumed), so the warp is a Python loop per
-  pixel and `decode_frames` buffers a whole chunk. At 12334 frames a song that
-  is not a production path. Treat the arithmetic as the specification and
-  rewrite the loops against numpy or the OpenCV extra that already exists.
+* **Not streaming.** `decode_frames` still buffers a whole chunk (~240 MB at
+  192 frames). The warp itself was the other half of this bullet and is done
+  (2026-10-05): with numpy importable — it comes with the `faces` extra and
+  with any depth-model environment, and is still not a declared dependency —
+  `warp_eye` runs a vectorised path that is **byte-identical** to the
+  original per-pixel loop, which stays as the fallback and as the test
+  oracle. On 18 real 864x480 warps of the v14 render it measured ~35 ms per
+  stereo pair against ~450 ms for the loop (12.8x; ~0.12 h against ~1.5 h of
+  warping for a 12334-frame song), and every output matched the loop byte for
+  byte: `~/mvm-runs/deathless/measurements/stereo68_2026-10-05/FINDINGS.md`.
+  The loop was slow, not unrunnable — under half a second a pair — so the
+  depth model, at ~0.5 s a frame on CPU, is now the dominant cost.
 * **Not inpainting.** The hole fill copies the nearest written pixel along the
   row — the "edge-stretch, for this test only" this document specifies for the
   *experiment*. The showcase shot is still the worst case, and it is exactly

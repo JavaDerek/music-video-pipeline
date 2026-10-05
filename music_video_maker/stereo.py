@@ -1,11 +1,19 @@
 """Stereoscopic conversion scaffold -- issue #68's conversion half.
 
-**NOTHING HERE HAS EVER BEEN RUN ON A REAL RENDERED FRAME.** Every function
-in this module is exercised by unit tests on synthetic frames a few pixels
-across, with the depth source injected and ffmpeg replaced by a fake runner.
-No chunk of any render has been through it, no depth model has been installed
-on this machine, and no anaglyph has been looked at. Read every claim below as
-"this is what the code does", never as "this is what it produces".
+**ALMOST NOTHING HERE HAS BEEN RUN ON REAL FOOTAGE.** Every function in this
+module is exercised by unit tests on synthetic frames a few pixels across,
+with the depth source injected and ffmpeg replaced by a fake runner. The one
+exception, 2026-10-05 (#68's vectorisation): :func:`stereo_pair`,
+:func:`anaglyph` and :func:`external_depth_source` (with ``cat`` standing in
+for the depth command) ran on 9 real 864x480 frames of the v14 render, with
+Depth Anything V2 Small depth computed on CPU *outside* this module -- the
+vectorised warp matched the original loop byte for byte on all of them, at
+~35 ms per stereo pair against ~450 ms
+(``~/mvm-runs/deathless/measurements/stereo68_2026-10-05/FINDINGS.md``).
+:func:`convert_chunk`, :func:`decode_frames` and :func:`encode_frames` have
+still never touched a real chunk, and nobody has judged an anaglyph *as
+stereo*. Read every claim below as "this is what the code does", never as
+"this is what it produces".
 
 Why it exists anyway
 --------------------
@@ -184,7 +192,7 @@ class StereoError(RuntimeError):
 
 
 # --------------------------------------------------------------------------- #
-# Pixel containers (no numpy -- see the module docstring)
+# Pixel containers (plain bytes and sequences: numpy is optional, see the module docstring)
 # --------------------------------------------------------------------------- #
 
 
@@ -309,6 +317,12 @@ def warp_eye(frame: Frame, depth: DepthMap, *, eye: str, params: StereoParams) -
     """
     if eye not in ("left", "right"):
         raise StereoError(f"eye must be 'left' or 'right', got {eye!r}")
+    _check_depth_matches(frame, depth)
+    direction = 1 if eye == "left" else -1
+    return _warp(frame, depth, direction, params, _depth_array(depth))
+
+
+def _check_depth_matches(frame: Frame, depth: DepthMap) -> None:
     if (depth.width, depth.height) != (frame.width, frame.height):
         raise StereoError(
             f"depth map is {depth.width}x{depth.height} but the frame is "
@@ -316,20 +330,32 @@ def warp_eye(frame: Frame, depth: DepthMap, *, eye: str, params: StereoParams) -
             "same size as the frame it was given"
         )
 
-    direction = 1 if eye == "left" else -1
+
+def _depth_array(depth: DepthMap):
+    """The depth values as a float64 numpy array for the vectorised warp, or
+    ``None`` to send the frame through the reference loop: when numpy is
+    absent, or when the map holds NaN (whose loop behaviour is
+    order-dependent and is not reproduced). Built once per frame and shared
+    by both eyes."""
     np = _numpy()
-    if np is not None:
-        values = np.asarray(depth.values, dtype=np.float64)
-        if not np.isnan(values).any():
-            return _warp_eye_numpy(
-                np, frame, depth, direction=direction, params=params, values=values
-            )
+    if np is None:
+        return None
+    values = np.asarray(depth.values, dtype=np.float64)
+    if np.isnan(values).any():
         logger.warning(
             "Stereo: depth map contains NaN -- warping this frame with the slow "
             "reference loop, whose (order-dependent) NaN behaviour the vectorised "
             "path does not reproduce. A depth source should never emit NaN."
         )
-    return _warp_eye_reference(frame, depth, direction=direction, params=params)
+        return None
+    return values
+
+
+def _warp(frame: Frame, depth: DepthMap, direction: int, params: StereoParams, values) -> Frame:
+    if values is None:
+        return _warp_eye_reference(frame, depth, direction=direction, params=params)
+    np = _numpy()
+    return _warp_eye_numpy(np, frame, depth, direction=direction, params=params, values=values)
 
 
 def _numpy():
@@ -362,49 +388,56 @@ def _warp_eye_numpy(np, frame: Frame, depth: DepthMap, *, direction: int, params
     * the z-buffer: the loop keeps a candidate only if its **unclamped**
       depth is strictly greater than what is already there (initially -1.0),
       visiting x left to right -- so each destination ends up holding the
-      maximum depth, the *leftmost* source on a tie, and nothing at all if
-      every candidate was <= -1.0. One ``lexsort`` by (destination, -depth,
-      x) picks exactly that;
+      maximum depth, the *leftmost* source on a tie (possible only where
+      round-half-to-even sends two equal-depth neighbours to one column),
+      and nothing at all if every candidate was <= -1.0.
+      ``np.maximum.at`` per destination, then
+      ``np.minimum.at`` over the sources that reached that maximum, picks
+      exactly that;
     * the hole fill copies from the nearest position whose written depth is
       >= 0.0, the **right-hand** one on a tie (the loop's ``<=`` advance), in
       rows that have at least one; a written depth in (-1, 0) still counts as
       a hole, as it does in the loop.
     """
     width, height = frame.width, frame.height
-    src = np.frombuffer(frame.pixels, dtype=np.uint8).reshape(height, width, 3)
-    if values is None:
-        values = np.asarray(depth.values, dtype=np.float64)
-    inv = values.reshape(height, width)
+    size = width * height
+    # One 3-byte item per pixel, so every gather/scatter below moves whole
+    # pixels with one flat index instead of a (row, column, channel) triple.
+    src = np.frombuffer(frame.pixels, dtype="V3")
+    inv = np.asarray(depth.values, dtype=np.float64) if values is None else values
 
+    columns = np.arange(width)
+    flat_columns = np.tile(columns, height)
     clamped = np.minimum(1.0, np.maximum(0.0, inv))
     shift = (clamped - params.convergence) * params.max_disparity_fraction * width * direction
-    dest = np.rint(np.arange(width, dtype=np.float64) + shift)
-    candidate = (dest >= 0) & (dest < width) & (inv > -1.0)
+    dest = np.rint(flat_columns + shift)
+    candidate = np.flatnonzero((dest >= 0) & (dest < width) & (inv > -1.0))
 
-    ys, xs = np.nonzero(candidate)  # row-major: x ascending within a row
-    dest_x = dest[ys, xs].astype(np.intp)
-    depth_v = inv[ys, xs]
-    slot = ys * width + dest_x
-    order = np.lexsort((xs, -depth_v, slot))
-    first = np.ones(order.size, dtype=bool)
-    first[1:] = slot[order[1:]] != slot[order[:-1]]
-    win = order[first]
+    depth_v = inv[candidate]
+    source_x = flat_columns[candidate]
+    slot = candidate - source_x + dest[candidate].astype(np.intp)
+    # z-buffer: the maximum depth landing on each slot (-1.0 where none
+    # does, the loop's initial value), then the leftmost source among the
+    # candidates that reached it.
+    written = np.full(size, -1.0)
+    np.maximum.at(written, slot, depth_v)
+    top = depth_v == written[slot]
+    winner_x = np.full(size, width, dtype=np.intp)
+    np.minimum.at(winner_x, slot[top], source_x[top])
+    landed = np.flatnonzero(winner_x < width)
 
-    out = np.zeros_like(src)
-    written = np.full((height, width), -1.0)
-    out[ys[win], dest_x[win]] = src[ys[win], xs[win]]
-    written[ys[win], dest_x[win]] = depth_v[win]
+    out = np.zeros(size, dtype="V3")
+    out[landed] = src[landed - flat_columns[landed] + winner_x[landed]]
 
-    filled = written >= 0.0
+    filled = (written >= 0.0).reshape(height, width)
     holes = ~filled & filled.any(axis=1, keepdims=True)
     if holes.any():
-        columns = np.arange(width)
         left = np.maximum.accumulate(np.where(filled, columns, -1), axis=1)
         right = np.minimum.accumulate(np.where(filled, columns, width)[:, ::-1], axis=1)[:, ::-1]
         use_right = (right < width) & ((left < 0) | (right - columns <= columns - left))
-        source = np.where(use_right, right, left)
-        hy, hx = np.nonzero(holes)
-        out[hy, hx] = out[hy, source[hy, hx]]
+        hole = np.flatnonzero(holes)
+        nearest = np.where(use_right, right, left).reshape(-1)[hole]
+        out[hole] = out[hole - flat_columns[hole] + nearest]
 
     return Frame(width=width, height=height, pixels=out.tobytes())
 
@@ -413,7 +446,8 @@ def _warp_eye_reference(frame: Frame, depth: DepthMap, *, direction: int, params
     """The original per-pixel loop -- **the specification** of the warp, kept
     verbatim as the fallback when numpy is absent and as the oracle
     :func:`_warp_eye_numpy` is tested against. Several hundred thousand
-    Python-level iterations per eye per frame at 864x480; see
+    Python-level iterations per eye per frame at 864x480 -- about 0.22 s an
+    eye on an M-series Mac, 13x the vectorised path; see
     ``~/mvm-runs/deathless/measurements/stereo68_2026-10-05/FINDINGS.md``
     for what that costs on a real frame."""
     width, height = frame.width, frame.height
@@ -468,9 +502,11 @@ def stereo_pair(
     """``(left_eye, right_eye)`` for one mono frame. See :func:`warp_eye` for
     the sign convention, which this function only fans out."""
     params = params or StereoParams()
+    _check_depth_matches(frame, depth)
+    values = _depth_array(depth)
     return (
-        warp_eye(frame, depth, eye="left", params=params),
-        warp_eye(frame, depth, eye="right", params=params),
+        _warp(frame, depth, 1, params, values),
+        _warp(frame, depth, -1, params, values),
     )
 
 

@@ -366,6 +366,27 @@ def test_the_vectorised_warp_matches_the_reference_loop(seed, eye):
     assert actual.pixels == expected.pixels
 
 
+def test_a_rounding_tie_keeps_the_leftmost_source_on_both_paths(monkeypatch):
+    """Equal depth means equal shift, so two sources can only meet on one
+    destination through round-half-to-even: with a shift of exactly +0.5 px,
+    x=1 lands on round(1.5) = 2 and x=2 on round(2.5) = 2. The loop's strict
+    ``>`` keeps the FIRST (leftmost) of the tie; so must the fast path."""
+    width = 20
+    colours = [(x, 10 * x % 256, 255 - x) for x in range(width)]
+    frame = _frame([colours])
+    # (0.75 - 0.5) * 0.1 * 20 = +0.5 px for the left eye, everywhere
+    depth = _depth([[0.75] * width])
+    params = stereo.StereoParams(convergence=0.5, max_disparity_fraction=0.1)
+
+    monkeypatch.setattr(stereo, "_numpy", lambda: None)
+    loop = stereo.warp_eye(frame, depth, eye="left", params=params)
+    monkeypatch.undo()
+    fast = stereo.warp_eye(frame, depth, eye="left", params=params)
+
+    assert loop.pixels[2 * 3 : 3 * 3] == bytes(colours[1])
+    assert fast.pixels == loop.pixels
+
+
 def test_the_vectorised_warp_leaves_an_unreachable_row_black_like_the_loop():
     """A row nothing lands on: every depth at or below the z-buffer's initial
     -1.0 (exactly -1.0 included -- the loop's test is ``<=``), so no source
