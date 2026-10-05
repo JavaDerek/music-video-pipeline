@@ -395,7 +395,9 @@ def build_photography_prompt(
         f'Write each one the way it reads after the word "camera" -- e.g. "{CAMERA_EXAMPLE}".',
         # Issue #97: the closed vocabulary, restated beside the table it
         # applies to and taken from the render path, so it cannot drift.
-        "Give a `framing` only where the shot's size matters; it must be exactly one of "
+        "Give a `framing` where the shot's size matters -- which is every \"voiced\" chunk "
+        '("face" or "close" on the singer; `camera` wording does not set size) -- and it '
+        "must be exactly one of "
         + ", ".join(f'"{level}"' for level in FRAMING_LEVELS)
         + ".",
     ]

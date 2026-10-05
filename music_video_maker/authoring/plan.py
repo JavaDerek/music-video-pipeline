@@ -122,7 +122,13 @@ class PlanIssue:
     So: still annotated into the file (a human reading the plan should see
     it), never turned into an objection. ``True`` by default, because "the
     prose can fix it" is the ordinary case and a new lint should have to
-    *say* it is the exception."""
+    *say* it is the exception.
+
+    A lint in ``shot_plan.py`` says so on its log record --
+    ``logger.warning(..., extra={"revisable": False})`` -- and
+    :func:`check_plan` copies that attribute here. The first to use it is
+    ``lint_voiced_framing``'s size warnings (issue #97): ``framing`` is the
+    photography stage's field, not the prose stage's."""
 
 
 @dataclass(frozen=True)
@@ -534,7 +540,17 @@ def check_plan(
         message = _strip_candidate_path(record.getMessage(), candidate)
         severity = "error" if loaded and record.levelno >= logging.ERROR else "warning"
         collected.append(
-            PlanIssue(chunk_id=_chunk_id_from(message), severity=severity, message=message)
+            PlanIssue(
+                chunk_id=_chunk_id_from(message),
+                severity=severity,
+                message=message,
+                # Issue #97: a lint that knows its finding is not the prose
+                # stage's to fix says so on the record (`extra=`), e.g.
+                # `lint_voiced_framing`'s size warnings -- `framing` is set by
+                # photography, and a prose reviser handed one would rewrite a
+                # correct shot line to please it. Default True, like the field.
+                revisable=getattr(record, "revisable", True),
+            )
         )
 
     warnings = tuple(issue for issue in collected if issue.severity == "warning")

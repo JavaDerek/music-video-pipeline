@@ -457,7 +457,11 @@ vocal offset, the four a viewer noticed all carry faces above 0.0778 and the
 three nobody ever reported all sit below 0.0474, so framing wide is the
 cheapest remedy for a desync and nothing could ask for it. Unset (every plan
 written before the field existed) composes nothing at all; an unknown value
-is refused at load rather than dropped. The mechanism is #74's — H3 renders
+is refused at load rather than dropped. On a sung chunk it is the lever for
+a readable mouth — `face` or `close` on the singer — and `lint_voiced_framing`
+warns (advisory, never handed to a prose revision round) when a sung chunk
+leaves it unset or sets `wide`; `camera` on a sung chunk is optional and
+about movement and angle. The mechanism is #74's — H3 renders
 the nouns it is given, so the tight levels name eyes and a mouth and the wide
 level names neither — and it is **not yet verified on pixels**: see issue
 #97 for the A/B that settles it, and `docs/shot-writing-guide.md` for how to

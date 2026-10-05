@@ -451,34 +451,40 @@ Reply with a single JSON object, no other text:
 field, lighting philosophy, grade. One string, no per-shot content. If you \
 are told the look is already fixed, return an empty string for it.
 
-`camera` is per-shot framing and movement, and it is OPTIONAL PER SHOT -- \
-with one exception, below. Give one only where the shot genuinely wants it. \
-An absent direction composes nothing, which is the right answer for most \
-shots; a direction on every chunk is filler, and every one of them still \
-lands in a real prompt.
+`camera` is per-shot movement and angle, and it is OPTIONAL PER SHOT, sung \
+chunks included. Give one only where the shot genuinely wants it. An absent \
+direction composes nothing, which is the right answer for most shots; a \
+direction on every chunk is filler, and every one of them still lands in a \
+real prompt. `camera` does not set size: writing "close" or "medium" in it \
+does not make the singer large in frame (issue #97, below).
 
-THE EXCEPTION, AND IT IS NOT OPTIONAL: every chunk tagged LYRIC below gets a \
-`camera` value, and that value must frame the person singing it CLOSE OR \
-MEDIUM -- near enough that a mouth can be read. This video exists to be \
-lip-synced; a singer who is small in frame has no lip-sync, however good the \
-picture is. Measured on the first machine-authored plan to reach a GPU: of \
-its 41 sung chunks, 29 carried no `camera` at all and only 11 were close or \
-medium, and across the rendered chunks a face was detectable in 0-33% of \
-sampled frames. One of those chunks was re-rendered four separate ways -- the \
-second character bound and unbound, the shot line rewritten to make the \
-singer its subject, the camera pointed explicitly at her -- and every variant \
-still lost the face, because the shots around it were landscape. No wording \
-elsewhere recovers a frame the photography gave away.
+ON A SUNG CHUNK -- one marked "voiced" in the beat table below -- the singer \
+must be big enough in frame that a mouth can be read. This video exists to \
+be lip-synced; a singer who is small in frame has no lip-sync, however good \
+the picture is. On a sung chunk, set `framing` to "face" or "close" on the \
+person singing it ("medium" is acceptable); that is the lever, and `camera` \
+wording is not. Measured on the first machine-authored plan to reach a GPU: \
+across its rendered sung chunks a face was detectable in 0-33% of sampled \
+frames. One of those chunks was re-rendered four separate ways -- the second \
+character bound and unbound, the shot line rewritten to make the singer its \
+subject, the camera pointed explicitly at her -- and every variant still lost \
+the face. Neither camera wording nor shot-line wording sets the size; \
+`framing` does.
 
-"Close or medium" means close enough to READ A MOUTH, so it has to include \
-the head: a framing anchored on boots, feet or the ground satisfies \
-"close" and still has no face in it. If a sung chunk's object sits at \
-foot level, frame the singer and let the object fall partly out of frame.
+Close enough to READ A MOUTH has to include the head: a framing anchored on \
+boots, feet or the ground is "close" and still has no face in it. If a sung \
+chunk's object sits at foot level, frame the singer and let the object fall \
+partly out of frame.
 
 Wide is very often the better image, and on this song the wide valleys were \
 the better image. Spend them on the INSTRUMENTAL chunks, which is where a \
-music video earns its scale and where no mouth has to match anything. On a \
-sung chunk, go close.
+music video earns its scale and where no mouth has to match anything. A \
+wide over a sung line is an editorial choice, never a default: make it \
+deliberately -- a held establishing shot under the first line of a verse, \
+say, or a line where a mouth visibly out of step would hurt more than a \
+small singer does (issue #97: of seven chunks measurably out of step, the \
+four a viewer noticed had the larger faces and the three nobody reported \
+had the smaller ones).
 
 THE ONE RULE THAT IS CHECKED MECHANICALLY: the renderer composes your value \
 as ", camera <your value>" -- it supplies the word "camera" itself. So write \
@@ -530,11 +536,12 @@ out tiny. Set to "face" and to "wide" on the same three chunks at identical \
 seeds, `framing` moved the face 3 of 3 times -- up to 15x larger under \
 "face", and under "wide" one chunk had no face in any sampled frame.
 
-`framing` is OPTIONAL PER SHOT, like `camera`, and independent of it -- a \
-shot can want a size and no move. An absent value leaves the size to the \
-renderer, which is the right answer wherever size does not matter. Spend it \
-where it does: "face" or "close" on a sung chunk whose mouth must read, \
-"wide" on an instrumental chunk that earns the landscape. Keep it \
+`framing` is independent of `camera` -- a shot can want a size and no move, \
+or a move and no size. Off the sung chunks it is OPTIONAL PER SHOT, like \
+`camera`: an absent value leaves the size to the renderer, which is the \
+right answer wherever size does not matter. Spend it where it does: "face" \
+or "close" on every sung chunk (above), "wide" on an instrumental chunk that \
+earns the landscape. Keep it \
 consistent with your own `camera` value for that chunk: a `camera` that \
 pushes in on her eyes and a `framing` of "wide" is a contradiction the \
 renderer resolves for you.\

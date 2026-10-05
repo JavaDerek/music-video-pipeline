@@ -211,6 +211,16 @@ the voiced-chunk analysis below.
 
 ## Part 3: `lint_voiced_framing` keyword-set separations (issue #76)
 
+> **Later change (issue #97, 2026-10-05):** the lint's *size* half -- a
+> sung chunk with no `camera`, and close/wide keywords read out of `camera`
+> -- was retired after #97 measured that `camera` wording does not set face
+> size. The size check now reads `framing` (warns when unset or `wide` on a
+> sung chunk). The orientation sets scored below (gaze-away, behind-camera,
+> `in profile`) are unchanged, but they no longer stop at an absent
+> `camera`, and the "close/wide-framing" step in the precedence described
+> under "Net effect" no longer exists. The tables are the record of what
+> the lint did when they were scored.
+
 Scored with the **same sequential/exclusive precedence
 `shot_plan.lint_voiced_framing` itself uses** (gaze-away checked against
 `shot` first; only if it doesn't fire is behind-camera checked against

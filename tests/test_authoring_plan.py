@@ -116,9 +116,17 @@ LINES = {
     3: "Rain crosses the whole length of the pavement, gutters filling",
 }
 
-# A sung chunk needs a framing close enough to read a mouth, or
-# `lint_voiced_framing` rightly objects -- these fixtures stand in for a
-# *clean* plan, so they have to satisfy the rule like a real one would.
+# A sung chunk needs a `framing` that puts the singer close enough to read a
+# mouth, or `lint_voiced_framing` rightly objects (issue #97) -- these
+# fixtures stand in for a *clean* plan, so they have to satisfy the rule like
+# a real one would. Every chunk gets one because the same three ids are
+# voiced in some tests and instrumental in others; a framing on an
+# instrumental chunk is harmless.
+FRAMING = {1: "close", 2: "medium", 3: "face"}
+
+# `camera` is optional on a sung chunk now (it is movement and angle, and #97
+# measured it does not set size), so this is kept only for the tests that
+# are about `camera` itself -- where `framing` sits relative to it.
 CAMERAS = {
     1: "medium on her as the shutters come down behind her",
     2: "close on the swinging receiver, her face held behind it",
@@ -151,7 +159,7 @@ def test_a_generated_plan_round_trips_through_the_real_loaders(tmp_path):
     chunks = _chunks(["a first line", "", "a third line"])
     beats = (_beat(1), _beat(2), _beat(3))
 
-    text = render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, camera=CAMERAS)
+    text = render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, framing=FRAMING)
     path = tmp_path / "shot_plan.toml"
     path.write_text(text)
 
@@ -173,7 +181,7 @@ def test_anchors_come_from_the_chunks_not_from_the_beats(tmp_path):
         ),
     )
 
-    text = render_plan_toml(chunks, stale, {1: LINES[1]}, provenance=PROVENANCE, camera=CAMERAS)
+    text = render_plan_toml(chunks, stale, {1: LINES[1]}, provenance=PROVENANCE, framing=FRAMING)
     path = tmp_path / "shot_plan.toml"
     path.write_text(text)
 
@@ -195,7 +203,7 @@ def test_focus_and_length_come_from_the_beat(tmp_path):
     beats = (_beat(1, role="consequence", focus="action"), _beat(2, length=9.0))
 
     path = tmp_path / "shot_plan.toml"
-    path.write_text(render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, camera=CAMERAS))
+    path.write_text(render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, framing=FRAMING))
     plan = load_shot_plan(path)
 
     assert plan[1].subject_is_focus is False
@@ -223,7 +231,7 @@ def test_location_comes_from_the_beat(tmp_path):
     beats = (_beat(1, location="the mill"), _beat(2, location="the watch-post"))
 
     path = tmp_path / "shot_plan.toml"
-    path.write_text(render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, camera=CAMERAS))
+    path.write_text(render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, framing=FRAMING))
     plan = load_shot_plan(path)
 
     assert plan[1].location == "the mill"
@@ -240,7 +248,7 @@ def test_act_is_surfaced_in_the_beat_comment_line(tmp_path):
         _beat(2, role="consequence", group=1, focus="action", act="resolution"),
     )
 
-    text = render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, camera=CAMERAS)
+    text = render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, framing=FRAMING)
 
     assert '[plant, group 1, act "situation"]' in text
     assert '[consequence, group 1, act "resolution"]' in text
@@ -253,7 +261,7 @@ def test_an_absent_act_is_omitted_from_the_comment_line(tmp_path):
     chunks = _chunks(["a line"])
     beats = (_beat(1, role="plant", group=1, act=""),)
 
-    text = render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, camera=CAMERAS)
+    text = render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, framing=FRAMING)
 
     assert "act" not in text.split("# beat:")[1].split("\n")[0]
 
@@ -269,7 +277,7 @@ def test_pop_object_is_surfaced_in_the_beat_comment_line_only(tmp_path):
         _beat(2, role="contact", group=1, act="situation", pop_object="the printer"),
     )
 
-    text = render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, camera=CAMERAS)
+    text = render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, framing=FRAMING)
 
     assert '[contact, group 1, act "situation", pop "the printer"]' in text
     assert "pop_object" not in text
@@ -280,7 +288,7 @@ def test_an_absent_pop_object_is_omitted_from_the_comment_line(tmp_path):
     chunks = _chunks(["a line"])
     beats = (_beat(1, role="plant", group=1),)
 
-    text = render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, camera=CAMERAS)
+    text = render_plan_toml(chunks, beats, LINES, provenance=PROVENANCE, framing=FRAMING)
 
     assert "pop" not in text.split("# beat:")[1].split("\n")[0]
 
@@ -293,7 +301,7 @@ def test_subject_is_emitted_next_to_present(tmp_path):
     shots = {1: "An instrumental line about Jan", 2: LINES[2]}
 
     text = render_plan_toml(
-        chunks, beats, shots, provenance=PROVENANCE, camera=CAMERAS, present={1: ["Jan"]},
+        chunks, beats, shots, provenance=PROVENANCE, framing=FRAMING, present={1: ["Jan"]},
     )
 
     assert 'subject = "Jan"' in text
@@ -485,8 +493,8 @@ def test_no_revisions_supplied_leaves_the_toml_byte_identical(tmp_path):
     ``revisions`` gets exactly today's output, byte for byte."""
     chunks = _chunks(["x", "y"])
     args = (chunks, (_beat(1), _beat(2)), LINES)
-    without_kwarg = render_plan_toml(*args, provenance=PROVENANCE, camera=CAMERAS)
-    with_none = render_plan_toml(*args, provenance=PROVENANCE, camera=CAMERAS, revisions=None)
+    without_kwarg = render_plan_toml(*args, provenance=PROVENANCE, framing=FRAMING)
+    with_none = render_plan_toml(*args, provenance=PROVENANCE, framing=FRAMING, revisions=None)
 
     assert without_kwarg == with_none
     assert "# revised" not in without_kwarg
@@ -555,7 +563,7 @@ def test_a_clean_plan_checks_clean(tmp_path):
     chunks = _chunks(["a first line", "", "a third line"])
     text = render_plan_toml(
         chunks, (_beat(1), _beat(2), _beat(3)), LINES,
-        provenance=PROVENANCE, camera=CAMERAS,
+        provenance=PROVENANCE, framing=FRAMING,
     )
 
     check = check_plan(text, _config(tmp_path), chunks)
@@ -709,7 +717,7 @@ def test_an_error_is_revised_and_the_fixed_plan_is_returned(tmp_path):
         {1: LINES[1]},  # chunk 2 blank -> an error
         provenance=PROVENANCE,
         reviser=reviser,
-        camera=CAMERAS,
+        framing=FRAMING,
     )
 
     assert [sorted(call) for call in reviser.calls] == [[2]]
@@ -729,7 +737,7 @@ def test_an_unfixable_error_aborts_after_the_bound_and_writes_nothing(tmp_path):
             {1: LINES[1]},
             provenance=PROVENANCE,
             reviser=reviser,
-            camera=CAMERAS,
+            framing=FRAMING,
         )
 
     assert len(reviser.calls) == MAX_ERROR_ROUNDS
@@ -748,7 +756,7 @@ def test_a_warning_gets_exactly_one_revision_round_then_is_annotated(tmp_path):
     built = build_plan(
         _config(tmp_path), chunks, (_beat(1), _beat(2)), shots, provenance=PROVENANCE,
         reviser=reviser,
-        camera=CAMERAS,
+        framing=FRAMING,
         revise_warnings=True,
     )
 
@@ -768,7 +776,7 @@ def test_a_revision_that_breaks_the_plan_is_discarded(tmp_path):
     built = build_plan(
         _config(tmp_path), chunks, (_beat(1), _beat(2)), shots, provenance=PROVENANCE,
         reviser=reviser,
-        camera=CAMERAS,
+        framing=FRAMING,
         revise_warnings=True,
     )
 
@@ -800,7 +808,7 @@ def test_by_default_a_warning_spends_no_reviser_call_and_is_still_annotated(tmp_
     built = build_plan(
         _config(tmp_path), chunks, (_beat(1), _beat(2)), shots, provenance=PROVENANCE,
         reviser=reviser,
-        camera=CAMERAS,
+        framing=FRAMING,
     )
 
     assert reviser.calls == []  # no reviser call at all
@@ -826,7 +834,7 @@ def test_a_surviving_warning_revision_is_marked_with_the_prose_original(tmp_path
     built = build_plan(
         _config(tmp_path), chunks, (_beat(1), _beat(2)), shots, provenance=PROVENANCE,
         reviser=reviser,
-        camera=CAMERAS,
+        framing=FRAMING,
         revise_warnings=True,
     )
 
@@ -850,7 +858,7 @@ def test_a_revision_reproducing_the_original_text_is_not_marked(tmp_path):
     built = build_plan(
         _config(tmp_path), chunks, (_beat(1), _beat(2)), shots, provenance=PROVENANCE,
         reviser=reviser,
-        camera=CAMERAS,
+        framing=FRAMING,
         revise_warnings=True,
     )
 
@@ -872,7 +880,7 @@ def test_an_error_tier_revision_is_marked_with_the_error_tier(tmp_path):
         {1: LINES[1]},  # chunk 2 is blank -> an error; chunk 2 was never in `shots`
         provenance=PROVENANCE,
         reviser=reviser,
-        camera=CAMERAS,
+        framing=FRAMING,
     )
 
     assert built.lint_round_edits[2] == ("error", "")
@@ -892,7 +900,7 @@ def test_a_clean_plan_calls_the_reviser_not_at_all(tmp_path):
         LINES,
         provenance=PROVENANCE,
         reviser=reviser,
-        camera=CAMERAS,
+        framing=FRAMING,
     )
 
     assert reviser.calls == []
@@ -913,7 +921,7 @@ def test_a_revision_leaves_every_out_of_scope_line_byte_identical(tmp_path):
         shots,
         provenance=PROVENANCE,
         reviser=reviser,
-        camera=CAMERAS,
+        framing=FRAMING,
     )
 
     assert built.shots[1] == LINES[1]
@@ -1000,7 +1008,7 @@ def test_extra_checks_reach_the_written_file_as_lint_comments(tmp_path):
         LINES,
         provenance=PROVENANCE,
         reviser=reviser,
-        camera=CAMERAS,
+        framing=FRAMING,
         extra_checks=lambda shots: [
             Issue(chunk_id=2, severity="warning", message="carries its own camera direction")
         ],
@@ -1033,7 +1041,7 @@ def test_extra_checks_are_re_run_on_the_revised_text_not_the_original(tmp_path):
         LINES,
         provenance=PROVENANCE,
         reviser=reviser,
-        camera=CAMERAS,
+        framing=FRAMING,
         extra_checks=extra_checks,
         revise_warnings=True,
     )
@@ -1181,7 +1189,7 @@ def test_subject_round_trips_through_the_real_loader(tmp_path):
             (_beat(1, subject="Jan"), _beat(2)),
             {1: "An instrumental line about Jan", 2: LINES[2]},
             provenance=PROVENANCE,
-            camera=CAMERAS,
+            framing=FRAMING,
             present={1: ["Jan"]},
         )
     )
@@ -1202,7 +1210,7 @@ def test_check_plan_refuses_a_generated_plan_with_a_voiced_chunk_subject(tmp_pat
     beats = (_beat(1, subject="Dianne"), _beat(2))
     shots = {1: LINES[1], 2: "An instrumental line"}
     text = render_plan_toml(
-        chunks, beats, shots, provenance=PROVENANCE, camera=CAMERAS,
+        chunks, beats, shots, provenance=PROVENANCE, framing=FRAMING,
     )
 
     check = check_plan(text, _config(tmp_path), chunks)
@@ -1215,7 +1223,7 @@ def test_check_plan_accepts_a_subject_on_an_instrumental_chunk(tmp_path):
     beats = (_beat(1, subject="Marcus"), _beat(2))
     shots = {1: "An instrumental line about Marcus", 2: LINES[2]}
     text = render_plan_toml(
-        chunks, beats, shots, provenance=PROVENANCE, camera=CAMERAS, present={1: ["Marcus"]},
+        chunks, beats, shots, provenance=PROVENANCE, framing=FRAMING, present={1: ["Marcus"]},
     )
 
     check = check_plan(text, _config(tmp_path), chunks)
@@ -1327,6 +1335,72 @@ def test_a_non_revisable_issue_is_annotated_but_never_objected_with():
 
 def test_plan_issues_are_revisable_by_default():
     assert PlanIssue(chunk_id=1, severity="warning", message="m").revisable is True
+
+
+# Issue #97: `framing` is the photography stage's field, not the prose
+# stage's. A sung chunk with no `framing` (or a wide one) is a real finding,
+# but handing it to the prose reviser would rewrite a correct shot line to
+# please a lint the line did not cause -- the exact failure CLAUDE.md warns
+# about. So `check_plan` must carry the lint's own non-revisable mark onto
+# the issue, and `build_plan` must annotate it without ever objecting with it.
+
+
+def test_check_plan_marks_a_missing_framing_on_a_sung_chunk_non_revisable(tmp_path):
+    chunks = _chunks(["a first line", "", "a third line"])
+    beats = (_beat(1), _beat(2), _beat(3))
+    text = render_plan_toml(
+        chunks, beats, LINES, provenance=PROVENANCE, framing={1: "close", 3: "wide"}
+    )
+
+    check = check_plan(text, _config(tmp_path), chunks)
+
+    framing_issues = [w for w in check.warnings if "`framing`" in w.message]
+    assert {w.chunk_id for w in framing_issues} == {3}
+    assert all(w.revisable is False for w in framing_issues)
+    assert objections_by_chunk(check.warnings) == {}
+
+
+def test_a_missing_framing_on_a_sung_chunk_never_reaches_the_reviser(tmp_path):
+    """Opted into the warning round, with a plan whose ONLY warnings are the
+    framing ones: the reviser must not be called at all, and the findings
+    must still be written into the file for a human to read."""
+    chunks = _chunks(["a first line", "", "a third line"])
+    beats = (_beat(1), _beat(2), _beat(3))
+    reviser = _Reviser([{1: "must never be asked", 3: "must never be asked"}])
+
+    built = build_plan(
+        _config(tmp_path), chunks, beats, dict(LINES), provenance=PROVENANCE,
+        reviser=reviser,
+        revise_warnings=True,  # no framing at all on either sung chunk
+    )
+
+    assert reviser.calls == []
+    assert built.shots == LINES
+    assert built.lint_round_edits == {}
+    framing_warnings = [w for w in built.surviving_warnings if "`framing`" in w.message]
+    assert {w.chunk_id for w in framing_warnings} == {1, 3}
+    lint_lines = [line for line in built.text.splitlines() if "# lint:" in line]
+    assert sum("`framing`" in line for line in lint_lines) == 2
+
+
+def test_a_framing_warning_rides_along_with_a_revisable_one_but_is_never_objected(tmp_path):
+    """When a revisable warning on the same chunk DOES drive the round, the
+    framing finding must still be left out of what the reviser is asked."""
+    chunks = _chunks(["a first line", "a second line"])
+    shots = {1: "She crosses Central Park as the shutters come down", 2: LINES[2]}
+    reviser = _Reviser([{}])
+
+    build_plan(
+        _config(tmp_path), chunks, (_beat(1), _beat(2)), shots, provenance=PROVENANCE,
+        reviser=reviser,
+        framing={2: "close"},  # chunk 1 is sung with no framing
+        revise_warnings=True,
+    )
+
+    assert len(reviser.calls) == 1
+    objected = [m for call in reviser.calls for ms in call.values() for m in ms]
+    assert objected  # the Central Park warning did reach it
+    assert not any("`framing`" in m for m in objected)
 
 
 # --------------------------------------------------------------------------- #

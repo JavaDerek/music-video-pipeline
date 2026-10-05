@@ -266,8 +266,10 @@ def run_shot_plan_lints(
             "audio. Describe what the shot shows without naming the mouth.",
             finding.chunk_id, finding.field, finding.matched, finding.text,
         )
-    # A sung chunk framed wide (or not framed at all) has no face big
-    # enough to read a mouth -- the one thing the whole pipeline is for.
+    # A sung chunk whose `framing` is wide (or unset) has no face big
+    # enough to read a mouth -- the one thing the whole pipeline is for
+    # (issue #97: `framing` sets size, `camera` wording does not). Also
+    # warns on a sung chunk turned away from the lens (#58, #76).
     lint_voiced_framing(plan, chunks)
     # Issue #72: a pronoun with only one bound candidate but text
     # that insists on a second, distinct person.
