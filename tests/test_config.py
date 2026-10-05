@@ -2070,8 +2070,44 @@ def test_seed_face_similarity_boundary_values_are_accepted(
     ).i2v_min_seed_face_similarity == -1.0
 
 
+def _point_at_missing_sface(monkeypatch, tmp_path: Path) -> Path:
+    """Make the recognition model resolve to a path that does not exist.
+
+    These tests used to assert the REPO's default path was absent, which made
+    them fail on any machine where an operator had installed the SFace weights
+    beside YuNet -- the documented, git-ignored location. That the weights are
+    never COMMITTED is a repository fact, checked by git below; what these
+    tests exercise is config's behaviour when the file is missing."""
+    missing = tmp_path / "no_sface_here.onnx"
+    monkeypatch.setattr(
+        config_module, "resolve_recognition_model_path", lambda *a, **k: missing
+    )
+    return missing
+
+
+def test_the_sface_weights_are_not_tracked_by_git() -> None:
+    """Issue #51: SFace is deliberately not committed. Checked against git's
+    index rather than the filesystem, so an operator's local, git-ignored copy
+    does not make the suite fail."""
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+    repo = resolve_recognition_model_path().parent.parent
+    result = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", str(resolve_recognition_model_path())],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    if "not a git repository" in result.stderr:
+        pytest.skip("not running from a git checkout")
+    assert result.returncode != 0, "the SFace weights are tracked by git; they must not be"
+
+
 def test_seed_face_similarity_set_but_recognition_model_missing_refuses_at_load(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """Recognition was explicitly requested but the 38.7 MB SFace model is --
     correctly -- absent from this checkout (issue #51: it is deliberately not
@@ -2079,9 +2115,7 @@ def test_seed_face_similarity_set_but_recognition_model_missing_refuses_at_load(
     time is spent, rather than silently degrade to a weaker detection-only
     gate at render time while reporting success."""
     _create_default_assets(tmp_path)
-    assert not resolve_recognition_model_path().exists(), (
-        "this test assumes the SFace model is not committed to the repository"
-    )
+    _point_at_missing_sface(monkeypatch, tmp_path)
 
     with pytest.raises(ConfigError, match="SFace") as excinfo:
         load_config(
@@ -2094,14 +2128,14 @@ def test_seed_face_similarity_set_but_recognition_model_missing_refuses_at_load(
 
 
 def test_seed_face_similarity_missing_model_check_is_independent_of_i2v_continuity(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """The pre-flight check fires purely on the knob being set -- the same
     'explicitly requested but cannot be honoured' logic applies whether or
     not i2v_continuity is also on, since a config is often prepared ahead of
     flipping that switch."""
     _create_default_assets(tmp_path)
-    assert not resolve_recognition_model_path().exists()
+    _point_at_missing_sface(monkeypatch, tmp_path)
 
     with pytest.raises(ConfigError, match="SFace"):
         load_config(
@@ -2113,13 +2147,13 @@ def test_seed_face_similarity_missing_model_check_is_independent_of_i2v_continui
 
 
 def test_unset_seed_face_similarity_never_touches_the_recognition_model_check(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """A config that never sets this key must load fine regardless of
     whether the (uncommitted) SFace model happens to be on disk -- the whole
     point of defaulting to None."""
     _create_default_assets(tmp_path)
-    assert not resolve_recognition_model_path().exists()
+    _point_at_missing_sface(monkeypatch, tmp_path)
 
     cfg = load_config(_write_config(tmp_path, extra_toml="i2v_continuity = false"))
 
