@@ -35,6 +35,8 @@ against the *config file's* directory, not the process cwd)::
     render_height            = 480       # biggest lever on run time -- see RunConfig
     instrumental_coverage    = true      # render the unvoiced spans too
     boundary_overrun         = false     # issue #100; cut on content, render past it
+    prompt_format            = "prose"   # issue #99; "structured" = H3's own grammar
+    lyric_language           = "English" # issue #99; only read by "structured"
     silent_output            = false     # issue #22; no audio stream at all
     duration_tolerance_seconds = 0.05    # issue #22; only consulted when silent_output=true
     i2v_continuity           = false     # issue #12
@@ -176,6 +178,17 @@ DEFAULT_LYRIC_LITERALNESS = "thematic"
 """Today's implicit behaviour, made explicit and chosen rather than inherited
 -- so every config committed before this field existed means exactly what it
 meant before (issue #67)."""
+
+PROMPT_FORMATS: tuple[str, ...] = ("prose", "structured")
+"""Issue #99: which grammar ``prompting.expand_prompt`` composes. ``"prose"``
+is every prompt this project has ever rendered; ``"structured"`` is MiniMax's
+own full-reference grammar for H3 (six sections, a ``retention_analysis``
+line per input, lyrics inside ``<d>[Language] ...</d>``). See
+:attr:`RunConfig.prompt_format`."""
+
+DEFAULT_PROMPT_FORMAT = "prose"
+
+DEFAULT_LYRIC_LANGUAGE = "English"
 
 _PATH_FIELDS = ("master_audio", "lyrics_file", "workflow_template", "chunks_dir", "final_video_dir")
 _SCALAR_FIELDS = ("global_style", "narrative_concept", "default_lead_vocalist")
@@ -634,6 +647,32 @@ class RunConfig:
     It reaches a composed prompt only through the ``shot`` text an authored
     plan carries, so ``ChunkFingerprint.prompt_hash`` already covers its
     effect and ``--resume`` needs no new fingerprint field."""
+
+    prompt_format: str = DEFAULT_PROMPT_FORMAT
+    """Issue #99: one of :data:`PROMPT_FORMATS`. **Opt-in, and unmeasured on
+    pixels when it shipped.**
+
+    H3's model repo publishes a prompt grammar for its reference-conditioned
+    mode (``docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md``) whose
+    ``retention_analysis`` section states, per input, what that input is for
+    -- ``<Audio 1>: fully_copy`` and so on -- and whose ``<d>``/``</d>`` are
+    special tokens in the H3 text encoder (ids 151669/151670, verified in
+    doris's ComfyUI). A free-form prompt states none of that, so the model
+    falls back on each input's default role. ``"structured"`` composes the
+    *same sentences* the prose path does, re-housed in that grammar plus the
+    routing declarations, so an A/B between the two varies format and not
+    content -- see ``prompting._compose_structured_prompt``.
+
+    Refused alongside ``i2v_continuity``: the grammar binds each
+    ``<Picture k>`` to a staged reference photo and the chained graph has
+    none. ``ChunkFingerprint.prompt_hash`` already covers the change, so
+    ``--resume`` cannot mix formats inside one video and no new fingerprint
+    field is needed."""
+
+    lyric_language: str = DEFAULT_LYRIC_LANGUAGE
+    """Issue #99: the language tag composed inside ``<d>[...]`` when
+    ``prompt_format = "structured"``; the guide preserves the original
+    language of lyrics and tags it. Never read by the prose path."""
 
     cinematography: str | None = None
     """Issue #53: the whole-video film-direction language -- stock, lens,
@@ -1855,6 +1894,19 @@ def _validate(config: RunConfig) -> None:
             "tell (issues #100, #12, #47). Turn one of the two off",
         )
 
+    if config.prompt_format == "structured" and config.i2v_continuity:
+        # Issue #99 x issue #12: the structured grammar names <Picture k> for
+        # every staged reference photo, and MiniMaxH3ImageToVideo has no
+        # ref_images input -- a chained chunk would be routed to pictures it
+        # is never given. Refused here, like boundary_overrun, rather than
+        # discovered hours in.
+        _fail(
+            "prompt_format",
+            "= 'structured' cannot be combined with i2v_continuity: the grammar binds "
+            "each <Picture k> to a staged reference photo and the chained graph has no "
+            "reference images at all (issues #99, #12). Turn one of the two off",
+        )
+
     if config.i2v_continuity and config.i2v_workflow_template is None:
         _fail(
             "i2v_workflow_template",
@@ -2156,6 +2208,27 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
             f"{raw_literalness!r} (issue #67)"
         )
     values["lyric_literalness"] = literalness
+
+    # Issue #99: an enum, normalised the way lyric_literalness is.
+    raw_format = merged.get("prompt_format", DEFAULT_PROMPT_FORMAT)
+    if not isinstance(raw_format, str) or raw_format.strip().lower() not in PROMPT_FORMATS:
+        raise ConfigError(
+            f"prompt_format must be one of {list(PROMPT_FORMATS)}, got {raw_format!r} "
+            "(issue #99)"
+        )
+    values["prompt_format"] = raw_format.strip().lower()
+    raw_language = merged.get("lyric_language", DEFAULT_LYRIC_LANGUAGE)
+    if (
+        not isinstance(raw_language, str)
+        or not raw_language.strip()
+        or any(ch in raw_language for ch in "[]<>")
+    ):
+        raise ConfigError(
+            f"lyric_language must be a plain language name such as 'English', got "
+            f"{raw_language!r} -- it is composed inside <d>[...]</d>, so brackets would "
+            "break the span (issue #99)"
+        )
+    values["lyric_language"] = raw_language.strip()
 
     shot_plan_path = merged.get("shot_plan")
     if shot_plan_path:

@@ -2726,3 +2726,64 @@ def test_diarize_with_no_mapping_says_the_first_pass_will_assign_nothing(
     with caplog.at_level(logging.WARNING, logger="music_video_maker.config"):
         load_config(path)
     assert any("clusters, never names" in r.getMessage() for r in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
+# Prompt grammar (issue #99)
+# --------------------------------------------------------------------------- #
+
+
+def test_prompt_format_defaults_to_prose(tmp_path: Path) -> None:
+    """Every cached chunk and fingerprint in existence is prose; a config that
+    never mentions the field must keep meaning exactly that."""
+    _create_default_assets(tmp_path)
+    loaded = load_config(_write_config(tmp_path))
+    assert loaded.prompt_format == "prose"
+    assert loaded.lyric_language == "English"
+
+
+def test_prompt_format_structured_is_read(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(
+        tmp_path, extra_toml='prompt_format = " Structured "\nlyric_language = "French"'
+    )
+    loaded = load_config(config_path)
+    assert loaded.prompt_format == "structured"
+    assert loaded.lyric_language == "French"
+
+
+def test_prompt_format_rejects_an_unknown_value(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path, extra_toml='prompt_format = "json"')
+    with pytest.raises(ConfigError, match="prompt_format"):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize("value", ['""', '"   "', '"[English]"', '"<d>"', "3"])
+def test_lyric_language_rejects_blank_markup_or_non_string(tmp_path: Path, value: str) -> None:
+    """It is composed inside ``<d>[...]`` -- a bracket or angle bracket in it
+    would break the special-token span the field exists to fill."""
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path, extra_toml=f"lyric_language = {value}")
+    with pytest.raises(ConfigError, match="lyric_language"):
+        load_config(config_path)
+
+
+def test_structured_prompt_format_is_refused_alongside_i2v_continuity(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The grammar binds each ``<Picture k>`` to a staged reference photo and
+    the chained graph (``MiniMaxH3ImageToVideo``) has no ``ref_images`` at
+    all, so a chained chunk would be told about pictures it is never shown."""
+    _create_default_assets(tmp_path)
+    config_path = _write_config(
+        tmp_path,
+        extra_toml=(
+            'prompt_format = "structured"\n'
+            "i2v_continuity = true\n"
+            f'i2v_workflow_template = "{tmp_path / "workflow_api.json"}"'
+        ),
+    )
+    with caplog.at_level(logging.ERROR), pytest.raises(ConfigError, match="prompt_format"):
+        load_config(config_path)
+    assert any("i2v_continuity" in record.getMessage() for record in caplog.records)

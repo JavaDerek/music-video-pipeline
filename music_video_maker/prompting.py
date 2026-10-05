@@ -377,6 +377,32 @@ def expand_prompt(
     members = _resolve_active_members(config, chunk, subject)
     present_members = _resolve_present_members(config, chunk, present, members)
     _warn_on_shared_reference_photo(chunk, members, present_members)
+    image_refs = tuple(member.image for member in (*members, *present_members))
+    if config.prompt_format == "structured":
+        # Issue #99. No chained variant: config refuses structured alongside
+        # i2v_continuity, because the grammar names <Picture k> for photos the
+        # chained graph never receives.
+        return ExpandedPrompt(
+            chunk_id=chunk.chunk_id,
+            prompt=_compose_structured_prompt(
+                config,
+                members,
+                chunk,
+                shot,
+                subject_is_focus,
+                camera=camera,
+                present=present_members,
+                location=location,
+                conditions=conditions,
+                framing=framing,
+                spoken=spoken,
+            ),
+            chained_prompt=None,
+            image_ref=members[0].image,
+            image_refs=image_refs,
+            characters=tuple(member.name for member in members),
+            present_cast=tuple(member.name for member in present_members),
+        )
     prompt = _compose_prompt(
         config,
         members,
@@ -430,9 +456,7 @@ def expand_prompt(
         prompt=prompt,
         chained_prompt=chained_prompt,
         image_ref=members[0].image,
-        image_refs=tuple(
-            member.image for member in (*members, *present_members)
-        ),
+        image_refs=image_refs,
         characters=tuple(member.name for member in members),
         present_cast=tuple(member.name for member in present_members),
     )
@@ -650,6 +674,157 @@ def _compose_prompt(
         # `RunConfig.avoid`'s docstring for the measurement.
     )
     return _join_sentences(parts)
+
+
+STRUCTURED_TASK_PREFIX = "[reference generation + audio reuse]"
+"""Issue #99: the guide's ``summary`` task-type prefix for this project's one
+graph. ``reference generation`` -- the cast photo guides a character without
+being a concrete frame (so it is NOT ``keyframe completion``, and the guide
+says such a picture gets no standalone ``<Picture N>`` line of its own); and
+``audio reuse`` -- the chunk's own excerpt of the master is the complete
+soundtrack, copied, not merely referenced."""
+
+_AUDIO_RETENTION = (
+    "<Audio 1>: fully_copy - <Audio 1> is reused 1:1 as the target video's complete "
+    "final audio track"
+)
+"""The guide's own example line for ``fully_copy``, verbatim. This is the
+routing declaration #99 is about: a prose prompt never says what the
+conditioning audio is for."""
+
+
+def _compose_structured_prompt(
+    config: RunConfig,
+    members: tuple[CastMember, ...],
+    chunk: AudioChunk,
+    shot: str | None = None,
+    subject_is_focus: bool = True,
+    *,
+    camera: str | None = None,
+    present: tuple[CastMember, ...] = (),
+    location: str | None = None,
+    conditions: str | None = None,
+    framing: str | None = None,
+    spoken: bool = False,
+) -> str:
+    """Issue #99: the same chunk, composed in MiniMax's full-reference grammar
+    (``docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md`` in the MiniMax-H3 repo,
+    read 2026-10-05, sha256 1e574f35...).
+
+    **Format, not content.** Every sentence :func:`_compose_prompt` would
+    compose appears here verbatim, except the lyric clause, which becomes the
+    guide's ``<Subject k> (Sk) sings, <d>[Language] ...</d>`` -- that
+    rewrite *is* the format under test. Nothing is added that the prose path
+    does not say: no "mouth closed" on an instrumental chunk (#74 measured
+    that naming anatomy pulls the camera in, which is why prose never says it),
+    no invented ambience. What the grammar adds is only its scaffolding and
+    the declarations it exists to carry:
+
+    * ``subject_definitions`` binds ``<Subject k>`` to the k-th staged photo
+      as ``<Picture k>``, in ``image_refs`` order (singers, then present
+      cast), which is the order ``ref_images.ref_image_0..N`` is wired in.
+      The guide cites a character-only picture *inside* the subject's
+      definition rather than giving it a line of its own.
+    * ``retention_analysis`` marks each subject ``fully_preserved`` and the
+      audio ``fully_copy``. No ``(Sx)`` here -- the guide forbids it.
+    * Singers get ``(S1)``, ``(S2)`` in order; the audio's definition reuses
+      those ids, as the guide requires of a speaker-bound ``<Audio N>``.
+    * ``detailed_description`` opens with the whole-video style sentences
+      and then a single ``[Shot 1]`` -- one chunk is one unbroken take.
+
+    The guide asks for 350-500 words of description; this composes what the
+    prose path composes (roughly 150 on "Deathless") rather than padding it,
+    because padding would be new content. Counterpoint lyrics (#33 level 3)
+    keep their prose sentence unconverted -- rare, and not under test.
+    """
+    subjects = (*members, *present)
+    singer_tags = _join_names(
+        tuple(f"<Subject {i}> (S{i})" for i in range(1, len(members) + 1))
+    )
+    member_labels = _join_names(tuple(f"<Subject {i}>" for i in range(1, len(members) + 1)))
+    text = chunk.text.strip() if chunk.text else ""
+    plural = len(members) > 1
+
+    definitions = [
+        f"<Subject {k}> is {member.name} in <Picture {k}>, {member.role.strip().rstrip('.')}."
+        for k, member in enumerate(subjects, start=1)
+    ]
+    if text:
+        vocal = "spoken line" if spoken else "sung vocal"
+        definitions.append(
+            "<Audio 1> is this shot's excerpt of the song, reused as its complete "
+            f"soundtrack; its {vocal} is performed by {singer_tags}."
+        )
+        verb = ("speak" if plural else "speaks") if spoken else ("sing" if plural else "sings")
+        summary = (
+            f"{STRUCTURED_TASK_PREFIX} One continuous shot in which {member_labels} "
+            f"{verb} to <Audio 1>."
+        )
+        said = ("say" if plural else "says") if spoken else ("sing" if plural else "sings")
+        lyric = f"{singer_tags} {said}, <d>[{config.lyric_language}] {text}</d>"
+        music = "The instrumental layer of <Audio 1> is reused as the audience-only score."
+    else:
+        passage = "a wordless passage" if spoken else "an instrumental passage"
+        definitions.append(
+            "<Audio 1> is this shot's excerpt of the song, reused as its complete "
+            f"soundtrack; it is {passage}."
+        )
+        summary = (
+            f"{STRUCTURED_TASK_PREFIX} One continuous shot featuring {member_labels}, "
+            "set to <Audio 1>."
+        )
+        lyric = _lyric_clause(text, len(members), spoken=spoken)
+        music = "<Audio 1> is directly reused as the complete audience-only score."
+    if present:
+        present_labels = _join_names(
+            tuple(f"<Subject {k}>" for k in range(len(members) + 1, len(subjects) + 1))
+        )
+        summary += f" {present_labels} {'are' if len(present) > 1 else 'is'} also in shot."
+
+    retention = [
+        f"<Subject {k}> (appears in [Shot 1]): fully_preserved - the likeness of "
+        f"{member.name} in <Picture {k}> is retained."
+        for k, member in enumerate(subjects, start=1)
+    ]
+    retention.append(f"{_AUDIO_RETENTION}.")
+
+    concept = shot if shot and shot.strip() else config.narrative_concept
+    shot_sentences = _join_sentences(
+        (
+            _apply_camera_clause(concept, camera),
+            None if subject_is_focus else REFOCUS_SENTENCE,
+            _setting_clause(config.setting, location),
+            _conditions_clause(conditions),
+            _character_clause(config, members, subject_is_focus, True),
+            _framing_clause(members, framing),
+            _present_clause(present, True),
+        )
+    )
+    # The lyric goes last and unpunctuated: the guide ends a <d> span with
+    # the source's own punctuation, and a period after </d> would be noise.
+    shot_line = f"[Shot 1] {shot_sentences}"
+    trailing = (lyric, *_counterpoint_clauses(chunk))
+    if text:
+        shot_line += f" {lyric}"
+        if len(trailing) > 1:
+            shot_line += f". {_join_sentences(trailing[1:])}"
+    else:
+        shot_line += f" {_join_sentences(trailing)}"
+    style = _join_sentences((config.global_style, config.cinematography))
+
+    sections = (
+        ("subject_definitions", "\n".join(definitions)),
+        ("summary", summary),
+        ("retention_analysis", "\n".join(retention)),
+        ("detailed_description", f"{style}\n{shot_line}"),
+        ("overall_soundscape", "N/A"),
+        ("non_diegetic_music", music),
+    )
+    body = "\n\n".join(f"{name}:\n{content}" for name, content in sections)
+    if config.lora and config.lora_trigger:
+        # Issue #62: the adapter's trigger word, first and bare, as in prose.
+        return f"{config.lora_trigger}\n\n{body}"
+    return body
 
 
 def _apply_camera_clause(concept: str, camera: str | None) -> str:
