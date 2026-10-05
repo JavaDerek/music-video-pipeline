@@ -848,13 +848,20 @@ a prohibition to subtract in).
 
 Three things to know before using it:
 
-- **The field is a mechanism, not yet a measured result.** That it composes
-  correctly is not evidence H3 honours it; the A/B that settles it is in
-  issue #97. Until then, treat `framing` the way this guide treats any
-  unverified lever: use it where you have a reason to, and check the pixels.
-- **It is not emitted by the authoring layer.** Set it by hand, on the chunks
-  where it matters. A generating stage that re-framed all 80 shots would be
-  paying an unmeasured cost across a whole video to fix a handful of them.
+- **It moves the pixels, measured 3 of 3 (2026-10-04).** Chunks 15/20/64 of
+  "Deathless", all authored "close"/"medium close" in `camera` and delivered
+  small, were rendered `face` vs `wide` at identical seeds: median face
+  fraction 0.0343 vs 0.0022, 0.0572 vs 0.0098, and 0.0133 vs a face in 0 of
+  12 sampled frames. Read it on the **median** over sampled frames, not the
+  max — the max inverted chunk 20, whose `wide` take swings into a close-up
+  for its last frames.
+- **The photography stage proposes it, sparsely.** `mvm-author photography`
+  emits `framing` beside `camera`, optional per shot and validated against
+  the same four values the loader accepts; `write` puts it in the plan. It is
+  told to spend it where size matters and leave the rest to the renderer — a
+  stage that re-framed all 80 shots would pay an unmeasured cost across a
+  whole video to fix a handful of them. Review it like any other proposal,
+  and set or remove it by hand where you disagree.
 - **It is an endpoint, not a displacement.** "Framed head and shoulders" is a
   state; the chained I2V path applies every per-chunk instruction to its own
   previous output, and anything that displaces rather than specifies drifts.

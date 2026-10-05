@@ -816,6 +816,13 @@ def _photography_payload(photography) -> dict:
     return {
         "cinematography": photography.cinematography,
         "camera": {str(k): v for k, v in sorted(photography.camera.items())},
+        # Issue #97: present only when something was framed, so a reply that
+        # frames nothing writes the same file it always did.
+        **(
+            {"framing": {str(k): v for k, v in sorted(photography.framing.items())}}
+            if photography.framing
+            else {}
+        ),
     }
 
 
@@ -869,6 +876,7 @@ def _pick_photography(authoring_dir: Path, run_dir: Path, pick: int) -> int:
     photography = photography_module.Photography(
         cinematography=chosen["photography"]["cinematography"],
         camera={int(k): v for k, v in chosen["photography"]["camera"].items()},
+        framing={int(k): v for k, v in (chosen["photography"].get("framing") or {}).items()},
     )
     _write_photography(
         authoring_dir,
@@ -898,6 +906,7 @@ def _print_candidates(results: Sequence[object]) -> None:
         if photography.cinematography:
             print(f"look:   {photography.cinematography}")
         print(f"camera: {len(photography.camera)} shot(s) directed")
+        print(f"framing: {len(photography.framing)} shot(s) framed")
         for chunk_id in sorted(photography.camera)[:6]:
             print(f"  {chunk_id:>4}  {photography.camera[chunk_id]}")
         if len(photography.camera) > 6:
@@ -914,6 +923,9 @@ def _print_photography(photography) -> None:
     print(f"camera directions: {len(photography.camera)} shot(s)")
     for chunk_id in sorted(photography.camera):
         print(f"  {chunk_id:>4}  {photography.camera[chunk_id]}")
+    print(f"framing: {len(photography.framing)} shot(s)")
+    for chunk_id in sorted(photography.framing):
+        print(f"  {chunk_id:>4}  {photography.framing[chunk_id]}")
 
 
 def _load_camera(run_dir: Path) -> dict[int, str]:
@@ -924,6 +936,16 @@ def _load_camera(run_dir: Path) -> dict[int, str]:
     if payload is None:
         return {}
     return {int(k): v for k, v in (payload.get("camera") or {}).items()}
+
+
+def _load_framing(run_dir: Path) -> dict[int, str]:
+    """Issue #97: whatever framing photography has frozen, or ``{}`` -- a
+    photography.json written before the field existed has no key at all,
+    and an absent ``framing`` composes nothing."""
+    payload = _load_stage_json(run_dir, "photography", quiet=True)
+    if payload is None:
+        return {}
+    return {int(k): v for k, v in (payload.get("framing") or {}).items()}
 
 
 def _total_cost(results: Sequence[object]) -> float | None:
@@ -998,6 +1020,7 @@ def _cmd_write(args: argparse.Namespace) -> int:
         )
 
     camera = _load_camera(run_dir)
+    framing = _load_framing(run_dir)
 
     # Issue #83: a function of the BEAT SHEET, not of the shot text, so it is
     # computed once rather than re-derived per round -- and marked
@@ -1050,6 +1073,7 @@ def _cmd_write(args: argparse.Namespace) -> int:
             reviser=reviser,
             camera=camera,
             present=present,
+            framing=framing,
             extra_checks=advisory,
             # Issue #87: the concrete objects this song's lyrics actually
             # name (issue #69's `reading.nouns`), so the shot-vs-lyric lint
@@ -1073,7 +1097,10 @@ def _cmd_write(args: argparse.Namespace) -> int:
         logger.exception("Failed to write the shot plan")
         return EXIT_ERROR
 
-    print(f"Wrote {written} ({len(chunks)} chunk(s), {len(camera)} with camera direction)")
+    print(
+        f"Wrote {written} ({len(chunks)} chunk(s), {len(camera)} with camera direction, "
+        f"{len(framing)} with framing)"
+    )
     if built.surviving_warnings:
         print(
             f"{len(built.surviving_warnings)} advisory warning(s) written into the file as "
