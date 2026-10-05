@@ -107,6 +107,25 @@ ASSET_MANIFEST: dict[str, Asset] = {
         depicts_real_person=True,
         consent="Derek Ferguson, project author, 2026-08-14 -- his own likeness",
     ),
+    # Architecture boards (2026-10-05): presentation copies of the C4 diagrams
+    # in docs/ARCHITECTURE.md, screenshotted by docs/architecture/render.py from
+    # the hand-laid SVG pages under docs/architecture/canvas/. Diagrams only:
+    # boxes, arrows and text, no photograph and no rendered frame.
+    **{
+        f"docs/architecture/boards/{stem}.png": Asset(
+            source="rendered by docs/architecture/render.py from docs/architecture/canvas/",
+            licence="project-owned output",
+        )
+        for stem in (
+            "Main",
+            "L2-Containers",
+            "L3-1-Stages-1-2",
+            "L3-2-Render-Loop",
+            "L3-3-Authoring",
+            "L3-4-Monitor-Control",
+            "L3-5-Instruments",
+        )
+    },
 }
 
 
@@ -192,7 +211,7 @@ def test_dotenv_is_ignored():
     )
     assert result.returncode == 0, (
         ".env is no longer gitignored -- restore it before anything else. "
-        "Telethon session files and API keys live there."
+        "Credentials (API keys, tokens) live there."
     )
 
 

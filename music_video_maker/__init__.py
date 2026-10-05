@@ -1,6 +1,8 @@
 """Turn a master audio track + lyrics + cast photos into a lip-synced music video.
 
-Pipeline stages (see CLAUDE.md and the blueprint PDF):
+Pipeline stages (see CLAUDE.md and docs/ARCHITECTURE.md; they were first laid
+out in an original design document, the "blueprint", which was never tracked
+in this repository):
 
 1. Forced alignment      -- stable-ts ``model.align()`` maps audio to lyric text
 2. Temporal slicing      -- pydub stems + deterministic prompt expansion

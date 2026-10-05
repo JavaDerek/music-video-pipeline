@@ -17,7 +17,6 @@ dependencies = [
     "pydub>=0.25.1",
     "requests>=2.31",
     "websocket-client>=1.7",
-    "ffmpeg-python>=0.2.0",
     "tomli>=2.0; python_version < '3.11'",
     # PEP 594 removed stdlib `audioop` in 3.13; pydub imports it unconditionally.
     "audioop-lts>=0.2; python_version >= '3.13'",

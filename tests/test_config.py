@@ -2821,3 +2821,44 @@ def test_structured_prompt_format_is_refused_alongside_i2v_continuity(
     with caplog.at_level(logging.ERROR), pytest.raises(ConfigError, match="prompt_format"):
         load_config(config_path)
     assert any("i2v_continuity" in record.getMessage() for record in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
+# RunConfig's class body declares every field exactly once
+# --------------------------------------------------------------------------- #
+
+
+def _runconfig_field_declarations() -> list[tuple[str, int]]:
+    """Every annotated name in ``RunConfig``'s class body, with its line, read
+    from config.py's AST -- never from the class object, because by the time
+    the class exists a second declaration has already silently replaced the
+    first (the later default wins; the field keeps the earlier position)."""
+    import ast
+
+    tree = ast.parse(Path(config_module.__file__).read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == "RunConfig":
+            return [
+                (stmt.target.id, stmt.lineno)
+                for stmt in node.body
+                if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+            ]
+    raise AssertionError("no class RunConfig found in config.py")
+
+
+def test_runconfig_declares_no_field_twice() -> None:
+    """A dataclass field declared twice raises nothing: the later declaration's
+    default and docstring win, and whoever edits the earlier one changes
+    nothing. Three fields (i2v_continuity, i2v_workflow_template,
+    min_free_vram_gb) were declared twice, with the two min_free_vram_gb
+    docstrings giving contradictory rationales."""
+    declarations = _runconfig_field_declarations()
+    assert declarations, "found no annotated fields in RunConfig -- the AST walk is broken"
+    seen: dict[str, int] = {}
+    duplicates: list[str] = []
+    for name, line in declarations:
+        if name in seen:
+            duplicates.append(f"{name} (lines {seen[name]} and {line})")
+        else:
+            seen[name] = line
+    assert not duplicates, "RunConfig declares these fields twice: " + ", ".join(duplicates)

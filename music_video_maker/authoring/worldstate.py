@@ -1,4 +1,4 @@
-"""World-state core timeline (run-dmcp design, FINAL DRAFT v1.0, spec §5.1).
+"""World-state core timeline (run-dmcp's docs/DESIGN.md, ACCEPTED v1.0 of 2026-08-18, spec §5.1).
 
 The music-video side's committed prototype of that cross-project engine's
 core: a small, working implementation of the same three-type model, built to
@@ -8,17 +8,21 @@ from the rest of ``music_video_maker`` -- ``t`` is a bare float, not an
 ``tests/test_authoring_boundary.py``: there is nothing here to wire into the
 render path.
 
-**The three types (spec §5.1, adopted verbatim plus one field, see below):**
+**The three types (spec §5.1):**
 
 * :class:`Entity` -- ``id``, ``kind``, ``name``, ``created_at_t``,
   ``destroyed_at_t | None``.
 * :class:`Fact` -- ``id``, ``entity_id``, ``key``, ``value``,
-  ``valid_from_t``, ``valid_to_t | None``, ``irreversible``. Plus
-  ``opened_by_event_id``, a deliberate addition beyond the literal spec
-  wording: it is what makes "one hop of causality" (see
-  :class:`IrreversibleFactViolation`) O(1) without repurposing
-  ``Event.causes``, which is left free for the client's own event-to-event
-  narrative annotation instead of fact provenance.
+  ``valid_from_t``, ``valid_to_t | None``, ``irreversible``,
+  ``opened_by_event_id | None``. That last field was added **here first**, as
+  a deliberate addition beyond the spec as accepted on 2026-08-18: it is what
+  makes "one hop of causality" (see :class:`IrreversibleFactViolation`) O(1)
+  without repurposing ``Event.causes``, which is left free for the client's
+  own event-to-event narrative annotation instead of fact provenance. The
+  engine has since adopted it: §5.1 carries ``opened_by_event_id NULL`` on
+  ``facts`` since run-dmcp commit 430db2c (2026-09-12, issue #30), so it is
+  spec now, not an addition. (There the engine stamps it when the fact
+  opens; here the caller passes it, optionally, to :meth:`WorldState.set_fact`.)
 * :class:`Event` -- ``id``, ``at_t``, ``kind``, ``description``, ``causes``
   (an opaque tuple of ids the engine never validates or reads back).
 

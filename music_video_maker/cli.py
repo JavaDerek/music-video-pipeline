@@ -1302,10 +1302,12 @@ def run_pipeline(
             ", ".join(f"{t.name} [{t.position}]" for t in timelines),
         )
 
-    # Issue #43: outside the GPU custody block on purpose. Custody is about the
-    # card; this is about the machine driving it staying awake long enough to
-    # hear the card finish -- and it must cover Stage 1 too, since alignment
-    # runs before custody is ever taken.
+    # Issue #43: a separate context manager from custody on purpose. Custody is
+    # about the card; this is about the machine driving it staying awake long
+    # enough to hear the card finish. Both are entered here, sleep prevention
+    # first, so custody's free-VRAM pre-flight runs BEFORE Stage 1: every
+    # timeline's alignment and slicing happen inside this block, under custody,
+    # and are covered by sleep prevention along with everything after them.
     with prevent_host_sleep(), custody:
         base_template = load_workflow_template(config.workflow_template)
         i2v_template = (

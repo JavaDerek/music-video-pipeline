@@ -140,8 +140,9 @@ The pipeline runs in five stages:
 
 1. **Forced alignment** (`music_video_maker/alignment.py`) — `stable-ts`'s
    `model.align()` maps the master audio to the lyric text, producing
-   word-level timestamps (`suppress_silence=True` for VAD, `regroup=True` for
-   logical segments).
+   word-level timestamps (`suppress_silence=True`, a loudness mask that clamps
+   timestamps to quiet audio — not Silero VAD, which stable-ts leaves off by
+   default; `regroup=True` for logical segments).
 2. **Temporal slicing + prompt expansion** (`slicing.py`, `prompting.py`) —
    `pydub` slices per-segment audio stems that fit MiniMax H3's temporal
    context window (see [Chunk duration window](#chunk-duration-window)
@@ -169,14 +170,20 @@ Three deeper capabilities build on that base:
   switch which cast member is "active" (and therefore whose reference photo
   and role text drive the prompt) for that line and every line after it,
   until the next tag. **If a song has more than one vocalist, these tags are
-  the only supported way to say so** — nothing in this project listens to the
-  audio and guesses a singer (issue #29). The failure mode is silent: an
-  untagged or mis-tagged handoff does not raise, it *inherits whoever was
-  tagged last*, so that line renders with the wrong face and no error
-  anywhere. Tag every handoff, not just the first one. See
-  [`docs/lyrics-format.md`](docs/lyrics-format.md) for the full format (and
-  [`docs/design-multi-vocalist.md`](docs/design-multi-vocalist.md) for the
-  automatic-detection design, which is not built).
+  the supported way to say so.** By default nothing in this project listens to
+  the audio and guesses a singer; automatic vocalist diarization
+  (`diarization.py`, issue #101, built from the #29 design) exists but is
+  **opt-in** (`diarize = true`), only fills lines no tag covers, and loses to
+  any authored tag. Its thresholds are unmeasured and no multi-vocalist song
+  has been diarized here — the mechanism is tested, the claim is not made; see
+  [Detecting who is singing](#detecting-who-is-singing-instead-of-tagging-it).
+  Without it, the failure mode is silent: an untagged or mis-tagged handoff
+  does not raise, it *inherits whoever was tagged last*, so that line renders
+  with the wrong face and no error anywhere. Tag every handoff, not just the
+  first one. See [`docs/lyrics-format.md`](docs/lyrics-format.md) for the full
+  format (and [`docs/design-multi-vocalist.md`](docs/design-multi-vocalist.md)
+  for the detection design and
+  [`docs/vocalist-diarization.md`](docs/vocalist-diarization.md) for using it).
 - **I2V latent continuity** (`continuity.py`) — optionally bridges chunk
   *N-1*'s rendered last frame into chunk *N*'s render as a seed image, so
   consecutive shots don't visually re-layout themselves on every lyric line.
@@ -211,7 +218,12 @@ front:
   editing the workflow on the ComfyUI canvas renumbers node IDs freely, and
   the orchestrator must survive that.
 - **No sleep-polling.** Execution tracking is entirely event-driven over the
-  WebSocket connection; there is no polling loop anywhere in the render path.
+  WebSocket connection; nothing polls to find out whether a chunk has
+  finished. The one bounded poll in the render path is not execution
+  tracking: after the between-chunk `POST /free`
+  (`release_vram_between_chunks`, on by default), `ResilientRunner` re-reads
+  `/system_stats` until the card reads back its free-VRAM floor or a timeout
+  stops the run, because nothing announces memory coming back.
 - **One chunk failing must not kill the run.** `resilience.py`'s state
   machine classifies failures, retries with backoff, dead-letters a chunk
   after exhausting its attempts, and persists resumable run state after every

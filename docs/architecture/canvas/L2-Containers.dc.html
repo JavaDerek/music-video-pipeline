@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>music-video-pipeline containers</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#F5F2EA;color:#1F1E1B;font-family:"IBM Plex Sans",system-ui,sans-serif}
+a{color:#2E5A87}a:hover{color:#1F3F62}
+svg text{font-family:"IBM Plex Sans",system-ui,sans-serif;fill:#1F1E1B}
+svg text.t{font-size:15px;font-weight:600}
+svg text.s{font-size:12px;fill:#5C5850}
+svg text.m{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:12px;fill:#2E5A87}
+svg text.p{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:12px;fill:#7A5410;letter-spacing:.04em}
+svg text.h{font-family:"Fraunces",Georgia,serif;font-weight:700}
+svg text.e{font-size:11.5px;fill:#3F3C36;paint-order:stroke;stroke:#F5F2EA;stroke-width:5px;stroke-linejoin:round}
+svg .node rect{fill:#FFFFFF;stroke:#1F1E1B;stroke-width:1.4}
+svg .ext rect{fill:#E7E2D6;stroke:#7B766B;stroke-width:1.2}
+svg .blue rect{fill:#E6EDF5;stroke:#2E5A87;stroke-width:1.8}
+svg .paper rect{fill:#F1EEE5;stroke:#8A8577;stroke-width:1.4}
+svg .panel rect{fill:#EEEAE0;stroke:#D2CBB9;stroke-width:1.2}
+svg .chip rect{fill:#FFFFFF;stroke:#8A8577;stroke-width:1.2}
+svg .bound rect{fill:none;stroke:#B4532F;stroke-width:1.6;stroke-dasharray:10 7}
+svg .person circle,svg .person path{fill:none;stroke:#5C5850;stroke-width:1.8}
+svg .edge{fill:none;stroke:#5C5850;stroke-width:1.6;marker-end:url(#arr)}
+svg .edge.nm{marker-end:none}
+svg .edge.d{stroke-dasharray:6 5}
+</style>
+</helmet>
+<div style="width: 1800px; height: 1180px; box-sizing: border-box; display: flex; flex-direction: column; background: #F5F2EA; overflow: hidden">
+  <div style="padding: 36px 56px 0; display: flex; align-items: baseline; gap: 22px">
+    <div style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #B4532F; letter-spacing: 0.08em; text-transform: uppercase">Level 2 · Containers</div>
+    <div style="font-family: 'Fraunces', Georgia, serif; font-size: 34px; font-weight: 700; line-height: 1">Four processes, two stores, one shared directory</div>
+  </div>
+  <div style="padding: 8px 56px 0; font-size: 14px; color: #5C5850">The processes couple only through files in the run directory, plus one spawn: the monitor starts the render CLI. Along the bottom, the render's stage order and what each stage hands to the next.</div>
+  <svg viewBox="0 0 1800 1010" width="1800" height="1010" style="display: block" role="img" aria-label="Container diagram with the stage order strip">
+    <defs>
+      <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#5C5850"></path></marker>
+    </defs>
+
+    <!-- externals, top -->
+    <g class="ext"><rect x="290" y="24" width="730" height="80" rx="8"></rect>
+      <text class="t" x="310" y="52">ComfyUI server</text>
+      <text class="s" x="310" y="74">HTTP and WebSocket, port 8188</text></g>
+    <g class="ext"><rect x="1050" y="24" width="200" height="80" rx="8"></rect>
+      <text class="t" x="1068" y="52">ffmpeg and ffprobe</text>
+      <text class="s" x="1068" y="74">subprocess</text></g>
+    <g class="ext"><rect x="1280" y="24" width="230" height="80" rx="8"></rect>
+      <text class="t" x="1298" y="50">Local ML libraries</text>
+      <text class="s" x="1298" y="68">stable-ts, pyannote, OpenCV,</text>
+      <text class="s" x="1298" y="84">in-process</text></g>
+    <g class="ext"><rect x="1540" y="24" width="220" height="80" rx="8"></rect>
+      <text class="t" x="1558" y="52">claude CLI</text>
+      <text class="s" x="1558" y="74">subprocess</text></g>
+
+    <!-- operator -->
+    <g class="node person">
+      <rect x="40" y="290" width="200" height="100" rx="10"></rect>
+      <circle cx="76" cy="324" r="13"></circle><path d="M58 370 q18 -30 36 0"></path>
+      <text class="t" x="112" y="328">Operator</text>
+      <text class="s" x="112" y="348">terminal</text>
+      <text class="s" x="112" y="364">and browser</text>
+    </g>
+
+    <!-- boundary -->
+    <g class="bound"><rect x="270" y="235" width="1470" height="450" rx="16"></rect></g>
+    <text class="h" x="292" y="260" font-size="18" fill="#B4532F">music-video-pipeline</text>
+    <text class="s" x="292" y="672">one source tree, four processes, two stores: coupling is files in the run directory plus one spawn</text>
+
+    <!-- containers -->
+    <g class="blue"><rect x="290" y="290" width="300" height="126" rx="10"></rect>
+      <text class="t" x="308" y="316">Operator instruments</text>
+      <text class="m" x="308" y="334">Python, python -m entries</text>
+      <text class="s" x="308" y="354">castgen, castcheck, facescan,</text>
+      <text class="s" x="308" y="370">desync_risk, dome, calibrate_voicing,</text>
+      <text class="s" x="308" y="386">vramsample, profiles, scenecuts.</text></g>
+    <g class="blue"><rect x="630" y="290" width="300" height="126" rx="10"></rect>
+      <text class="t" x="648" y="316">Run monitor</text>
+      <text class="m" x="648" y="334">stdlib http.server, mvm-webui</text>
+      <text class="s" x="648" y="354">Server-rendered page plus SSE over</text>
+      <text class="s" x="648" y="370">run_state.json. Opt-in POST start</text>
+      <text class="s" x="648" y="386">and stop.</text></g>
+    <g class="blue"><rect x="1060" y="290" width="300" height="126" rx="10"></rect>
+      <text class="t" x="1078" y="316">Render CLI</text>
+      <text class="m" x="1078" y="334">Python, music-video-maker</text>
+      <text class="s" x="1078" y="354">Stages 1 to 5 under GPU custody, or</text>
+      <text class="s" x="1078" y="370">--prepare and --review with no GPU.</text>
+      <text class="s" x="1078" y="386">Writes chunks, run state, final video.</text></g>
+    <g class="blue"><rect x="1420" y="290" width="300" height="126" rx="10"></rect>
+      <text class="t" x="1438" y="316">Authoring CLI</text>
+      <text class="m" x="1438" y="334">Python, mvm-author</text>
+      <text class="s" x="1438" y="354">Concept, beats, photography, prose,</text>
+      <text class="s" x="1438" y="370">write. Calls the claude CLI. Writes</text>
+      <text class="s" x="1438" y="386">.authoring and shot_plan.toml.</text></g>
+
+    <!-- stores -->
+    <g class="paper"><rect x="290" y="540" width="1110" height="110" rx="8"></rect>
+      <text class="t" x="310" y="568">Run directory</text>
+      <text class="s" x="310" y="590">Filesystem, outside the repo (conventionally ~/mvm-runs/&lt;song&gt;/). The only thing the binaries share.</text>
+      <text class="s" x="310" y="608">run.toml · shot_plan.toml · .authoring · output/chunks (run_state.json, prepare_report.json) · output/final</text></g>
+    <g class="paper"><rect x="1450" y="540" width="270" height="110" rx="8"></rect>
+      <text class="t" x="1468" y="568">Committed assets</text>
+      <text class="s" x="1468" y="588">Files in the checkout.</text>
+      <text class="s" x="1468" y="604">workflow_*.json templates, models</text>
+      <text class="s" x="1468" y="620">with YuNet, profiles, docs read as</text>
+      <text class="s" x="1468" y="636">system prompts.</text></g>
+
+    <!-- operator bus -->
+    <path class="edge nm" d="M140 290 V215 H1450"></path>
+    <path class="edge" d="M555 215 V290"></path>
+    <text class="e" x="563" y="258">runs · CLI</text>
+    <path class="edge" d="M900 215 V290"></path>
+    <text class="e" x="892" y="252" text-anchor="end">watches · optional start, stop</text>
+    <text class="e" x="892" y="265" text-anchor="end">HTTP GET, SSE, POST · port 8787</text>
+    <path class="edge" d="M1200 215 V290"></path>
+    <text class="e" x="1208" y="258">runs · CLI</text>
+    <path class="edge" d="M1450 215 V290"></path>
+    <text class="e" x="1458" y="258">runs and approves · CLI</text>
+
+    <!-- container to external -->
+    <path class="edge" d="M520 290 V104"></path>
+    <text class="e" x="512" y="130" text-anchor="end">castgen only: Krea 2 graphs</text>
+    <text class="e" x="512" y="143" text-anchor="end">HTTP and WebSocket</text>
+    <path class="edge" d="M680 290 V104"></path>
+    <text class="e" x="688" y="130">free-VRAM gate before a start</text>
+    <text class="e" x="688" y="143">HTTP GET system_stats</text>
+    <path class="edge" d="M1070 290 V160 H1000 V104"></path>
+    <text class="e" x="1062" y="184" text-anchor="end">stages, submits, monitors,</text>
+    <text class="e" x="1062" y="197" text-anchor="end">fetches, frees · HTTP, WebSocket</text>
+    <path class="edge" d="M1110 290 V104"></path>
+    <text class="e" x="1118" y="130">frame extraction, concat,</text>
+    <text class="e" x="1118" y="143">mux, checks · argv</text>
+    <path class="edge" d="M1310 290 V104"></path>
+    <text class="e" x="1318" y="130">align, diarize, detect faces</text>
+    <text class="e" x="1318" y="143">Python calls</text>
+    <path class="edge" d="M1680 290 V104"></path>
+    <text class="e" x="1672" y="150" text-anchor="end">one call per stage or beat group</text>
+    <text class="e" x="1672" y="163" text-anchor="end">argv, JSON stdout</text>
+
+    <!-- spawn -->
+    <path class="edge" d="M930 350 H1060"></path>
+    <text class="e" x="995" y="336" text-anchor="middle">spawns its own CLI,</text>
+    <text class="e" x="995" y="368" text-anchor="middle">SIGINTs its group</text>
+    <text class="e" x="995" y="381" text-anchor="middle">· subprocess</text>
+
+    <!-- container to store -->
+    <path class="edge" d="M420 416 V540"></path>
+    <text class="e" x="428" y="460">reads chunks, logs,</text>
+    <text class="e" x="428" y="473">photography.json</text>
+    <path class="edge" d="M720 416 V540"></path>
+    <text class="e" x="728" y="460">reads state and report;</text>
+    <text class="e" x="728" y="473">writes lock and log</text>
+    <path class="edge" d="M1100 416 V540"></path>
+    <text class="e" x="1092" y="444" text-anchor="end">reads config and plan;</text>
+    <text class="e" x="1092" y="457" text-anchor="end">writes chunks, state,</text>
+    <text class="e" x="1092" y="470" text-anchor="end">report, final</text>
+    <path class="edge" d="M1300 416 V500 H1560 V540"></path>
+    <text class="e" x="1292" y="440" text-anchor="end">loads workflow templates</text>
+    <text class="e" x="1292" y="453" text-anchor="end">and face models</text>
+    <path class="edge" d="M1440 416 V470 H1370 V540"></path>
+    <text class="e" x="1448" y="436">reads config; writes</text>
+    <text class="e" x="1448" y="449">.authoring, shot_plan.toml</text>
+    <path class="edge" d="M1650 416 V540"></path>
+    <text class="e" x="1642" y="472" text-anchor="end">reads docs as</text>
+    <text class="e" x="1642" y="485" text-anchor="end">system prompts</text>
+
+    <!-- legend -->
+    <g class="person"><circle cx="56" cy="456" r="8"></circle><path d="M45 478 q11 -18 22 0"></path></g>
+    <text class="s" x="76" y="464">Person</text>
+    <g class="blue"><rect x="40" y="498" width="44" height="22" rx="5"></rect></g>
+    <text class="s" x="94" y="514">Container (process)</text>
+    <g class="paper"><rect x="40" y="534" width="44" height="22" rx="5"></rect></g>
+    <text class="s" x="94" y="550">Data store (files)</text>
+    <g class="ext"><rect x="40" y="570" width="44" height="22" rx="5"></rect></g>
+    <text class="s" x="94" y="586">External system</text>
+    <g class="bound"><rect x="40" y="606" width="44" height="22" rx="5"></rect></g>
+    <text class="s" x="94" y="622">System boundary</text>
+
+    <!-- strip -->
+    <g class="panel"><rect x="40" y="715" width="1720" height="275" rx="12"></rect></g>
+    <text class="p" x="60" y="740">stage order and hand-off artefacts · run_pipeline, left to right, then the second row · all inside prevent_host_sleep() and custody</text>
+    <g class="chip"><rect x="55" y="755" width="270" height="84" rx="8"></rect>
+      <text class="t" x="69" y="777">0 · Config</text>
+      <text class="s" x="69" y="795">config.load_config + profiles, timelines</text>
+      <text class="s" x="69" y="811">in: run TOML; optional profile TOML</text>
+      <text class="s" x="69" y="827">out: RunConfig; a Timeline per [[segment]]</text></g>
+    <path class="edge" d="M325 797 H339"></path>
+    <g class="chip"><rect x="339" y="755" width="270" height="84" rx="8"></rect>
+      <text class="t" x="353" y="777">Custody</text>
+      <text class="s" x="353" y="795">custody.VramCustodyManager</text>
+      <text class="s" x="353" y="811">in: GET /system_stats</text>
+      <text class="s" x="353" y="827">out: refusal below min_free_vram_gb</text></g>
+    <path class="edge" d="M609 797 H623"></path>
+    <g class="chip"><rect x="623" y="755" width="270" height="84" rx="8"></rect>
+      <text class="t" x="637" y="777">Templates</text>
+      <text class="s" x="637" y="795">workflow_graph.load_workflow_template</text>
+      <text class="s" x="637" y="811">in: workflow_template + i2v template</text>
+      <text class="s" x="637" y="827">out: Workflow objects; stack versions</text></g>
+    <path class="edge" d="M893 797 H907"></path>
+    <g class="chip"><rect x="907" y="755" width="270" height="84" rx="8"></rect>
+      <text class="t" x="921" y="777">1 · Align</text>
+      <text class="s" x="921" y="795">lyrics.parse_lyrics, alignment.align</text>
+      <text class="s" x="921" y="811">in: timeline audio, script text</text>
+      <text class="s" x="921" y="827">out: AlignmentResult with word timings</text></g>
+    <path class="edge" d="M1177 797 H1191"></path>
+    <g class="chip"><rect x="1191" y="755" width="270" height="84" rx="8"></rect>
+      <text class="t" x="1205" y="777">1a · Diarize (opt-in)</text>
+      <text class="s" x="1205" y="795">diarization.assign_characters</text>
+      <text class="s" x="1205" y="811">in: vocal_stem</text>
+      <text class="s" x="1205" y="827">out: AlignedSegment.characters</text></g>
+    <path class="edge" d="M1461 797 H1475"></path>
+    <g class="chip"><rect x="1475" y="755" width="270" height="84" rx="8"></rect>
+      <text class="t" x="1489" y="777">2a · Slice</text>
+      <text class="s" x="1489" y="795">slicing.slice_audio (+ shot_plan)</text>
+      <text class="s" x="1489" y="811">in: alignment, hardware, length_seconds</text>
+      <text class="s" x="1489" y="827">out: AudioChunk, chunk_NNN.wav</text></g>
+    <g class="chip"><rect x="55" y="851" width="270" height="84" rx="8"></rect>
+      <text class="t" x="69" y="873">2a-stem (opt-in)</text>
+      <text class="s" x="69" y="891">stems.slice_stem_for_chunks</text>
+      <text class="s" x="69" y="907">in: vocal_stem, the chunks</text>
+      <text class="s" x="69" y="923">out: chunks_dir/stem/chunk_NNN_vocal.wav</text></g>
+    <path class="edge" d="M325 893 H339"></path>
+    <g class="chip"><rect x="339" y="851" width="270" height="84" rx="8"></rect>
+      <text class="t" x="353" y="873">2b · Prompt</text>
+      <text class="s" x="353" y="891">prompting.expand_prompt (+ plan lints)</text>
+      <text class="s" x="353" y="907">in: chunk, plan entry, config</text>
+      <text class="s" x="353" y="923">out: ExpandedPrompt per chunk (memory)</text></g>
+    <path class="edge" d="M609 893 H623"></path>
+    <g class="chip"><rect x="623" y="851" width="270" height="84" rx="8"></rect>
+      <text class="t" x="637" y="873">3 · Stage</text>
+      <text class="s" x="637" y="891">staging.ComfyUIAssetStager</text>
+      <text class="s" x="637" y="907">in: reference photos, chunk audio</text>
+      <text class="s" x="637" y="923">out: server filenames, de-duplicated</text></g>
+    <path class="edge" d="M893 893 H907"></path>
+    <g class="chip"><rect x="907" y="851" width="270" height="84" rx="8"></rect>
+      <text class="t" x="921" y="873">Envelope</text>
+      <text class="s" x="921" y="891">envelope.check_render_envelope</text>
+      <text class="s" x="921" y="907">in: chunks to render, resolution</text>
+      <text class="s" x="921" y="923">out: refusal outside PROVEN_ENVELOPES</text></g>
+    <path class="edge" d="M1177 893 H1191"></path>
+    <g class="chip"><rect x="1191" y="851" width="270" height="84" rx="8"></rect>
+      <text class="t" x="1205" y="873">4 · Render</text>
+      <text class="s" x="1205" y="891">ResilientRunner, continuity, execution</text>
+      <text class="s" x="1205" y="907">in: graph per chunk, ChunkFingerprint</text>
+      <text class="s" x="1205" y="923">out: chunk mp4s, run_state.json, frames/</text></g>
+    <path class="edge" d="M1461 893 H1475"></path>
+    <g class="chip"><rect x="1475" y="851" width="270" height="84" rx="8"></rect>
+      <text class="t" x="1489" y="873">5 · Assemble</text>
+      <text class="s" x="1489" y="891">assembly.assemble_final_video</text>
+      <text class="s" x="1489" y="907">in: chunk mp4s, run state, master audio</text>
+      <text class="s" x="1489" y="923">out: final_video.mp4, master muxed in</text></g>
+
+    <text class="s" x="60" y="962">Stage 5 is skipped for an --only-chunks slice and whenever any chunk is dead-lettered. A config with [[segment]] tables runs Stages 1 to 4 once per timeline, then assemble_timelines</text>
+    <text class="s" x="60" y="979">joins them and measures the seam. --prepare runs Stages 1 to 2 only, with no custody and no ComfyUI; the custody pre-flight runs before Stage 1.</text>
+  </svg>
+  <div style="padding: 14px 56px 0; display: flex; gap: 18px; align-items: center; font-size: 12px; color: #5C5850; border-top: 1px solid #DDD7C9; margin: 0 56px">
+    <span>Presentation copy of <span style="font-family: 'IBM Plex Mono', monospace">docs/ARCHITECTURE.md</span>, Level 2. Drawn from music-video-pipeline 0.1.0 at ce2ffd5 on 2026-10-05.</span>
+    <span style="margin-left: auto; padding: 4px 10px; border-radius: 999px; background: #F6EBCB; color: #7A5410; font-weight: 600">Expected drift: medium</span>
+    <span>a new process, console script or data store makes this board stale</span>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1800,"height":1180}}'>
+class Component extends DCLogic {
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>

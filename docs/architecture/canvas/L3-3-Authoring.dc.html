@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>music-video-pipeline authoring layer</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#F5F2EA;color:#1F1E1B;font-family:"IBM Plex Sans",system-ui,sans-serif}
+a{color:#2E5A87}a:hover{color:#1F3F62}
+svg text{font-family:"IBM Plex Sans",system-ui,sans-serif;fill:#1F1E1B}
+svg text.t{font-size:14px;font-weight:600}
+svg text.s{font-size:11.5px;fill:#5C5850}
+svg text.m{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:13px;font-weight:500;fill:#1F1E1B}
+svg text.p{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:12px;fill:#7A5410;letter-spacing:.04em}
+svg text.h{font-family:"Fraunces",Georgia,serif;font-weight:700}
+svg text.e{font-size:11.5px;fill:#3F3C36;paint-order:stroke;stroke:#F5F2EA;stroke-width:5px;stroke-linejoin:round}
+svg .panel rect{fill:#EEEAE0;stroke:#D2CBB9;stroke-width:1.2}
+svg .chip rect{fill:#FFFFFF;stroke:#8A8577;stroke-width:1.2}
+svg .ext rect{fill:#E7E2D6;stroke:#7B766B;stroke-width:1.2}
+svg .clay rect{fill:#F8E9E1;stroke:#B4532F;stroke-width:2.4}
+svg .slate rect{fill:#E4E2DC;stroke:#45423C;stroke-width:1.4}
+svg .rule rect{fill:#FFFFFF;stroke:#B4532F;stroke-width:1.2}
+svg .edge{fill:none;stroke:#5C5850;stroke-width:1.6;marker-end:url(#arr)}
+svg .edge.nm{marker-end:none}
+svg .edge.d{stroke-dasharray:6 5}
+svg .edge.hot{stroke:#B4532F;stroke-width:2}
+</style>
+</helmet>
+<div style="width: 1800px; height: 1260px; box-sizing: border-box; display: flex; flex-direction: column; background: #F5F2EA; overflow: hidden">
+  <div style="padding: 36px 56px 0; display: flex; align-items: baseline; gap: 22px">
+    <div style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #B4532F; letter-spacing: 0.08em; text-transform: uppercase">Level 3.3 · Components</div>
+    <div style="font-family: 'Fraunces', Georgia, serif; font-size: 34px; font-weight: 700; line-height: 1">The authoring layer</div>
+  </div>
+  <div style="padding: 8px 56px 0; font-size: 14px; color: #5C5850">The only place a language model is called, and the seam tests/test_authoring_boundary.py holds from both sides. Stages draft; a committed shot_plan.toml is the hand-off.</div>
+  <svg viewBox="0 0 1800 1040" width="1800" height="1040" style="display: block" role="img" aria-label="Component diagram of the authoring layer">
+    <defs>
+      <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#5C5850"></path></marker>
+    </defs>
+<g class="panel"><rect x="340" y="20" width="1150" height="650" rx="12"></rect></g>
+<text class="p" x="360" y="48">music_video_maker/authoring</text>
+<g class="chip">
+<rect x="380" y="70" width="330" height="130" rx="8"></rect>
+<text class="m" x="396" y="96">cli.py — mvm-author</text>
+<text class="s" x="396" y="118">concept · beats · photography · prose</text>
+<text class="s" x="396" y="134">write · all · status</text>
+<text class="s" x="396" y="150">approval loop · --notes · --dry-run</text>
+</g>
+<g class="chip">
+<rect x="380" y="230" width="330" height="100" rx="8"></rect>
+<text class="m" x="396" y="256">conditions.py</text>
+<text class="s" x="396" y="278">world-state tags on the beat sheet;</text>
+<text class="s" x="396" y="294">reports what the choke point refuses</text>
+</g>
+<g class="chip">
+<rect x="380" y="360" width="330" height="110" rx="8"></rect>
+<text class="m" x="396" y="386">worldstate.py</text>
+<text class="s" x="396" y="408">Entity · Fact · Event</text>
+<text class="s" x="396" y="424">interval-versioned facts</text>
+<text class="s" x="396" y="440">one write choke point: set_fact</text>
+</g>
+<g class="chip">
+<rect x="380" y="510" width="330" height="100" rx="8"></rect>
+<text class="m" x="396" y="536">chunks.py</text>
+<text class="s" x="396" y="558">skeleton: lyrics, align, slice</text>
+<text class="s" x="396" y="574">repeats Stage 1–2 calls; cannot import cli</text>
+</g>
+<g class="chip">
+<rect x="750" y="70" width="330" height="84" rx="8"></rect>
+<text class="m" x="766" y="96">concept.py</text>
+<text class="s" x="766" y="118">reading · acts · locations · conditions</text>
+</g>
+<g class="chip">
+<rect x="750" y="182" width="330" height="84" rx="8"></rect>
+<text class="m" x="766" y="208">beats.py</text>
+<text class="s" x="766" y="230">beat_role · beat_group · act</text>
+</g>
+<g class="chip">
+<rect x="750" y="294" width="330" height="84" rx="8"></rect>
+<text class="m" x="766" y="320">reanchor.py</text>
+<text class="s" x="766" y="342">beats onto re-cut timeline by song time</text>
+</g>
+<g class="chip">
+<rect x="750" y="406" width="330" height="84" rx="8"></rect>
+<text class="m" x="766" y="432">photography.py</text>
+<text class="s" x="766" y="454">look · camera · framing</text>
+</g>
+<g class="chip">
+<rect x="750" y="518" width="330" height="84" rx="8"></rect>
+<text class="m" x="766" y="544">prose.py</text>
+<text class="s" x="766" y="566">shot lines per beat group</text>
+</g>
+<g class="chip">
+<rect x="1120" y="70" width="330" height="90" rx="8"></rect>
+<text class="m" x="1136" y="96">prompts.py</text>
+<text class="s" x="1136" y="118">preambles + docs, read fresh every call</text>
+<text class="s" x="1136" y="134">and hashed into provenance</text>
+</g>
+<g class="clay">
+<rect x="1120" y="230" width="330" height="120" rx="8"></rect>
+<text class="m" x="1136" y="256">driver.py</text>
+<text class="s" x="1136" y="278">ModelDriver · ClaudeCliDriver</text>
+<text class="s" x="1136" y="294">retry 3 · 300 s · 2.0 USD guard</text>
+<text class="s" x="1136" y="310">the only subprocess that reaches a model</text>
+</g>
+<g class="chip">
+<rect x="1120" y="400" width="330" height="90" rx="8"></rect>
+<text class="m" x="1136" y="426">session.py + hashing.py</text>
+<text class="s" x="1136" y="448">input hashes · staleness,</text>
+<text class="s" x="1136" y="464">never auto-healed</text>
+</g>
+<g class="chip">
+<rect x="1120" y="520" width="330" height="100" rx="8"></rect>
+<text class="m" x="1136" y="546">plan.py</text>
+<text class="s" x="1136" y="568">compose · check via the real loaders · write</text>
+<text class="s" x="1136" y="584">error revisions bounded at 2 rounds</text>
+</g>
+<g class="ext">
+<rect x="40" y="70" width="260" height="130" rx="8"></rect>
+<text class="m" x="56" y="96">run directory</text>
+<text class="s" x="56" y="118">.authoring/*.json</text>
+<text class="s" x="56" y="134">session.json</text>
+<text class="s" x="56" y="150">shot_plan.toml</text>
+</g>
+<g class="ext">
+<rect x="40" y="470" width="260" height="140" rx="8"></rect>
+<text class="m" x="56" y="496">allowed render modules</text>
+<text class="s" x="56" y="518">config · contracts · shot_plan</text>
+<text class="s" x="56" y="534">alignment · slicing · lyrics</text>
+<text class="s" x="56" y="550">logging_setup</text>
+<text class="s" x="56" y="566">alignment_quality</text>
+</g>
+<g class="ext">
+<rect x="1540" y="70" width="220" height="90" rx="8"></rect>
+<text class="m" x="1556" y="96">docs</text>
+<text class="s" x="1556" y="118">shot-writing-guide.md</text>
+<text class="s" x="1556" y="134">lyrics-format.md</text>
+</g>
+<g class="ext">
+<rect x="1540" y="230" width="220" height="120" rx="8"></rect>
+<text class="m" x="1556" y="256">claude CLI</text>
+<text class="s" x="1556" y="278">-p · --json-schema</text>
+<text class="s" x="1556" y="294">--tools empty</text>
+<text class="s" x="1556" y="310">--safe-mode</text>
+</g>
+<path class="edge " d="M380 135 H300"></path>
+<path class="edge " d="M545 200 V230"></path>
+<path class="edge " d="M545 330 V360"></path>
+<path class="edge " d="M380 560 H300"></path>
+<path class="edge " d="M915 266 V294"></path>
+<path class="edge " d="M1540 115 H1450"></path>
+<path class="edge " d="M1450 290 H1540"></path>
+<path class="edge nm" d="M1080 112 H1100 V560 H1080"></path>
+<path class="edge nm" d="M1080 224 H1100"></path>
+<path class="edge nm" d="M1080 336 H1100"></path>
+<path class="edge nm" d="M1080 448 H1100"></path>
+<path class="edge " d="M1100 112 H1120"></path>
+<path class="edge " d="M1100 290 H1120"></path>
+<g class="panel"><rect x="40" y="700" width="1720" height="126" rx="12"></rect></g>
+<text class="p" x="60" y="728">edges not drawn, and why</text>
+<text class="s" x="60" y="756">• cli.py fans out to concept, beats, photography, prose, plan, session and chunks: seven arrows from one box. It writes the run directory (drawn); plan.py composes shot_plan.toml there.</text>
+<text class="s" x="60" y="778">• The bus right of the stage column is two edges, not one: concept, beats, photography and prose each feed prompts.py and driver.py; reanchor.py feeds driver.py only.</text>
+<text class="s" x="60" y="800">• chunks, plan, concept, beats, photography and prose all import from the eight allowed render modules; only chunks.py's arrow is drawn. conditions.py reaches worldstate.py, and nothing else does.</text>
+<g class="rule">
+<rect x="40" y="860" width="560" height="140" rx="10"></rect>
+<text class="p" x="60" y="888" fill="#B4532F">the seam</text>
+<text class="t" x="60" y="912">The one place a language model is called</text>
+<text class="s" x="60" y="934">tests/test_authoring_boundary.py holds the seam from both sides:</text>
+<text class="s" x="60" y="950">nothing outside authoring/ imports it, and it reaches the render</text>
+<text class="s" x="60" y="966">half through eight named modules.</text>
+</g>
+<g class="rule">
+<rect x="620" y="860" width="560" height="140" rx="10"></rect>
+<text class="p" x="640" y="888" fill="#B4532F">hand-off</text>
+<text class="t" x="640" y="912">Nothing a stage writes is read back into a render</text>
+<text class="s" x="640" y="934">The hand-off is a committed shot_plan.toml. The one exception</text>
+<text class="s" x="640" y="950">crosses as a file, not an import: profiles promote reads</text>
+<text class="s" x="640" y="966">photography.json into a profile.</text>
+</g>
+<g class="rule">
+<rect x="1200" y="860" width="560" height="140" rx="10"></rect>
+<text class="p" x="1220" y="888" fill="#B4532F">allowlist</text>
+<text class="t" x="1220" y="912">Eight modules, not six</text>
+<text class="s" x="1220" y="934">The design named six; logging_setup and alignment_quality</text>
+<text class="s" x="1220" y="950">were added, with reasons in the test's docstring. worldstate.py</text>
+<text class="s" x="1220" y="966">imports nothing from the package; its one caller is conditions.py.</text>
+</g>
+  </svg>
+  <div style="padding: 14px 56px 0; display: flex; gap: 18px; align-items: center; font-size: 12px; color: #5C5850; border-top: 1px solid #DDD7C9; margin: 0 56px">
+    <span>Presentation copy of <span style="font-family: 'IBM Plex Mono', monospace">docs/ARCHITECTURE.md</span>, §3.3. Drawn from music-video-pipeline 0.1.0 at ce2ffd5 on 2026-10-05.</span>
+    <span style="margin-left: auto; padding: 4px 10px; border-radius: 999px; background: #F8E9E1; color: #93412A; font-weight: 600">Expected drift: fast</span>
+    <span>a new module under authoring/ or a change to the render allowlist makes this board stale; the Markdown wins</span>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1800,"height":1260}}'>
+class Component extends DCLogic {
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>

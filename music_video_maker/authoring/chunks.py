@@ -2,11 +2,14 @@
 
 Mirrors ``cli.prepare_shot_plan``'s Stage 1-2 call sequence exactly (parse
 lyrics, force-align, slice) -- but this module cannot import ``cli.py``: the
-authoring/render import boundary (design section 2,
-``tests/test_authoring_boundary.py``) only allows ``authoring/`` to import
-``config``, ``contracts``, ``shot_plan``, ``alignment``, ``slicing`` and
-``lyrics``, never ``cli``. Duplicating four function calls here is a much
-smaller cost than blurring that boundary.
+authoring/render import boundary (design section 2) allows ``authoring/``
+only the render-side modules named in
+``tests/test_authoring_boundary.py``'s ``ALLOWED_AUTHORING_IMPORTS`` -- that
+set is the authority, not this sentence; at the time of writing it holds
+eight (``config``, ``contracts``, ``shot_plan``, ``alignment``, ``slicing``,
+``lyrics``, ``logging_setup``, ``alignment_quality``, the last of which this
+module imports) -- and never ``cli``. Duplicating four function calls here is
+a much smaller cost than blurring that boundary.
 
 No GPU, no ComfyUI, no custody handoff -- same as ``--prepare``, and for the
 same reason: this is ~6s of CPU work with nothing to hand either of them.

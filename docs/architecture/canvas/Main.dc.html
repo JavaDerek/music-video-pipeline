@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>music-video-pipeline system context</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#F5F2EA;color:#1F1E1B;font-family:"IBM Plex Sans",system-ui,sans-serif}
+a{color:#2E5A87}a:hover{color:#1F3F62}
+svg text{font-family:"IBM Plex Sans",system-ui,sans-serif;fill:#1F1E1B}
+svg text.t{font-size:15px;font-weight:600}
+svg text.s{font-size:12px;fill:#5C5850}
+svg text.m{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:12px;fill:#2E5A87}
+svg text.h{font-family:"Fraunces",Georgia,serif;font-weight:700}
+svg text.e{font-size:11.5px;fill:#3F3C36;paint-order:stroke;stroke:#F5F2EA;stroke-width:5px;stroke-linejoin:round}
+svg .node rect{fill:#FFFFFF;stroke:#1F1E1B;stroke-width:1.4}
+svg .ext rect{fill:#E7E2D6;stroke:#7B766B;stroke-width:1.2}
+svg .clay rect{fill:#F8E9E1;stroke:#B4532F;stroke-width:2.2}
+svg .person circle,svg .person path{fill:none;stroke:#5C5850;stroke-width:1.8}
+svg .edge{fill:none;stroke:#5C5850;stroke-width:1.6;marker-end:url(#arr)}
+svg .edge.nm{marker-end:none}
+svg .edge.d{stroke-dasharray:6 5}
+</style>
+</helmet>
+<div style="width: 1600px; height: 1000px; box-sizing: border-box; display: flex; flex-direction: column; background: #F5F2EA; overflow: hidden">
+  <div style="padding: 36px 56px 0; display: flex; align-items: baseline; gap: 22px">
+    <div style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #B4532F; letter-spacing: 0.08em; text-transform: uppercase">Level 1 · System context</div>
+    <div style="font-family: 'Fraunces', Georgia, serif; font-size: 34px; font-weight: 700; line-height: 1">music-video-pipeline in its surroundings</div>
+  </div>
+  <div style="padding: 8px 56px 0; font-size: 14px; color: #5C5850">It drives one ComfyUI server to turn audio, lyrics, cast photos and an authored shot plan into a lip-synced video. The render calls no language model; only the separate authoring binary does.</div>
+  <svg viewBox="0 0 1600 780" width="1600" height="780" style="display: block" role="img" aria-label="System context diagram">
+    <defs>
+      <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#5C5850"></path></marker>
+    </defs>
+
+    <!-- people -->
+    <g class="node person">
+      <rect x="40" y="130" width="320" height="104" rx="10"></rect>
+      <circle cx="76" cy="164" r="13"></circle><path d="M58 210 q18 -30 36 0"></path>
+      <text class="t" x="112" y="168">Cast member</text>
+      <text class="s" x="112" y="188">A real person whose reference photo</text>
+      <text class="s" x="112" y="204">conditions the render. Publishing a</text>
+      <text class="s" x="112" y="220">likeness is their decision.</text>
+    </g>
+    <g class="node person">
+      <rect x="40" y="358" width="320" height="104" rx="10"></rect>
+      <circle cx="76" cy="392" r="13"></circle><path d="M58 438 q18 -30 36 0"></path>
+      <text class="t" x="112" y="396">Operator / director</text>
+      <text class="s" x="112" y="416">Edits run.toml, authors and approves</text>
+      <text class="s" x="112" y="432">the shot plan, takes GPU custody by</text>
+      <text class="s" x="112" y="448">hand, runs every binary.</text>
+    </g>
+    <g class="node person">
+      <rect x="40" y="600" width="320" height="104" rx="10"></rect>
+      <circle cx="76" cy="634" r="13"></circle><path d="M58 680 q18 -30 36 0"></path>
+      <text class="t" x="112" y="638">Viewer</text>
+      <text class="s" x="112" y="658">Watches the finished video and</text>
+      <text class="s" x="112" y="674">reports symptoms, which become</text>
+      <text class="s" x="112" y="690">measurements.</text>
+    </g>
+
+    <!-- the system -->
+    <g class="clay">
+      <rect x="540" y="300" width="360" height="220" rx="12"></rect>
+      <text class="h" x="564" y="348" font-size="26">music-video-pipeline</text>
+      <text class="m" x="564" y="370">0.1.0 · Python 3.10+</text>
+      <text class="s" x="564" y="400">Render CLI, authoring CLI, run monitor</text>
+      <text class="s" x="564" y="416">and leaf instruments over one run directory.</text>
+      <text class="s" x="564" y="444">music-video-maker · mvm-author · mvm-webui</text>
+      <text class="s" x="564" y="460">python -m instruments</text>
+      <text class="s" x="564" y="488">The run directory is the only thing they share.</text>
+    </g>
+
+    <!-- right column externals -->
+    <g class="ext">
+      <rect x="1180" y="24" width="380" height="70" rx="8"></rect>
+      <text class="t" x="1200" y="48">ComfyUI on a GPU host</text>
+      <text class="s" x="1200" y="66">MiniMax H3 core nodes, Krea 2 for synthetic cast.</text>
+      <text class="s" x="1200" y="82">Default 127.0.0.1:8188, or doris:8188 (Tailscale).</text>
+    </g>
+    <g class="ext">
+      <rect x="1180" y="130" width="380" height="70" rx="8"></rect>
+      <text class="t" x="1200" y="154">GPU co-tenants</text>
+      <text class="s" x="1200" y="172">Ollama, a TTS service, a desktop session on doris.</text>
+      <text class="s" x="1200" y="188">Never called, only contended with.</text>
+    </g>
+    <g class="ext">
+      <rect x="1180" y="214" width="380" height="70" rx="8"></rect>
+      <text class="t" x="1200" y="238">claude CLI</text>
+      <text class="s" x="1200" y="256">The only language-model endpoint the project calls.</text>
+      <text class="s" x="1200" y="272">Authenticated as the operator set it up.</text>
+    </g>
+    <g class="ext">
+      <rect x="1180" y="298" width="380" height="54" rx="8"></rect>
+      <text class="t" x="1200" y="322">ffmpeg and ffprobe</text>
+      <text class="s" x="1200" y="340">OS-installed binaries: concat, mux, frames, probes.</text>
+    </g>
+    <g class="ext">
+      <rect x="1180" y="366" width="380" height="54" rx="8"></rect>
+      <text class="t" x="1200" y="390">stable-ts and Whisper</text>
+      <text class="s" x="1200" y="408">Forced alignment, align extra, in-process.</text>
+    </g>
+    <g class="ext">
+      <rect x="1180" y="434" width="380" height="70" rx="8"></rect>
+      <text class="t" x="1200" y="458">pyannote and Hugging Face Hub</text>
+      <text class="s" x="1200" y="476">Opt-in diarization, diarize extra. Gated CC-BY-4.0</text>
+      <text class="s" x="1200" y="492">weights under the operator's token.</text>
+    </g>
+    <g class="ext">
+      <rect x="1180" y="518" width="380" height="54" rx="8"></rect>
+      <text class="t" x="1200" y="542">OpenCV YuNet and SFace</text>
+      <text class="s" x="1200" y="560">Faces extra. Detection and recognition, ONNX files.</text>
+    </g>
+    <g class="ext">
+      <rect x="1180" y="586" width="380" height="70" rx="8"></rect>
+      <text class="t" x="1200" y="610">Stem separator</text>
+      <text class="s" x="1200" y="628">Demucs, run by the operator out of band to</text>
+      <text class="s" x="1200" y="644">produce the isolated vocal stem.</text>
+    </g>
+    <g class="ext">
+      <rect x="1180" y="670" width="380" height="70" rx="8" stroke-dasharray="7 5"></rect>
+      <text class="t" x="1200" y="694">run-dmcp DESIGN.md</text>
+      <text class="s" x="1200" y="712">The engine spec whose 5.1 timeline core</text>
+      <text class="s" x="1200" y="728">worldstate.py implements on purpose.</text>
+    </g>
+
+    <!-- edges, left -->
+    <path class="edge" d="M200 234 V358"></path>
+    <text class="e" x="212" y="290">supplies reference photos,</text>
+    <text class="e" x="212" y="303">with consent</text>
+
+    <path class="edge" d="M360 410 H540"></path>
+    <text class="e" x="370" y="387">runs, configures, reviews</text>
+    <text class="e" x="370" y="400">CLI, TOML, browser</text>
+
+    <path class="edge" d="M360 652 H660 V520"></path>
+    <text class="e" x="372" y="644">watches final_video.mp4 · a file</text>
+
+    <!-- edges, right: one trunk out of the system -->
+    <path class="edge nm" d="M900 410 H970"></path>
+    <path class="edge nm" d="M970 59 V545"></path>
+
+    <path class="edge" d="M970 59 H1180"></path>
+    <text class="e" x="982" y="38">uploads, submits, watches,</text>
+    <text class="e" x="982" y="51">fetches, frees · HTTP, WebSocket</text>
+
+    <path class="edge" d="M1370 130 V94"></path>
+    <text class="e" x="1384" y="116">share the one 4090 · VRAM</text>
+
+    <path class="edge" d="M970 249 H1180"></path>
+    <text class="e" x="982" y="228">mvm-author and nothing else</text>
+    <text class="e" x="982" y="241">subprocess, JSON on stdout</text>
+
+    <path class="edge" d="M970 325 H1180"></path>
+    <text class="e" x="982" y="317">argv only · subprocess</text>
+
+    <path class="edge" d="M970 393 H1180"></path>
+    <text class="e" x="982" y="372">align, never transcribe</text>
+    <text class="e" x="982" y="385">in-process Python</text>
+
+    <path class="edge" d="M970 469 H1180"></path>
+    <text class="e" x="982" y="448">who sings, read off vocal stem</text>
+    <text class="e" x="982" y="461">in-process · HTTPS for weights</text>
+
+    <path class="edge" d="M970 545 H1180"></path>
+    <text class="e" x="982" y="524">seed-frame gate, face scans,</text>
+    <text class="e" x="982" y="537">cast scoring · in-process</text>
+
+    <path class="edge" d="M1180 621 H860 V520"></path>
+    <text class="e" x="872" y="611">vocals.wav for vocal_stem · a file</text>
+
+    <path class="edge d" d="M1180 705 H820 V520"></path>
+    <text class="e" x="832" y="681">tracks the spec by hand · design only</text>
+    <text class="e" x="832" y="694">no code or package dependency</text>
+
+    <!-- legend -->
+    <g class="person">
+      <circle cx="56" cy="752" r="8"></circle><path d="M45 774 q11 -18 22 0"></path>
+    </g>
+    <text class="s" x="76" y="760">Person</text>
+    <g class="clay"><rect x="150" y="744" width="56" height="28" rx="6"></rect></g>
+    <text class="s" x="216" y="763">The system</text>
+    <g class="ext"><rect x="320" y="744" width="56" height="28" rx="6"></rect></g>
+    <text class="s" x="386" y="763">External system</text>
+    <path class="edge d" d="M510 758 H564"></path>
+    <text class="s" x="574" y="763">Design-only link</text>
+  </svg>
+  <div style="padding: 14px 56px 0; display: flex; gap: 18px; align-items: center; font-size: 12px; color: #5C5850; border-top: 1px solid #DDD7C9; margin: 0 56px">
+    <span>Presentation copy of <span style="font-family: 'IBM Plex Mono', monospace">docs/ARCHITECTURE.md</span>, Level 1. Drawn from music-video-pipeline 0.1.0 at ce2ffd5 on 2026-10-05.</span>
+    <span style="margin-left: auto; padding: 4px 10px; border-radius: 999px; background: #E2EFEC; color: #1E5E59; font-weight: 600">Expected drift: slow</span>
+    <span>changes only when a new kind of external system or surface appears</span>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1600,"height":1000}}'>
+class Component extends DCLogic {
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>

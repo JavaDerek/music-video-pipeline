@@ -2,8 +2,13 @@
 the photography -- all before the GPU starts.
 
 **Strictly outside the render path.** ``music_video_maker/authoring/`` is the
-only place in this project that talks to an LLM or shells out to a subprocess
-for inference. Everything under it produces a ``shot_plan.toml`` a human
+only place in this project that talks to an LLM. It is not the only place
+that shells out to a model: ``stereo.external_depth_source`` pipes frames
+through an external depth-estimation command -- a post-render pass over
+finished chunk mp4s that moves no fingerprint and cannot cause a re-render,
+admitted with that reason spelled out in
+``tests/test_authoring_boundary.py``'s ``SUBPROCESS_ALLOWLIST`` entry for
+``stereo.py``. Everything under ``authoring/`` produces a ``shot_plan.toml`` a human
 reviews and commits; nothing here is ever imported by ``prompting.py`` or any
 other module that runs during a render, and nothing outside this package may
 import it -- enforced by ``tests/test_authoring_boundary.py``, not just
