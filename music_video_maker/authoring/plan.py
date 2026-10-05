@@ -203,6 +203,7 @@ def render_plan_toml(
     present: Mapping[int, Sequence[str]] | None = None,
     lint_comments: Mapping[int | None, Sequence[str]] | None = None,
     revisions: Mapping[int, tuple[str, str]] | None = None,
+    framing: Mapping[int, str] | None = None,
 ) -> str:
     """Compose the text of a generated ``shot_plan.toml``.
 
@@ -217,8 +218,14 @@ def render_plan_toml(
     ``build_plan`` is what decides which chunks qualify. Absent or omitted
     entries emit nothing, so a caller that never mentions it (every call site
     before this one) gets byte-identical output to before.
+
+    ``framing`` (issue #97) is the photography stage's per-shot framing
+    level, already validated there against ``prompting.FRAMING_LEVELS``;
+    the real loader re-checks it in :func:`check_plan`. Same rule as
+    ``revisions``: absent or empty emits nothing, byte-identically.
     """
     camera = dict(camera or {})
+    framing = dict(framing or {})
     present = {k: list(v) for k, v in (present or {}).items()}
     lint_comments = {k: list(v) for k, v in (lint_comments or {}).items()}
     revisions = dict(revisions or {})
@@ -332,6 +339,11 @@ def render_plan_toml(
                 block.append(f"conditions = {_toml_string(beat.conditions)}")
         if chunk.chunk_id in camera:
             block.append(f"camera = {_toml_string(camera[chunk.chunk_id])}")
+        # Issue #97: beside `camera`, because both come from the photography
+        # stage -- but never inside its `if`: a shot can want a size and no
+        # camera move.
+        if chunk.chunk_id in framing:
+            block.append(f"framing = {_toml_string(framing[chunk.chunk_id])}")
         # Issue #59: omitted entirely when nobody else is in shot, the same
         # convention as every other optional field here -- an absent `present`
         # means "she is alone", never a default somebody has to read past.
@@ -616,6 +628,7 @@ def build_plan(
     reviser,
     camera: Mapping[int, str] | None = None,
     present: Mapping[int, Sequence[str]] | None = None,
+    framing: Mapping[int, str] | None = None,
     extra_checks=None,
     scratch_dir: Path | None = None,
     stageable_nouns: Sequence[str] = (),
@@ -683,6 +696,7 @@ def build_plan(
             present=present,
             lint_comments=comments,
             revisions=revisions,
+            framing=framing,
         )
 
     def inspect() -> PlanCheck:

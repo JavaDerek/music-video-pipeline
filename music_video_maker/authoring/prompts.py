@@ -443,7 +443,8 @@ movement of individual shots.
 Reply with a single JSON object, no other text:
 {
   "cinematography": "35mm film, shallow depth of field, overcast natural light, cool grade",
-  "camera": [{"chunk_id": 12, "camera": "tracking backwards ahead of her"}]
+  "camera": [{"chunk_id": 12, "camera": "tracking backwards ahead of her"}],
+  "framing": [{"chunk_id": 12, "framing": "close"}]
 }
 
 `cinematography` is the whole video's look -- stock, lens family, depth of \
@@ -515,7 +516,28 @@ sentence's subject to the consequence, and no camera clause -- a trailing \
 phrase, by design -- reliably overrides that. If a chunk below is tagged \
 LYRIC and its beat is a consequence, treat lip-sync loss on it as a real \
 possibility this field cannot fully prevent, not a bug in how you phrase \
-this value.\
+this value.
+
+`framing` (issue #97) is how much of the frame the shot's focus person \
+fills, and it is the ONE field that measurably sets it. Exactly one of four \
+values, tightest first: "face", "close", "medium", "wide". Nothing else is \
+accepted -- not "medium close", not "extreme close-up". Each value composes \
+its own sentence naming the person, which is why it works where camera \
+wording did not: of 39 sung chunks whose `camera` said close or medium \
+close, the delivered face size ran the whole range from no face at all to a \
+third of the frame, and two chunks both reading "close on her face" came \
+out tiny. Set to "face" and to "wide" on the same three chunks at identical \
+seeds, `framing` moved the face 3 of 3 times -- up to 15x larger under \
+"face", and under "wide" one chunk had no face in any sampled frame.
+
+`framing` is OPTIONAL PER SHOT, like `camera`, and independent of it -- a \
+shot can want a size and no move. An absent value leaves the size to the \
+renderer, which is the right answer wherever size does not matter. Spend it \
+where it does: "face" or "close" on a sung chunk whose mouth must read, \
+"wide" on an instrumental chunk that earns the landscape. Keep it \
+consistent with your own `camera` value for that chunk: a `camera` that \
+pushes in on her eyes and a `framing` of "wide" is a contradiction the \
+renderer resolves for you.\
 """
 
 

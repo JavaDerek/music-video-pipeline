@@ -310,6 +310,69 @@ def test_a_beat_with_no_subject_emits_no_subject_key(tmp_path):
     assert "subject" not in path.read_text()
 
 
+# --------------------------------------------------------------------------- #
+# Issue #97: `framing`, proposed by the photography stage, written beside
+# `camera`, and read back by the render's own loader.
+# --------------------------------------------------------------------------- #
+
+
+def test_framing_is_emitted_and_round_trips_through_the_real_loader(tmp_path):
+    chunks = _chunks(["a first line", "", "a third line"])
+    beats = (_beat(1), _beat(2), _beat(3))
+    path = tmp_path / "shot_plan.toml"
+
+    path.write_text(
+        render_plan_toml(
+            chunks, beats, LINES, provenance=PROVENANCE, camera=CAMERAS,
+            framing={1: "face", 2: "wide"},
+        )
+    )
+
+    plan = load_shot_plan(path)
+    assert plan[1].framing == "face"
+    assert plan[2].framing == "wide"
+    assert plan[3].framing is None
+
+
+def test_framing_is_written_directly_after_camera(tmp_path):
+    text = render_plan_toml(
+        _chunks(["a line"]), (_beat(1),), LINES, provenance=PROVENANCE, camera=CAMERAS,
+        framing={1: "close"},
+    )
+
+    lines = text.split("[[shot]]")[1].splitlines()
+    camera_at = next(i for i, line in enumerate(lines) if line.startswith("camera"))
+    assert lines[camera_at + 1] == 'framing = "close"'
+
+
+def test_no_framing_renders_byte_identically_to_before_it_existed():
+    args = (_chunks(["a line", ""]), (_beat(1), _beat(2)), LINES)
+
+    without_kwarg = render_plan_toml(*args, provenance=PROVENANCE, camera=CAMERAS)
+    with_none = render_plan_toml(*args, provenance=PROVENANCE, camera=CAMERAS, framing=None)
+    with_empty = render_plan_toml(*args, provenance=PROVENANCE, camera=CAMERAS, framing={})
+
+    assert without_kwarg == with_none == with_empty
+    assert "framing" not in without_kwarg
+
+
+def test_build_plan_carries_framing_into_the_written_plan(tmp_path):
+    chunks = _chunks(["a line", ""])
+    built = build_plan(
+        _config(tmp_path),
+        chunks,
+        (_beat(1), _beat(2)),
+        {1: LINES[1], 2: LINES[2]},
+        provenance=PROVENANCE,
+        reviser=_Reviser(),
+        camera=CAMERAS,
+        framing={1: "face"},
+    )
+
+    assert 'framing = "face"' in built.text
+    assert check_plan(built.text, _config(tmp_path), chunks).ok
+
+
 def test_provenance_records_hashes_never_content(tmp_path):
     """Design section 8: a committed plan must not drag the whole lyric sheet
     into git -- and per #51, anything committed ships."""
