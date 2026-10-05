@@ -1,0 +1,95 @@
+{
+  "v": 3,
+  "attachments": {},
+  "boards": {
+    "L2-Containers.dc.html": {
+      "h": 1180,
+      "title": "Level 2 · Containers",
+      "w": 1800,
+      "x": 1720,
+      "y": 0
+    },
+    "L3-1-Stages-1-2.dc.html": {
+      "h": 1250,
+      "title": "Level 3.1 · Stages 1–2: planning the timeline",
+      "w": 1800,
+      "x": 0,
+      "y": 1600
+    },
+    "L3-2-Render-Loop.dc.html": {
+      "h": 1250,
+      "title": "Level 3.2 · Stages 3–5: the render loop and assembly",
+      "w": 1900,
+      "x": 1920,
+      "y": 1600
+    },
+    "L3-3-Authoring.dc.html": {
+      "h": 1260,
+      "title": "Level 3.3 · The authoring layer",
+      "w": 1800,
+      "x": 0,
+      "y": 2970
+    },
+    "L3-4-Monitor-Control.dc.html": {
+      "h": 1220,
+      "title": "Level 3.4 · The monitor and its control half",
+      "w": 1800,
+      "x": 1920,
+      "y": 2970
+    },
+    "L3-5-Instruments.dc.html": {
+      "h": 1170,
+      "title": "Level 3.5 · Leaf instruments",
+      "w": 1800,
+      "x": 0,
+      "y": 4350
+    },
+    "Main.dc.html": {
+      "h": 1000,
+      "title": "Level 1 · System context",
+      "w": 1600,
+      "x": 0,
+      "y": 0
+    }
+  },
+  "designSystems": [],
+  "launch": {
+    "view": "canvas"
+  },
+  "notes": {
+    "drift": {
+      "fill": "orange",
+      "w": 420,
+      "x": 3940,
+      "y": 0,
+      "text": "These boards are presentation copies of the 7 Mermaid diagrams in music-video-pipeline/docs/ARCHITECTURE.md.\n\nThe Markdown is the source of truth. These pictures are redrawn from it, never edited by hand, and they WILL drift:\n\n• Level 3 boards go stale first.\n• Level 2 drifts when a process, port or protocol changes.\n• Level 1 drifts only when a new kind of actor or external system appears.\n\nEach board's footer states the commit it was drawn from and its expected drift. When a board disagrees with the Markdown, the Markdown wins."
+    },
+    "t1": {
+      "kind": "title1",
+      "maxW": 3520,
+      "w": 240,
+      "x": 0,
+      "y": -300,
+      "text": "music-video-pipeline — C4 architecture, presentation copies (levels 1 and 2)"
+    },
+    "t2": {
+      "kind": "title1",
+      "maxW": 3820,
+      "w": 240,
+      "x": 0,
+      "y": 1300,
+      "text": "Level 3 — components, in 5 cuts along the enforced seams"
+    }
+  },
+  "order": [
+    "Main.dc.html",
+    "L2-Containers.dc.html",
+    "L3-1-Stages-1-2.dc.html",
+    "L3-2-Render-Loop.dc.html",
+    "L3-3-Authoring.dc.html",
+    "L3-4-Monitor-Control.dc.html",
+    "L3-5-Instruments.dc.html"
+  ],
+  "pages": [],
+  "title": "music-video-pipeline Architecture Diagrams"
+}

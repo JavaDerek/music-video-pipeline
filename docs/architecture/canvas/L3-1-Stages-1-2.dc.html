@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>music-video-pipeline stages 1 and 2</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#F5F2EA;color:#1F1E1B;font-family:"IBM Plex Sans",system-ui,sans-serif}
+a{color:#2E5A87}a:hover{color:#1F3F62}
+svg text{font-family:"IBM Plex Sans",system-ui,sans-serif;fill:#1F1E1B}
+svg text.t{font-size:14px;font-weight:600}
+svg text.s{font-size:11.5px;fill:#5C5850}
+svg text.m{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:13px;font-weight:500;fill:#1F1E1B}
+svg text.p{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:12px;fill:#7A5410;letter-spacing:.04em}
+svg text.h{font-family:"Fraunces",Georgia,serif;font-weight:700}
+svg text.e{font-size:11.5px;fill:#3F3C36;paint-order:stroke;stroke:#F5F2EA;stroke-width:5px;stroke-linejoin:round}
+svg .panel rect{fill:#EEEAE0;stroke:#D2CBB9;stroke-width:1.2}
+svg .chip rect{fill:#FFFFFF;stroke:#8A8577;stroke-width:1.2}
+svg .file rect{fill:#F1EEE5;stroke:#8A8577;stroke-width:1.4}
+svg .rule rect{fill:#FFFFFF;stroke:#B4532F;stroke-width:1.2}
+svg .edge{fill:none;stroke:#5C5850;stroke-width:1.6;marker-end:url(#arr)}
+svg .edge.nm{marker-end:none}
+svg .edge.d{stroke-dasharray:6 5}
+</style>
+</helmet>
+<div style="width: 1800px; height: 1250px; box-sizing: border-box; display: flex; flex-direction: column; background: #F5F2EA; overflow: hidden">
+  <div style="padding: 36px 56px 0; display: flex; align-items: baseline; gap: 22px">
+    <div style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #B4532F; letter-spacing: 0.08em; text-transform: uppercase">Level 3.1 · Components</div>
+    <div style="font-family: 'Fraunces', Georgia, serif; font-size: 34px; font-weight: 700; line-height: 1">Planning the timeline: Stages 1 and 2</div>
+  </div>
+  <div style="padding: 8px 56px 0; font-size: 14px; color: #5C5850">The CPU-only half every mode shares: the full run, --prepare, --review and, through a four-call copy in authoring/chunks.py, the authoring skeleton.</div>
+  <svg viewBox="0 0 1800 1100" width="1800" height="1100" style="display: block" role="img" aria-label="Component diagram of Stages 1 and 2">
+    <defs>
+      <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#5C5850"></path></marker>
+    </defs>
+
+    <!-- input: config file -->
+    <g class="file">
+      <rect x="40" y="70" width="210" height="80" rx="8"></rect>
+      <text class="m" x="56" y="98">run.toml</text>
+      <text class="s" x="56" y="118">+ optional profile TOML</text>
+    </g>
+
+    <!-- panel: configuration -->
+    <g class="panel"><rect x="290" y="20" width="570" height="200" rx="12"></rect></g>
+    <text class="p" x="310" y="44">configuration</text>
+    <g class="chip">
+      <rect x="310" y="60" width="250" height="100" rx="8"></rect>
+      <text class="m" x="326" y="86">config.py</text>
+      <text class="s" x="326" y="108">load_config · RunConfig</text>
+      <text class="s" x="326" y="124">· validation</text>
+    </g>
+    <g class="chip">
+      <rect x="600" y="45" width="240" height="65" rx="8"></rect>
+      <text class="m" x="616" y="71">profiles.py</text>
+      <text class="s" x="616" y="91">house look, run config wins</text>
+    </g>
+    <g class="chip">
+      <rect x="600" y="125" width="240" height="65" rx="8"></rect>
+      <text class="m" x="616" y="151">timelines.py</text>
+      <text class="s" x="616" y="171">song + segment timelines</text>
+    </g>
+
+    <!-- panel: conductor -->
+    <g class="panel"><rect x="290" y="260" width="570" height="330" rx="12"></rect></g>
+    <text class="p" x="310" y="284">cli.py — the conductor</text>
+    <g class="chip">
+      <rect x="350" y="305" width="460" height="64" rx="8"></rect>
+      <text class="m" x="366" y="331">main()</text>
+      <text class="s" x="366" y="352">--prepare · --review · full run</text>
+    </g>
+    <g class="chip">
+      <rect x="350" y="399" width="460" height="64" rx="8"></rect>
+      <text class="m" x="366" y="425">_align_and_slice_timeline</text>
+      <text class="s" x="366" y="446">one call per timeline</text>
+    </g>
+    <g class="chip">
+      <rect x="350" y="493" width="460" height="64" rx="8"></rect>
+      <text class="m" x="366" y="519">prepare_shot_plan / prepare_timelines</text>
+      <text class="s" x="366" y="540">writes a skeleton per timeline, then the report</text>
+    </g>
+
+    <!-- panel: no-GPU outputs -->
+    <g class="panel"><rect x="290" y="620" width="570" height="160" rx="12"></rect></g>
+    <text class="p" x="340" y="644">no-GPU outputs</text>
+    <g class="chip">
+      <rect x="350" y="665" width="240" height="80" rx="8"></rect>
+      <text class="m" x="366" y="691">review.py</text>
+      <text class="s" x="366" y="712">static HTML + JSON</text>
+    </g>
+    <g class="chip">
+      <rect x="620" y="665" width="220" height="80" rx="8"></rect>
+      <text class="m" x="636" y="691">prepare_report.py</text>
+      <text class="s" x="636" y="712">prepare_report.json</text>
+    </g>
+
+    <!-- input: audio -->
+    <g class="file">
+      <rect x="1030" y="20" width="610" height="56" rx="8"></rect>
+      <text class="m" x="1048" y="53">master audio · lyrics file · optional vocal stem</text>
+    </g>
+
+    <!-- panel: stage 1 -->
+    <g class="panel"><rect x="920" y="110" width="840" height="285" rx="12"></rect></g>
+    <text class="p" x="940" y="134">Stage 1 — alignment</text>
+    <g class="chip">
+      <rect x="940" y="160" width="360" height="90" rx="8"></rect>
+      <text class="m" x="956" y="186">lyrics.py</text>
+      <text class="s" x="956" y="208">Name: Role tags, 3 grammar levels</text>
+    </g>
+    <g class="chip">
+      <rect x="1350" y="160" width="380" height="90" rx="8"></rect>
+      <text class="m" x="1366" y="186">alignment.py</text>
+      <text class="s" x="1366" y="208">stable-ts align(), never transcribe</text>
+    </g>
+    <g class="chip">
+      <rect x="940" y="290" width="360" height="75" rx="8"></rect>
+      <text class="m" x="956" y="316">diarization.py</text>
+      <text class="s" x="956" y="338">opt-in, reads the stem only</text>
+    </g>
+    <g class="chip">
+      <rect x="1350" y="290" width="380" height="75" rx="8"></rect>
+      <text class="m" x="1366" y="316">alignment_quality.py + voicing.py</text>
+      <text class="s" x="1366" y="338">timing, energy, voicing findings</text>
+    </g>
+
+    <!-- panel: stage 2 -->
+    <g class="panel"><rect x="920" y="430" width="840" height="315" rx="12"></rect></g>
+    <text class="p" x="940" y="454">Stage 2 — slicing and prompts</text>
+    <g class="chip">
+      <rect x="940" y="480" width="360" height="100" rx="8"></rect>
+      <text class="m" x="956" y="506">slicing.py</text>
+      <text class="s" x="956" y="528">window, frame grid, coverage,</text>
+      <text class="s" x="956" y="544">onset preference, overrun</text>
+    </g>
+    <g class="chip">
+      <rect x="1350" y="480" width="380" height="100" rx="8"></rect>
+      <text class="m" x="1366" y="506">stems.py</text>
+      <text class="s" x="1366" y="528">stem cut at the same spans</text>
+    </g>
+    <g class="chip">
+      <rect x="940" y="630" width="360" height="80" rx="8"></rect>
+      <text class="m" x="956" y="656">shot_plan.py</text>
+      <text class="s" x="956" y="678">load, resolve, lint</text>
+    </g>
+    <g class="chip">
+      <rect x="1350" y="630" width="380" height="80" rx="8"></rect>
+      <text class="m" x="1366" y="656">prompting.py</text>
+      <text class="s" x="1366" y="678">pure string composition</text>
+    </g>
+
+    <!-- input: shot plan -->
+    <g class="file">
+      <rect x="940" y="790" width="360" height="56" rx="8"></rect>
+      <text class="m" x="956" y="823">shot_plan.toml</text>
+    </g>
+
+    <!-- edges: configuration -->
+    <path class="edge" d="M250 110 H310"></path>
+    <path class="edge nm" d="M560 110 H580"></path>
+    <path class="edge nm" d="M580 77 V157"></path>
+    <path class="edge" d="M580 77 H600"></path>
+    <path class="edge" d="M580 157 H600"></path>
+    <path class="edge" d="M540 305 V160"></path>
+
+    <!-- edges: conductor -->
+    <path class="edge" d="M580 369 V399"></path>
+    <path class="edge" d="M700 493 V463"></path>
+    <path class="edge" d="M350 345 H330 V525 H350"></path>
+    <path class="edge d" d="M350 318 H312 V705 H350"></path>
+    <text class="e" x="284" y="520" text-anchor="end">lazy import, cycle</text>
+    <path class="edge d" d="M470 665 V557"></path>
+    <text class="e" x="480" y="610">lazy import</text>
+    <path class="edge" d="M725 557 V665"></path>
+
+    <!-- edges: trunk out of the conductor -->
+    <path class="edge nm" d="M810 431 H880"></path>
+    <path class="edge nm" d="M880 205 V670"></path>
+    <path class="edge" d="M880 205 H940"></path>
+    <path class="edge" d="M880 325 H940"></path>
+    <path class="edge" d="M880 530 H940"></path>
+    <path class="edge" d="M880 670 H940"></path>
+
+    <!-- edges: stage 1 -->
+    <path class="edge" d="M1120 76 V160"></path>
+    <path class="edge" d="M1540 76 V160"></path>
+    <path class="edge" d="M1300 205 H1350"></path>
+    <path class="edge" d="M1540 250 V290"></path>
+
+    <!-- edges: stage 2 -->
+    <path class="edge" d="M1120 630 V580"></path>
+    <path class="edge" d="M1300 670 H1350"></path>
+    <path class="edge" d="M1300 530 H1350"></path>
+    <path class="edge" d="M1120 790 V710"></path>
+
+    <!-- legend -->
+    <g class="chip"><rect x="40" y="330" width="44" height="22" rx="5"></rect></g>
+    <text class="s" x="94" y="346">Module</text>
+    <g class="file"><rect x="40" y="366" width="44" height="22" rx="5"></rect></g>
+    <text class="s" x="94" y="382">File or input</text>
+    <path class="edge d" d="M40 410 H84"></path>
+    <text class="s" x="94" y="414">Lazy import</text>
+    <path class="edge" d="M40 438 H84"></path>
+    <text class="s" x="94" y="442">Calls or reads</text>
+
+    <!-- edges not drawn -->
+    <g class="panel"><rect x="40" y="810" width="860" height="125" rx="12"></rect></g>
+    <text class="p" x="60" y="836">edges not drawn, and why</text>
+    <text class="s" x="60" y="862">• master audio, lyrics file and vocal stem: arrows go to lyrics.py and alignment.py. diarization.py reads the vocal stem only;</text>
+    <text class="s" x="60" y="878">  that arrow is left out because it would run through lyrics.py.</text>
+    <text class="s" x="60" y="902">• prepare_report.py persists what --prepare found (schema_version 1) for the monitor; review.py renders a read-only page</text>
+    <text class="s" x="60" y="918">  from the same Stages 1 and 2 run.</text>
+
+    <!-- fact cards -->
+    <g class="rule"><rect x="40" y="965" width="560" height="120" rx="10"></rect>
+      <text class="p" x="60" y="991" fill="#B4532F">import cycle</text>
+      <text class="t" x="60" y="1013">review.py and cli.py import each other, both lazily</text>
+      <text class="s" x="60" y="1035">review reuses cli.prepare_timeline and run_shot_plan_lints; cli.main</text>
+      <text class="s" x="60" y="1051">imports review inside the --review branch, so the cycle never forms at</text>
+      <text class="s" x="60" y="1067">import time.</text></g>
+    <g class="rule"><rect x="620" y="965" width="560" height="120" rx="10"></rect>
+      <text class="p" x="640" y="991" fill="#B4532F">asymmetry on purpose</text>
+      <text class="t" x="640" y="1013">--prepare reads only length_seconds from --from-plan</text>
+      <text class="s" x="640" y="1035">Never the config's own plan. --review does read the config's plan.</text>
+      <text class="s" x="640" y="1051">The asymmetry is documented in _align_and_slice_timeline and</text>
+      <text class="s" x="640" y="1067">preserved on purpose.</text></g>
+    <g class="rule"><rect x="1200" y="965" width="560" height="120" rx="10"></rect>
+      <text class="p" x="1220" y="991" fill="#B4532F">boundaries move</text>
+      <text class="t" x="1220" y="1013">Slicing moves boundaries relative to any older plan</text>
+      <text class="s" x="1220" y="1035">The onset preference and the tail fix re-cut chunks, so re-anchor an</text>
+      <text class="s" x="1220" y="1051">older plan with --prepare --from-plan; ShotPlanDriftError catches the</text>
+      <text class="s" x="1220" y="1067">case where it was not.</text></g>
+  </svg>
+  <div style="padding: 14px 56px 0; display: flex; gap: 18px; align-items: center; font-size: 12px; color: #5C5850; border-top: 1px solid #DDD7C9; margin: 0 56px">
+    <span>Presentation copy of <span style="font-family: 'IBM Plex Mono', monospace">docs/ARCHITECTURE.md</span>, §3.1. Drawn from music-video-pipeline 0.1.0 at ce2ffd5 on 2026-10-05.</span>
+    <span style="margin-left: auto; padding: 4px 10px; border-radius: 999px; background: #F8E9E1; color: #93412A; font-weight: 600">Expected drift: fast</span>
+    <span>a new module in Stages 1 or 2, or a changed import, makes this board stale; the Markdown wins</span>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1800,"height":1250}}'>
+class Component extends DCLogic {
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>

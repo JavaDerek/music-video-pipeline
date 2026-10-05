@@ -8,7 +8,10 @@ run of chunks without ever letting one chunk's failure kill the run:
   ``watchdog_timeout_seconds`` at construction time -- issue #9 already
   raises :class:`~music_video_maker.execution.WebSocketTimeoutError` when
   ``recv()`` doesn't hear from ComfyUI in time; this module treats that as
-  the watchdog firing. No sleep-polling anywhere in this module.
+  the watchdog firing. Execution tracking never sleep-polls; the one
+  bounded poll in this module is :meth:`ResilientRunner._release_and_wait`'s
+  free-VRAM read-back after a between-chunk ``POST /free``, through the
+  injectable :data:`Sleeper`, because nothing announces memory coming back.
 * **Recovery.** On a transient failure: ``POST /interrupt`` -> ``POST
   /free`` -> backoff (through an injectable :data:`Sleeper`, never a real
   ``time.sleep``) -> retry. A *transport* failure never reaches this path

@@ -32,10 +32,11 @@ jobs:
 
       - run: ruff check .
 
-      # Integration tests need a real ffmpeg/claude binary and are deselected
-      # here, not skipped silently -- see the `integration` marker registered
-      # in pyproject.toml. Both self-skip if run directly without their
-      # binary present, but deselecting keeps the CI run's intent explicit.
+      # Integration tests need a real ffmpeg/claude binary (or a real render on
+      # disk) and are deselected here, not skipped silently -- see the
+      # `integration` marker registered in pyproject.toml. Each self-skips if
+      # run directly without what it needs, but deselecting keeps the CI run's
+      # intent explicit. `pytest --collect-only -q -m integration` lists them.
       - run: pytest -m "not integration"
 
       # Issue #68: the stereo warp's 400 byte-for-byte equivalence cases need

@@ -20,22 +20,26 @@ pytest -m "not integration"
 ```
 
 **Tests run fully offline: no GPU, no network, no live ComfyUI, no real
-`stable-ts`/OpenCV/Telethon.** A mock ComfyUI harness (`tests/harness/`) fakes
+`stable-ts`/OpenCV/pyannote.** A mock ComfyUI harness (`tests/harness/`) fakes
 every HTTP/WebSocket call the orchestrator makes; forced alignment and face
 detection are exercised through injected fakes, never the real models. If a
 test you're adding needs something that isn't mocked, that's a sign the
 interface under test needs a seam, not that the test needs a real service.
 
-`-m "not integration"` deselects the two tests that *do* want a real binary
-(`ffmpeg`, the `claude` CLI) — both self-skip anyway if that binary is
-missing, but deselecting keeps CI's intent explicit. `pyproject.toml` enforces
+`-m "not integration"` deselects every test marked `integration` — the ones
+that *do* want a real binary (`ffmpeg`, the `claude` CLI) or a real render
+under `~/mvm-runs/`. Each self-skips anyway if what it needs is missing, but
+deselecting keeps CI's intent explicit. `pytest --collect-only -q -m
+integration` lists them without running any. `pyproject.toml` enforces
 80% branch coverage (`--cov-fail-under=80`); a PR that drops below it fails
 CI, not just review.
 
-CI (`.github/workflows/ci.yml`) runs exactly the two commands above, on the
-core install plus `[dev]` only, across Python 3.10–3.13 — deliberately the
-same as a fresh clone, so a green run there means a stranger can actually
-reproduce it.
+CI (`.github/workflows/ci.yml`) runs the two commands above on the core
+install plus `[dev]` only, across Python 3.10–3.13 — deliberately the same as
+a fresh clone, so a green run there means a stranger can actually reproduce
+it. Then, as a separate later step, it installs `[stereo]` (numpy) and runs
+`pytest tests/test_stereo.py -m "not integration" --no-cov`, so the core run
+has already proven nothing else silently needs that extra.
 
 ## Two invariants worth knowing before you touch the render path
 

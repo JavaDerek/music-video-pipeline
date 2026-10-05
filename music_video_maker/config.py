@@ -1043,65 +1043,40 @@ class RunConfig:
 
     min_free_vram_gb: float = 16.0
     """Issue #19 custody pre-flight: the absolute free-VRAM floor, in GB, a
-    run must clear before rendering starts.
+    run must clear before rendering starts. An absolute number, deliberately
+    mirroring ``min_free_disk_gb``.
 
     Set to **the lowest free-VRAM figure at which a render has ever
     demonstrably succeeded** -- ~16.4 GB, measured repeatedly on doris with
     the desktop session and other GPU services resident. Everything below that
     is untested; everything at or above it is proven. See
-    ``custody.DEFAULT_MIN_FREE_VRAM_GB`` for the full reasoning, including why
-    H3's 19995 MB staging figure is *not* the floor.
+    ``custody.DEFAULT_MIN_FREE_VRAM_GB`` (the same 16.0) for the full
+    reasoning.
 
-    This was 12.0 until 2026-08-07 -- below anything ever demonstrated -- and
-    it green-lit a run onto a contended card that then went silent rather than
-    raising CUDA OOM, wedging the host.
+    **H3's staging figures are not the floor.** ComfyUI's own load lines
+    report ``MiniMaxH3`` 19995 MB for the diffusion model, plus a 14956 MB
+    text encoder, a 4965 MB video VAE and a 576 MB audio VAE, loaded and
+    offloaded around each other rather than co-resident -- which is why the
+    blueprint's "~42.5 GB appetite" never materialized, and why renders
+    succeed at 16.4 GB free. (This field was once declared twice in this
+    class, and the second docstring called 19995 MB "a hard floor for any
+    run" beside this same 16.0 default; the default and the measured
+    successes both contradict that, so it was dropped when the duplicate
+    was.)
+
+    This number has been wrong in both directions. It began as a *fraction of
+    the profile's nominal VRAM* (90% of 24 GB = 21.6 GB) -- an assumption, and
+    too strict. It was then 12.0 until 2026-08-07 -- below anything ever
+    demonstrated -- and it green-lit a run onto a contended card that then
+    went silent rather than raising CUDA OOM, wedging the host.
 
     Note this is a *point-in-time* check. It cannot see another process
     claiming the card mid-run, which is exactly how that incident started:
-    doris shares one 4090 between four independent workloads. Confirm the card
-    is genuinely clear before a long run; stopping the one tenant you know
-    about is not the same as freeing the card."""
-
-    i2v_continuity: bool = False
-    """Issue #12: enable seed-and-feed I2V bridging between chunks."""
-
-    i2v_workflow_template: Path | None = None
-    """Issue #12: the separate I2V-path template used for every chunk after a
-    successful predecessor. Required when ``i2v_continuity`` is set -- the I2V
-    graph is a different node topology (``MiniMaxH3ImageToVideo``), not a
-    tweak of the reference-to-video one, so it is a second authored template
-    rather than a rewrite of the first."""
-
-    # -- Issue #19 GPU-custody seam. All optional with defaults. --- #
-
-    min_free_vram_gb: float = 16.0
-    """Issue #19 custody pre-flight: the absolute free-VRAM floor, in GB, a
-    run must clear before rendering starts. An absolute number, deliberately
-    mirroring ``min_free_disk_gb`` -- an earlier version used a *fraction of
-    the profile's nominal VRAM* (90% of 24 GB = 21.6 GB), which encoded an
-    assumption rather than a measurement.
-
-    **20 GB is what MiniMax H3 actually stages**, measured from ComfyUI's own
-    load lines: ``MiniMaxH3`` 19995 MB for the diffusion model alone, plus a
-    14956 MB text encoder, a 4965 MB video VAE and a 576 MB audio VAE. Those
-    are loaded and offloaded around each other rather than being co-resident,
-    which is why the blueprint's "~42.5 GB appetite" never materialized -- but
-    the diffusion model's own 19995 MB is a hard floor for any run.
-
-    This was 12.0 until 2026-08-07, chosen against an observed *working*
-    configuration (~16.4 GB free) rather than against what the model stages.
-    That was too low in the dangerous direction: it green-lit a run on a card
-    that could not hold the model, and rather than raising CUDA OOM the load
-    went **silent** mid-stage and wedged the host hard enough to need a power
-    cycle. A pre-flight that passes a run which cannot possibly fit is worse
-    than no pre-flight, because it converts a fast, legible failure into a
-    hung machine.
-
-    Note this is a *point-in-time* check. It cannot see another process
-    claiming the card mid-run, which is exactly how that incident started --
-    doris shares one 4090 between four independent workloads. Confirm the card
-    is genuinely clear before a long run; stopping the one tenant you know
-    about is not the same as freeing the card."""
+    doris then shared one 4090 between four independent workloads. Confirm the
+    card is genuinely clear before a long run; stopping the one tenant you know
+    about is not the same as freeing the card. (``ResilientRunner`` now
+    re-reads free VRAM between chunks as well; that is a second check, not a
+    reason to skip this one.)"""
 
     def real_likenesses(self) -> tuple[str, ...]:
         """Cast members whose reference photo depicts a real, identifiable

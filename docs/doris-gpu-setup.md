@@ -173,7 +173,8 @@ that actually matters: `GET /system_stats` happens *before* the first
 **Automating the pause/resume of another service was tried and removed.** A
 Telethon user-session integration lived here for months, enabled by default,
 and never ran once outside its own tests — every real render used the manual
-path. It is in the git history if it is ever wanted back.
+path. It was removed before this repository's git history begins, so it is
+not recoverable from that history; nothing in the tree uses Telegram now.
 
 What this does **not** do is free VRAM held by anything else on the card.
 A TTS service and the desktop session (Chrome, nautilus) hold GPU memory
