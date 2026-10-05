@@ -199,6 +199,105 @@ def test_an_entirely_empty_row_is_left_black(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# The warp's output, PINNED (issue #68's vectorisation)
+#
+# These digests were computed from the original pure-Python per-pixel loop
+# (commit 9e47e37's warp_eye) BEFORE anything was vectorised, and are the
+# proof that the rewrite changed no output: every case below must keep
+# producing these exact bytes whichever implementation warp_eye dispatches
+# to. Inputs come from stdlib `random` with fixed seeds (its Random.random /
+# randrange / uniform sequences are stable across Python versions), so the
+# cases need no numpy and run in CI, which installs none.
+#
+# Do NOT regenerate these to make a failing test pass. A changed digest means
+# the warp's output changed, which is exactly what they exist to catch.
+# --------------------------------------------------------------------------- #
+
+# name -> (seed, width, height, depth levels (0 = continuous), depth lo, depth
+# hi, convergence, max_disparity_fraction)
+_GOLDEN_CASES = {
+    # the shipped defaults on smooth depth, wide enough (240) to move +-1.8 px
+    "smooth": (1, 240, 4, 0, 0.0, 1.0, 0.5, 0.015),
+    # the largest ceiling StereoParams allows: long shifts, many collisions
+    "wide_disparity": (2, 64, 6, 0, 0.0, 1.0, 0.3, 0.1),
+    # four depth levels: exact z-buffer TIES, which the first writer keeps
+    "quantised_ties": (3, 41, 7, 4, 0.0, 1.0, 0.5, 0.1),
+    # values below 0, below -1 and above 1: the clamp, plus the unclamped
+    # z-buffer quirk (a pixel written at inv in (-1, 0) is still a "hole")
+    "out_of_range": (4, 29, 5, 0, -1.5, 2.0, 0.7, 0.08),
+    "convergence_far": (5, 50, 4, 0, 0.0, 1.0, 0.0, 0.05),
+    "convergence_near": (6, 50, 4, 0, 0.0, 1.0, 1.0, 0.05),
+    # shifts of exactly +-0.5 and +-1.0 px: round-half-to-even matters here
+    "half_pixel_rounding": (7, 40, 3, 5, 0.0, 1.0, 0.5, 0.05),
+}
+
+_GOLDEN_SHA256 = {
+    # (left eye, right eye)
+    "smooth": (
+        "3adc77a877cecf07f2dd23903eaba5f9930488b75384269ac40b313da1379bec",
+        "ec1f0c7f8a5f3f71f08b8799450f3a41e70cc38c16484a0d96e38885f0b85817",
+    ),
+    "wide_disparity": (
+        "f4439ecd955e79728e733132be5da1f41f25571233c5d9d10de7b57069ee463d",
+        "7971f9facf5aa4b4b1f1dbb16432edb733546e947e635b1a1c1f6ba3bd299007",
+    ),
+    "quantised_ties": (
+        "c76e0dee6359890cc872311aa2a64d6dbccb8219609d8fb190f4f116d0008fc5",
+        "b9ecdbae12656137ecf15b7d84aa80136158593cb900f3d01d3ab110306d4af2",
+    ),
+    "out_of_range": (
+        "d68407aa0b284927b09b6604d433201aa042af8a9143a7cc9fac4ab5c6125c52",
+        "5d19563a4e08139d749ed8c1a1ef85cb7b8157e81ecbd9fad3869ffd24493fad",
+    ),
+    "convergence_far": (
+        "19d53c73f5e1f6d83a778114197b39e5bd2e036702523a9602d75362074472de",
+        "41264fc5a84a64623f9e60d6949291486da9f5772b690f2a871b05f743426c87",
+    ),
+    "convergence_near": (
+        "2ebad6f674dd336eb86024dd12f5788911f21572df101078f33f8a521de922ce",
+        "63db3452c502022f07142dd968cd8f1cb99d2c1877ab070d1d5aba7ce3496a14",
+    ),
+    "half_pixel_rounding": (
+        "e093a24faa292d03497bea7d9a70f016118669f135b8840820897eddecb57f2e",
+        "46fe7fbb143147bd02d8b5a869ba6e2cdbc4a67dea000b6d4e1e3983ce7f580b",
+    ),
+}
+
+
+def _golden_case(name: str) -> tuple[stereo.Frame, stereo.DepthMap, stereo.StereoParams]:
+    import random
+
+    seed, width, height, levels, lo, hi, convergence, fraction = _GOLDEN_CASES[name]
+    rng = random.Random(seed)
+    pixels = bytes(rng.randrange(256) for _ in range(width * height * 3))
+    if levels:
+        values = [
+            lo + (hi - lo) * rng.randrange(levels) / (levels - 1) for _ in range(width * height)
+        ]
+    else:
+        values = [rng.uniform(lo, hi) for _ in range(width * height)]
+    return (
+        stereo.Frame(width=width, height=height, pixels=pixels),
+        stereo.DepthMap(width=width, height=height, values=values),
+        stereo.StereoParams(convergence=convergence, max_disparity_fraction=fraction),
+    )
+
+
+@pytest.mark.parametrize("name", sorted(_GOLDEN_CASES))
+def test_the_warp_output_is_pinned(name):
+    import hashlib
+
+    frame, depth, params = _golden_case(name)
+
+    left, right = stereo.stereo_pair(frame, depth, params=params)
+
+    assert (
+        hashlib.sha256(left.pixels).hexdigest(),
+        hashlib.sha256(right.pixels).hexdigest(),
+    ) == _GOLDEN_SHA256[name]
+
+
+# --------------------------------------------------------------------------- #
 # Output formats
 # --------------------------------------------------------------------------- #
 
