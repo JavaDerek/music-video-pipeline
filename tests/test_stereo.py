@@ -188,7 +188,11 @@ def test_a_row_with_no_holes_is_left_alone():
 
 def test_an_entirely_empty_row_is_left_black(monkeypatch):
     """The real out-of-frame case, forced: every pixel shifts past the right
-    edge, so the row receives nothing and the fill declines to invent."""
+    edge, so the row receives nothing and the fill declines to invent. Forced
+    through the reference loop, the only path that calls the scalar
+    ``half_disparity_pixels`` this patches; the vectorised path's version of
+    the same case is tested below with a depth nothing can land from."""
+    monkeypatch.setattr(stereo, "_numpy", lambda: None)
     monkeypatch.setattr(stereo, "half_disparity_pixels", lambda *a, **k: 1000.0)
     frame = _frame([[WHITE] * 5])
     depth = _depth([[1.0] * 5])
@@ -196,6 +200,255 @@ def test_an_entirely_empty_row_is_left_black(monkeypatch):
     left = stereo.warp_eye(frame, depth, eye="left", params=stereo.StereoParams())
 
     assert left.pixels == bytes(len(frame.pixels))
+
+
+# --------------------------------------------------------------------------- #
+# The warp's output, PINNED (issue #68's vectorisation)
+#
+# These digests were computed from the original pure-Python per-pixel loop
+# (commit 9e47e37's warp_eye) BEFORE anything was vectorised, and are the
+# proof that the rewrite changed no output: every case below must keep
+# producing these exact bytes whichever implementation warp_eye dispatches
+# to. Inputs come from stdlib `random` with fixed seeds (its Random.random /
+# randrange / uniform sequences are stable across Python versions), so the
+# cases need no numpy and run in CI, which installs none.
+#
+# Do NOT regenerate these to make a failing test pass. A changed digest means
+# the warp's output changed, which is exactly what they exist to catch.
+# --------------------------------------------------------------------------- #
+
+# name -> (seed, width, height, depth levels (0 = continuous), depth lo, depth
+# hi, convergence, max_disparity_fraction)
+_GOLDEN_CASES = {
+    # the shipped defaults on smooth depth, wide enough (240) to move +-1.8 px
+    "smooth": (1, 240, 4, 0, 0.0, 1.0, 0.5, 0.015),
+    # the largest ceiling StereoParams allows: long shifts, many collisions
+    "wide_disparity": (2, 64, 6, 0, 0.0, 1.0, 0.3, 0.1),
+    # four depth levels: exact z-buffer TIES, which the first writer keeps
+    "quantised_ties": (3, 41, 7, 4, 0.0, 1.0, 0.5, 0.1),
+    # values below 0, below -1 and above 1: the clamp, plus the unclamped
+    # z-buffer quirk (a pixel written at inv in (-1, 0) is still a "hole")
+    "out_of_range": (4, 29, 5, 0, -1.5, 2.0, 0.7, 0.08),
+    "convergence_far": (5, 50, 4, 0, 0.0, 1.0, 0.0, 0.05),
+    "convergence_near": (6, 50, 4, 0, 0.0, 1.0, 1.0, 0.05),
+    # shifts of exactly +-0.5 and +-1.0 px: round-half-to-even matters here
+    "half_pixel_rounding": (7, 40, 3, 5, 0.0, 1.0, 0.5, 0.05),
+}
+
+_GOLDEN_SHA256 = {
+    # (left eye, right eye)
+    "smooth": (
+        "3adc77a877cecf07f2dd23903eaba5f9930488b75384269ac40b313da1379bec",
+        "ec1f0c7f8a5f3f71f08b8799450f3a41e70cc38c16484a0d96e38885f0b85817",
+    ),
+    "wide_disparity": (
+        "f4439ecd955e79728e733132be5da1f41f25571233c5d9d10de7b57069ee463d",
+        "7971f9facf5aa4b4b1f1dbb16432edb733546e947e635b1a1c1f6ba3bd299007",
+    ),
+    "quantised_ties": (
+        "c76e0dee6359890cc872311aa2a64d6dbccb8219609d8fb190f4f116d0008fc5",
+        "b9ecdbae12656137ecf15b7d84aa80136158593cb900f3d01d3ab110306d4af2",
+    ),
+    "out_of_range": (
+        "d68407aa0b284927b09b6604d433201aa042af8a9143a7cc9fac4ab5c6125c52",
+        "5d19563a4e08139d749ed8c1a1ef85cb7b8157e81ecbd9fad3869ffd24493fad",
+    ),
+    "convergence_far": (
+        "19d53c73f5e1f6d83a778114197b39e5bd2e036702523a9602d75362074472de",
+        "41264fc5a84a64623f9e60d6949291486da9f5772b690f2a871b05f743426c87",
+    ),
+    "convergence_near": (
+        "2ebad6f674dd336eb86024dd12f5788911f21572df101078f33f8a521de922ce",
+        "63db3452c502022f07142dd968cd8f1cb99d2c1877ab070d1d5aba7ce3496a14",
+    ),
+    "half_pixel_rounding": (
+        "e093a24faa292d03497bea7d9a70f016118669f135b8840820897eddecb57f2e",
+        "46fe7fbb143147bd02d8b5a869ba6e2cdbc4a67dea000b6d4e1e3983ce7f580b",
+    ),
+}
+
+
+def _golden_case(name: str) -> tuple[stereo.Frame, stereo.DepthMap, stereo.StereoParams]:
+    import random
+
+    seed, width, height, levels, lo, hi, convergence, fraction = _GOLDEN_CASES[name]
+    rng = random.Random(seed)
+    pixels = bytes(rng.randrange(256) for _ in range(width * height * 3))
+    if levels:
+        values = [
+            lo + (hi - lo) * rng.randrange(levels) / (levels - 1) for _ in range(width * height)
+        ]
+    else:
+        values = [rng.uniform(lo, hi) for _ in range(width * height)]
+    return (
+        stereo.Frame(width=width, height=height, pixels=pixels),
+        stereo.DepthMap(width=width, height=height, values=values),
+        stereo.StereoParams(convergence=convergence, max_disparity_fraction=fraction),
+    )
+
+
+@pytest.mark.parametrize("name", sorted(_GOLDEN_CASES))
+def test_the_warp_output_is_pinned(name):
+    import hashlib
+
+    frame, depth, params = _golden_case(name)
+
+    left, right = stereo.stereo_pair(frame, depth, params=params)
+
+    assert (
+        hashlib.sha256(left.pixels).hexdigest(),
+        hashlib.sha256(right.pixels).hexdigest(),
+    ) == _GOLDEN_SHA256[name]
+
+
+@pytest.mark.parametrize("name", sorted(_GOLDEN_CASES))
+def test_the_reference_loop_still_produces_the_pinned_output(name, monkeypatch):
+    """The pure-Python loop is kept as the fallback and as the oracle the
+    vectorised path is proven against, so it is pinned on its own too --
+    forced here, whatever this environment has installed."""
+    import hashlib
+
+    monkeypatch.setattr(stereo, "_numpy", lambda: None)
+    frame, depth, params = _golden_case(name)
+
+    left, right = stereo.stereo_pair(frame, depth, params=params)
+
+    assert (
+        hashlib.sha256(left.pixels).hexdigest(),
+        hashlib.sha256(right.pixels).hexdigest(),
+    ) == _GOLDEN_SHA256[name]
+
+
+# --------------------------------------------------------------------------- #
+# The vectorised warp is the loop, byte for byte (needs numpy, which CI does
+# not install -- the pinned digests above are what CI checks instead)
+# --------------------------------------------------------------------------- #
+
+
+def _random_case(seed: int) -> tuple[stereo.Frame, stereo.DepthMap, stereo.StereoParams]:
+    import random
+
+    rng = random.Random(1000 + seed)
+    width = rng.randrange(1, 90)
+    height = rng.randrange(1, 6)
+    pixels = bytes(rng.randrange(256) for _ in range(width * height * 3))
+    style = seed % 4
+    if style == 0:  # continuous, in range
+        values = [rng.random() for _ in range(width * height)]
+    elif style == 1:  # few levels: exact ties everywhere
+        levels = rng.randrange(2, 5)
+        values = [rng.randrange(levels) / (levels - 1) for _ in range(width * height)]
+    elif style == 2:  # out of range both ways, incl. below -1 (never written)
+        values = [rng.uniform(-2.5, 2.5) for _ in range(width * height)]
+    else:  # gray16le-shaped, as external_depth_source produces
+        values = [rng.randrange(65536) / 65535.0 for _ in range(width * height)]
+    params = stereo.StereoParams(
+        convergence=rng.choice([0.0, 0.25, 0.5, 1.0, rng.random()]),
+        max_disparity_fraction=rng.choice([0.0, 0.015, 0.05, 0.1, rng.uniform(0.0, 0.1)]),
+    )
+    return (
+        stereo.Frame(width=width, height=height, pixels=pixels),
+        stereo.DepthMap(width=width, height=height, values=values),
+        params,
+    )
+
+
+@pytest.mark.parametrize("seed", range(200))
+@pytest.mark.parametrize("eye", ["left", "right"])
+def test_the_vectorised_warp_matches_the_reference_loop(seed, eye):
+    np = pytest.importorskip("numpy")
+    frame, depth, params = _random_case(seed)
+    direction = 1 if eye == "left" else -1
+
+    expected = stereo._warp_eye_reference(frame, depth, direction=direction, params=params)
+    actual = stereo._warp_eye_numpy(np, frame, depth, direction=direction, params=params)
+
+    assert actual.pixels == expected.pixels
+
+
+def test_a_rounding_tie_keeps_the_leftmost_source_on_both_paths(monkeypatch):
+    """Equal depth means equal shift, so two sources can only meet on one
+    destination through round-half-to-even: with a shift of exactly +0.5 px,
+    x=1 lands on round(1.5) = 2 and x=2 on round(2.5) = 2. The loop's strict
+    ``>`` keeps the FIRST (leftmost) of the tie; so must the fast path."""
+    width = 20
+    colours = [(x, 10 * x % 256, 255 - x) for x in range(width)]
+    frame = _frame([colours])
+    # (0.75 - 0.5) * 0.1 * 20 = +0.5 px for the left eye, everywhere
+    depth = _depth([[0.75] * width])
+    params = stereo.StereoParams(convergence=0.5, max_disparity_fraction=0.1)
+
+    monkeypatch.setattr(stereo, "_numpy", lambda: None)
+    loop = stereo.warp_eye(frame, depth, eye="left", params=params)
+    monkeypatch.undo()
+    fast = stereo.warp_eye(frame, depth, eye="left", params=params)
+
+    assert loop.pixels[2 * 3 : 3 * 3] == bytes(colours[1])
+    assert fast.pixels == loop.pixels
+
+
+def test_the_vectorised_warp_leaves_an_unreachable_row_black_like_the_loop():
+    """A row nothing lands on: every depth at or below the z-buffer's initial
+    -1.0 (exactly -1.0 included -- the loop's test is ``<=``), so no source
+    pixel is ever accepted. Both paths leave it black."""
+    np = pytest.importorskip("numpy")
+    frame = _frame([[WHITE] * 5, [WHITE] * 5, [WHITE] * 5])
+    depth = _depth([[-2.0] * 5, [-1.0] * 5, [0.5] * 5])
+    params = stereo.StereoParams()
+
+    expected = stereo._warp_eye_reference(frame, depth, direction=1, params=params)
+    actual = stereo._warp_eye_numpy(np, frame, depth, direction=1, params=params)
+
+    assert actual.pixels == expected.pixels
+    assert actual.pixels[:30] == bytes(30)
+
+
+def test_warp_eye_uses_the_vectorised_path_when_numpy_is_present(monkeypatch):
+    pytest.importorskip("numpy")
+    called = []
+    real = stereo._warp_eye_numpy
+    monkeypatch.setattr(
+        stereo, "_warp_eye_numpy", lambda *a, **k: called.append(1) or real(*a, **k)
+    )
+    frame, depth, params = _golden_case("quantised_ties")
+
+    stereo.warp_eye(frame, depth, eye="left", params=params)
+
+    assert called == [1]
+
+
+def test_warp_eye_falls_back_to_the_loop_without_numpy(monkeypatch):
+    monkeypatch.setattr(stereo, "_numpy", lambda: None)
+    monkeypatch.setattr(
+        stereo, "_warp_eye_numpy", lambda *a, **k: pytest.fail("numpy path taken")
+    )
+    frame, depth, params = _golden_case("quantised_ties")
+
+    left = stereo.warp_eye(frame, depth, eye="left", params=params)
+
+    assert left.pixels == stereo._warp_eye_reference(
+        frame, depth, direction=1, params=params
+    ).pixels
+
+
+def test_a_nan_depth_takes_the_loop_rather_than_a_different_answer(monkeypatch):
+    """The loop's handling of NaN is order-dependent (NaN never loses a
+    z-buffer comparison and is neither a hole nor filled), so the vectorised
+    path does not attempt to reproduce it: a map containing NaN goes through
+    the reference loop and gets the loop's answer, slowly."""
+    pytest.importorskip("numpy")
+    monkeypatch.setattr(
+        stereo, "_warp_eye_numpy", lambda *a, **k: pytest.fail("numpy path taken")
+    )
+    frame = _frame([[WHITE, BLACK, WHITE, BLACK]])
+    depth = _depth([[0.2, float("nan"), 0.9, 0.4]])
+    params = stereo.StereoParams(max_disparity_fraction=0.1)
+
+    left = stereo.warp_eye(frame, depth, eye="left", params=params)
+
+    assert left.pixels == stereo._warp_eye_reference(
+        frame, depth, direction=1, params=params
+    ).pixels
 
 
 # --------------------------------------------------------------------------- #
@@ -432,6 +685,28 @@ def test_the_external_depth_source_reads_gray16le_back_as_normalised_depth():
 
     assert list(depth.values) == pytest.approx([0.0, 1.0])
     assert (depth.width, depth.height) == (2, 1)
+
+
+def test_the_external_depth_source_decodes_every_sample_exactly(monkeypatch):
+    """Vectorised or not, each sample is ``int / 65535.0`` -- the same IEEE
+    division -- so the values are equal, not approximately equal."""
+    import random
+
+    rng = random.Random(68)
+    samples = [rng.randrange(65536) for _ in range(6 * 4)] + [0, 1, 32767, 32768, 65534, 65535]
+    payload = b"".join(s.to_bytes(2, "little") for s in samples)
+    frame = stereo.Frame(width=6, height=5, pixels=bytes(6 * 5 * 3))
+    expected = [s / 65535.0 for s in samples]
+
+    def runner(args, stdin):
+        return _completed(payload)
+
+    fast = stereo.external_depth_source(["depth"], runner=runner)(0, frame)
+    monkeypatch.setattr(stereo, "_numpy", lambda: None)
+    slow = stereo.external_depth_source(["depth"], runner=runner)(0, frame)
+
+    assert list(fast.values) == expected
+    assert list(slow.values) == expected
 
 
 def test_the_external_depth_source_refuses_a_short_reply():
