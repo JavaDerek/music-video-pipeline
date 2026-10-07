@@ -109,6 +109,17 @@ the length stays a VRAM decision, and the grid is paid in frames nobody
 watches. ``boundary_overrun`` is off by default -- it re-cuts every chunk in
 the song and has not been rendered here. See ``_overrun_timeline``.
 
+An opt-in replacement for pass 4's *placement* sits between the tiling and
+pass 6 (``phrase_aware_slicing``): **plan every boundary at once**. Passes
+1-4 decide boundaries one at a time by grid arithmetic, and #70 measured
+where that lands -- 24 of "Deathless"'s 79 boundaries inside a sung phrase,
+and a local preference that could never pay for a move because the chunk
+that must pay sits at the 124-frame floor. Choosing the whole tiling at once,
+over every grid-valid sequence of chunk lengths, lets the slack a move needs
+come from anywhere in the passage -- an instrumental gap seconds away --
+instead of only from the two chunks either side of the boundary. Passes 6
+and 7 then run on its result unchanged. See ``_plan_phrase_boundaries``.
+
 A cross-cutting fix, not a pass at all, because it moves no boundary (issue
 #92): a chunk can merge segments from two singers, and the pipeline picks a
 dominant one to attribute the chunk to but used to hand them the *whole*
@@ -138,6 +149,7 @@ would silently desync the whole video.
 
 from __future__ import annotations
 
+import bisect
 import dataclasses
 import logging
 import math
@@ -1417,7 +1429,7 @@ def _dominant_character_member(
 
 
 def _prompted_members(
-    members: tuple[AlignedSegment, ...], start: float, end: float
+    members: tuple[AlignedSegment, ...], start: float, end: float, *, quiet: bool = False
 ) -> tuple[AlignedSegment, ...]:
     """The members this chunk is actually prompted with (issue #92).
 
@@ -1445,13 +1457,17 @@ def _prompted_members(
     nothing, when that character contributes voiced overlap but no word
     whose midpoint lands in the window. When that happens this falls back to
     the full ``members`` tuple and logs a warning, rather than silently
-    prompting the chunk as instrumental.
+    prompting the chunk as instrumental. ``quiet`` takes the same fallback
+    without the warning, for :func:`_plan_phrase_boundaries`, which asks this
+    question of thousands of trial chunks that are never emitted.
     """
     if not members:
         return members
     dominant = _dominant_character_member(members, start, end)
     narrowed = tuple(m for m in members if m.character == dominant.character)
     if not _text_within(narrowed, start, end):
+        if quiet:
+            return members
         logger.warning(
             "Chunk span %.3f-%.3fs: narrowing its prompt to the dominant character %r left "
             "no prompted words (it contributes voiced overlap but no word whose midpoint "
@@ -2147,6 +2163,356 @@ def _prefer_vocal_onset(
 
 
 # --------------------------------------------------------------------------- #
+# Opt-in: phrase-aware boundary planning (keep a sung phrase in one chunk)
+# --------------------------------------------------------------------------- #
+
+# Costs, in tiers, dearest first. The order is the specification; the spacing
+# between tiers is wide enough that, on a real song (~10^2 boundaries, offsets
+# of a few seconds), no pile of cheaper events outweighs one dearer one.
+# Measured on "Deathless" (v16 alignment: segment 56 overridden to
+# 486.55-495.0 s, window 124-192 frames), the outcome falls on one of two
+# plateaus, and which one is a judgement the order below makes:
+#
+#   plan B (shipped): 5 fitting phrases cut, long phrases cut between words
+#     wherever any tiling allows (segment 29 never does), 6 voiced chunks
+#     opening >1 s before their first word (worst +2.30 s; default 7 / +2.65 s),
+#     and segment 26 -- one of the four a viewer reported -- among the 5.
+#   plan A: the same 5-cut minimum but all four reported phrases whole and #79
+#     at 4 / +1.93 s -- bought by cutting segment 56 0.53 s *into* the held
+#     word "deathless,". Reached by pricing a late second above a long
+#     phrase's in-word cut (_LATE_ONSET_COST_PER_SECOND >= 1e10).
+_PHRASE_CUT_COST = 1e12
+"""A boundary inside a phrase the chunk window could have held whole."""
+_LONG_IN_WORD_COST = 1e10
+"""A phrase longer than the window must be cut; cutting it inside a *word*
+instead of between two costs this. Above the late-onset tier on purpose: a
+forced cut should fall between words wherever any tiling allows it, which is
+the fallback this mode promises."""
+_LATE_ONSET_COST_PER_SECOND = 1e8
+"""Issue #79's defect itself, priced: every second a voiced chunk's first
+prompted word starts past ``LEADING_VOCAL_OFFSET_WARN_SECONDS`` into the
+chunk. Without this tier the plan trades #79 away for phrases -- on
+"Deathless" chunks over 1 s went 7 -> 9 and the worst +2.65 -> +5.16 s, with
+two of the reported phrases still cut. Swept 0 / 1e7 / 1e8 / 1e9 / 1e10 /
+3e10 / 1e11 / 1e12: 1e7-1e9 is plan B, 1e10-1e11 plan A, and at 1e12 the plan
+starts buying onset seconds with a sixth phrase cut. 1e8 is mid-plateau."""
+_IN_WORD_COST = 1e7
+"""Added to a cut inside a phrase that *fits* (already a phrase cut) when it
+also lands inside a word. Below the late-onset tier on purpose: stable-ts
+word timings abut, so "between two words" is a single instant the frame grid
+must hit to within half a frame, and pricing it above a late second (1e9)
+bought 5 -> 3 in-word cuts for #79 going back to 9 chunks over 1 s and a
+worst offset of +5.16 s, with the same number of phrase cuts."""
+_LONG_PHRASE_CUT_COST = 1e5
+"""A boundary inside a phrase longer than the window. Some cut there is
+forced; this makes each one beyond the forced minimum cost something."""
+_LOST_LYRIC_COST = 1e4
+"""A chunk holding sung words but voiced for under ``_MIN_VOICED_FRACTION``
+of its length, so it is prompted as instrumental and its words are never
+sung on screen."""
+_FRAGMENT_COST_PER_SECOND = 100.0
+"""Within a cut tier, prefer the cut that leaves the smaller fragment of the
+phrase on one side."""
+_ONSET_COST_PER_SECOND = 100.0
+"""Issue #79's objective as a tie-break below its warning line: a voiced chunk
+should open on its own first prompted word, because H3 starts the mouth at
+frame 0 regardless."""
+_NEAR_EDGE_COST = 10.0
+"""A boundary within half a frame of a phrase edge. Strictly inside the
+phrase -- the frame grid cannot land closer -- but by under 21 ms, which is
+inside the aligner's own precision."""
+_MOVED_BOUNDARY_COST = 5.0
+"""A boundary the default tiling did not have. A tie-break only: among equally
+good timelines, keep the one closest to what earlier renders and plans were
+built against."""
+_OVERSHOOT_COST_PER_FRAME = 1.0
+"""Frames rendered past the track's own end, which ``-shortest`` discards."""
+
+
+def _cut_detail(t: float, segment: AlignedSegment, half_frame: float) -> tuple[bool, str]:
+    """Whether ``t`` falls inside one of ``segment``'s words, and a phrase
+    naming where the cut falls, for the log. A boundary within half a frame of
+    a word's edge is at that edge: the grid cannot land any closer. A segment
+    with no word timings is one word, the same fallback ``_text_within`` uses.
+    """
+    words = segment.words
+    if not words:
+        return True, "inside a phrase with no word timings"
+    for word in words:
+        if word.start + half_frame < t < word.end - half_frame:
+            return True, f"inside the word {word.word.strip()!r}"
+    before = [w for w in words if w.end <= t + half_frame]
+    after = [w for w in words if w.start >= t - half_frame]
+    left = before[-1].word.strip() if before else ""
+    right = after[0].word.strip() if after else ""
+    return False, f"between {left!r} and {right!r}"
+
+
+def _plan_phrase_boundaries(
+    boundaries: list[tuple[float, int, bool]],
+    segments: tuple[AlignedSegment, ...],
+    track_duration: float,
+    *,
+    min_frames: int,
+    max_frames: int,
+    filler_max_frames: int,
+    grid: FrameGrid,
+) -> list[tuple[float, int, bool]]:
+    """Re-plan the whole tiling so that no sung phrase is cut in two when the
+    chunk window can hold it whole (opt-in, ``phrase_aware_slicing``).
+
+    **Why the default lands where it does.** Passes 1-3 size each voiced
+    chunk around its own segments and pass 4 lays them end to end with
+    grid-quantized filler between, so a boundary's position is the running
+    sum of every grid length before it. Nothing in that sum knows where the
+    *next* phrase starts: on "Deathless" 15 of the 24 mid-phrase cuts are
+    made by that accumulation alone (#70). And no local repair can fix it,
+    which is what #70 measured from the other side: a boundary can only move
+    by whole grid steps (every length is ``5 + 17k``, so every chunk moves a
+    boundary by a multiple of 17 frames relative to its index), clearing a
+    phrase head costs 4-6 of them, and the chunk that must pay sits at the
+    124-frame floor.
+
+    **What this does instead.** A shortest-path over integer frame positions
+    from 0 to the track's end, where each edge is one chunk of a grid-valid,
+    in-window length: ``min_frames``-``max_frames`` when the chunk overlaps
+    a phrase, up to ``filler_max_frames`` when it does not. That is exactly
+    the set of timelines pass 4 could ever have produced, searched whole, so
+    the slack a move needs can come from an instrumental gap seconds away,
+    and the phase between two boundaries can be changed by changing how many
+    chunks lie between them (5 is coprime with 17). Contiguity -- video
+    offset == audio offset for every chunk -- holds by construction, the same
+    way it does for pass 4: every boundary is a frame position, and every
+    chunk's length is the difference of two of them.
+
+    Cost tiers, dearest first (see the ``_*_COST`` constants): a cut in a
+    phrase that fits the window; a cut inside a word of a phrase too long for
+    any chunk; each second of issue #79's leading vocal offset beyond its 1 s
+    warning line; a cut inside a word of a phrase that fits; any cut in a
+    phrase too long for any chunk; a chunk whose words are demoted to
+    instrumental;
+    then tie-breaks -- the smaller phrase fragment, the leading offset below
+    the line, a boundary within half a frame of a phrase edge, a boundary the
+    default did not have, frames past the track's end. So a phrase longer
+    than the window is cut, but between words wherever any tiling allows it,
+    and #79's objective is carried inside the plan rather than left to
+    :func:`_prefer_vocal_onset` afterwards, which can only move one boundary
+    by whole grid steps and so cannot repair what a global plan trades away.
+
+    Measured on "Deathless" with the v16 alignment (57 segments, segment 56
+    overridden to 486.55-495.0 s, window 124-192 frames): mid-phrase
+    boundaries 25 -> 8, phrases that fit the window and are cut 21 -> 5,
+    voiced chunks opening more than 1 s before their first word 7 -> 6 (worst
+    +2.65 -> +2.30 s), 80 -> 75 chunks. Every one of the 5 is forced: a
+    shortest path over every grid-valid tiling finds none with fewer, and the
+    same search over *every integer* length (issue #100's edge set) still
+    finds 2 -- two phrases closer together than the 5.167 s floor. Which 5
+    is the tier order's call; the comment above the constants records the
+    alternative.
+
+    **What it cannot do.** The window is 5.167-8.0 s on "Deathless", and two
+    long phrases separated by less than the floor cannot both be held whole
+    by any tiling at all, grid or no grid. Every cut that survives is the
+    minimum any tiling makes, and each is named at WARNING. Issue #100's
+    overrun widens the edge set to every integer length and so may remove
+    more; it composes by running afterwards on this result, unchanged.
+
+    Returns the same ``(start, frames, is_continuation)`` shape pass 4 hands
+    on, with ``is_continuation`` set where a chunk starts inside a phrase.
+    """
+    fps = grid.fps
+    half_frame = 0.5 / fps
+    longest = max(max_frames, filler_max_frames)
+    lengths = [n for n in range(min_frames, longest + 1) if grid.is_valid(n)]
+    fit_seconds = grid.frames_to_seconds(max_frames)
+
+    default_edges = {0}
+    position = 0
+    for _start, frames, _cont in boundaries:
+        position += frames
+        default_edges.add(position)
+
+    track_frames = track_duration * fps
+    # The same tolerance pass 4's tail rule uses: under one frame of uncovered
+    # track is not representable in any video.
+    need = max(1, math.floor(track_frames - 1.0 + _EPS) + 1)
+    horizon = need + longest
+
+    starts = [s.start for s in segments]
+    ends = [s.end for s in segments]
+
+    def _overlapping(start: float, end: float) -> tuple[AlignedSegment, ...]:
+        lo = bisect.bisect_right(ends, start + _EPS)
+        hi = bisect.bisect_left(starts, end - _EPS)
+        return _segments_overlapping(segments[lo:hi], start, end)
+
+    def _containing(t: float) -> AlignedSegment | None:
+        index = bisect.bisect_right(starts, t) - 1
+        if index < 0:
+            return None
+        return _segment_containing(t, (segments[index],))
+
+    def _boundary_cost(frame: int) -> float:
+        cost = 0.0 if frame in default_edges else _MOVED_BOUNDARY_COST
+        t = frame / fps
+        segment = _containing(t)
+        if segment is None:
+            return cost
+        fragment = min(t - segment.start, segment.end - t)
+        if fragment <= half_frame:
+            return cost + _NEAR_EDGE_COST
+        in_word, _where = _cut_detail(t, segment, half_frame)
+        fits = segment.duration <= fit_seconds + _EPS
+        in_word_cost = _IN_WORD_COST if fits else _LONG_IN_WORD_COST
+        return (
+            cost
+            + (_PHRASE_CUT_COST if fits else _LONG_PHRASE_CUT_COST)
+            + (in_word_cost if in_word else 0.0)
+            + _FRAGMENT_COST_PER_SECOND * fragment
+        )
+
+    def _chunk_cost(frame: int, frames: int) -> float | None:
+        start, end = frame / fps, (frame + frames) / fps
+        members = _overlapping(start, end)
+        if not members:
+            return 0.0 if frames <= filler_max_frames else None
+        if frames > max_frames:
+            return None
+        voiced = _voiced_seconds_within(members, start, end)
+        if voiced < _MIN_VOICED_FRACTION * (end - start):
+            return _LOST_LYRIC_COST if _text_within(members, start, end) else 0.0
+        # A trial chunk is not a chunk: issue #92's fallback warning is for
+        # the timeline that renders, so it stays quiet here.
+        prompted = _prompted_members(members, start, end, quiet=True)
+        onset = _first_prompted_word_onset(prompted, start, end)
+        if onset is None:
+            return 0.0
+        offset = max(0.0, onset - start)
+        late = max(0.0, offset - LEADING_VOCAL_OFFSET_WARN_SECONDS)
+        return _ONSET_COST_PER_SECOND * offset + _LATE_ONSET_COST_PER_SECOND * late
+
+    boundary_cost = [0.0] + [_boundary_cost(f) for f in range(1, need)]
+    best = [math.inf] * (horizon + 1)
+    back = [-1] * (horizon + 1)
+    best[0] = 0.0
+    for frame in range(need):
+        if best[frame] == math.inf:
+            continue
+        for frames in lengths:
+            nxt = frame + frames
+            chunk = _chunk_cost(frame, frames)
+            if chunk is None:
+                continue
+            arrive = (
+                boundary_cost[nxt]
+                if nxt < need
+                else _OVERSHOOT_COST_PER_FRAME * max(0.0, nxt - track_frames)
+            )
+            total = best[frame] + chunk + arrive
+            if total < best[nxt]:
+                best[nxt] = total
+                back[nxt] = frame
+
+    end_frame = min(range(need, horizon + 1), key=lambda f: best[f])
+    edges = [end_frame]
+    while edges[-1] > 0:
+        edges.append(back[edges[-1]])
+    edges.reverse()
+    frames_list = [b - a for a, b in zip(edges[:-1], edges[1:], strict=True)]
+    planned_starts = _boundary_starts(frames_list, grid)
+    planned = [
+        (start, frames, _containing(start) is not None)
+        for start, frames in zip(planned_starts, frames_list, strict=True)
+    ]
+
+    _log_phrase_plan(edges, segments, fit_seconds, half_frame, grid, len(boundaries))
+    return planned
+
+
+def _log_phrase_plan(
+    edges: Sequence[int],
+    segments: tuple[AlignedSegment, ...],
+    fit_seconds: float,
+    half_frame: float,
+    grid: FrameGrid,
+    default_count: int,
+) -> None:
+    """Say what the phrase-aware plan achieved, phrase by phrase: every cut it
+    could not avoid at WARNING with where it falls, and one summary line."""
+    fps = grid.fps
+    interior = [frame / fps for frame in edges[1:-1]]
+    fitting = [s for s in segments if s.duration <= fit_seconds + _EPS]
+    whole = near = 0
+    for segment in segments:
+        inside = [t for t in interior if segment.start + _EPS < t < segment.end - _EPS]
+        material = [
+            t for t in inside if min(t - segment.start, segment.end - t) > half_frame
+        ]
+        fits = segment.duration <= fit_seconds + _EPS
+        if not inside:
+            whole += fits
+            continue
+        if not material:
+            near += fits
+            logger.info(
+                "Phrase-aware slicing: segment index=%d (%r) is split within half a frame "
+                "(%.0f ms) of its own edge -- the frame grid cannot land closer, and this is "
+                "inside the aligner's own precision.",
+                segment.index,
+                segment.text,
+                1000.0 * half_frame,
+            )
+            continue
+        for t in material:
+            _in_word, where = _cut_detail(t, segment, half_frame)
+            if fits:
+                logger.warning(
+                    "Phrase-aware slicing: segment index=%d (%r, %.3f-%.3fs, %.3fs) could not "
+                    "be held whole -- cut at %.3fs, %.3fs in, %s. It fits the %.3fs window on "
+                    "its own, but no tiling of in-window chunks on H3's %d+%dk grid holds "
+                    "every phrase around it whole; this is the fewest phrase cuts any tiling "
+                    "makes. boundary_overrun (issue #100) is the lever that can move it.",
+                    segment.index,
+                    segment.text,
+                    segment.start,
+                    segment.end,
+                    segment.duration,
+                    t,
+                    t - segment.start,
+                    where,
+                    fit_seconds,
+                    grid.base_frames,
+                    grid.step_frames,
+                )
+            else:
+                logger.warning(
+                    "Phrase-aware slicing: segment index=%d (%r, %.3f-%.3fs, %.3fs) is longer "
+                    "than the %.3fs window, so no chunk can hold it; cut at %.3fs, %.3fs in, "
+                    "%s (an inter-word gap wherever any tiling allows one).",
+                    segment.index,
+                    segment.text,
+                    segment.start,
+                    segment.end,
+                    segment.duration,
+                    fit_seconds,
+                    t,
+                    t - segment.start,
+                    where,
+                )
+    logger.info(
+        "Phrase-aware slicing: %d chunk(s) (the default tiling had %d); %d of %d phrases that "
+        "fit the %.3fs window held whole%s; %d phrase(s) longer than the window.",
+        len(edges) - 1,
+        default_count,
+        whole,
+        len(fitting),
+        fit_seconds,
+        f" and {near} more split within half a frame of their own edge" if near else "",
+        len(segments) - len(fitting),
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Pass 7 (opt-in): quantize the work, not the boundary (issue #100)
 # --------------------------------------------------------------------------- #
 
@@ -2341,6 +2707,7 @@ def _cover_instrumentals(
     shot_lengths: Sequence[ShotLength] = (),
     instrumental_shot_seconds: float | None = None,
     boundary_overrun: bool = False,
+    phrase_aware_slicing: bool = False,
 ) -> list[_Piece]:
     """Retile ``pieces`` into a contiguous covering of ``[0, track_duration]``.
 
@@ -2435,6 +2802,20 @@ def _cover_instrumentals(
         else:
             boundaries.append((running, min_frames, False))
             running += grid.frames_to_seconds(min_frames)
+
+    if phrase_aware_slicing:
+        # Replaces where pass 4 put the boundaries, never what a chunk is:
+        # everything after this line (#79, #100, the members/prompting
+        # derivation) runs on its result exactly as it runs on pass 4's.
+        boundaries = _plan_phrase_boundaries(
+            boundaries,
+            segments,
+            track_duration,
+            min_frames=min_frames,
+            max_frames=max_frames,
+            filler_max_frames=filler_max_frames,
+            grid=grid,
+        )
 
     if shot_lengths:
         boundaries, pinned_indices = _apply_shot_lengths(
@@ -2582,6 +2963,7 @@ def slice_audio(
     cover_instrumentals: bool = False,
     *,
     boundary_overrun: bool = False,
+    phrase_aware_slicing: bool = False,
     shot_lengths: Sequence[ShotLength] = (),
     instrumental_shot_seconds: float | None = None,
     instrumental_audio_gain_db: float | None = None,
@@ -2703,6 +3085,34 @@ def slice_audio(
         )
         boundary_overrun = False
 
+    if phrase_aware_slicing and not cover_instrumentals:
+        logger.warning(
+            "Ignoring phrase_aware_slicing: it plans boundaries across a contiguous "
+            "timeline, and instrumental_coverage is off, so this run only renders the "
+            "voiced spans and has no such timeline. Turn instrumental_coverage on "
+            "(it is the default, and Stage 5 silently desyncs without it)."
+        )
+        phrase_aware_slicing = False
+
+    if phrase_aware_slicing and shot_lengths:
+        # Both decide where boundaries fall, and a length request is anchored
+        # to a boundary of the timeline its author saw -- which this mode
+        # moves. Honouring one after the other would match anchors against
+        # the wrong timeline, silently; refusing is the honest answer until
+        # someone needs both and the anchor question is designed.
+        logger.error(
+            "phrase_aware_slicing cannot be combined with %d shot-plan length_seconds "
+            "request(s) (issue #27): both decide where chunk boundaries fall, and each "
+            "request is anchored to a boundary this mode moves.",
+            len(shot_lengths),
+        )
+        raise ValueError(
+            "phrase_aware_slicing cannot be combined with shot-plan length_seconds "
+            f"requests ({len(shot_lengths)} given): both decide where chunk boundaries "
+            "fall, and each request is anchored to a boundary this mode moves. Remove "
+            "the plan's length_seconds or turn phrase_aware_slicing off"
+        )
+
     eff_min, eff_max, grid = _effective_bounds(hardware)
     _log_effective_frame_window(eff_min, eff_max, grid)
 
@@ -2746,6 +3156,7 @@ def slice_audio(
             shot_lengths=shot_lengths,
             instrumental_shot_seconds=instrumental_shot_seconds,
             boundary_overrun=boundary_overrun,
+            phrase_aware_slicing=phrase_aware_slicing,
         )
 
     chunks_dir = Path(chunks_dir)

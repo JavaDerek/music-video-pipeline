@@ -798,3 +798,22 @@ def test_a_run_with_no_facts_hashes_exactly_as_before_the_field_existed(tmp_path
     check = stage_staleness(record, concept_input_hashes(config, chunks))
 
     assert check.stale is False
+
+
+def test_skeleton_slices_with_the_runs_phrase_aware_setting(tmp_path, monkeypatch):
+    """The skeleton a plan is authored against must be the timeline the render
+    emits: a run with ``phrase_aware_slicing`` on re-cuts boundaries, so the
+    authoring call site has to pass it through like ``boundary_overrun``."""
+    from music_video_maker.authoring import chunks as chunks_module
+
+    captured: dict = {}
+    real_slice = chunks_module.slice_audio
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return real_slice(*args, **kwargs)
+
+    monkeypatch.setattr(chunks_module, "slice_audio", spy)
+    config = replace(_config(tmp_path), phrase_aware_slicing=True)
+    load_chunk_skeleton(config)
+    assert captured.get("phrase_aware_slicing") is True
