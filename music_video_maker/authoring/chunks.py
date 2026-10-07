@@ -19,11 +19,12 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from pathlib import Path
 
 from music_video_maker import alignment_quality
 from music_video_maker.alignment import align
 from music_video_maker.config import RunConfig
-from music_video_maker.contracts import AudioChunk
+from music_video_maker.contracts import AlignmentResult, AudioChunk
 from music_video_maker.lyrics import parse_lyrics
 from music_video_maker.shot_plan import ShotLength
 from music_video_maker.slicing import slice_audio
@@ -41,6 +42,20 @@ def load_chunk_skeleton(
     align_model: object | None = None,
     shot_lengths: Sequence[ShotLength] = (),
 ) -> tuple[AudioChunk, ...]:
+    """Run Stages 1-2 and return the resulting chunk timeline -- see
+    :func:`load_alignment_and_skeleton`, which this is the chunks half of."""
+    return load_alignment_and_skeleton(
+        config, align_model=align_model, shot_lengths=shot_lengths
+    )[1]
+
+
+def load_alignment_and_skeleton(
+    config: RunConfig,
+    *,
+    align_model: object | None = None,
+    shot_lengths: Sequence[ShotLength] = (),
+    chunks_dir: Path | None = None,
+) -> tuple[AlignmentResult, tuple[AudioChunk, ...]]:
     """Run Stages 1-2 and return the resulting chunk timeline.
 
     Every authoring stage that needs to know the song's structure (span,
@@ -53,6 +68,12 @@ def load_chunk_skeleton(
     ``--prepare --from-plan`` this mirrors). Stage 2 calls this a second time
     with its own sheet's requests, then re-anchors onto the result -- see
     :mod:`~music_video_maker.authoring.reanchor`.
+
+    Also returns the alignment the chunks were cut from, for a caller that
+    needs word timings rather than chunk text (``authoring.replan``).
+    ``chunks_dir`` slices the stems somewhere other than the config's own
+    ``chunks_dir`` -- slicing always writes a WAV per chunk, and a tool that
+    only needs the timeline must not overwrite a render's stems to get it.
     """
     lines = parse_lyrics(config.lyrics_file, config.cast, config.default_lead_vocalist)
     # Issue #96/#92: the third align() call site, and the one CLAUDE.md warns
@@ -76,7 +97,7 @@ def load_chunk_skeleton(
         config.master_audio,
         alignment,
         config.hardware,
-        config.chunks_dir,
+        config.chunks_dir if chunks_dir is None else chunks_dir,
         cover_instrumentals=config.instrumental_coverage,
         # Issue #100, for the reason the alignment-model comment above gives:
         # this is the timeline a plan's anchors are authored against, so it
@@ -101,7 +122,7 @@ def load_chunk_skeleton(
             f"{config.lyrics_file} -- nothing to author against"
         )
     logger.info("Chunk skeleton loaded: %d chunk(s) available to author", len(chunks))
-    return chunks
+    return alignment, chunks
 
 
 def skeleton_table_text(chunks: Sequence[AudioChunk]) -> str:
