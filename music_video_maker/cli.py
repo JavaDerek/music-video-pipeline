@@ -869,6 +869,8 @@ def _align_and_slice_timeline(
         cover_instrumentals=config.instrumental_coverage,
         # Issue #100: opt-in, so every existing config slices byte-identically.
         boundary_overrun=config.boundary_overrun,
+        # Opt-in, so every existing config slices byte-identically.
+        phrase_aware_slicing=config.phrase_aware_slicing,
         shot_lengths=shot_lengths,
         instrumental_shot_seconds=config.instrumental_shot_seconds,
         instrumental_audio_gain_db=config.instrumental_audio_gain_db,

@@ -84,6 +84,9 @@ def load_chunk_skeleton(
         # grid-cut boundaries and rendered with boundary_overrun on describes
         # chunks that do not exist, which is ShotPlanDriftError's whole job.
         boundary_overrun=config.boundary_overrun,
+        # Same reason: a plan authored against the default tiling describes
+        # chunks a phrase-aware render never emits.
+        phrase_aware_slicing=config.phrase_aware_slicing,
         instrumental_shot_seconds=config.instrumental_shot_seconds,
         shot_lengths=shot_lengths,
         suspect_segment_indices=(

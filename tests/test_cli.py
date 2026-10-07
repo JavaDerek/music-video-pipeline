@@ -1310,6 +1310,26 @@ def test_run_pipeline_passes_shot_lengths_from_the_plan_into_slicing(
     assert requests[0].length_seconds == pytest.approx(10.0)
 
 
+def test_run_pipeline_passes_phrase_aware_slicing_into_slicing(tmp_path: Path, monkeypatch):
+    """Opt-in timeline flags only mean something if the render's own call site
+    hands them over -- the same seam #100's ``boundary_overrun`` crosses."""
+    rig = Rig(tmp_path)
+    rig.config = replace(rig.config, phrase_aware_slicing=True)
+
+    captured: dict = {}
+    real_slice = cli.slice_audio
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return real_slice(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "slice_audio", spy)
+    sequences = [build_success_sequence(rig.seed_success(n, n - 1)) for n in (1, 2, 3)]
+    rig.run(sequences)
+
+    assert captured.get("phrase_aware_slicing") is True
+
+
 # --------------------------------------------------------------------------- #
 # Two lints built and tested in isolation by an earlier pass but never wired
 # into run_pipeline's own plan/chunks -- "the render's own loaders" only

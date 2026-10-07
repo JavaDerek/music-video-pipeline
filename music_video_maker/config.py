@@ -35,6 +35,7 @@ against the *config file's* directory, not the process cwd)::
     render_height            = 480       # biggest lever on run time -- see RunConfig
     instrumental_coverage    = true      # render the unvoiced spans too
     boundary_overrun         = false     # issue #100; cut on content, render past it
+    phrase_aware_slicing     = false     # keep each sung phrase whole inside one chunk
     prompt_format            = "prose"   # issue #99; "structured" = H3's own grammar
     lyric_language           = "English" # issue #99; only read by "structured"
     silent_output            = false     # issue #22; no audio stream at all
@@ -957,6 +958,29 @@ class RunConfig:
 
     Requires ``instrumental_coverage`` (ignored, loudly, without it), and is
     refused alongside ``i2v_continuity`` -- see :func:`load_config`."""
+
+    phrase_aware_slicing: bool = False
+    """Choose every chunk boundary at once so that no sung phrase is cut in
+    two when the chunk window can hold it whole (see
+    ``slicing._plan_phrase_boundaries``).
+
+    The default tiling decides boundaries by grid arithmetic and lands 24 of
+    "Deathless"'s 79 boundaries inside a phrase (#70); a viewer sees the
+    singer restart mid-word across two independently rendered shots. This
+    plans the whole timeline over every grid-valid tiling instead, so a move
+    is paid for by slack anywhere in the passage, not only by the two chunks
+    either side of the boundary -- which is the budget #70's local preference
+    never had. A phrase longer than ``max_chunk_seconds`` is cut at an
+    inter-word gap and logged.
+
+    Off by default: it moves chunk starts across the song, so every existing
+    shot plan's anchors drift and must be carried over with
+    ``python -m music_video_maker.authoring.replan`` before a render. Requires
+    ``instrumental_coverage`` (ignored, loudly, without it); refused alongside
+    shot-plan ``length_seconds`` requests; composes with ``boundary_overrun``
+    (which then only has the cuts this could not avoid left to move) and with
+    issue #79's always-on onset preference (which can never re-introduce a
+    cut)."""
 
     i2v_continuity: bool = False
     """Issue #12: enable seed-and-feed I2V bridging between chunks."""
@@ -1990,6 +2014,7 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
     values["render_width"], values["render_height"] = _render_dimensions(merged)
     values["instrumental_coverage"] = _flag(merged, "instrumental_coverage", True)
     values["boundary_overrun"] = _flag(merged, "boundary_overrun", False)
+    values["phrase_aware_slicing"] = _flag(merged, "phrase_aware_slicing", False)
     values["silent_output"] = _flag(merged, "silent_output", False)
     values["duration_tolerance_seconds"] = _positive_number(
         merged, "duration_tolerance_seconds", DEFAULT_DURATION_TOLERANCE_SECONDS

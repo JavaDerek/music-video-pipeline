@@ -497,6 +497,24 @@ def test_boundary_overrun_is_refused_alongside_i2v_continuity(
 
 
 # --------------------------------------------------------------------------- #
+# Phrase-aware slicing (opt-in)
+# --------------------------------------------------------------------------- #
+
+
+def test_phrase_aware_slicing_defaults_off(tmp_path: Path) -> None:
+    """Off unless asked for: it re-cuts boundaries across the song, which moves
+    chunk starts and so invalidates every existing shot plan's anchors."""
+    _create_default_assets(tmp_path)
+    assert load_config(_write_config(tmp_path)).phrase_aware_slicing is False
+
+
+def test_phrase_aware_slicing_is_read(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    config_path = _write_config(tmp_path, extra_toml="phrase_aware_slicing = true")
+    assert load_config(config_path).phrase_aware_slicing is True
+
+
+# --------------------------------------------------------------------------- #
 # Cross-video continuity fields (#31, #32) and alignment strictness (#35).
 #
 # Each of these is a property that must hold across the WHOLE video but was
