@@ -110,6 +110,14 @@ _SECTION_HEADER_RES = (
 _BRACKETED_SECTION_RE = re.compile(rf"^{_SECTION}{_NUMBER}$", re.IGNORECASE)
 _DIRECTIVES_ISSUE_URL = "https://github.com/JavaDerek/music-video-pipeline/issues/106"
 
+DRAFT_HEADER_PREFIX = "#!"
+"""Marks a header line ``python -m music_video_maker.draft_lyrics`` writes
+(issue #105). Every line of the header carries it, and the parser refuses a
+file containing *any* such line: deleting them is the operator's explicit "I
+have reviewed this", and refusing on one leftover line means a half-deleted
+header can never turn into lyrics. A hash of the body would not work as the
+gate -- a careful operator who finds nothing to fix never changes it."""
+
 
 class LyricsError(Exception):
     """Raised when the lyrics source is malformed or references a character
@@ -266,6 +274,7 @@ def parse_lyrics_text(
         stripped = raw_line.strip()
         if not stripped:
             continue
+        _refuse_draft_header(stripped, line_number)
         _refuse_directive(stripped, line_number, cast)
         state.feed(stripped)
 
@@ -483,6 +492,21 @@ class _ParseState:
     def _fail(self, message: str) -> None:
         logger.error("Malformed lyrics file: %s", message)
         raise LyricsError(message)
+
+
+def _refuse_draft_header(stripped: str, line_number: int) -> None:
+    """Refuse an unreviewed ``--draft-lyrics`` draft (issue #105). ASR may
+    draft the lyrics file; its output never reaches Stage 1 directly."""
+    if not stripped.startswith(DRAFT_HEADER_PREFIX):
+        return
+    message = (
+        f"line {line_number}: this lyrics file is still an unreviewed --draft-lyrics draft "
+        f"(it has a {DRAFT_HEADER_PREFIX!r} header line). Listen through it against the "
+        "vocal stem, correct it -- its .report.txt lists where to listen -- then delete "
+        f"every line starting {DRAFT_HEADER_PREFIX!r}; that deletion is what accepts it"
+    )
+    logger.error("Malformed lyrics file: %s", message)
+    raise LyricsError(message)
 
 
 def _refuse_directive(stripped: str, line_number: int, cast: Mapping[str, CastMember]) -> None:

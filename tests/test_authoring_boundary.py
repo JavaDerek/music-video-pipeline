@@ -205,6 +205,25 @@ def test_nothing_in_the_package_imports_the_image_generator():
     )
 
 
+def test_nothing_in_the_package_imports_the_lyrics_drafter():
+    violations = []
+    for path in _python_files(PACKAGE_ROOT):
+        if path.name == "draft_lyrics.py":
+            continue
+        for name, lineno in _dotted_imports(path):
+            if name == "music_video_maker.draft_lyrics" or name.startswith(
+                "music_video_maker.draft_lyrics."
+            ):
+                violations.append(f"{path.relative_to(REPO_ROOT)}:{lineno} imports {name!r}")
+
+    assert not violations, (
+        "music_video_maker.draft_lyrics runs ASR (issue #105), so it must stay a leaf "
+        "nothing imports -- its output reaches Stage 1 only through a lyrics file a "
+        "person has reviewed. Something in the package importing it is the first step "
+        "of ASR text reaching Stage 1 without that person:\n  " + "\n  ".join(violations)
+    )
+
+
 def test_authoring_only_imports_the_allowed_render_side_modules():
     violations = []
     for path in _python_files(AUTHORING_ROOT):
