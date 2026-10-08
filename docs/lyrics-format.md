@@ -325,6 +325,31 @@ vocals; `expand_prompt()` (Stage 2b) also has a dedicated fallback clause for
 a chunk with no lyric text at all (an empty merged/split chunk), independent
 of whether the source line literally said "(instrumental)".
 
+## Repeat directives and section headers are refused (#106)
+
+The lyrics file is what was **sung**, in the order it was sung — not the
+published lyric sheet. Published lyrics abbreviate: `(repeat chorus)`,
+`Chorus x2`, `[Verse 2]`, or a third chorus that simply isn't written out.
+None of those words are sung, so none of them can be a correct line of the
+transcript, and the parser refuses them at config load, naming the line:
+
+| Refused | Why |
+|---|---|
+| `(repeat chorus)`, `(repeat)`, `Repeat chorus`, `(x2)`, `(2x)`, `Chorus x2`, a trailing `x3` / `(x3)` on a line | repeat directive |
+| `Chorus`, `Chorus:`, `Verse 2:`, `Intro:`, `(Chorus)`, `(Verse 1)` | section header |
+| `[Chorus]`, `[Verse 2]`, `[Bridge]` — unless a cast member has that name | section header (before #106 this was reported as an unknown character) |
+
+Write the repeated lines out once for every time they are sung, and delete
+the headers. What is **not** refused: the instrumental parentheticals above
+(`(guitar solo)`, `(long instrumental intro)`, `(Intro)`, `(Bridge)`),
+ordinary lyrics that start with or contain a section word (`Repeat after
+me`, `Bridge over troubled water`), and a section word in a tag's role slot
+(`[The Dead: chorus]` — only the name decides whether a tag is a header).
+
+A repeat that is missing *without* a directive — the sheet just doesn't
+write the third chorus — is invisible to a text check and is not caught
+here. It needs something that listens; that is #105's reconcile mode.
+
 ## Tags never reach forced alignment
 
 This is the load-bearing rule: **`LyricLine.text` is always tag-stripped**

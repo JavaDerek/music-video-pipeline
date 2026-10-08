@@ -79,6 +79,37 @@ _BLOCK_OPEN_KEYWORD = "simultaneously"
 _BLOCK_CLOSE_KEYWORD = "/simultaneously"
 _LEVEL3_ISSUE_URL = "https://github.com/JavaDerek/music-video-pipeline/issues/33"
 
+# Issue #106: published lyrics abbreviate what was sung -- "(repeat chorus)",
+# "Chorus x2", "[Verse 2]" -- and none of those words are ever sung, so none
+# can be a correct line of the one linear transcript forced alignment times
+# against. A parenthetical is otherwise ordinary line content (the documented
+# instrumental markers), so these patterns match only whole-line headers and
+# repeat/multiplier forms, never a section word inside a lyric.
+_SECTION = (
+    r"(?:pre-?\s?chorus|post-?\s?chorus|chorus|verse|refrain|hook|bridge|intro|outro"
+    r"|interlude|breakdown|middle\s+eight|coda)"
+)
+# The sections a parenthetical label means "sing this again" for. "(Intro)",
+# "(Bridge)" and "(Outro)" are left alone: they read as instrumental markers.
+_SUNG_SECTION = r"(?:pre-?\s?chorus|post-?\s?chorus|chorus|verse|refrain|hook)"
+_NUMBER = r"(?:\s*\d+)?"
+_MULTIPLIER = r"(?:[x×]\s*\d+|\d+\s*[x×])"
+_REPEAT_RES = (
+    re.compile(r"^\(.*\b(?:repeat|rpt)\b.*\)$", re.IGNORECASE),
+    re.compile(
+        rf"^(?:repeat|rpt)(?:\s+(?:{_SECTION}|{_MULTIPLIER}|\d+|all|again|twice))*\s*[:.]?$",
+        re.IGNORECASE,
+    ),
+    re.compile(rf"(?:^|\s)\(?\s*{_MULTIPLIER}\s*\)?$", re.IGNORECASE),
+    re.compile(r"\(\s*(?:twice|three\s+times)\s*\)$", re.IGNORECASE),
+)
+_SECTION_HEADER_RES = (
+    re.compile(rf"^{_SECTION}{_NUMBER}\s*(?::.*)?$", re.IGNORECASE),
+    re.compile(rf"^\(\s*{_SUNG_SECTION}{_NUMBER}\s*\)$", re.IGNORECASE),
+)
+_BRACKETED_SECTION_RE = re.compile(rf"^{_SECTION}{_NUMBER}$", re.IGNORECASE)
+_DIRECTIVES_ISSUE_URL = "https://github.com/JavaDerek/music-video-pipeline/issues/106"
+
 
 class LyricsError(Exception):
     """Raised when the lyrics source is malformed or references a character
@@ -231,10 +262,11 @@ def parse_lyrics_text(
     """
     state = _ParseState(cast=dict(cast), default_lead_vocalist=default_lead_vocalist)
 
-    for raw_line in text.splitlines():
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
         stripped = raw_line.strip()
         if not stripped:
             continue
+        _refuse_directive(stripped, line_number, cast)
         state.feed(stripped)
 
     state.finish()
@@ -451,6 +483,42 @@ class _ParseState:
     def _fail(self, message: str) -> None:
         logger.error("Malformed lyrics file: %s", message)
         raise LyricsError(message)
+
+
+def _refuse_directive(stripped: str, line_number: int, cast: Mapping[str, CastMember]) -> None:
+    """Refuse a repeat or section directive before it can reach the transcript (#106).
+
+    A bracketed line is a character tag first: ``[Hook]`` is refused only
+    when no cast member is called ``Hook``. Checked before the tag parser so a
+    ``[Chorus]`` header is reported as a header rather than as an unknown
+    character, which sent the operator to the wrong file.
+    """
+    tag = _TAG_RE.match(stripped)
+    if tag:
+        candidate = tag.group("name").strip()
+        if candidate in cast:
+            return
+        header_res: tuple[re.Pattern[str], ...] = (_BRACKETED_SECTION_RE,)
+    else:
+        candidate = stripped
+        header_res = _SECTION_HEADER_RES
+
+    if any(pattern.search(candidate) for pattern in _REPEAT_RES):
+        message = (
+            f"line {line_number}: {stripped!r} is a repeat directive, not sung words; "
+            "forced alignment would time it as lyrics. Write the repeated lines out "
+            f"as sung, once for every time they are sung (see {_DIRECTIVES_ISSUE_URL})"
+        )
+    elif any(pattern.search(candidate) for pattern in header_res):
+        message = (
+            f"line {line_number}: {stripped!r} is a section header, not sung words; "
+            "forced alignment would time it as lyrics. Delete it -- the lyrics file "
+            f"is only what is sung, in the order it is sung (see {_DIRECTIVES_ISSUE_URL})"
+        )
+    else:
+        return
+    logger.error("Malformed lyrics file: %s", message)
+    raise LyricsError(message)
 
 
 def _parse_names(name_field: str) -> tuple[str, ...]:
