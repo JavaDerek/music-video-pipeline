@@ -325,6 +325,21 @@ vocals; `expand_prompt()` (Stage 2b) also has a dedicated fallback clause for
 a chunk with no lyric text at all (an empty merged/split chunk), independent
 of whether the source line literally said "(instrumental)".
 
+## An unreviewed draft is refused (#105)
+
+`python -m music_video_maker.draft_lyrics --stem <vocals.wav>` writes a
+machine transcription of the vocal stem in this format, headed by lines
+starting `#!` (model, stem name and sha256, date, how to accept it). Any
+line starting `#!` anywhere in the file makes the parser refuse it, so a
+draft can't reach Stage 1 until someone has listened through it,
+corrected it and deleted **every** `#!` line. Refusing on any one line,
+not just the first, means a half-deleted header can never be read as
+lyrics. A hash of the body wouldn't work as the gate: a careful reviewer
+who finds nothing to fix never changes it. The sidecar
+`lyrics.draft.report.txt` lists where to listen (words removed for having
+no voice under them on the stem, and words whisper was unsure of) by
+timestamp and draft line.
+
 ## Repeat directives and section headers are refused (#106)
 
 The lyrics file is what was **sung**, in the order it was sung — not the

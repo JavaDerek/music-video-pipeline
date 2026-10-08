@@ -95,7 +95,7 @@ Python orchestrator that turns a master audio track + lyrics file + cast referen
 
 ## Non-negotiable invariants
 
-- **Lyrics are immutable truth.** Forced alignment only — never ASR transcription of the vocals.
+- **Lyrics are immutable truth.** Forced alignment only. ASR may *draft* the lyrics file for the operator to review (`python -m music_video_maker.draft_lyrics`, #105); its output never reaches Stage 1 directly. The parser refuses any file still carrying the draft's `#!` header, and nothing in the package imports the drafter (`tests/test_authoring_boundary.py`), so the only road from a transcript to Stage 1 is a file a person has reviewed.
 - **The master audio track is the only audio in the final video.** Generated audio is always discarded; sync comes from alignment timestamps, not generated sound.
 - **Never hardcode ComfyUI node IDs.** Locate nodes by `class_type` (plus title disambiguation) via graph introspection; user edits on the canvas renumber IDs.
 - **No sleep-polling.** Execution tracking is event-driven over the WebSocket; completion = `executing` message with `node == null` and matching `prompt_id`.

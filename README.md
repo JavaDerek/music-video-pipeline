@@ -202,7 +202,9 @@ front:
 
 - **Lyrics are immutable truth.** Stage 1 is forced alignment only — it never
   runs ASR/transcription of the vocals. The lyric text file is the ground
-  truth timestamps are fit *to*, not text the model is asked to guess.
+  truth timestamps are fit *to*, not text the model is asked to guess. ASR
+  may *draft* that file for you to correct (see the FAQ below); Stage 1
+  refuses the draft until you have reviewed it.
 - **The master audio track is the only audio in the final video.** Every
   chunk's own generated audio (even MiniMax H3's own audio VAE output) is
   discarded at assembly time; lip-sync comes entirely from the Stage 1
@@ -1167,6 +1169,26 @@ changes who writes `lyrics_file` and what the process that produces it is
 called. Accepting unverified ASR output directly into Stage 1 instead would
 remove the one property ("this text is ground truth") that makes alignment
 trustworthy at all, to save supplying one input file. See issue #57.
+
+**That supervised step now exists (#105), and the answer is still no.** It
+makes the file cheaper to write; it doesn't make it optional:
+
+```bash
+python -m music_video_maker.draft_lyrics --stem stems/htdemucs/master/vocals.wav
+# -> lyrics.draft.txt  and  lyrics.draft.report.txt
+```
+
+It transcribes the **isolated vocal stem** (never the mix; see
+[`docs/vocal-stem-workflow.md`](docs/vocal-stem-workflow.md)) with
+`medium` by default, independent of `alignment_model_size` (pooled over two
+songs, 26.9% word error rate against `large-v3`'s 34.9%; `large-v3` won one
+song and invented looping lines on the other, so try both). It drops any
+word with no voice under it on the stem, which is whisper's habit of filling
+silence, and lists those words plus the low-confidence ones, with
+timestamps, in the report. The draft opens with a `#!` header, and every
+run refuses a `lyrics_file` with a `#!` line in it. Listen through, correct
+it, then delete the header; that deletion is the review. Needs the
+`[align]` extra; no GPU render, no ComfyUI.
 
 ### Running a render
 
