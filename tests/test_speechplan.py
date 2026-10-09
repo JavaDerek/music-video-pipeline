@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import array
 import json
+import logging
 import math
 import wave
 from pathlib import Path
@@ -167,6 +168,7 @@ def test_cli_writes_all_three_files(tmp_path, caplog):
         json.dumps([{"text": "one", "audio": "c0.wav"}, {"text": "two", "audio": "c1.wav"}])
     )
     out = tmp_path / "out"
+    caplog.set_level(logging.INFO, logger="music_video_maker.speechplan")
     assert speechplan.main([str(lines), "--out-dir", str(out)]) == 0
     assert {p.name for p in out.iterdir()} == {"master.wav", "script.txt", "shot_plan.toml"}
     assert "1 chunks" in caplog.text

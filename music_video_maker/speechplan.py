@@ -1,5 +1,12 @@
 """Lay out synthesized speech so every chunk cut falls in silence.
 
+**Negative result (#107, 2026-10-08): a render laid out by this module was
+graded much WORSE for lip-sync than the same speech sliced ordinarily.** The
+structural targets below were met; they were the wrong targets. Likeliest
+cause: padding short lines to the 124-frame floor leaves 1.5-2 s of trailing
+silence, and the prompt's lyric drives the mouth on its own clock (#103). Do
+not use this for H3 lip-sync until that is understood.
+
 **General form: when the voice is synthesized one line at a time, the
 timeline is a choice, not a measurement.** A sung master is fixed: the
 vocalist breathed where they breathed, and slicing (issue #70) can only pick
