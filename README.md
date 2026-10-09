@@ -407,29 +407,25 @@ lip-sync **B+**. H3 does sync speech. What cost the grade was slicing, not the
 model — see the next section. Budget a segment as a whole second song: a
 four-minute prologue at ~6 s/chunk is ~40 chunks, ~6.5 min each at 1344×768.
 
-#### Synthesized speech: lay it out, don't slice it (`speechplan`)
+#### Synthesized speech: `speechplan` made lip-sync worse (negative result)
 
-A sung master is fixed; a text-to-speech master is assembled from one clip
-per line, so the timeline is a choice. `python -m music_video_maker.speechplan
-lines.json --out-dir D` makes it
-([#107](https://github.com/JavaDerek/music-video-pipeline/issues/107)):
-lines grouped greedily into chunks under `--max-frames`, every chunk starting
-on its first sample of speech and padded with silence to a grid-valid length,
-so **every cut falls in silence**. It writes `master.wav`, `script.txt` and a
-`shot_plan.toml` whose `length_seconds` pin those lengths; point a
-`[[segment]]`'s `audio`, `script` and `shot_plan` at them.
+`python -m music_video_maker.speechplan lines.json --out-dir D`
+([#107](https://github.com/JavaDerek/music-video-pipeline/issues/107)) lays a
+text-to-speech master out from one clip per line so that every chunk starts on
+its first sample of speech and every cut falls in silence, and writes a shot
+plan pinning those lengths. It does what it says -- on the monologue above,
+cuts inside a phrase fell from 14 of 21 to 3 of 20 (each <= 0.8 % in) and
+chunks starting > 1 s before their first word from 2 to 0 -- and **the viewer
+graded the lip-sync much worse** than the ordinarily sliced B+ render.
 
-```json
-[{"text": "It's two eleven.", "audio": "line_000.wav"},
- {"text": "The network did not blink.", "audio": "line_001.wav"}]
-```
-
-Measured on the monologue above: ordinary slicing put 14 of 21 cuts inside a
-phrase and started 2 chunks more than a second before their first word;
-laid out first, 0 chunks start more than a second early and the 3 remaining
-"mid-phrase" cuts are ≤ 0.8 % into a segment — the aligner's own slop. A line
-whose speech alone cannot fit in one chunk is refused by name: synthesize long
-sentences clause by clause, because only you know where the text divides.
+The likeliest reason is #103, not the cuts: to reach the 124-frame trained
+floor, short lines were padded with 1.5-2 s of trailing silence, and the lyric
+in the prompt drives the mouth on its own clock, so the mouth keeps going into
+silence. Ordinarily sliced chunks are full of speech and never ask that. The
+render also re-synthesized long sentences clause by clause, which changes the
+delivery. **Do not use it for H3 lip-sync** until #103 is understood; the
+structural metrics above are what it optimizes, and they were the wrong
+target.
 
 #### Properties that must hold across the whole video
 
