@@ -1186,6 +1186,15 @@ run refuses a `lyrics_file` with a `#!` line in it. Listen through, correct
 it, then delete the header; that deletion is the review. Needs the
 `[align]` extra; no GPU render, no ComfyUI.
 
+The draft also writes `lyrics.draft.words.json`, where each word was
+heard. Once your reviewed lyrics file exists, `transcript_file =
+"lyrics.draft.words.json"` in the run config makes it a second witness
+against forced alignment: the alignment quality report gains WARNING
+findings for a line placed far from where it was heard (#71's closing line
+12 s into the fadeout), singing no lyric line covers (an unwritten repeat
+chorus), and lyric lines nothing sang. It reads the transcript and never
+moves a timestamp.
+
 ### Running a render
 
 ```bash

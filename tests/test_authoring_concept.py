@@ -817,3 +817,28 @@ def test_skeleton_slices_with_the_runs_phrase_aware_setting(tmp_path, monkeypatc
     config = replace(_config(tmp_path), phrase_aware_slicing=True)
     load_chunk_skeleton(config)
     assert captured.get("phrase_aware_slicing") is True
+
+
+def test_skeleton_passes_the_configured_transcript(tmp_path, monkeypatch):
+    """#105 part 2: the third align() call site gets the witness too."""
+    from dataclasses import replace
+
+    from music_video_maker.authoring import chunks as chunks_mod
+
+    transcript = tmp_path / "words.json"
+    config = replace(
+        _config(tmp_path, lyrics_text="Walking through the empty halls tonight\n"),
+        transcript_file=transcript,
+    )
+    seen: dict = {}
+    real_align = chunks_mod.align
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        kwargs["transcript_file"] = None
+        return real_align(*args, **kwargs)
+
+    monkeypatch.setattr(chunks_mod, "align", spy)
+    load_chunk_skeleton(config, align_model=_FakeAlignModel())
+
+    assert seen["transcript_file"] == transcript

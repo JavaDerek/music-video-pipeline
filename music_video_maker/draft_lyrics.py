@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import array
 import hashlib
+import json
 import logging
 import math
 import re
@@ -114,6 +115,7 @@ class TranscribedWord:
 class DraftResult:
     draft_path: Path
     report_path: Path
+    words_path: Path
     lines: tuple[tuple[TranscribedWord, ...], ...]
     removed: tuple[TranscribedWord, ...]
     language: str | None
@@ -298,6 +300,7 @@ def write_draft(
             f"{out} already exists; it may hold corrections. Pass --force to overwrite it"
         )
     report_path = out.with_name(f"{out.stem}.report.txt")
+    words_path = out.with_name(f"{out.stem}.words.json")
     # Before the model runs: a transcription costs minutes, and an unwritable
     # destination discovered afterwards would throw all of them away.
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -309,8 +312,9 @@ def write_draft(
     transcribed, detected = transcribe(model, stem, language=language)
     lines, removed = screen_silent_words(transcribed, audio)
 
+    stem_sha256 = _sha256(stem)
     header = _header(
-        stem=stem, stem_sha256=_sha256(stem), model_size=model_size,
+        stem=stem, stem_sha256=stem_sha256, model_size=model_size,
         language=language or detected, requested_language=language,
         report_name=report_path.name,
     )
@@ -326,8 +330,35 @@ def write_draft(
         "Wrote %s: %d line(s); %d word(s) removed with no voice under them; report %s",
         out, len(lines), len(removed), report_path,
     )
+    # #105 part 2: the transcript with its timings, every word including the
+    # ones the voice gate removed (marked, never silently dropped), so a later
+    # check can read where each word was HEARD. Only voiced words are evidence.
+    removed_ids = {id(word) for word in removed}
+    words_path.write_text(
+        json.dumps(
+            {
+                "model": model_size,
+                "language": language or detected,
+                "stem": stem.name,
+                "stem_sha256": stem_sha256,
+                "words": [
+                    {
+                        "text": word.text,
+                        "start": word.start,
+                        "end": word.end,
+                        "probability": word.probability,
+                        "voiced": id(word) not in removed_ids,
+                    }
+                    for line in transcribed
+                    for word in line
+                ],
+            },
+            indent=1,
+        )
+        + "\n"
+    )
     return DraftResult(
-        draft_path=out, report_path=report_path,
+        draft_path=out, report_path=report_path, words_path=words_path,
         lines=tuple(tuple(line) for line in lines), removed=tuple(removed),
         language=language or detected,
     )

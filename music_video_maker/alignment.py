@@ -63,7 +63,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from music_video_maker import alignment_quality
+from music_video_maker import alignment_quality, transcript_witness
 from music_video_maker.contracts import (
     AlignedSegment,
     AlignmentOverride,
@@ -246,6 +246,7 @@ def align(
     counterpoint: Sequence[CounterpointStream] | None = None,
     overrides: Sequence[AlignmentOverride] = (),
     on_quality_report: Callable[[alignment_quality.AlignmentQualityReport], None] | None = None,
+    transcript_file: Path | str | None = None,
 ) -> AlignmentResult:
     """Force-align ``audio_file`` against tag-stripped ``lyric_lines``.
 
@@ -286,6 +287,11 @@ def align(
     (segment, severity, message), not the log lines :func:`log_report`
     already writes. ``None`` (the default) matches every call site that
     predates this and costs nothing.
+
+    ``transcript_file`` (issue #105 part 2) is a transcript of the vocal stem
+    that ``python -m music_video_maker.draft_lyrics`` wrote off the render
+    path (``*.words.json``). It is read, never produced, here: it adds the
+    quality report's ``transcript_*`` findings and changes no timestamp.
     """
     audio_path = Path(audio_file)
     streams = _resolve_counterpoint(lyric_lines, counterpoint)
@@ -416,6 +422,11 @@ def align(
         # here reasons about timing and text, and all of them passed the
         # phantom closing line "Deathless" placed 12s into the fadeout.
         audio_path=audio_path,
+        transcript=(
+            transcript_witness.load_transcript(transcript_file)
+            if transcript_file is not None
+            else None
+        ),
     )
     alignment_quality.log_report(quality_report, context=str(audio_path))
     if on_quality_report is not None:

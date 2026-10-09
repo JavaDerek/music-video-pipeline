@@ -92,6 +92,7 @@ def load_alignment_and_skeleton(
         model_size=config.alignment_model_size,
         strict_alignment=config.strict_alignment,
         overrides=config.alignment_overrides,
+        transcript_file=config.transcript_file,
     )
     chunks = slice_audio(
         config.master_audio,

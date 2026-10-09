@@ -2797,3 +2797,23 @@ def test_a_diarizer_that_cannot_load_its_weights_does_not_end_the_run(tmp_path: 
     assert report.dead_lettered == ()
     assert report.rendered == 3
     assert any("GATED" in r.getMessage() for r in caplog.records)
+
+
+def test_configured_transcript_file_reaches_align(tmp_path, monkeypatch):
+    """#105 part 2: the second witness is the song's, like the overrides."""
+    rig = Rig(tmp_path)
+    transcript = tmp_path / "words.json"
+    rig.config = replace(rig.config, transcript_file=transcript)
+
+    seen: dict[str, Any] = {}
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        kwargs["transcript_file"] = None  # the rig's transcript is not a real file
+        return real_align(*args, **kwargs)
+
+    real_align = cli.align
+    monkeypatch.setattr(cli, "align", spy)
+    rig.run([rig.seed_success(1, 0), rig.seed_success(2, 1), rig.seed_success(3, 2)])
+
+    assert seen["transcript_file"] == transcript

@@ -183,6 +183,20 @@ that holds the master::
 
 -- see :mod:`music_video_maker.calibrate_voicing` and
 ``docs/voicing-corpus.md`` for what to look at in its output.
+
+The transcript as a second witness (issue #105, part 2)
+--------------------------------------------------------
+Every check above assumes the lyrics file is right and asks whether the
+aligner placed it well. Given a transcript of the isolated vocal stem
+(``draft_lyrics``' ``*.words.json``, via ``transcript_file``), three more are
+possible; :mod:`music_video_maker.transcript_witness` makes the comparison and
+says why it is built the way it is. ``transcript_disagreement``: a segment
+placed far from where its words were heard, or -- for a line too short to
+match -- outside the heard span its neighbours allow. ``transcript_sung_not_written``
+and ``transcript_written_not_sung``: the lyrics file disagreeing with the
+singing. All WARNING: the transcript checks and reports, and never moves a
+timestamp. Measured against #42 and #71's documented misplacements, every one
+fires; see that module for what it cannot see.
 """
 
 from __future__ import annotations
@@ -198,7 +212,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
 
-from music_video_maker import voicing
+from music_video_maker import transcript_witness, voicing
 from music_video_maker.contracts import AlignedSegment, AlignmentResult
 
 logger = logging.getLogger(__name__)
@@ -765,6 +779,7 @@ def evaluate_alignment_quality(
     voicing_frame_level_drop_db: float = VOICING_FRAME_LEVEL_DROP_DB,
     voicing_min_measured_frames: int = VOICING_MIN_MEASURED_FRAMES,
     ffmpeg_runner: FfmpegRunner | None = None,
+    transcript: transcript_witness.Transcript | None = None,
 ) -> AlignmentQualityReport:
     """Pure function *by default*: no audio, no model, no I/O. Runs every
     check below over ``result.segments`` (plus the optional
@@ -856,6 +871,9 @@ def evaluate_alignment_quality(
             runner=ffmpeg_runner,
         )
     )
+
+    if transcript is not None:
+        findings.extend(_check_transcript(result, transcript))
 
     findings.sort(key=lambda f: (f.segment_index if f.segment_index is not None else -1, f.code))
     return AlignmentQualityReport(
@@ -1870,6 +1888,84 @@ def _check_vocal_energy(
 # --------------------------------------------------------------------------- #
 # Logging + optional refusal.
 # --------------------------------------------------------------------------- #
+
+
+def _check_transcript(
+    result: AlignmentResult, transcript: transcript_witness.Transcript
+) -> list[Finding]:
+    """Issue #105 part 2 -- see the module docstring's last section."""
+    comparison = transcript_witness.compare(result, transcript)
+    texts = {segment.index: segment.text for segment in result.segments}
+    ends = {segment.index: segment.end for segment in result.segments}
+    findings: list[Finding] = []
+    for d in comparison.disagreements:
+        text = texts[d.segment_index]
+        if d.basis == "matched":
+            detail = (
+                f"the vocal-stem transcript heard its words at {d.heard_start:.1f}s "
+                f"({d.offset:+.1f}s, median over {d.matched_words} matched word(s))"
+            )
+        else:
+            side = "after" if d.offset > 0 else "before"
+            detail = (
+                f"{side} the singing its neighbouring lines were heard in (bound "
+                f"{d.heard_start:.1f}s, {d.offset:+.1f}s); too few of its own words matched "
+                "the transcript to place it directly"
+            )
+        findings.append(
+            Finding(
+                segment_index=d.segment_index,
+                start=d.placed_start,
+                end=ends[d.segment_index],
+                severity=Severity.WARNING,
+                code="transcript_disagreement",
+                message=(
+                    f"segment {d.segment_index} {text!r} is placed at {d.placed_start:.1f}s, "
+                    f"but {detail}. The aligner's timing stands -- listen at both times "
+                    "(issue #105)"
+                ),
+            )
+        )
+    for passage in comparison.passages:
+        if passage.kind == "sung_not_written":
+            repeat = (
+                f" -- it repeats segment {passage.resembles_segment} "
+                f"{texts[passage.resembles_segment]!r}; if that is sung again here, write "
+                "the repeat out in the lyrics file"
+                if passage.resembles_segment is not None
+                else " -- an unwritten line, or the transcript mishearing at length"
+            )
+            findings.append(
+                Finding(
+                    segment_index=None,
+                    related_segment_index=passage.resembles_segment,
+                    start=passage.start,
+                    end=passage.end,
+                    severity=Severity.WARNING,
+                    code="transcript_sung_not_written",
+                    message=(
+                        f"{passage.start:.1f}s -> {passage.end:.1f}s: the vocal stem has "
+                        f"singing no lyric line covers: {passage.text!r}{repeat} (issue #105)"
+                    ),
+                )
+            )
+        else:
+            findings.append(
+                Finding(
+                    segment_index=passage.segment_indices[0] if passage.segment_indices else None,
+                    start=passage.start,
+                    end=passage.end,
+                    severity=Severity.WARNING,
+                    code="transcript_written_not_sung",
+                    message=(
+                        f"segment(s) {list(passage.segment_indices)} ({passage.text!r}) are in "
+                        "the lyrics file, but the transcript heard nothing in their place "
+                        "between the lines either side -- a line that is not sung, or two "
+                        "voices at once (a transcript hears one) (issue #105)"
+                    ),
+                )
+            )
+    return findings
 
 
 def format_summary(report: AlignmentQualityReport) -> str:
