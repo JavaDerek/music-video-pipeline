@@ -8,6 +8,7 @@ installed in this environment on purpose -- this file (and
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 import sys
@@ -886,3 +887,38 @@ def test_align_marks_counterpoint_segments_as_authored(tmp_path):
     assert isinstance(result, CounterpointAlignmentResult)
     assert result.concurrent_segments
     assert all(s.characters_authored for s in result.concurrent_segments)
+
+
+# --------------------------------------------------------------------------- #
+# Issue #105 part 2: a transcript of the vocal stem as a second witness.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_transcript_file_reaches_the_quality_report(tmp_path):
+    audio = write_silent_wav(tmp_path / "master.wav", seconds=40.0)
+    lines = parse_lyrics(LYRICS_PLAIN_PATH, CAST, DEFAULT_LEAD)[:1]
+    model = _fake_model(_raw_result(_segment("Walking through the empty halls tonight", 0.0, 6.5)))
+    heard = [
+        {"text": w, "start": 30.0 + i * 0.5, "end": 30.4 + i * 0.5, "probability": 0.9,
+         "voiced": True}
+        for i, w in enumerate(["walking", "through", "the", "empty", "halls", "tonight"])
+    ]
+    transcript = tmp_path / "lyrics.draft.words.json"
+    transcript.write_text(json.dumps({"model": "medium", "words": heard}))
+    reports = []
+
+    align(audio, lines, model=model, transcript_file=transcript, on_quality_report=reports.append)
+
+    codes = [f.code for f in reports[0].findings]
+    assert "transcript_disagreement" in codes
+
+
+def test_no_transcript_file_means_no_witness_findings(tmp_path):
+    audio = write_silent_wav(tmp_path / "master.wav", seconds=40.0)
+    lines = parse_lyrics(LYRICS_PLAIN_PATH, CAST, DEFAULT_LEAD)[:1]
+    model = _fake_model(_raw_result(_segment("Walking through the empty halls tonight", 0.0, 6.5)))
+    reports = []
+
+    align(audio, lines, model=model, on_quality_report=reports.append)
+
+    assert not [f for f in reports[0].findings if f.code.startswith("transcript_")]

@@ -111,6 +111,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import NoReturn
 from urllib.parse import urlparse
 
+from music_video_maker import transcript_witness
 from music_video_maker.assembly import DEFAULT_DURATION_TOLERANCE_SECONDS
 from music_video_maker.contracts import AlignmentOverride, CastMember, CastOrigin, HardwareProfile
 from music_video_maker.faces import (
@@ -272,6 +273,18 @@ class RunConfig:
     the render path (e.g. ``python -m demucs --two-stems=vocals``) and
     inspected before use -- never an inference call inside the pipeline.
     ``None`` means today's behaviour: condition on the mix."""
+
+    transcript_file: Path | None = None
+    """Issue #105 part 2: a transcript of this song's vocal stem, as
+    ``python -m music_video_maker.draft_lyrics`` writes it (``*.words.json``),
+    used as a second witness against forced alignment.
+
+    Read, never produced, by a run: it adds ``transcript_*`` WARNING findings
+    to the alignment quality report (a line placed far from where it was
+    heard; singing no lyric line covers; lyric lines nothing sang) and moves
+    no timestamp. Applies to the song's timeline only, like
+    ``alignment_overrides``. Refused at load if missing or unreadable.
+    ``None`` means no second witness, which is today's behaviour."""
 
     diarize: bool = False
     """Issue #101: detect which cast member is singing from the vocal stem.
@@ -2370,6 +2383,18 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
         values["vocal_stem"] = resolved_stem
     else:
         values["vocal_stem"] = None
+
+    transcript_file = merged.get("transcript_file")
+    if transcript_file:
+        resolved_transcript = _resolve_path(transcript_file, base_dir)
+        _validate_file("transcript_file", resolved_transcript)
+        try:
+            transcript_witness.load_transcript(resolved_transcript)
+        except transcript_witness.TranscriptError as exc:
+            raise ConfigError(f"transcript_file: {exc}") from exc
+        values["transcript_file"] = resolved_transcript
+    else:
+        values["transcript_file"] = None
 
     values["diarize"] = _flag(merged, "diarize", False)
     values["diarization_speakers"] = _build_diarization_speakers(merged, values["cast"])

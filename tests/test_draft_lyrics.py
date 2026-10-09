@@ -9,6 +9,7 @@ torch, no whisper weights, no ffmpeg.
 from __future__ import annotations
 
 import array
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -382,3 +383,31 @@ def test_main_writes_the_draft(stem, tmp_path, monkeypatch, caplog):
     assert code == 0
     assert "Count" in out.read_text()
     assert str(out) in caplog.text
+
+
+# -- the transcript, kept for the second witness (#105 part 2) ----------- #
+
+
+def test_the_word_timings_are_written_beside_the_draft(stem, tmp_path):
+    model = _FakeModel(
+        _Result(
+            _segments(
+                [(" Count", 1.0, 1.4, 0.9), (" the", 1.4, 1.6, 0.8)],
+                [(" phantom", 8.0, 8.5, 0.7)],
+            )
+        )
+    )
+    out = tmp_path / "lyrics.draft.txt"
+
+    result = _run(stem, out, model, _stem_audio(10.0, [(0.9, 1.7)]), model_size="medium")
+
+    assert result.words_path == tmp_path / "lyrics.draft.words.json"
+    payload = json.loads(result.words_path.read_text())
+    assert payload["model"] == "medium"
+    assert payload["stem"] == "vocals.wav"
+    assert len(payload["stem_sha256"]) == 64
+    assert payload["words"] == [
+        {"text": "Count", "start": 1.0, "end": 1.4, "probability": 0.9, "voiced": True},
+        {"text": "the", "start": 1.4, "end": 1.6, "probability": 0.8, "voiced": True},
+        {"text": "phantom", "start": 8.0, "end": 8.5, "probability": 0.7, "voiced": False},
+    ]

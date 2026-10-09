@@ -2880,3 +2880,45 @@ def test_runconfig_declares_no_field_twice() -> None:
         else:
             seen[name] = line
     assert not duplicates, "RunConfig declares these fields twice: " + ", ".join(duplicates)
+
+
+# --------------------------------------------------------------------------- #
+# Issue #105 part 2: the transcript as a second witness is opt-in, and a
+# transcript that cannot be read is refused at load, not after alignment.
+# --------------------------------------------------------------------------- #
+
+
+def _write_transcript(path: Path) -> None:
+    path.write_text(
+        '{"model": "medium", "words": [{"text": "a", "start": 1.0, "end": 1.2, '
+        '"probability": 0.9, "voiced": true}]}'
+    )
+
+
+def test_transcript_file_defaults_to_none(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    assert load_config(_write_config(tmp_path)).transcript_file is None
+
+
+def test_transcript_file_resolves_relative_to_the_config_dir(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    _write_transcript(tmp_path / "audio" / "lyrics.draft.words.json")
+    cfg = load_config(
+        _write_config(tmp_path, extra_toml='transcript_file = "audio/lyrics.draft.words.json"')
+    )
+    assert cfg.transcript_file == tmp_path / "audio" / "lyrics.draft.words.json"
+
+
+def test_missing_transcript_file_is_refused_at_load(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    path = _write_config(tmp_path, extra_toml='transcript_file = "audio/nope.json"')
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+def test_unreadable_transcript_file_is_refused_at_load(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    (tmp_path / "audio" / "words.json").write_text('{"words": "no"}')
+    path = _write_config(tmp_path, extra_toml='transcript_file = "audio/words.json"')
+    with pytest.raises(ConfigError, match="transcript_file"):
+        load_config(path)

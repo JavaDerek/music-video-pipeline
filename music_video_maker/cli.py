@@ -823,6 +823,9 @@ def _align_and_slice_timeline(
         strict_alignment=config.strict_alignment,
         overrides=config.alignment_overrides if timeline.is_song else (),
         on_quality_report=_capture,
+        # #105 part 2: a transcript of the song's stem says nothing about a
+        # prologue's audio, for the same reason the overrides do not apply.
+        transcript_file=config.transcript_file if timeline.is_song else None,
     )
     if not timeline.is_song and config.alignment_overrides:
         logger.info(
