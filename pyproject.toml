@@ -76,6 +76,7 @@ mvm-author = "music_video_maker.authoring.cli:main"
 # *configures* a run: run.toml stays the source of truth. See
 # music_video_maker/webui.py and control.py's module docstrings.
 mvm-webui = "music_video_maker.webui:main"
+mvm-syncscore = "music_video_maker.syncscore:main"
 
 [tool.setuptools.packages.find]
 include = ["music_video_maker*"]
