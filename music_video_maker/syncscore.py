@@ -15,8 +15,8 @@ subprocess, through an injected runner, so it needs nothing beyond the
 standard library to import or test.
 
 The decision rule -- flag when ``|AV offset| >= 3`` frames or confidence
-``< 3.0`` -- was calibrated on 19 hand-labelled close-up speech chunks (6 bad,
-13 good; it matched all 19). It is a rule for **one frontal face speaking**.
+``< 3.0`` -- was calibrated on 20 hand-labelled close-up speech chunks (6 bad,
+14 good; it matched all 20). It is a rule for **one frontal face speaking**.
 On sung, multi-performer, wide shots it is uncalibrated, and the report says
 which chunks had no usable face track rather than scoring them. See
 ``docs/syncscore.md`` for the calibration and the music-video caveats.

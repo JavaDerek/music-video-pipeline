@@ -59,13 +59,17 @@ the re-render reproduces the take.
 
 ### Close-up synthesized speech (one performer, frontal, 1344×768)
 
-19 chunks, each labelled in sync / out of sync by eye on the finished video,
+20 chunks, each labelled in sync / out of sync by eye on the finished video,
 scored against their own voice stems:
 
 | label | n | flagged by the rule |
 |---|---|---|
 | bad | 6 | 6 |
-| good | 13 | 0 |
+| good | 14 | 0 |
+
+One label was corrected after re-watching: the scorer passed a chunk the
+viewer had rejected, and on a second viewing it was fine. The instrument and
+the human disagreed once, and the human was wrong.
 
 One further chunk the viewer passed was flagged. On inspection it silently
 re-mouths its line in trailing silence (#103's symptom), so the flag is
