@@ -96,6 +96,11 @@ SUBPROCESS_ALLOWLIST = frozenset(
         # No model, and not in the render path at all: nothing imports it, it is
         # run by hand from its own terminal (`python -m ...`) beside a render.
         "vramsample.py",
+        # syncscore.py: ffmpeg mux + SyncNet (a lip-sync *model*, like stereo's
+        # depth estimator) over FINISHED chunk mp4s -- a measurement, outside the
+        # render path, moving no fingerprint. Its optional re-roll spawns this
+        # project's own CLI (`--reseed`), the control.py case, never a model call.
+        "syncscore.py",
     }
 )
 
