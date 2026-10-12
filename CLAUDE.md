@@ -174,6 +174,16 @@ committed ships, and check before adding, not before releasing.
   it at all. A fix scoped to the example helps one song in fifty and looks
   finished, which is the expensive kind of wrong. The example proves the bug;
   it does not define it.
+- **Generic tools here; the show's recipes elsewhere (2026-10-12).** A tool
+  that does one generic job belongs in this repo — `dome.py`'s projection,
+  conformance checks and stems, `castgen` as a mechanism. What a particular
+  show learned does not: which combination of layers and generators worked,
+  which model or settings won a comparison, a viewer's verdict on a dome
+  render, venue / festival / licence notes, and the approved text of a house
+  look. Those are kept in the maintainer's private notes until they say
+  otherwise, and the rule covers issues, comments and commit messages exactly
+  as it covers files. If a finding is a mix, commit the generic rule and leave
+  the recipe out.
 - **Authoring session state stays out too.** `.authoring/` (issue #54) —
   `session.json`, generated stage JSON, and especially `raw/` (full,
   unredacted model replies, which routinely include the whole lyrics file) —
