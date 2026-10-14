@@ -45,6 +45,16 @@ against the *config file's* directory, not the process cwd)::
     resume_ignore_prompt_changes = false # issue #34; --ignore-prompt-changes overrides
     resume_require_same_stack = false    # issue #95; re-render chunks from another ComfyUI/torch
 
+    # Which model makes the lip-synced pixels, and at what quality. See
+    # music_video_maker/lipsync.py. "minimax_api" is the default and the only
+    # backend a final render may use; "local_h3" (the open weights through
+    # ComfyUI) is locked behind h3_authorization_file; "local_draft" waits
+    # for a model to be chosen.
+    lipsync_backend          = "minimax_api"   # "minimax_api" | "local_draft" | "local_h3"
+    quality_tier             = "draft"         # "draft" (480P / local) | "final" (2K, API only)
+    h3_authorization_file    = "license/minimax_h3_authorization.pdf"  # unlocks local_h3
+    local_draft_model        = "<name>"        # required by local_draft once one is integrated
+
     strict_alignment         = false     # issue #35; --strict-alignment overrides
 
     # Issue #101, optional and off. Reads the vocal stem and fills
@@ -121,6 +131,7 @@ from music_video_maker.faces import (
     RECOGNITION_MODEL_SOURCE,
     resolve_recognition_model_path,
 )
+from music_video_maker.lipsync import LipSyncError, LipSyncSettings, validate_settings
 from music_video_maker.profiles import LOOK_FIELDS as PROFILE_LOOK_FIELDS
 from music_video_maker.profiles import Profile, ProfileError, load_profile, resolve_look
 from music_video_maker.timelines import Segment, TimelineError, build_segments
@@ -998,6 +1009,32 @@ class RunConfig:
     i2v_continuity: bool = False
     """Issue #12: enable seed-and-feed I2V bridging between chunks."""
 
+    lipsync_backend: str = "minimax_api"
+    """Which backend makes the lip-synced shots -- see ``lipsync.py``.
+    ``minimax_api`` (the hosted API; default, and the only backend a final
+    render may ship), ``local_draft`` (a free local model for iteration, not
+    yet integrated), or ``local_h3`` (the open weights through ComfyUI --
+    locked unless :attr:`h3_authorization_file` names a file that exists).
+    Validated at load, so a locked or unknown backend fails before any
+    alignment or GPU time; ``i2v_continuity`` is refused on the hosted
+    backend when the run starts, because its request shape is
+    reference-to-video only."""
+
+    quality_tier: str = "draft"
+    """``draft`` (MiniMax-H3-Max at 480P, or a local draft model) or
+    ``final`` (MiniMax-H3 at 2K, ``minimax_api`` only). Independent of the
+    backend; recorded on every shot's provenance record, and a final-grade
+    render, publish or package refuses draft-tier shots."""
+
+    h3_authorization_file: Path | None = None
+    """The written authorization MiniMax grants for running the H3 open
+    weights inside an Excluded Territory (https://platform.minimax.io/h3-license).
+    ``local_h3`` refuses to run unless this names a file that exists."""
+
+    local_draft_model: str | None = None
+    """Which local draft model ``local_draft`` drives. None are integrated
+    yet (``lipsync.LOCAL_DRAFT_MODELS``), so the backend currently refuses."""
+
     i2v_workflow_template: Path | None = None
     """Issue #12: the separate I2V-path template used for every chunk after a
     successful predecessor. Required when ``i2v_continuity`` is set -- the I2V
@@ -1847,7 +1884,32 @@ def _ensure_dir(field_name: str, path: Path) -> None:
         raise ConfigError(f"{field_name}: could not create directory {path} ({exc})") from exc
 
 
+def lipsync_settings(config: RunConfig) -> LipSyncSettings:
+    """The backend/tier decision this config makes, as ``lipsync.py`` reads it."""
+    return LipSyncSettings(
+        backend=config.lipsync_backend,
+        tier=config.quality_tier,
+        h3_authorization_file=config.h3_authorization_file,
+        local_draft_model=config.local_draft_model,
+    )
+
+
+def _validate_lipsync(config: RunConfig) -> None:
+    """The backend lock, at load: a locked ``local_h3``, an un-integrated
+    ``local_draft``, or a ``final`` tier on a local backend all fail here,
+    before Stage 1 runs. (Chained I2V on the hosted backend is refused where
+    the backend is built, in ``cli.run_pipeline`` -- still before any GPU or
+    API time, but after the config tests that exercise ``i2v_continuity``
+    against the ComfyUI graph have loaded.)"""
+    try:
+        validate_settings(lipsync_settings(config))
+    except LipSyncError as exc:
+        logger.error("lipsync backend refused at config load: %s", exc)
+        raise ConfigError(str(exc)) from exc
+
+
 def _validate(config: RunConfig) -> None:
+    _validate_lipsync(config)
     _validate_file("master_audio", config.master_audio)
     _validate_file("lyrics_file", config.lyrics_file)
 
@@ -2033,6 +2095,14 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
         merged, "duration_tolerance_seconds", DEFAULT_DURATION_TOLERANCE_SECONDS
     )
     values["i2v_continuity"] = _flag(merged, "i2v_continuity", False)
+    values["lipsync_backend"] = str(merged.get("lipsync_backend") or "minimax_api")
+    values["quality_tier"] = str(merged.get("quality_tier") or "draft")
+    auth_file = merged.get("h3_authorization_file")
+    values["h3_authorization_file"] = (
+        _resolve_path(auth_file, base_dir) if auth_file not in (None, "") else None
+    )
+    draft_model = merged.get("local_draft_model")
+    values["local_draft_model"] = str(draft_model) if draft_model not in (None, "") else None
     values["resume_ignore_prompt_changes"] = _flag(merged, "resume_ignore_prompt_changes", False)
     values["resume_require_same_stack"] = _flag(merged, "resume_require_same_stack", False)
     values["strict_alignment"] = _flag(merged, "strict_alignment", False)

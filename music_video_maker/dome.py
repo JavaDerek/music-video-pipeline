@@ -108,10 +108,24 @@ import logging
 import math
 import subprocess
 import sys
+import zipfile
 from array import array
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+from music_video_maker.provenance import (
+    PROVENANCE_FILENAME,
+    TIER_DRAFT,
+    TIER_FINAL,
+    TIERS,
+    FinalRenderGuardError,
+    Provenance,
+    assert_final_grade,
+    load_provenance,
+    merge_provenance,
+    save_provenance,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1040,6 +1054,99 @@ def verify_render(
 # --------------------------------------------------------------------------- #
 
 
+def guard_provenance(provenance: Sequence[Path | str] | Path | str | None, *, tier: str,
+                     what: str) -> Provenance | None:
+    """The one gate every final-grade step passes through (see
+    ``provenance.py``). ``tier`` is the step's own tier: a ``final`` step needs
+    a provenance file whose every shot is a final-tier shot from an
+    exhibitable backend; a ``draft`` step may run without one, but if one is
+    given its shots must still be exhibitable -- a draft is for iteration,
+    not for laundering a local shot into the pipeline."""
+    if tier not in TIERS:
+        raise ValueError(f"tier must be one of {TIERS}, got {tier!r}")
+    paths = ([] if provenance is None
+             else [provenance] if isinstance(provenance, (str, Path)) else list(provenance))
+    if not paths:
+        if tier == TIER_FINAL:
+            raise FinalRenderGuardError(
+                f"a final {what} needs --provenance (the shots' provenance.json, written by "
+                f"the lip-sync backend) so every shot can be proven to come from an "
+                f"exhibitable backend; none was given"
+            )
+        return None
+    merged = merge_provenance(paths) if len(paths) > 1 else load_provenance(paths[0])
+    assert_final_grade(merged, tier=tier)
+    logger.info("provenance: %d shot(s), all from exhibitable backends%s (%s)",
+                len(merged.shots), " at final tier" if tier == TIER_FINAL else "", what)
+    return merged
+
+
+PACKAGE_MEMBERS = (DISTRIBUTION_FILENAME, "preview_seat_view.mp4", "contact_sheet.png",
+                   VERIFICATION_FILENAME, MANIFEST_FILENAME)
+"""What a render directory contributes to a package, besides ``audio/``."""
+
+
+def package_render(out_dir: Path, zip_path: Path, *, provenance: Sequence[Path | str],
+                   tier: str = TIER_FINAL, folder_name: str | None = None,
+                   readme: Path | None = None, extras: Sequence[Path] = ()) -> Path:
+    """Build the deliverable ZIP from a verified render directory.
+
+    Refuses when the directory's conformance report is missing or failed, and
+    when the provenance guard refuses. Members are stored uncompressed (they
+    are already-compressed media) under one top-level folder: the
+    distribution copy, the six stems and the stereo reference, the seat
+    preview, the contact sheet, ``dome_verification.json``, the merged
+    ``provenance.json`` (rewritten beside it so the two ship together), the
+    readme, and any ``extras`` by their own basename.
+    """
+    out_dir = Path(out_dir)
+    zip_path = Path(zip_path)
+    report_path = out_dir / VERIFICATION_FILENAME
+    if not report_path.is_file():
+        raise FileNotFoundError(f"no {VERIFICATION_FILENAME} in {out_dir}: verify the render first")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if not report.get("ok"):
+        failed = [c.get("name") for c in report.get("checks", []) if not c.get("ok")]
+        raise FinalRenderGuardError(
+            f"refusing to package {out_dir}: dome_verification.json reports failed "
+            f"check(s) {failed}"
+        )
+    merged = guard_provenance(list(provenance), tier=tier, what="package")
+    assert merged is not None  # a package always has provenance
+    merged_path = out_dir / PROVENANCE_FILENAME
+    save_provenance(merged, merged_path)
+
+    members: list[tuple[Path, str]] = []
+    for name in PACKAGE_MEMBERS:
+        path = out_dir / name
+        if not path.is_file():
+            raise FileNotFoundError(f"package member missing from {out_dir}: {name}")
+        members.append((path, name))
+    audio_dir = out_dir / "audio"
+    stems = sorted(audio_dir.glob("*.wav")) if audio_dir.is_dir() else []
+    if len(stems) < len(SURROUND_CHANNELS):
+        raise FileNotFoundError(f"expected the stems in {audio_dir}, found {len(stems)} wav(s)")
+    members.extend((stem, f"audio/{stem.name}") for stem in stems)
+    members.append((merged_path, PROVENANCE_FILENAME))
+    if readme is not None:
+        members.append((Path(readme), Path(readme).name))
+    for extra in extras:
+        extra = Path(extra)
+        if not extra.is_file():
+            raise FileNotFoundError(f"extra package member not found: {extra}")
+        members.append((extra, extra.name))
+    folder = folder_name or zip_path.stem
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = zip_path.with_suffix(zip_path.suffix + ".part")
+    with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+        for path, arcname in members:
+            archive.write(path, f"{folder}/{arcname}")
+    tmp.replace(zip_path)
+    logger.info("packaged %d member(s) from %s into %s (%d bytes)", len(members), out_dir,
+                zip_path, zip_path.stat().st_size)
+    return zip_path
+
+
 @dataclass(frozen=True)
 class RenderResult:
     out_dir: Path
@@ -1129,13 +1236,22 @@ def render(
     sample_frames: int = 12,
     base: Path | None = None,
     foreground: Path | None = None,
+    provenance: Sequence[Path | str] | None = None,
+    tier: str = TIER_DRAFT,
 ) -> RenderResult:
     """Background, disc, master sequence, distribution copy, audio stems,
     verification, seat preview, contact sheet, manifest -- in that order.
     ``surround_offset_seconds`` is surround-file time minus stereo-master
-    time for the same musical moment (see the module docstring)."""
+    time for the same musical moment (see the module docstring).
+
+    ``tier`` is this render's own grade. A ``final`` render needs
+    ``provenance`` (the lip-sync backend's ``provenance.json``, one or more)
+    and refuses, before ffmpeg runs, if any shot in it came from a backend
+    that may not be exhibited or was made at draft tier; the merged record is
+    written beside the manifest so the package can carry it."""
     if retime not in RETIME_MODES:
         raise ValueError(f"retime must be one of {RETIME_MODES}, got {retime!r}")
+    merged_provenance = guard_provenance(provenance, tier=tier, what="render")
     surround_start = source_start + surround_offset_seconds
     if surround_start < 0:
         raise ValueError(
@@ -1147,6 +1263,8 @@ def render(
     audio_dir = out_dir / "audio"
     frames_dir.mkdir(parents=True, exist_ok=True)
     audio_dir.mkdir(parents=True, exist_ok=True)
+    if merged_provenance is not None:
+        save_provenance(merged_provenance, out_dir / PROVENANCE_FILENAME)
     commands: list[dict] = []
 
     def run(stage: str, args: list[str]) -> None:
@@ -1224,6 +1342,10 @@ def render(
         "credits": None if credits is None else {**asdict(credits), "image": str(credits_png)},
         "retime": retime, "frame_pattern": str(pattern), "distribution": str(distribution),
         "audio_dir": str(audio_dir), "verification": verification.to_dict(),
+        "tier": tier,
+        "provenance": (None if merged_provenance is None
+                       else {"file": str(out_dir / PROVENANCE_FILENAME),
+                             "shots": len(merged_provenance.shots)}),
         "commands": commands,
     }, indent=2), encoding="utf-8")
     return RenderResult(
@@ -1288,18 +1410,48 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--credits-elevation", type=float, default=35.0)
     r.add_argument("--threads", type=int, default=None)
     r.add_argument("--sample-frames", type=int, default=12)
+    _add_provenance_args(r)
 
     v = sub.add_parser("verify", help="re-run the conformance checks on an output directory")
     v.add_argument("--out-dir", type=Path, required=True)
     v.add_argument("--program-seconds", type=float, required=True)
     _add_spec_args(v)
     v.add_argument("--sample-frames", type=int, default=12)
+    _add_provenance_args(v)
+
+    k = sub.add_parser("package", help="zip a verified render directory as the deliverable")
+    k.add_argument("--out-dir", type=Path, required=True, help="a verified render directory")
+    k.add_argument("--zip", type=Path, required=True, help="the ZIP to write")
+    k.add_argument("--folder-name", default=None,
+                   help="top-level folder inside the ZIP (default: the ZIP's stem)")
+    k.add_argument("--readme", type=Path, default=None, help="a readme to ship at the top level")
+    k.add_argument("--extra", type=Path, action="append", default=[],
+                   help="another file to ship at the top level (repeatable)")
+    _add_provenance_args(k, default_tier=TIER_FINAL)
     return parser
+
+
+def _add_provenance_args(parser: argparse.ArgumentParser, *,
+                         default_tier: str = TIER_DRAFT) -> None:
+    parser.add_argument("--provenance", type=Path, action="append", default=[],
+                        help="a provenance.json written by the lip-sync backend (repeatable; "
+                             "several are merged). Required at --tier final")
+    parser.add_argument("--tier", choices=TIERS, default=default_tier,
+                        help="this step's grade: a final step refuses any shot not made at "
+                             "final tier by an exhibitable backend (default: %(default)s)")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     ns = build_parser().parse_args(argv)
+    if ns.command == "package":
+        try:
+            package_render(ns.out_dir, ns.zip, provenance=ns.provenance, tier=ns.tier,
+                           folder_name=ns.folder_name, readme=ns.readme, extras=ns.extra)
+        except (FinalRenderGuardError, FileNotFoundError) as exc:
+            logger.error("dome package refused: %s", exc)
+            return 1
+        return 0
     spec = _spec_from(ns)
     if ns.command == "verify":
         report = verify_render(
@@ -1310,6 +1462,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         for check in report.checks:
             logger.log(logging.INFO if check.ok else logging.ERROR, "dome check %s: %s -- %s",
                        check.name, "ok" if check.ok else "FAIL", check.detail)
+        try:
+            guard_provenance(ns.provenance, tier=ns.tier, what="verify")
+        except FinalRenderGuardError as exc:
+            logger.error("dome verify provenance: %s", exc)
+            return 1
         return 0 if report.ok else 1
 
     credits = None
@@ -1330,6 +1487,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             source_alpha=ns.source_alpha),
         credits_png=ns.credits, credits=credits, retime=ns.retime, threads=ns.threads,
         sample_frames=ns.sample_frames, base=ns.base, foreground=ns.foreground,
+        provenance=ns.provenance, tier=ns.tier,
     )
     logger.info("dome render %s: %s", "VERIFIED" if result.verification.ok else "FAILED checks",
                 result.manifest)

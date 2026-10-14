@@ -79,6 +79,14 @@ SUBPROCESS_ALLOWLIST = frozenset(
         # unconditional `POST /free` stay the CLI's own.
         "control.py",
         "dome.py",  # ffmpeg/ffprobe only: POST-render domemaster projection + checks -- no model
+        # lipsync.py: ffmpeg only -- pads a chunk's conditioning audio to the
+        # billed duration and conforms the hosted API's mp4 to the chunk's
+        # frame count. The hosted model is reached over HTTP through an
+        # injected session, never a shell; and it IS the render path's own
+        # generator (what makes the pixels), not a model call authoring would
+        # own -- the no-metered-API rule is about LLM calls deciding content,
+        # and lipsync.py decides nothing: it submits what prompting composed.
+        "lipsync.py",
         # stereo.py (issue #68): ffmpeg probe/decode/encode for a POST-render
         # stereo pass, plus an optional shell-out to a monocular depth model.
         # Listed with the reason spelled out because it is the first entry

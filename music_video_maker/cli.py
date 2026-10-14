@@ -44,10 +44,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import shutil
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from dataclasses import replace as dc_replace
 from datetime import date
@@ -67,7 +69,7 @@ from music_video_maker.assembly import (
     assemble_final_video,
     assemble_timelines,
 )
-from music_video_maker.config import ConfigError, RunConfig, load_config
+from music_video_maker.config import ConfigError, RunConfig, lipsync_settings, load_config
 from music_video_maker.continuity import ContinuityWorkflowProvider, planned_chain_source
 from music_video_maker.contracts import (
     AlignmentResult,
@@ -90,6 +92,12 @@ from music_video_maker.envelope import check_render_envelope, measured_ceiling
 from music_video_maker.execution import ComfyUIExecutionClient
 from music_video_maker.faces import build_seed_face_gate
 from music_video_maker.hardware import scan_workflow_for_missing_optimizations
+from music_video_maker.lipsync import (
+    OUTPUT_FPS,
+    build_minimax_backend,
+    confirm_spend,
+    estimate_cost,
+)
 from music_video_maker.logging_setup import configure_logging
 from music_video_maker.lyrics import parse_lyrics
 from music_video_maker.prepare_report import (
@@ -577,6 +585,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--yes",
+        action="store_true",
+        help=(
+            "Confirm a hosted-API spend over the confirmation threshold ($10, estimated "
+            "from the published per-second prices before anything is submitted). "
+            "Without it a run that would cost more is refused and the estimate is logged."
+        ),
+    )
+    parser.add_argument(
         "--from-plan",
         type=Path,
         default=None,
@@ -928,6 +945,7 @@ def _render_one_timeline(
     disk_usage: DiskUsage,
     seed_face_gate: Callable[[Path, Path], bool] | None,
     render_stack: RenderStack,
+    uses_comfyui: bool = True,
 ) -> RunState:
     """Stages 2b-4 for one timeline: prompts, staging, and the resilient
     render (issue #66).
@@ -1065,10 +1083,11 @@ def _render_one_timeline(
         execution_client,
         sleeper=sleeper,
         disk_usage=disk_usage,
-        vram_probe=build_vram_probe(session, config.comfyui_url),
+        # No card to probe or release on a hosted backend.
+        vram_probe=build_vram_probe(session, config.comfyui_url) if uses_comfyui else None,
         vram_releaser=(
             build_vram_releaser(session, config.comfyui_url)
-            if config.release_vram_between_chunks
+            if uses_comfyui and config.release_vram_between_chunks
             else None
         ),
     )
@@ -1140,13 +1159,16 @@ def _render_one_timeline(
     # means 1344x768 here, not "no resolution". No GPU work has happened at
     # this point -- staging is an upload.
     template_width, template_height = read_render_dimensions(base_template)
-    check_render_envelope(
-        [chunk for chunk in chunks if chunk.chunk_id in set(render_ids)],
-        hardware_name=config.hardware.name,
-        width=config.render_width if config.render_width is not None else template_width,
-        height=config.render_height if config.render_height is not None else template_height,
-        acknowledged=config.acknowledge_unproven_envelope,
-    )
+    if uses_comfyui:
+        # A hosted backend has no card to wedge, so the envelope is not its
+        # concern; the local path keeps the refusal exactly as it was.
+        check_render_envelope(
+            [chunk for chunk in chunks if chunk.chunk_id in set(render_ids)],
+            hardware_name=config.hardware.name,
+            width=config.render_width if config.render_width is not None else template_width,
+            height=config.render_height if config.render_height is not None else template_height,
+            acknowledged=config.acknowledge_unproven_envelope,
+        )
 
     return runner.render_run(
         render_ids,
@@ -1202,6 +1224,8 @@ def run_pipeline(
     reseed_generation: int = DEFAULT_RESEED_GENERATION,
     seed_face_gate: Callable[[Path, Path], bool] | None = None,
     flag_timeline: str | None = None,
+    yes: bool = False,
+    lipsync_session: Any = None,
 ) -> RunReport:
     """Run Stages 1-5 end-to-end against an already-loaded, validated config.
 
@@ -1245,7 +1269,17 @@ def run_pipeline(
     """
     start = clock()
     session = comfyui_session if comfyui_session is not None else requests.Session()
-    custody = build_custody_manager(config, session=session)
+    # Which backend makes the pixels (lipsync.py). The hosted API has no card
+    # to take custody of, no VRAM to probe and no render stack to read; the
+    # ComfyUI path keeps every seam it always had.
+    lipsync = lipsync_settings(config)
+    hosted = not lipsync.uses_comfyui
+    if hosted and config.i2v_continuity:
+        raise PipelineError(
+            f"i2v_continuity needs the ComfyUI graph and is not available on "
+            f"lipsync_backend = {config.lipsync_backend!r}; set it false or use local_h3"
+        )
+    custody = nullcontext() if hosted else build_custody_manager(config, session=session)
 
     # Issue #55: record the resolved house style verbatim beside this run's
     # outputs, before any GPU time is spent. prompt_hash proves that a look
@@ -1329,18 +1363,39 @@ def run_pipeline(
         # which a resumed run compares at the end rather than per chunk.
         # Best-effort by construction: an unreadable answer is recorded as
         # unknown and never as agreement.
-        render_stack = read_render_stack(session, config.comfyui_url)
-        if render_stack.known:
-            logger.info(
-                "Render stack for this run: comfyui %s / torch %s (issue #95)",
-                render_stack.comfyui_version or "unknown",
-                render_stack.torch_version or "unknown",
+        if hosted:
+            backend = build_minimax_backend(
+                lipsync, session=lipsync_session, sleeper=sleeper, clock=clock,
+                **({"runner": ffmpeg_runner} if ffmpeg_runner is not None else {}),
             )
+            # The stack tier of the fingerprint names the hosted model and
+            # resolution, so a resumed run can tell a hosted chunk from a
+            # local one and from a different tier.
+            render_stack = RenderStack(comfyui_version=backend.stack_label, torch_version=None)
+            stager = backend.stager
+            execution_client = backend.execution_client
+            logger.info(
+                "Lip-sync backend for this run: %s (%s at %s, tier %s)",
+                lipsync.backend, lipsync.minimax_model, lipsync.minimax_resolution,
+                lipsync.tier,
+            )
+        else:
+            render_stack = read_render_stack(session, config.comfyui_url)
+            if render_stack.known:
+                logger.info(
+                    "Render stack for this run: comfyui %s / torch %s (issue #95)",
+                    render_stack.comfyui_version or "unknown",
+                    render_stack.torch_version or "unknown",
+                )
 
-        stager = ComfyUIAssetStager(base_url=config.comfyui_url, session=session)
-        execution_client = ComfyUIExecutionClient(
-            base_url=config.comfyui_url, session=session, ws_factory=ws_factory
-        )
+            stager = ComfyUIAssetStager(base_url=config.comfyui_url, session=session)
+            execution_client = ComfyUIExecutionClient(
+                base_url=config.comfyui_url, session=session, ws_factory=ws_factory
+            )
+            logger.info(
+                "Lip-sync backend for this run: %s (ComfyUI at %s, tier %s)",
+                lipsync.backend, config.comfyui_url, lipsync.tier,
+            )
 
         renders: list[TimelineRender] = []
         for timeline in rendered_timelines:
@@ -1359,6 +1414,23 @@ def run_pipeline(
                     timeline.chunks_dir / "stem",
                     master_path=timeline.audio,
                 ).chunks
+            if hosted:
+                # Money before pixels: every API chunk this timeline may bill,
+                # at the published per-second price, logged -- and refused
+                # over the threshold unless --yes said so.
+                scope = only_chunks if timeline is flagged and only_chunks else None
+                billable = [
+                    c.rendered_frame_count or math.ceil(c.duration * OUTPUT_FPS)
+                    for c in chunks
+                    if scope is None or c.chunk_id in scope
+                ]
+                confirm_spend(
+                    estimate_cost(
+                        billable, model=lipsync.minimax_model,
+                        resolution=lipsync.minimax_resolution,
+                    ),
+                    yes=yes,
+                )
             run_state = _render_one_timeline(
                 config,
                 timeline,
@@ -1379,6 +1451,7 @@ def run_pipeline(
                 disk_usage=disk_usage,
                 seed_face_gate=seed_face_gate,
                 render_stack=render_stack,
+                uses_comfyui=not hosted,
             )
             renders.append(
                 TimelineRender(
@@ -1982,6 +2055,7 @@ def main(argv: list[str] | None = None) -> int:
             reseed_chunk_ids=args.reseed,
             reseed_generation=args.reseed_generation,
             flag_timeline=args.timeline,
+            yes=args.yes,
         )
     except Exception:
         logger.exception("Pipeline run failed")

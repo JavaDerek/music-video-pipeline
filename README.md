@@ -326,8 +326,10 @@ narrative_concept = "Wandering through a surgery, kicking a life support plug ou
 setting = "London, UK -- contemporary, overcast winter"    # where/when the WHOLE video happens
 global_appearance = "everyone slim, trim and healthy looking"   # optional; whole-cast presentation
 default_lead_vocalist = "Dianne"
-comfyui_url = "http://127.0.0.1:8188"      # optional -- this is the default
+comfyui_url = "http://127.0.0.1:8188"      # optional -- only used by lipsync_backend = "local_h3"
 workflow_template = "workflow_api.json"
+lipsync_backend = "minimax_api"            # optional -- the default; see docs/lipsync-backends.md
+quality_tier = "draft"                     # optional -- "draft" (480P) or "final" (2K, hosted only)
 chunks_dir = "output/chunks"
 final_video_dir = "output/final"
 
@@ -1931,6 +1933,19 @@ terms of:
   image is committed in this repository; they are run assets under
   `~/mvm-runs/<song>/cast/`. The weights themselves are not redistributed
   here either.
+
+## Which model makes the pixels
+
+Since 2026-10-13 the lip-sync backend is a config setting, and the default is
+MiniMax's **hosted** H3 (`lipsync_backend = "minimax_api"`, key in
+`MINIMAX_API_KEY`, cost estimated from the published prices before anything
+is submitted and refused over $10 without `--yes`). The open weights through
+your own ComfyUI (`"local_h3"`) are still here and are **locked** behind
+`h3_authorization_file`, because the H3 Community License excludes the United
+States, the EU, the UK and Korea -- outputs included. Every shot is recorded
+in `provenance.json`, and `dome.py`'s final render, verify and package steps
+refuse a shot that may not be exhibited. Details, the terms relied on, and
+the candidates for a free local draft model: `docs/lipsync-backends.md`.
 
 ## Further reading
 

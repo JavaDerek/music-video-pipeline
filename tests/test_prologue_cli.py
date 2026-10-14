@@ -53,6 +53,14 @@ PROLOGUE_SEGMENTS = [("you were never going to find me here", 1.0, 6.0)]
 to produce the same chunk count would let a mix-up pass unnoticed."""
 
 
+
+def _unlock_local_h3(tmp_path: Path) -> Path:
+    """A stand-in for MiniMax's written authorization, so the ComfyUI path
+    (``lipsync_backend = "local_h3"``) is unlocked for this offline rig."""
+    path = tmp_path / "minimax_h3_authorization.txt"
+    path.write_text("test stand-in for the authorization document\n")
+    return path
+
 class PerAudioAlignModel:
     """A stable-ts stand-in that answers differently per audio file.
 
@@ -235,6 +243,10 @@ class PrologueRig:
             min_free_disk_gb=1.0,
             run_state_file=chunks_dir / "run_state.json",
             instrumental_coverage=True,
+            # This rig drives the mock ComfyUI, i.e. the open-weights path, which
+            # lipsync.py locks behind an authorization file (any readable file).
+            lipsync_backend="local_h3",
+            h3_authorization_file=_unlock_local_h3(tmp_path),
             # Issues #24/#98: this rig names doris's profile and renders
             # 175-frame chunks at the template's 1344x768 against a MOCK, so
             # the envelope gate (which is right to refuse that on the real

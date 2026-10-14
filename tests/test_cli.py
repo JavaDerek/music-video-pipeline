@@ -21,11 +21,14 @@ import subprocess
 import sys
 from collections import deque
 from dataclasses import replace
+from dataclasses import replace as dc_replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+
+from music_video_maker.provenance import load_provenance
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -56,6 +59,14 @@ from tests.harness.ws import ScriptedWebSocket, build_hang_sequence, build_succe
 # Local scaffolding (mirrors tests/test_wave3_integration.py's rig)
 # --------------------------------------------------------------------------- #
 
+
+
+def _unlock_local_h3(tmp_path: Path) -> Path:
+    """A stand-in for MiniMax's written authorization, so the ComfyUI path
+    (``lipsync_backend = "local_h3"``) is unlocked for this offline rig."""
+    path = tmp_path / "minimax_h3_authorization.txt"
+    path.write_text("test stand-in for the authorization document\n")
+    return path
 
 class SequencedWSFactory:
     """Hand out a differently-scripted WebSocket per connection -- a whole run
@@ -286,6 +297,10 @@ class Rig:
             run_state_file=chunks_dir / "run_state.json",
             i2v_continuity=i2v_continuity,
             i2v_workflow_template=i2v_template_path,
+            # This rig drives the mock ComfyUI, i.e. the open-weights path, which
+            # lipsync.py locks behind an authorization file (any readable file).
+            lipsync_backend="local_h3",
+            h3_authorization_file=_unlock_local_h3(tmp_path),
             # Default off in the rig so the chunk count stays pinned to the
             # three lyric segments and each test below can seed exactly one
             # WebSocket sequence per chunk. The shipping default (on) is
@@ -2817,3 +2832,106 @@ def test_configured_transcript_file_reaches_align(tmp_path, monkeypatch):
     rig.run([rig.seed_success(1, 0), rig.seed_success(2, 1), rig.seed_success(3, 2)])
 
     assert seen["transcript_file"] == transcript
+
+
+# --------------------------------------------------------------------------- #
+# The hosted lip-sync backend through the same rig (lipsync.py)
+# --------------------------------------------------------------------------- #
+
+
+def _hosted_config(rig: Rig, **overrides):
+    return dc_replace(
+        rig.config, lipsync_backend="minimax_api", h3_authorization_file=None, **overrides
+    )
+
+
+def test_hosted_backend_renders_every_chunk_without_touching_comfyui(tmp_path, monkeypatch):
+    from tests.test_lipsync import KEY, FakeMiniMaxSession
+
+    monkeypatch.setenv("MINIMAX_API_KEY", KEY)
+    rig = Rig(tmp_path)
+    api = FakeMiniMaxSession()
+    report = cli.run_pipeline(
+        _hosted_config(rig, quality_tier="final"),
+        align_model=rig.align_model,
+        comfyui_session=rig.session,
+        lipsync_session=api,
+        ffmpeg_runner=rig.ffmpeg,
+        sleeper=rig.sleeper,
+        disk_usage=_abundant_disk,
+        clock=rig.clock,
+    )
+    assert report.rendered == 3 and report.dead_lettered == ()
+    assert report.output_video.is_file()
+    # ComfyUI was never asked for anything: no upload, no prompt, no custody.
+    assert rig.session.uploads == []
+    assert rig.session.submitted_prompts == []
+    # three tasks at the final tier, each with its image and padded audio
+    assert len(api.created) == 3
+    assert {c["model"] for c in api.created} == {"MiniMax-H3"}
+    assert {c["resolution"] for c in api.created} == {"2K"}
+    assert len(api.uploads) == 6
+    chunks_dir = rig.config.chunks_dir
+    provenance = load_provenance(chunks_dir / "provenance.json")
+    assert sorted(s.shot_id for s in provenance.shots) == ["chunk_0000", "chunk_0001",
+                                                            "chunk_0002"]
+    assert all(s.backend == "minimax_api" and s.tier == "final" for s in provenance.shots)
+    # the fingerprint's stack tier names the hosted model, not a ComfyUI build
+    state = json.loads((chunks_dir / "run_state.json").read_text())
+    stacks = {r["fingerprint"]["comfyui_version"] for r in state["results"].values()}
+    assert stacks == {"minimax_api:MiniMax-H3@2K"}
+    assert KEY not in (chunks_dir / "provenance.json").read_text()
+
+
+def test_hosted_backend_refuses_a_spend_over_the_threshold_without_yes(tmp_path, monkeypatch):
+    from music_video_maker.lipsync import SpendNotConfirmedError
+    from tests.test_lipsync import KEY, FakeMiniMaxSession
+
+    monkeypatch.setenv("MINIMAX_API_KEY", KEY)
+    # 3 chunks x up to 15 s at $0.13/s stays under $10; a 12-chunk song does not.
+    rig = Rig(tmp_path, segment_specs=[
+        (f"line number {i} of the long song tonight", 16.0 * i, 16.0 * i + 14.0)
+        for i in range(12)
+    ])
+    api = FakeMiniMaxSession()
+    with pytest.raises(SpendNotConfirmedError, match="--yes"):
+        cli.run_pipeline(
+            _hosted_config(rig, quality_tier="final"),
+            align_model=rig.align_model, comfyui_session=rig.session, lipsync_session=api,
+            ffmpeg_runner=rig.ffmpeg, sleeper=rig.sleeper, disk_usage=_abundant_disk,
+            clock=rig.clock,
+        )
+    assert api.created == []
+    report = cli.run_pipeline(
+        _hosted_config(rig, quality_tier="final"),
+        align_model=rig.align_model, comfyui_session=rig.session, lipsync_session=api,
+        ffmpeg_runner=rig.ffmpeg, sleeper=rig.sleeper, disk_usage=_abundant_disk,
+        clock=rig.clock, yes=True,
+    )
+    assert report.rendered == 12
+
+
+def test_hosted_backend_refuses_chained_continuity(tmp_path, monkeypatch):
+    from tests.test_lipsync import KEY
+
+    monkeypatch.setenv("MINIMAX_API_KEY", KEY)
+    rig = Rig(tmp_path, i2v_continuity=True)
+    with pytest.raises(cli.PipelineError, match="i2v_continuity"):
+        cli.run_pipeline(_hosted_config(rig), align_model=rig.align_model,
+                         comfyui_session=rig.session, ffmpeg_runner=rig.ffmpeg,
+                         sleeper=rig.sleeper, disk_usage=_abundant_disk, clock=rig.clock)
+
+
+def test_main_passes_yes_through(tmp_path, monkeypatch):
+    config_path = _make_config_file(tmp_path)
+    seen: dict[str, Any] = {}
+
+    def fake_run_pipeline(config, *, resume, **kwargs):
+        seen.update(kwargs)
+        return _fake_report()
+
+    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+    assert cli.main(["--config", str(config_path), "--yes"]) == cli.EXIT_SUCCESS
+    assert seen["yes"] is True
+    assert cli.main(["--config", str(config_path)]) == cli.EXIT_SUCCESS
+    assert seen["yes"] is False
