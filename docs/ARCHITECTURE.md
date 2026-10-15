@@ -39,7 +39,7 @@ It presents four surfaces to the outside:
 | **`music-video-maker`** | The render CLI (`music_video_maker.cli:main`). One run TOML in; per-chunk mp4s, a run state file and a final mp4 out. Also `--prepare` (no-GPU skeleton + report) and `--review` (static HTML/JSON). | The operator, by hand or under `nohup`; or the monitor's control half, which spawns it. |
 | **`mvm-author`** | The authoring CLI (`music_video_maker.authoring.cli:main`): concept, beats, photography, prose, write. Ends in a `shot_plan.toml`. | The operator, once per song, reviewing between stages. |
 | **`mvm-webui`** | An HTTP monitor for one run (`music_video_maker.webui:main`), read-only unless started with `--enable-control`. | The operator in a browser, over loopback or Tailscale. |
-| **`python -m` instruments** | Leaf tools: synthetic cast generation and scoring, face scans, desync ranking, fulldome and stereo post-processing, VRAM sampling, voicing calibration, profile promotion. | The operator, by hand, before or after a render. |
+| **`python -m` instruments** | Leaf tools: synthetic cast generation and scoring, face scans, desync ranking, stereo post-processing, VRAM sampling, voicing calibration, profile promotion. | The operator, by hand, before or after a render. |
 
 A fifth, indirect surface is **the run directory** (conventionally `~/mvm-runs/<song>/`, outside the
 repository): the run TOML, the shot plan, `.authoring/`, `output/chunks/` and `output/final/`. Every
@@ -138,7 +138,7 @@ C4Container
     Container(render, "Render CLI", "Python, music-video-maker", "Stages 1 to 5 under GPU custody, or --prepare and --review with no GPU. Writes chunks, run state, final video.")
     Container(author, "Authoring CLI", "Python, mvm-author", "Concept, beats, photography, prose, write. Calls the claude CLI. Writes .authoring and shot_plan.toml.")
     Container(webui, "Run monitor", "Python stdlib http.server, mvm-webui", "Server-rendered page plus SSE over run_state.json. Opt-in POST start and stop.")
-    Container(tools, "Operator instruments", "Python, python -m entries", "castgen, castcheck, facescan, desync_risk, dome, calibrate_voicing, vramsample, profiles, scenecuts.")
+    Container(tools, "Operator instruments", "Python, python -m entries", "castgen, castcheck, facescan, desync_risk, calibrate_voicing, vramsample, profiles, scenecuts.")
     ContainerDb(rundir, "Run directory", "Filesystem, outside the repo", "run.toml, shot_plan.toml, .authoring, output/chunks with run_state.json and prepare_report.json, output/final.")
     ContainerDb(repo, "Committed assets", "Files in the checkout", "workflow_*.json templates, models with YuNet, profiles, docs read as system prompts.")
   }
@@ -171,7 +171,7 @@ C4Container
 | **Render CLI** | Python ≥ 3.10; `music_video_maker/cli.py`; console script `music-video-maker` | `main()` loads and validates the config, logs which real likenesses the run conditions on, then takes one of three paths: `--prepare` (`prepare_shot_plan`), `--review` (`review.build_review`), or the full run (`run_pipeline`). Exit codes distinguish success, error and partial failure (dead-lettered chunks). | The only process that takes GPU custody or writes chunk mp4s. Its core dependencies are deliberately light (`pydub`, `requests`, `websocket-client`); stable-ts, OpenCV, pyannote and numpy are extras. |
 | **Authoring CLI** | Python; `music_video_maker/authoring/`; console script `mvm-author` | Seven subcommands: `concept`, `beats`, `prose`, `photography`, `write`, `all`, `status`. `all` runs concept → beats → photography → prose, stopping for approval between each, then `write`. | A **separate binary on purpose**: "does the render binary ever call a model?" stays answerable by reading `pyproject.toml`'s `[project.scripts]`. Adds no pip dependency. |
 | **Run monitor** | Python stdlib `http.server`; `webui.py`, `progress.py`, `control.py`; console script `mvm-webui` | Serves `/`, `/events` (SSE), `/chunks/<id>/thumbnail.png`, `/prepare`, `/review`; with `--enable-control` also `POST /start` and `POST /stop`. | Binds IP literals only — `127.0.0.1` and this host's Tailscale IPv4 (`tailscale ip -4`) — on port **8787** by default. A start spawns `python -m music_video_maker.cli --config <same file>`; it never calls `run_pipeline` in-process. |
-| **Operator instruments** | Python; leaf modules with their own `main()` | `castgen` (Krea 2 reference sets), `castcheck`, `facescan`, `desync_risk`, `dome`, `scenecuts`, `calibrate_voicing`, `vramsample`, `profiles promote`. | Nothing in the package imports `castgen` (tested). `stereo.py`, `markers.py` and `ableton.py` have no entry point and no caller: **built, not wired**. |
+| **Operator instruments** | Python; leaf modules with their own `main()` | `castgen` (Krea 2 reference sets), `castcheck`, `facescan`, `desync_risk`, `scenecuts`, `calibrate_voicing`, `vramsample`, `profiles promote`. | Nothing in the package imports `castgen` (tested). `stereo.py`, `markers.py` and `ableton.py` have no entry point and no caller: **built, not wired**. |
 | **Run directory** | Filesystem | Everything a run produces and consumes. Relative paths in the run TOML resolve against the TOML's own directory (`config.py`). | Lives outside the repo by convention (`~/mvm-runs/<song>/`); `.authoring/` holds raw model replies and is gitignored belt-and-braces (`CLAUDE.md`). |
 | **Committed assets** | Files in the checkout | Four ComfyUI API-format graphs (`workflow_api.json`, `workflow_i2v_api.json`, `workflow_cast_api.json`, `workflow_cast_view_api.json`), `models/face_detection_yunet_2023mar.onnx`, `profiles/`, `examples/`, and two docs the authoring layer reads at call time. | The SFace recognition model is **not** committed: `models/face_recognition_sface_2021dec.onnx` is gitignored, fetched by the operator, and required at config load only when `i2v_min_seed_face_similarity` is set. |
 
@@ -551,7 +551,6 @@ flowchart LR
   end
 
   subgraph post["post-processing"]
-    dome["dome.py<br/>4096 fisheye domemaster<br/>stdlib only"]
     stereo["stereo.py<br/>depth-warp stereo pair<br/>built, not wired"]
   end
 
@@ -571,7 +570,7 @@ flowchart LR
   castgen --> castcheck --> faces
   facescan --> faces
   facescan -->|"CSV"| desync
-  facescan & calib & scene & dome & stereo --> ffmpeg
+  facescan & calib & scene & stereo --> ffmpeg
   stereo -.->|"injected, never in tests"| depth
   vram --> smi
   ableton --> markers
@@ -586,7 +585,6 @@ flowchart LR
 | **Cast scorer** | `music_video_maker/castcheck.py` | Pairwise SFace similarity across a reference set against the 0.34 floor calibrated on photographs of real people. |
 | **Face scan / desync rank** | `facescan.py`, `desync_risk.py` | Per-chunk face presence with input path, size, mtime and model sha256 recorded; `desync_risk` joins that CSV with the render log's onset-offset warnings. |
 | **Calibration and sampling** | `calibrate_voicing.py`, `vramsample.py` | Print every placed segment's voicing statistics; poll `nvidia-smi` beside an attended render. Neither is imported by anything. |
-| **Fulldome** | `music_video_maker/dome.py` | Post-render domemaster via ffmpeg `v360`: 16-bit PNG master, H.265 copy, six 5.1 stems with a 2-pop, conformance check. |
 | **Stereo** | `music_video_maker/stereo.py` | Depth-image-based stereo pair and anaglyph; vectorised with numpy when present, byte-identical loop otherwise. **Built, not wired**, and per its own docstring almost none of it has run on real footage. |
 | **Concert-mode markers** | `markers.py`, `ableton.py` | A `(time, label)` CSV contract and an Ableton `.als` reader producing it. **Built, not wired** into `cli.py`; the Ableton reader is **unverified** against a real set file (`docs/design-concert-mode.md`). The parts of concert mode that are wired are `silent_output` and the measured-duration check in assembly. |
 
@@ -659,7 +657,6 @@ Each of these is true of the tree today (checked by AST walk on 2026-10-05) and 
 docstring, but no test goes red if it stops being true:
 
 - `contracts.py` imports no stage module, ComfyUI client, torch or pydub.
-- `dome.py` is stdlib-only (it imports only `array` and `subprocess` beyond the usual stdlib).
 - `progress.py` and `control.py` import no `http` and no `socket`.
 - `worldstate.py` matches run-dmcp's DESIGN.md §5.1 — compared by hand only, if at all.
 

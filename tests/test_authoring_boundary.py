@@ -78,7 +78,6 @@ SUBPROCESS_ALLOWLIST = frozenset(
         # pre-flight, the disk check, the render-envelope refusal and the
         # unconditional `POST /free` stay the CLI's own.
         "control.py",
-        "dome.py",  # ffmpeg/ffprobe only: POST-render domemaster projection + checks -- no model
         # lipsync.py: ffmpeg only -- pads a chunk's conditioning audio to the
         # billed duration and conforms the hosted API's mp4 to the chunk's
         # frame count. The hosted model is reached over HTTP through an

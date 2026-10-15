@@ -15,7 +15,7 @@ its conformance report, and :func:`assert_final_grade` is the one function a
 renderer, a publisher or a packager calls to refuse work that contains a shot
 from a backend that may not be exhibited.
 
-Stdlib-only on purpose, like ``dome.py``: the guard runs on the render host,
+Stdlib-only on purpose: the guard runs on the render host,
 which has ffmpeg and nothing else installed, and ``lipsync.py`` (which needs
 ``requests``) imports *this*, never the other way round.
 """

@@ -105,16 +105,9 @@ SHA-256 of every input (reference image, reference audio, padded audio) and
 of the conformed output, the cost, and notes (raw API file and its hash,
 ratio, prompt, usage). `terms` carries the MiniMax terms above.
 
-`dome.py` consumes it:
-
-- `render --provenance <json> [--provenance <json>...] --tier final` refuses,
-  before ffmpeg runs, any shot from `local_h3`/`local_draft` or at draft
-  tier, and writes the merged record beside the manifest.
-- `verify --provenance ...` runs the same guard after the ten checks.
-- `package --out-dir <render> --zip <out.zip> --provenance ...` builds the
-  deliverable (distribution copy, stems, seat preview, contact sheet,
-  `dome_verification.json`, the merged `provenance.json`, a readme and any
-  extras) and refuses a failed verification or a non-exhibitable shot.
+A post-render packager can consume it: `provenance.assert_final_grade` refuses, before
+anything is rendered, any shot from `local_h3`/`local_draft` or at draft tier, and
+`provenance.merge_provenance` joins several records into one.
 
 ## Secrets
 

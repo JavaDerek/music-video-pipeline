@@ -1943,8 +1943,8 @@ is submitted and refused over $10 without `--yes`). The open weights through
 your own ComfyUI (`"local_h3"`) are still here and are **locked** behind
 `h3_authorization_file`, because the H3 Community License excludes the United
 States, the EU, the UK and Korea -- outputs included. Every shot is recorded
-in `provenance.json`, and `dome.py`'s final render, verify and package steps
-refuse a shot that may not be exhibited. Details, the terms relied on, and
+in `provenance.json`, and any post-render packager can call
+`provenance.assert_final_grade` to refuse a shot that may not be exhibited. Details, the terms relied on, and
 the candidates for a free local draft model: `docs/lipsync-backends.md`.
 
 ## Further reading
