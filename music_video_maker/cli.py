@@ -92,6 +92,14 @@ from music_video_maker.envelope import check_render_envelope, measured_ceiling
 from music_video_maker.execution import ComfyUIExecutionClient
 from music_video_maker.faces import build_seed_face_gate
 from music_video_maker.hardware import scan_workflow_for_missing_optimizations
+from music_video_maker.join_witness import (
+    TranscribeWindow,
+    check_joins,
+    chunk_joins,
+    whisper_window_transcriber,
+)
+from music_video_maker.join_witness import log_findings as log_join_findings
+from music_video_maker.join_witness import raise_if_blocking as raise_if_join_blocking
 from music_video_maker.lipsync import (
     OUTPUT_FPS,
     build_minimax_backend,
@@ -786,6 +794,7 @@ def _align_and_slice_timeline(
     from_plan: str | Path | None = None,
     load_plan: bool = True,
     on_quality_report: Callable[[AlignmentQualityReport], None] | None = None,
+    join_transcriber: TranscribeWindow | None = None,
 ) -> tuple[AlignmentResult, tuple[AudioChunk, ...], Mapping[int, ShotPlanEntry] | None]:
     """Stages 1-2 for one timeline (issue #66).
 
@@ -908,6 +917,21 @@ def _align_and_slice_timeline(
         # that has been overtaken twice.
         measured_ceiling=measured_ceiling(timeline.run_state_file),
     )
+    if timeline.is_song and config.check_join_words:
+        # A pre-spend witness against the aligner's word times: see join_witness.
+        # The stem (when there is one) is the cleaner thing to transcribe.
+        join_check = check_joins(
+            chunk_joins(chunks),
+            join_transcriber
+            if join_transcriber is not None
+            else whisper_window_transcriber(
+                config.vocal_stem or timeline.audio,
+                model_size=config.join_check_model_size,
+                language=config.join_check_language,
+            ),
+        )
+        log_join_findings(join_check)
+        raise_if_join_blocking(join_check, strict=config.strict_alignment)
     if not chunks:
         raise PipelineError(
             f"no chunks produced by slicing {timeline.audio} against {timeline.script} "

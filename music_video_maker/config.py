@@ -36,6 +36,9 @@ against the *config file's* directory, not the process cwd)::
     instrumental_coverage    = true      # render the unvoiced spans too
     boundary_overrun         = false     # issue #100; cut on content, render past it
     phrase_aware_slicing     = false     # keep each sung phrase whole inside one chunk
+    check_join_words         = false     # transcribe around every join; report any inside a word
+    join_check_model_size    = "base"    # whisper size for that check (CPU)
+    join_check_language      = "en"      # whisper language code; "" = auto-detect
     prompt_format            = "prose"   # issue #99; "structured" = H3's own grammar
     lyric_language           = "English" # issue #99; only read by "structured"
     silent_output            = false     # issue #22; no audio stream at all
@@ -982,6 +985,20 @@ class RunConfig:
 
     Requires ``instrumental_coverage`` (ignored, loudly, without it), and is
     refused alongside ``i2v_continuity`` -- see :func:`load_config`."""
+
+    check_join_words: bool = False
+    """Before any spend, independently transcribe +-1.5 s of the vocal audio
+    (``vocal_stem`` if set, else the master) around every chunk join and report
+    each join that falls inside a sung word (``join_witness``). Needs the
+    ``[align]`` extra; runs on CPU. ``strict_alignment`` turns a finding into a
+    refusal. Reports only -- it never moves a join. Off by default."""
+
+    join_check_model_size: str = "base"
+    """Whisper size used by :attr:`check_join_words`."""
+
+    join_check_language: str | None = "en"
+    """Whisper language code for :attr:`check_join_words`; ``None`` auto-detects
+    (unreliable on a 3 s clip of singing)."""
 
     phrase_aware_slicing: bool = False
     """Choose every chunk boundary at once so that no sung phrase is cut in
@@ -2090,6 +2107,9 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
     values["instrumental_coverage"] = _flag(merged, "instrumental_coverage", True)
     values["boundary_overrun"] = _flag(merged, "boundary_overrun", False)
     values["phrase_aware_slicing"] = _flag(merged, "phrase_aware_slicing", False)
+    values["check_join_words"] = _flag(merged, "check_join_words", False)
+    values["join_check_model_size"] = str(merged.get("join_check_model_size") or "base")
+    values["join_check_language"] = str(merged.get("join_check_language", "en")) or None
     values["silent_output"] = _flag(merged, "silent_output", False)
     values["duration_tolerance_seconds"] = _positive_number(
         merged, "duration_tolerance_seconds", DEFAULT_DURATION_TOLERANCE_SECONDS

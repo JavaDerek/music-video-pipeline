@@ -2922,3 +2922,21 @@ def test_unreadable_transcript_file_is_refused_at_load(tmp_path: Path) -> None:
     path = _write_config(tmp_path, extra_toml='transcript_file = "audio/words.json"')
     with pytest.raises(ConfigError, match="transcript_file"):
         load_config(path)
+
+
+def test_join_check_keys_default_and_are_read(tmp_path: Path) -> None:
+    _create_default_assets(tmp_path)
+    default = load_config(_write_config(tmp_path))
+    assert default.check_join_words is False
+    assert default.join_check_model_size == "base"
+    assert default.join_check_language == "en"
+    set_ = load_config(
+        _write_config(
+            tmp_path,
+            extra_toml='check_join_words = true\njoin_check_model_size = "small"\n'
+            'join_check_language = ""',
+        )
+    )
+    assert set_.check_join_words is True
+    assert set_.join_check_model_size == "small"
+    assert set_.join_check_language is None

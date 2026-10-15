@@ -2935,3 +2935,69 @@ def test_main_passes_yes_through(tmp_path, monkeypatch):
     assert seen["yes"] is True
     assert cli.main(["--config", str(config_path)]) == cli.EXIT_SUCCESS
     assert seen["yes"] is False
+
+
+# -- join-inside-word check wiring ----------------------------------------- #
+
+
+def _stub_join_transcriber(monkeypatch, words_at_every_join):
+    from music_video_maker import join_witness
+
+    def fake_factory(*_args, **_kwargs):
+        def window(start, end):
+            mid = (start + end) / 2
+            return [join_witness.HeardWord("beyond", mid - 0.3, mid + 0.3)] if (
+                words_at_every_join
+            ) else []
+
+        return window
+
+    monkeypatch.setattr(cli, "whisper_window_transcriber", fake_factory)
+
+
+def test_join_check_is_off_by_default(tmp_path: Path, monkeypatch):
+    def boom(*_a, **_k):
+        raise AssertionError("whisper must not be touched when the check is off")
+
+    monkeypatch.setattr(cli, "whisper_window_transcriber", boom)
+    rig = Rig(tmp_path)
+    cli.prepare_shot_plan(
+        rig.config, tmp_path / "plan.toml", source="run.toml",
+        generated_at="2026-08-12", align_model=rig.align_model,
+    )
+
+
+def test_join_check_reports_without_refusing_when_not_strict(tmp_path: Path, monkeypatch, caplog):
+    _stub_join_transcriber(monkeypatch, True)
+    rig = Rig(tmp_path)
+    rig.config = replace(rig.config, check_join_words=True)
+    with caplog.at_level(logging.WARNING):
+        cli.prepare_shot_plan(
+            rig.config, tmp_path / "plan.toml", source="run.toml",
+            generated_at="2026-08-12", align_model=rig.align_model,
+        )
+    assert "Join inside a word" in caplog.text
+
+
+def test_join_check_refuses_in_strict_mode(tmp_path: Path, monkeypatch):
+    from music_video_maker.join_witness import JoinInsideWordError
+
+    _stub_join_transcriber(monkeypatch, True)
+    rig = Rig(tmp_path)
+    rig.config = replace(rig.config, check_join_words=True, strict_alignment=True)
+    with pytest.raises(JoinInsideWordError):
+        cli.prepare_shot_plan(
+            rig.config, tmp_path / "plan.toml", source="run.toml",
+            generated_at="2026-08-12", align_model=rig.align_model,
+        )
+    assert not (tmp_path / "plan.toml").exists()
+
+
+def test_join_check_passes_when_joins_sit_in_pauses(tmp_path: Path, monkeypatch):
+    _stub_join_transcriber(monkeypatch, False)
+    rig = Rig(tmp_path)
+    rig.config = replace(rig.config, check_join_words=True, strict_alignment=True)
+    cli.prepare_shot_plan(
+        rig.config, tmp_path / "plan.toml", source="run.toml",
+        generated_at="2026-08-12", align_model=rig.align_model,
+    )
