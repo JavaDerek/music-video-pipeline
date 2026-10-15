@@ -192,6 +192,7 @@ KNOWN_IMAGE_MODELS: dict[str, dict[str, object]] = {
         "architecture": "krea2 SingleStreamDiT (comfy/ldm/krea2/model.py), bf16",
         "needs_text_encoder": "Qwen3-VL-4B, loaded with CLIPLoader type='krea2'",
         "needs_vae": "qwen_image_vae.safetensors (latent_format Wan21)",
+        "template_verified": False,
         # Measured by reading the safetensors header on doris, 2026-10-04: the
         # file is the DiT ONLY -- 364 'blocks.*' tensors at 24.32 GB, plus
         # txtfusion/tproj/tmlp. No 'vae.' and no 'text_encoders.' keys, despite
@@ -212,6 +213,7 @@ KNOWN_IMAGE_MODELS: dict[str, dict[str, object]] = {
         "architecture": "krea2 SingleStreamDiT, bf16 (few-step distillation of Raw)",
         "needs_text_encoder": "Qwen3-VL-4B, loaded with CLIPLoader type='krea2'",
         "needs_vae": "qwen_image_vae.safetensors (latent_format Wan21)",
+        "template_verified": True,
         "caveat": (
             "ComfyUI's own blueprint samples Turbo at steps=8, cfg=1.0 -- those "
             "are Turbo's numbers and are wrong for Raw; set them per spec"
@@ -221,7 +223,14 @@ KNOWN_IMAGE_MODELS: dict[str, dict[str, object]] = {
 """Provenance for the image models #56's decision picked from. Descriptive
 only: nothing here restricts which file a spec may name, because which weights
 are installed on the ComfyUI host is not this repo's business (the same stance
-``KNOWN_LORAS`` takes). A spec naming a model that is *not* in this table is
+``KNOWN_LORAS`` takes).
+
+``template_verified`` records whether the committed ComfyUI templates have
+rendered cleanly with that model. ``False`` means *untested*, and
+:func:`assert_template_verified` makes ``generate`` refuse it before anything
+is spent, unless the operator overrides (``--allow-untested-model`` or
+``allow_untested_model = true`` in the spec). Set it to ``True`` only after a
+clean render through these templates. A spec naming a model that is *not* in this table is
 generated anyway, with ``licence = "UNRECORDED"`` in its manifest and a
 WARNING -- loud, because "it downloaded fine" is not a licence."""
 
@@ -359,6 +368,8 @@ class CharacterSpec:
     template carries. ``None`` leaves the template's own value, which is the
     only value this repo ever *states*; what is installed on a given host is
     the host's business."""
+    allow_untested_model: bool = False
+    """Operator override for :func:`assert_template_verified`."""
     source_path: Path | None = None
 
     @property
@@ -394,6 +405,7 @@ _SPEC_TOP_LEVEL_KEYS = frozenset(
         "unet_name",
         "clip_name",
         "vae_name",
+        "allow_untested_model",
         "views",
     }
 )
@@ -573,6 +585,10 @@ def load_character_spec(path: Path | str) -> CharacterSpec:
             sorted(KNOWN_IMAGE_MODELS),
         )
 
+    allow_untested = raw.get("allow_untested_model", False)
+    if not isinstance(allow_untested, bool):
+        _spec_fail("allow_untested_model", f"must be true or false, got {allow_untested!r}")
+
     spec = CharacterSpec(
         character=character,
         prompt=base_prompt,
@@ -588,6 +604,7 @@ def load_character_spec(path: Path | str) -> CharacterSpec:
         unet_name=raw.get("unet_name"),
         clip_name=raw.get("clip_name"),
         vae_name=raw.get("vae_name"),
+        allow_untested_model=allow_untested,
         source_path=path,
     )
     logger.info(
@@ -620,6 +637,33 @@ class ViewPlan:
     @property
     def name(self) -> str:
         return self.view.name
+
+
+def assert_template_verified(spec: CharacterSpec, *, allow_untested_model: bool = False) -> None:
+    """Refuse a known model the committed templates have not rendered with.
+
+    Runs before anything is spent. Overridden by the argument (CLI flag) or by
+    ``spec.allow_untested_model``. A model absent from
+    :data:`KNOWN_IMAGE_MODELS` is not judged here (it already warns, and is
+    recorded as UNRECORDED).
+    """
+    record = KNOWN_IMAGE_MODELS.get(spec.model) if spec.model is not None else None
+    if record is None or record.get("template_verified") is True:
+        return
+    if allow_untested_model or spec.allow_untested_model:
+        logger.warning(
+            "castgen: model %r is untested with these templates; proceeding because "
+            "the override was given",
+            spec.model,
+        )
+        return
+    raise CastGenError(
+        f"model {spec.model!r} is untested with this template: the committed ComfyUI "
+        "template has not rendered cleanly with it, so generating would spend "
+        "custody on output that may be unusable. The override exists for whoever is "
+        "fixing the template: pass --allow-untested-model, or set "
+        "allow_untested_model = true in the spec."
+    )
 
 
 def slugify(text: str) -> str:
@@ -1269,12 +1313,14 @@ def generate_character(
     min_free_vram_gb: float = custody.DEFAULT_MIN_FREE_VRAM_GB,
     hardware_profile: HardwareProfile = hardware.PROFILE_RTX_4090_24GB,
     client_id: str | None = None,
+    allow_untested_model: bool = False,
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
 ) -> CharacterResult:
     """Generate every view of ``spec`` and return the whole record.
 
     Order of operations, and why:
 
+    0. **Refuse an untested model** (:func:`assert_template_verified`).
     1. **Plan everything first** (:func:`plan_views`), so a spec that cannot
        hold identity, or a template mix-up, fails before the card is touched.
     2. **Weights pre-flight** (:func:`preflight_installed_weights`) -- a
@@ -1296,6 +1342,7 @@ def generate_character(
        not leave 24 GB of DiT resident on a shared 4090.
     6. **Score the set with ``castcheck``**, never with a second scorer.
     """
+    assert_template_verified(spec, allow_untested_model=allow_untested_model)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     base_url = base_url.rstrip("/")
@@ -1511,6 +1558,14 @@ def build_parser() -> argparse.ArgumentParser:
             "the set's status is then recorded as 'unchecked', which is not a pass"
         ),
     )
+    parser.add_argument(
+        "--allow-untested-model",
+        action="store_true",
+        help=(
+            "generate with a model the committed template has not rendered cleanly "
+            "with (generate only). For whoever is fixing the template."
+        ),
+    )
     return parser
 
 
@@ -1578,6 +1633,7 @@ def main(argv: list[str] | None = None, *, session: Any = None) -> int:
             sleep=_real_sleep,
             poll_interval=args.poll_interval,
             min_free_vram_gb=args.min_free_vram_gb,
+            allow_untested_model=args.allow_untested_model,
         )
     except (CastGenError, execution.ExecutionError, custody.CustodyError) as exc:
         sys.stdout.write(f"castgen: {exc}\n")
@@ -1610,6 +1666,7 @@ __all__ = [
     "FILTERING_DISCLOSURE",
     "HOSTED_API_CLASS_TYPES",
     "KNOWN_IMAGE_MODELS",
+    "assert_template_verified",
     "KREA2_COMMUNITY_LICENCE",
     "VIEW_TEMPLATE_FILENAME",
     "CastGenError",

@@ -374,6 +374,14 @@ only — it loads no weights and touches no GPU):
 3. **The VAE is present**: `qwen_image_vae.safetensors`
    (`supported_models.Krea2` uses the Wan 2.1 latent format).
 
+Each `KNOWN_IMAGE_MODELS` entry also records `template_verified`: whether the
+committed templates have rendered cleanly with that model. `krea2-turbo` is
+verified; `krea2-raw` is not (untested with this template). `generate` refuses
+an unverified model before spending anything, unless the operator passes
+`--allow-untested-model` or sets `allow_untested_model = true` in the spec — an
+override meant for whoever is fixing the template. `plan` is offline and is not
+affected. Flip the flag to `True` only after a clean render.
+
 `castgen` checks all three *before* taking custody, by reading each loader's
 own enum (`GET /object_info/{class_type}`) and comparing it with what the
 templates name. A missing file is refused with its name and the directory it
@@ -402,7 +410,7 @@ A spec is small:
 character = "Nobody"
 prompt = "studio portrait photograph of a woman in her thirties, short dark hair"
 seed = 4242
-model = "krea2-raw"      # resolves the licence record in KNOWN_IMAGE_MODELS
+model = "krea2-turbo"    # resolves the licence record in KNOWN_IMAGE_MODELS
 steps = 28
 cfg = 4.0
 

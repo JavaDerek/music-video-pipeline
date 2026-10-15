@@ -67,7 +67,7 @@ SPEC_TOML = """
 character = "Nobody"
 prompt = "studio portrait photograph of a woman in her thirties, short dark hair"
 seed = 4242
-model = "krea2-raw"
+model = "krea2-turbo"
 steps = 28
 cfg = 4.0
 
@@ -302,7 +302,7 @@ def test_required_scalars_are_type_checked(tmp_path):
 
 
 def test_an_unrecorded_model_warns_and_records_its_licence_as_unrecorded(tmp_path, caplog):
-    body = SPEC_TOML.replace('model = "krea2-raw"', 'model = "something-else"')
+    body = SPEC_TOML.replace('model = "krea2-turbo"', 'model = "something-else"')
     with caplog.at_level(logging.WARNING):
         spec = castgen.load_character_spec(write_spec(tmp_path, body))
 
@@ -1135,3 +1135,93 @@ def test_a_generation_failure_exits_one(tmp_path, capsys):
     ]
     assert castgen.main(argv, session=session) == 1
     assert "castgen:" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# A model the template has not rendered with is refused before anything is spent
+# --------------------------------------------------------------------------- #
+
+UNTESTED_SPEC = SPEC_TOML.replace('model = "krea2-turbo"', 'model = "krea2-raw"')
+
+
+def test_every_known_model_states_whether_the_template_has_rendered_with_it():
+    for name, record in castgen.KNOWN_IMAGE_MODELS.items():
+        assert isinstance(record["template_verified"], bool), name
+    assert castgen.KNOWN_IMAGE_MODELS["krea2-turbo"]["template_verified"] is True
+    assert castgen.KNOWN_IMAGE_MODELS["krea2-raw"]["template_verified"] is False
+
+
+def test_an_untested_model_is_refused_before_the_server_is_touched(
+    tmp_path, anchor_template, view_template
+):
+    session = FakeComfyUISession()
+    spec = castgen.load_character_spec(write_spec(tmp_path, UNTESTED_SPEC))
+    with pytest.raises(castgen.CastGenError, match="untested with this template") as info:
+        castgen.generate_character(
+            spec,
+            output_dir=tmp_path / "cast",
+            anchor_template=anchor_template,
+            view_template=view_template,
+            session=session,
+            base_url=session.base_url,
+            checker=pass_checker,
+        )
+    assert "--allow-untested-model" in str(info.value)
+    assert "fixing the template" in str(info.value)
+    assert not (tmp_path / "cast").exists()
+
+
+def test_the_override_argument_lets_an_untested_model_through(
+    tmp_path, anchor_template, view_template, caplog
+):
+    spec = castgen.load_character_spec(write_spec(tmp_path, UNTESTED_SPEC))
+    with caplog.at_level(logging.WARNING):
+        _, result = generate(
+            tmp_path, anchor_template, view_template, spec=spec, allow_untested_model=True
+        )
+    assert result.status == "pass"
+    assert "untested with these templates" in caplog.text
+
+
+def test_the_spec_key_is_also_an_override(tmp_path, anchor_template, view_template):
+    body = UNTESTED_SPEC.replace("steps = 28", "allow_untested_model = true\nsteps = 28")
+    spec = castgen.load_character_spec(write_spec(tmp_path, body))
+    assert spec.allow_untested_model is True
+    _, result = generate(tmp_path, anchor_template, view_template, spec=spec)
+    assert result.status == "pass"
+
+
+def test_the_override_key_must_be_a_boolean(tmp_path):
+    body = UNTESTED_SPEC.replace("steps = 28", 'allow_untested_model = "yes"\nsteps = 28')
+    with pytest.raises(castgen.CharacterSpecError, match="allow_untested_model"):
+        castgen.load_character_spec(write_spec(tmp_path, body))
+
+
+def test_a_verified_model_needs_no_override(tmp_path, anchor_template, view_template):
+    _, result = generate(tmp_path, anchor_template, view_template)
+    assert result.status == "pass"
+
+
+def test_cli_refuses_an_untested_model_and_the_flag_overrides(tmp_path, capsys):
+    def argv(*extra):
+        return [
+            "generate",
+            str(write_spec(tmp_path, UNTESTED_SPEC)),
+            "--out-dir",
+            str(tmp_path / "cast"),
+            "--comfyui-url",
+            FakeComfyUISession().base_url,
+            "--anchor-template",
+            str(ANCHOR_TEMPLATE_PATH),
+            "--view-template",
+            str(VIEW_TEMPLATE_PATH),
+            "--skip-check",
+            *extra,
+        ]
+
+    assert castgen.main(argv(), session=FakeComfyUISession()) == 1
+    assert "untested with this template" in capsys.readouterr().out
+
+    session = seed_happy_path(FakeComfyUISession())
+    castgen.main(argv("--allow-untested-model"), session=session)
+    assert "untested with this template" not in capsys.readouterr().out
