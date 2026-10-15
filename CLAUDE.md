@@ -144,7 +144,7 @@ committed ships, and check before adding, not before releasing.
   footage proves the bug, keep the test skip-if-absent so the fixture can be
   removed without gutting the suite.
 - **Whether a run depends on someone's likeness is a query, not a memory (#56).** `CastMember.synthetic` (default false — every existing config means "a real person") requires `[cast.<name>.origin]` (model, prompt, seed, created) and vice versa; a `voiced_by` character with no photo of its own inherits its performer's answer and may not restate it. `RunConfig.real_likenesses()` is logged at run start. `castcheck.py` scores a reference set pairwise against the 0.34 SFace floor — calibrated on photographs of real people, which every report says, and which must be re-derived before trusting it on generated faces.
-- **A character can now be invented, and the method is a chain, not a seed sweep (#56 part 2, 2026-10-04).** `castgen.py` (`python -m music_video_maker.castgen`, authoring-time, imported by nothing — `test_authoring_boundary.py` enforces that) drives **Krea 2**, already on doris, through two committed templates: the first view is text-to-image and every other is img2img from an earlier view's *rendered file* at a stated `denoise`. A second view with no `from`, a derived view at `denoise >= 1.0`, or a set of one are refused **at spec load**, because a set re-rolled from one prompt at different seeds is four different people and nothing downstream could tell. There is no default `denoise`: unmeasured for this model. The **Krea 2 Community License** reaches the code, not just the README's rights table — company-wide annual revenue under US$1,000,000 counting affiliates (Section 2.3, its only commercial threshold), derivative model names begin with "Krea", and **no classifier ships with the weights, so filtering is the deployer's** (every manifest records `filtering = "none"` rather than being silent about it). It checks the server's own `object_info` enums before taking custody, reuses `custody.preflight_free_vram` and `POST /free`, and scores the result with `castcheck` rather than a second scorer. **Nothing has been generated yet:** the DiT (24.32 GB bf16 against a 24 GB card) is only in the HF cache and the Qwen3-VL-4B encoder is not downloaded — `docs/design-synthetic-cast.md` lists both, plus everything that cannot be known until a real generation runs.
+- **A character can now be invented, and the method is a chain, not a seed sweep (#56 part 2, 2026-10-04).** `castgen.py` (`python -m music_video_maker.castgen`, authoring-time, imported by nothing — `test_authoring_boundary.py` enforces that) drives **Krea 2**, already on doris, through two committed templates: the first view is text-to-image and every other is img2img from an earlier view's *rendered file* at a stated `denoise`. A second view with no `from`, a derived view at `denoise >= 1.0`, or a set of one are refused **at spec load**, because a set re-rolled from one prompt at different seeds is four different people and nothing downstream could tell. There is no default `denoise`: unmeasured for this model. The **Krea 2 Community License** reaches the code, not just the README's rights table — company-wide annual revenue under US$1,000,000 counting affiliates (Section 2.3, its only commercial threshold), derivative model names begin with "Krea", and **no classifier ships with the weights, so filtering is the deployer's** (every manifest records `filtering = "none"` rather than being silent about it). It checks the server's own `object_info` enums before taking custody, reuses `custody.preflight_free_vram` and `POST /free`, and scores the result with `castcheck` rather than a second scorer. **First production use, 2026-10-07: it works, and Krea 2 Turbo is the model.** In the full v16 render of "Deathless", The Dead was conditioned on a Turbo portrait from `castgen` (castcheck pass, 0.64–0.77), and the viewer rated the two passages it sings "perfect" and "amazing". In the arm B/C comparison (2026-10-05) the portrait carried the identity: SFace against the portrait was 0.50 and 0.55 on frames from chunks 38 and 73, against ~0 for the singer's own photo. **Turbo at 8 steps / cfg 1.0 is the castgen model.** Raw was unusable: speckle at any settings tried, and pure noise through this template even at 28 steps / cfg 4.0 (its model card says it is not meant for inference; ai-toolkit's own flowmatch sampler renders it cleanly, so the defect is in how the template samples it — see the Raw issue). `template_verified` in `KNOWN_IMAGE_MODELS` refuses Raw until that is fixed.
 - **Check redistribution before committing a third-party binary** — models,
   weights, fonts, sample media. Record source, licence and sha256 beside it in
   code, the way `faces.py` does for YuNet. "It downloaded fine" is not a
@@ -173,16 +173,17 @@ committed ships, and check before adding, not before releasing.
   it at all. A fix scoped to the example helps one song in fifty and looks
   finished, which is the expensive kind of wrong. The example proves the bug;
   it does not define it.
-- **Generic tools here; the show's recipes elsewhere (2026-10-12).** A tool
-  that does one generic job belongs in this repo — `castgen` as a mechanism,
-  `facescan`, `provenance`'s guard. What a particular
-  show learned does not: which combination of layers and generators worked,
-  which model or settings won a comparison, a viewer's verdict on a finished
-  render, venue / festival / licence notes, and the approved text of a house
-  look. Those are kept in the maintainer's private notes until they say
-  otherwise, and the rule covers issues, comments and commit messages exactly
-  as it covers files. If a finding is a mix, commit the generic rule and leave
-  the recipe out.
+- **Everything about making a music video lives here; one kind of show does not (2026-10-15).** This repo is
+  meant to hold everything known about making a standard music video well:
+  the tools, the measurements, which model or settings won a comparison and
+  why, and what a viewer said about a render. Model choices are part of that
+  and belong here. What stays out is one separate line of work that the
+  maintainer keeps private until they say otherwise, along with its compute strategy and costs, its venue /
+  festival / licence notes, and the licence paperwork for any model. That rule
+  covers issues, comments and commit messages exactly as it covers files. When
+  a lesson from that work applies to ordinary music videos (it often does:
+  chunk joins, lip-sync at clip edges, a figure that jumps at a cut), restate
+  it here in ordinary music-video terms and leave the venue out.
 - **Authoring session state stays out too.** `.authoring/` (issue #54) —
   `session.json`, generated stage JSON, and especially `raw/` (full,
   unredacted model replies, which routinely include the whole lyrics file) —
