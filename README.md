@@ -1922,9 +1922,9 @@ terms of:
   **Krea 2 Community License**, not by this repo's MIT grant. Three of its
   terms decide what a user of this pipeline may do, so they are recorded in
   code as well — `castgen.KNOWN_IMAGE_MODELS`, beside the loader, the way
-  `faces.py` records YuNet's: commercial use is free **under $1M annual
-  revenue and under 50 seats** (beyond either, that is between the deployer
-  and Krea); a **derivative model's name must begin with "Krea"** (nothing
+  `faces.py` records YuNet's: commercial use is free while **company-wide
+  annual revenue, counting affiliates, is under US$1,000,000** (Section 2.3;
+  above that, it is between the deployer and Krea); a **derivative model's name must begin with "Krea"** (nothing
   here trains or merges one, but a cast LoRA trained on this output would);
   and because **no classifiers ship with the open weights, filtering is
   explicitly the deployer's responsibility** — none ships here either, every

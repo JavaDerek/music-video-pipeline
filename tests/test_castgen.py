@@ -313,7 +313,13 @@ def test_an_unrecorded_model_warns_and_records_its_licence_as_unrecorded(tmp_pat
 def test_the_krea2_licence_record_carries_the_three_terms_that_reach_the_code():
     record = castgen.KNOWN_IMAGE_MODELS["krea2-raw"]
     licence = str(record["licence"])
-    assert "$1M" in licence and "50 seats" in licence
+    # Section 2.3 is the licence's only commercial threshold: company-wide annual
+    # revenue under US$1,000,000, affiliates included. It sets no seat, user or
+    # headcount limit; an earlier record said "50 seats".
+    assert "Section 2.3" in licence
+    assert "company-wide annual revenue" in licence and "US$1,000,000" in licence
+    assert "affiliates" in licence
+    assert "seat" not in licence.lower()
     assert "Krea" in licence  # derivative naming rule
     assert "deployer" in licence  # filtering responsibility
     assert record["source"].startswith("https://huggingface.co/krea/")
@@ -651,7 +657,7 @@ def test_the_manifest_records_the_licence_the_filtering_and_the_floors_calibrati
     _session, result = generate(tmp_path, anchor_template, view_template)
     manifest = result.manifest()
 
-    assert "$1M" in str(manifest["licence"])
+    assert "US$1,000,000" in str(manifest["licence"])
     assert manifest["filtering"] == castgen.FILTERING_DISCLOSURE
     assert manifest["model_record"]["source"].startswith("https://huggingface.co/krea/")
     assert manifest["consistency"]["floor"] == pytest.approx(faces.DEFAULT_MIN_FACE_SIMILARITY)
@@ -725,7 +731,7 @@ def test_the_origin_block_is_what_configpy_already_requires(
     extras = dict(origin.extra)
     assert extras["steps"] == 28
     assert "img2img" in str(extras["method"])
-    assert "$1M" in str(extras["licence"])
+    assert "US$1,000,000" in str(extras["licence"])
 
 
 @pytest.mark.parametrize("character", ["The Dead", 'Odd "Quoted" One', "Nobody.Else"])

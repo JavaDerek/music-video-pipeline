@@ -78,10 +78,11 @@ beside the code that loads these weights exactly the way
 ``workflow_graph.KNOWN_LORAS`` and ``faces.py`` record theirs. Three terms
 reach this code rather than only the README's rights table:
 
-1. **Commercial use is free under $1M annual revenue and under 50 seats.**
-   Beyond either, the deployer needs Krea's commercial terms. Recorded in
-   every manifest this module writes, so a published asset carries the
-   condition it was produced under.
+1. **Commercial use is free while company-wide annual revenue, counting
+   affiliates, is under US$1,000,000 (Section 2.3).** Above that, the deployer
+   needs Krea's commercial terms. Section 2.3 is the licence's only commercial
+   threshold. Recorded in every manifest this module writes, so a published
+   asset carries the condition it was produced under.
 2. **A derivative model's name must begin with "Krea".** Nothing here trains
    or merges a model, so nothing here can breach it -- but if a cast LoRA is
    ever trained on this output, it must be named ``krea2-...``.
@@ -163,8 +164,9 @@ else:  # pragma: no cover - exercised on 3.10 only
 # --------------------------------------------------------------------------- #
 
 KREA2_COMMUNITY_LICENCE = (
-    "Krea 2 Community License: commercial use free under $1M annual revenue and "
-    "under 50 seats; a derivative model's name must begin with 'Krea'; no "
+    "Krea 2 Community License: commercial use free while company-wide annual "
+    "revenue, counting affiliates, is under US$1,000,000 (Section 2.3); a "
+    "derivative model's name must begin with 'Krea'; no "
     "classifiers ship with the open weights, so content filtering is explicitly "
     "the deployer's responsibility"
 )

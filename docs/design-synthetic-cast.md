@@ -296,7 +296,7 @@ that loads the weights, the way `faces.py` records YuNet's and
 
 | Term | What it obliges here |
 |---|---|
-| Commercial use free under **$1M annual revenue and under 50 seats** | Beyond either, the deployer needs Krea's commercial terms. Written into every manifest, so a published asset carries the condition it was made under. |
+| Commercial use free while **company-wide annual revenue, counting affiliates, is under US$1,000,000** (Section 2.3) | Above that, the deployer needs Krea's commercial terms. Written into every manifest, so a published asset carries the condition it was made under. |
 | A **derivative model's name must begin with "Krea"** | Nothing here trains or merges a model, so nothing here can breach it — but a cast LoRA ever trained on this output must be named `krea2-…`. |
 | **No classifiers ship with the open weights**, so filtering is explicitly the deployer's responsibility | No classifier ships here either, and the provenance says so rather than being silent: every manifest records `filtering = "none — …"` and every generate run logs it at WARNING. A human looks at every image. |
 
