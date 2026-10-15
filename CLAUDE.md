@@ -179,7 +179,10 @@ committed ships, and check before adding, not before releasing.
   why, and what a viewer said about a render. Model choices are part of that
   and belong here. What stays out is one separate line of work that the
   maintainer keeps private until they say otherwise, along with its compute strategy and costs, its venue /
-  festival / licence notes, and the licence paperwork for any model. That rule
+  festival / licence notes, and the licence paperwork for any model. The
+  house look is branding and stays out too: the profile *mechanism* is public,
+  but the approved look text is never committed (`profiles/refestramus-house-v1.toml`
+  stays a skeleton here). That rule
   covers issues, comments and commit messages exactly as it covers files. When
   a lesson from that work applies to ordinary music videos (it often does:
   chunk joins, lip-sync at clip edges, a figure that jumps at a cut), restate
