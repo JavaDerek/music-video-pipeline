@@ -22,6 +22,17 @@
       "shot": "wide shot of the corridor, her hand trailing the wall",
       "start": 0.0,
       "subject": null,
+      "timing_unverified": {
+        "chunk_id": 0,
+        "end": 6.5,
+        "low_word_count": 4,
+        "share_threshold": 0.5,
+        "start": 0.0,
+        "word_count": 6,
+        "word_floor": 0.35,
+        "worst_probability": 0.02,
+        "worst_word": "halls"
+      },
       "voiced": true
     },
     {
@@ -40,6 +51,7 @@
       "shot": null,
       "start": 6.5,
       "subject": "Dianne",
+      "timing_unverified": null,
       "voiced": false
     },
     {
@@ -67,6 +79,7 @@
       "shot": "<script>alert(\"staged\")</script> she vanishes mid-step",
       "start": 8.0,
       "subject": null,
+      "timing_unverified": null,
       "voiced": true
     },
     {
@@ -91,6 +104,7 @@
       "shot": "she walks on, not looking back",
       "start": 14.0,
       "subject": null,
+      "timing_unverified": null,
       "voiced": true
     }
   ],

@@ -59,6 +59,7 @@ against the *config file's* directory, not the process cwd)::
     local_draft_model        = "<name>"        # required by local_draft once one is integrated
 
     strict_alignment         = false     # issue #35; --strict-alignment overrides
+    timing_unverified_share  = 0.5       # issue #104; low-confidence share marking a chunk
 
     # Issue #101, optional and off. Reads the vocal stem and fills
     # AlignedSegment.characters on the lines nobody tagged; needs vocal_stem.
@@ -125,6 +126,7 @@ from typing import NoReturn
 from urllib.parse import urlparse
 
 from music_video_maker import transcript_witness
+from music_video_maker.alignment_quality import TIMING_UNVERIFIED_SHARE
 from music_video_maker.assembly import DEFAULT_DURATION_TOLERANCE_SECONDS
 from music_video_maker.contracts import AlignmentOverride, CastMember, CastOrigin, HardwareProfile
 from music_video_maker.faces import (
@@ -853,6 +855,13 @@ class RunConfig:
 
     Defaults to ``"base"`` so every config written before this key existed
     aligns exactly as it always did."""
+
+    timing_unverified_share: float = TIMING_UNVERIFIED_SHARE
+    """Issue #104 (a): a sung chunk is recorded as *timing unverified* (in
+    ``run_state.json``, the log and the review page) when at least this share of
+    its words score under the alignment-confidence floor (0.35). In ``(0, 1]``;
+    lower flags more chunks. Record-only: it never changes what renders -- see
+    ``alignment_quality.TIMING_UNVERIFIED_SHARE`` for how the default was chosen."""
 
     strict_alignment: bool = False
     """Issue #35: fail the run when the alignment-quality check finds problems
@@ -1733,6 +1742,14 @@ def _positive_number(merged: dict, key: str, default: float) -> float:
     return value
 
 
+def _share(merged: dict, key: str, default: float) -> float:
+    """Read an optional fraction in ``(0, 1]``."""
+    value = _positive_number(merged, key, default)
+    if value > 1:
+        _fail(key, f"must be at most 1 (a share of words), got {value}")
+    return value
+
+
 def _positive_int(merged: dict, key: str, default: int) -> int:
     if key not in merged or merged[key] is None:
         return default
@@ -2126,6 +2143,9 @@ def load_config(path: Path, **overrides: object) -> RunConfig:
     values["resume_ignore_prompt_changes"] = _flag(merged, "resume_ignore_prompt_changes", False)
     values["resume_require_same_stack"] = _flag(merged, "resume_require_same_stack", False)
     values["strict_alignment"] = _flag(merged, "strict_alignment", False)
+    values["timing_unverified_share"] = _share(
+        merged, "timing_unverified_share", TIMING_UNVERIFIED_SHARE
+    )
 
     model_size = merged.get("alignment_model_size", DEFAULT_ALIGNMENT_MODEL_SIZE)
     if model_size not in ALIGNMENT_MODEL_SIZES:

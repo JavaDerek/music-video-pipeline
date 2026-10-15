@@ -1407,12 +1407,43 @@ class VramStopEvent:
     run's config to know how close the margin was."""
 
 
+@dataclass(frozen=True)
+class TimingUnverified:
+    """A sung chunk whose word timings the aligner could not vouch for (issue
+    #104 (a)): at least ``share_threshold`` of its words scored under
+    ``word_floor`` forced-alignment confidence.
+
+    A *record*, not a gate: nothing slices or renders differently because a
+    chunk is listed here. It exists so the operator learns, before spending GPU
+    hours, which spans to check by ear and pin with ``[[alignment_override]]``
+    (#42). Built by ``alignment_quality.timing_unverified_chunks``."""
+
+    chunk_id: int
+    start: float
+    end: float
+    word_count: int
+    low_word_count: int
+    worst_word: str
+    worst_probability: float
+    word_floor: float
+    share_threshold: float
+
+    @property
+    def share(self) -> float:
+        return self.low_word_count / self.word_count if self.word_count else 0.0
+
+
 @dataclass
 class RunState:
     """Resumable per-run state persisted by the resilience layer (issue #10)."""
 
     run_id: str
     results: dict[int, ChunkResult] = field(default_factory=dict)
+
+    timing_unverified: dict[int, TimingUnverified] = field(default_factory=dict)
+    """Issue #104 (a): chunk id -> why this chunk's timing is unverified. Describes
+    the alignment of the *current* invocation (a resume re-aligns and replaces it),
+    purely informational, and not part of any ``--resume`` match."""
 
     vram_stop: VramStopEvent | None = None
     """Set exactly once, by ``ResilientRunner._check_vram_before_chunk``,

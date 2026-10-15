@@ -207,13 +207,18 @@ import shutil
 import statistics
 import subprocess
 import tempfile
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
 
 from music_video_maker import transcript_witness, voicing
-from music_video_maker.contracts import AlignedSegment, AlignmentResult
+from music_video_maker.contracts import (
+    AlignedSegment,
+    AlignmentResult,
+    AudioChunk,
+    TimingUnverified,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +266,21 @@ ISOLATED_SEGMENT_GAP_S = 20.0
 # for the placement; below CRITICAL, essentially none.
 LOW_WORD_CONFIDENCE = 0.35
 CRITICAL_WORD_CONFIDENCE = 0.10
+
+TIMING_UNVERIFIED_SHARE = 0.5
+"""Issue #104 (a): a sung chunk is marked *timing unverified* when at least this
+share of its words score under :data:`LOW_WORD_CONFIDENCE`.
+
+Why a share and not "any low word": on the "Deathless" v16 re-alignment 42% of
+all 254 words score under 0.35 and 28% under 0.10, so a single low word flags 33
+of the 38 sung chunks and tells the operator nothing. A share of one third
+flags 20, a majority 14, two thirds 7. A majority includes chunk 63
+(438.83-446.83 s, 4 of 7 words low), the viewer's reported desync -- and is
+still more than a third of the song, which the log says: the signal is "listen
+to these first", not "these are wrong". One song, one model size (small), one
+known-bad chunk: the config key ``timing_unverified_share`` exists so a second
+song can move it. Chunk 63 at 4/7 (0.57) sits close to the line, so this is a
+default to revisit, not a measured optimum."""
 
 MIN_WORDS_FOR_COLLAPSE_CHECK = 20
 """Below this many words the whole-track fraction is noise, and the caller may
@@ -710,6 +730,11 @@ class AlignmentQualityReport:
     counterpoint_segment_count: int = 0
     """Concurrent segments evaluated (issue #33). ``0`` for every level-1 and
     level-2 file, which is every file written before counterpoint existed."""
+    word_confidences: tuple[LowConfidenceWord, ...] = ()
+    """Every word the caller supplied, with its probability (issue #104 (a)).
+    ``alignment.align`` supplies all of the track's words, which is what lets
+    :func:`timing_unverified_chunks` compute a per-chunk *share*; a caller that
+    passed only suspected words gets a share over those words only."""
 
     @property
     def is_clean(self) -> bool:
@@ -880,6 +905,7 @@ def evaluate_alignment_quality(
         findings=tuple(findings),
         segment_count=len(segments),
         counterpoint_segment_count=len(concurrent),
+        word_confidences=tuple(low_confidence_words),
     )
 
 
@@ -1694,6 +1720,82 @@ def _check_voiced_periodicity(
             )
         )
     return findings
+
+
+def timing_unverified_chunks(
+    chunks: Sequence[AudioChunk],
+    report: AlignmentQualityReport,
+    *,
+    word_floor: float = LOW_WORD_CONFIDENCE,
+    share: float = TIMING_UNVERIFIED_SHARE,
+    pinned_segments: Collection[int] = (),
+) -> dict[int, TimingUnverified]:
+    """Sung chunks whose timing the aligner could not verify (issue #104 (a)).
+
+    A word belongs to the chunk containing its midpoint, so each word is counted
+    in exactly one chunk. A chunk is flagged when at least ``share`` of its words
+    have a probability under ``word_floor``. Instrumental chunks and chunks with
+    no scored words are never flagged. Words of ``pinned_segments`` (segments an
+    ``[[alignment_override]]`` already pins) are not counted: the aligner's doubt
+    about them was answered by a human, and flagging them again would send the
+    operator back to a span they just fixed. Pure and read-only: the verdict is for the
+    operator and for ``run_state.json``, and changes nothing about slicing or
+    rendering (#104's strict mode and span proposals are separate decisions).
+    """
+    flagged: dict[int, TimingUnverified] = {}
+    for chunk in chunks:
+        if chunk.is_instrumental:
+            continue
+        words = [
+            w
+            for w in report.word_confidences
+            if chunk.start <= (w.start + w.end) / 2.0 < chunk.end
+            and w.segment_index not in pinned_segments
+        ]
+        low = [w for w in words if w.probability < word_floor]
+        if not words or len(low) / len(words) < share:
+            continue
+        worst = min(words, key=lambda w: w.probability)
+        flagged[chunk.chunk_id] = TimingUnverified(
+            chunk_id=chunk.chunk_id,
+            start=chunk.start,
+            end=chunk.end,
+            word_count=len(words),
+            low_word_count=len(low),
+            worst_word=worst.word.strip(),
+            worst_probability=worst.probability,
+            word_floor=word_floor,
+            share_threshold=share,
+        )
+    return flagged
+
+
+def log_timing_unverified(
+    flagged: dict[int, TimingUnverified], *, can_override: bool
+) -> None:
+    """One WARNING naming every flagged chunk, and (for a timeline that honours
+    them) where the fix lives. Silent when nothing is flagged."""
+    if not flagged:
+        return
+    spans = "; ".join(
+        f"chunk {e.chunk_id} ({e.start:.2f}-{e.end:.2f}s, {e.low_word_count}/{e.word_count} "
+        f"words under {e.word_floor:.2f}, worst '{e.worst_word}' at {e.worst_probability:.2f})"
+        for e in flagged.values()
+    )
+    pointer = (
+        "; if listening shows a span is off, pin it with [[alignment_override]] (issue #42)"
+        if can_override
+        else ""
+    )
+    logger.warning(
+        "%d sung chunk(s) have timing unverified -- the aligner had weak evidence for at "
+        "least %.0f%% of their words, so lip-sync there may not match. This is a prompt to "
+        "listen, not proof of a defect, and it does not change the render: %s%s",
+        len(flagged),
+        next(iter(flagged.values())).share_threshold * 100,
+        spans,
+        pointer,
+    )
 
 
 def suspect_segment_indices(report: AlignmentQualityReport) -> frozenset[int]:

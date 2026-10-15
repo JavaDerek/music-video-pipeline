@@ -50,7 +50,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dataclasses import replace as dc_replace
 from datetime import date
 from pathlib import Path
@@ -62,7 +62,9 @@ from music_video_maker.alignment import align
 from music_video_maker.alignment_quality import (
     AlignmentQualityReport,
     evaluate_alignment_quality,
+    log_timing_unverified,
     suspect_segment_indices,
+    timing_unverified_chunks,
 )
 from music_video_maker.assembly import (
     TimelineAssembly,
@@ -77,6 +79,7 @@ from music_video_maker.contracts import (
     ChunkFingerprint,
     ChunkStatus,
     RunState,
+    TimingUnverified,
     Workflow,
 )
 from music_video_maker.custody import (
@@ -795,6 +798,7 @@ def _align_and_slice_timeline(
     load_plan: bool = True,
     on_quality_report: Callable[[AlignmentQualityReport], None] | None = None,
     join_transcriber: TranscribeWindow | None = None,
+    on_timing_unverified: Callable[[dict[int, TimingUnverified]], None] | None = None,
 ) -> tuple[AlignmentResult, tuple[AudioChunk, ...], Mapping[int, ShotPlanEntry] | None]:
     """Stages 1-2 for one timeline (issue #66).
 
@@ -938,6 +942,25 @@ def _align_and_slice_timeline(
             f"(timeline {timeline.name!r}) -- nothing to render (no non-empty lines "
             "aligned to audio?)"
         )
+    # Issue #104 (a): record, never act. Which sung chunks the aligner could not
+    # verify, for the log, run_state.json and the review page. Nothing below
+    # this point reads it, so it cannot change what slices or renders.
+    unverified = (
+        timing_unverified_chunks(
+            chunks,
+            quality_reports[0],
+            share=config.timing_unverified_share,
+            # Overrides are song-only (see the docstring above).
+            pinned_segments={o.segment_index for o in config.alignment_overrides}
+            if timeline.is_song
+            else (),
+        )
+        if quality_reports
+        else {}
+    )
+    log_timing_unverified(unverified, can_override=timeline.is_song)
+    if on_timing_unverified is not None:
+        on_timing_unverified(unverified)
     logger.info(
         "Stage 1-2 complete for timeline %r: %d chunk(s), %.3fs of track",
         timeline.name,
@@ -969,6 +992,7 @@ def _render_one_timeline(
     disk_usage: DiskUsage,
     seed_face_gate: Callable[[Path, Path], bool] | None,
     render_stack: RenderStack,
+    timing_unverified: Mapping[int, TimingUnverified] | None = None,
     uses_comfyui: bool = True,
 ) -> RunState:
     """Stages 2b-4 for one timeline: prompts, staging, and the resilient
@@ -1202,6 +1226,7 @@ def _render_one_timeline(
         force_chunk_ids=force_chunk_ids,
         fingerprints=fingerprints,
         fingerprint_amender=lambda chunk_id, fp: _amend_from_render(provider, chunk_id, fp),
+        timing_unverified=timing_unverified,
     )
 
 
@@ -1423,8 +1448,13 @@ def run_pipeline(
 
         renders: list[TimelineRender] = []
         for timeline in rendered_timelines:
+            unverified: dict[int, TimingUnverified] = {}
             alignment, chunks, plan = _align_and_slice_timeline(
-                config, timeline, align_model=align_model, diarizer=diarizer
+                config,
+                timeline,
+                align_model=align_model,
+                diarizer=diarizer,
+                on_timing_unverified=unverified.update,
             )
             if timeline.is_song and config.vocal_stem:
                 # Issue #25: condition H3 on the isolated vocal stem, cut at
@@ -1476,6 +1506,7 @@ def run_pipeline(
                 seed_face_gate=seed_face_gate,
                 render_stack=render_stack,
                 uses_comfyui=not hosted,
+                timing_unverified=unverified,
             )
             renders.append(
                 TimelineRender(
@@ -1610,6 +1641,9 @@ class PreparedTimeline:
     alignment: AlignmentResult
     chunks: tuple[Any, ...]
     quality_report: AlignmentQualityReport
+    timing_unverified: Mapping[int, TimingUnverified] = field(default_factory=dict)
+    """Issue #104 (a): sung chunks the aligner could not verify -- what the
+    review page shows beside each, with the pointer to ``[[alignment_override]]``."""
 
 
 def prepare_timeline(
@@ -1666,6 +1700,7 @@ def _prepare_one_timeline(
     from_plan: str | Path | None = None,
 ) -> PreparedTimeline:
     quality_reports: list[AlignmentQualityReport] = []
+    unverified: dict[int, TimingUnverified] = {}
     alignment, chunks, _plan = _align_and_slice_timeline(
         config,
         timeline,
@@ -1677,6 +1712,7 @@ def _prepare_one_timeline(
         # refactor -- see _align_and_slice_timeline for why.
         load_plan=False,
         on_quality_report=quality_reports.append,
+        on_timing_unverified=unverified.update,
     )
     if from_plan is not None:
         logger.info(
@@ -1690,7 +1726,10 @@ def _prepare_one_timeline(
         quality_reports[0] if quality_reports else evaluate_alignment_quality(alignment)
     )
     return PreparedTimeline(
-        alignment=alignment, chunks=tuple(chunks), quality_report=quality_report
+        alignment=alignment,
+        chunks=tuple(chunks),
+        quality_report=quality_report,
+        timing_unverified=unverified,
     )
 
 

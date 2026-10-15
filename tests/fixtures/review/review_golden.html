@@ -45,11 +45,11 @@
       <th>chunk_id</th><th>span</th><th>duration</th><th>frames</th><th>voicing</th>
       <th>lyric</th><th>shot</th><th>camera</th><th>location</th><th>present</th>
       <th>subject</th><th>conditions</th><th>framing</th>
-      <th>alignment findings</th><th>lint warnings</th>
+      <th>alignment findings</th><th>lint warnings</th><th>timing</th>
     </tr>
   </thead>
   <tbody>
-    <tr class="">
+    <tr class="row-warning">
       <td>0</td>
       <td>0.000s&ndash;6.500s</td>
       <td>6.500s</td>
@@ -65,6 +65,7 @@
       <td>&mdash;</td>
       <td>&mdash;</td>
       <td>&mdash;</td>
+      <td><span class="badge sev-warning">timing unverified</span> 4 of 6 words under 0.35 alignment confidence (worst &lsquo;halls&rsquo; at 0.02). Listen to 0.00&ndash;6.50s; if it is off, pin the span with <code>[[alignment_override]]</code>.</td>
     </tr>
     <tr class="">
       <td>1</td>
@@ -80,6 +81,7 @@
       <td>Dianne</td>
       <td>dust settling</td>
       <td>wide</td>
+      <td>&mdash;</td>
       <td>&mdash;</td>
       <td>&mdash;</td>
     </tr>
@@ -99,6 +101,7 @@
       <td>&mdash;</td>
       <td><ul class="findings"><li><span class="badge sev-critical">CRITICAL</span> <code>zero_length_segment</code> segment 1 (8.000s -&gt; 8.020s) is only 20ms long -- too short to contain real audio</li></ul></td>
       <td>&mdash;</td>
+      <td>&mdash;</td>
     </tr>
     <tr class="row-warning">
       <td>3</td>
@@ -116,6 +119,7 @@
       <td>&mdash;</td>
       <td>&mdash;</td>
       <td><ul class="findings"><li><span class="badge sev-warning">WARNING</span> chunk_id=3: lyric names &quot;printer&quot;, staged only in chunk(s) [5] -- consider staging it here too (or removing it from the lyric-vs-shot check)</li></ul></td>
+      <td>&mdash;</td>
     </tr>
   </tbody>
 </table>

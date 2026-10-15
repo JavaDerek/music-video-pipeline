@@ -32,6 +32,7 @@ import pytest
 
 from music_video_maker import cli
 from music_video_maker import review as review_module
+from music_video_maker.contracts import TimingUnverified
 from music_video_maker.review import (
     AlignmentFindingView,
     ChunkReview,
@@ -69,6 +70,17 @@ def _golden_review_data() -> ReviewData:
         present=(),
         subject=None,
         conditions=None,
+        timing_unverified=TimingUnverified(
+            chunk_id=0,
+            start=0.0,
+            end=6.5,
+            word_count=6,
+            low_word_count=4,
+            worst_word="halls",
+            worst_probability=0.02,
+            word_floor=0.35,
+            share_threshold=0.5,
+        ),
     )
     instrumental_chunk = ChunkReview(
         chunk_id=1,

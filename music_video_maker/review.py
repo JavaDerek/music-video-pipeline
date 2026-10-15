@@ -56,7 +56,7 @@ import logging
 import re
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from dataclasses import replace as dc_replace
 from pathlib import Path
 
@@ -68,7 +68,7 @@ from music_video_maker.alignment_quality import (
     format_summary,
 )
 from music_video_maker.config import RunConfig
-from music_video_maker.contracts import AudioChunk
+from music_video_maker.contracts import AudioChunk, TimingUnverified
 from music_video_maker.shot_plan import (
     ShotPlanEntry,
     ShotPlanError,
@@ -252,6 +252,10 @@ class ChunkReview:
     see :func:`_findings_for_chunk`."""
     lint_warnings: tuple[LintWarning, ...] = ()
     """Shot-plan warnings that named this ``chunk_id``."""
+    timing_unverified: TimingUnverified | None = None
+    """Issue #104 (a): set when the aligner could not vouch for this sung chunk's
+    word timings. A prompt to listen and, if it is off, to pin the span with
+    ``[[alignment_override]]`` (#42) -- never a statement that it is wrong."""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -271,6 +275,9 @@ class ChunkReview:
             "framing": self.framing,
             "findings": [finding.to_dict() for finding in self.findings],
             "lint_warnings": [warning.to_dict() for warning in self.lint_warnings],
+            "timing_unverified": (
+                None if self.timing_unverified is None else asdict(self.timing_unverified)
+            ),
         }
 
 
@@ -494,6 +501,7 @@ def build_review(
             lyric=chunk.text,
             findings=_findings_for_chunk(timeline.quality_report, chunk),
             lint_warnings=tuple(lint_warnings_by_chunk.get(chunk.chunk_id, ())),
+            timing_unverified=timeline.timing_unverified.get(chunk.chunk_id),
             **chunk_fields[chunk.chunk_id],
         )
         for chunk in timeline.chunks
@@ -562,6 +570,19 @@ def _lint_cell(warnings: Sequence[LintWarning]) -> str:
     return f'<ul class="findings">{items}</ul>'
 
 
+def _timing_cell(entry: TimingUnverified | None) -> str:
+    if entry is None:
+        return "&mdash;"
+    return (
+        f'<span class="badge sev-warning">timing unverified</span> '
+        f"{entry.low_word_count} of {entry.word_count} words under "
+        f"{entry.word_floor:.2f} alignment confidence (worst "
+        f"&lsquo;{_esc(entry.worst_word)}&rsquo; at {entry.worst_probability:.2f}). "
+        f"Listen to {entry.start:.2f}&ndash;{entry.end:.2f}s; if it is off, pin the span "
+        "with <code>[[alignment_override]]</code>."
+    )
+
+
 def _list_cell(values: Sequence[str]) -> str:
     return _esc(", ".join(values)) if values else "&mdash;"
 
@@ -587,6 +608,7 @@ _CHUNK_ROW_TEMPLATE = """
       <td>{framing}</td>
       <td>{findings}</td>
       <td>{lint_warnings}</td>
+      <td>{timing}</td>
     </tr>"""
 
 
@@ -594,7 +616,9 @@ def _chunk_row(chunk: ChunkReview) -> str:
     has_critical = any(f.severity == "CRITICAL" for f in chunk.findings) or any(
         w.severity == "error" for w in chunk.lint_warnings
     )
-    has_warning = not has_critical and (chunk.findings or chunk.lint_warnings)
+    has_warning = not has_critical and (
+        chunk.findings or chunk.lint_warnings or chunk.timing_unverified is not None
+    )
     row_class = "row-critical" if has_critical else "row-warning" if has_warning else ""
     return _CHUNK_ROW_TEMPLATE.format(
         row_class=row_class,
@@ -613,6 +637,7 @@ def _chunk_row(chunk: ChunkReview) -> str:
         framing=_text_cell(chunk.framing),
         findings=_findings_cell(chunk.findings),
         lint_warnings=_lint_cell(chunk.lint_warnings),
+        timing=_timing_cell(chunk.timing_unverified),
     )
 
 
@@ -663,7 +688,7 @@ _PAGE_TEMPLATE = """<!doctype html>
       <th>chunk_id</th><th>span</th><th>duration</th><th>frames</th><th>voicing</th>
       <th>lyric</th><th>shot</th><th>camera</th><th>location</th><th>present</th>
       <th>subject</th><th>conditions</th><th>framing</th>
-      <th>alignment findings</th><th>lint warnings</th>
+      <th>alignment findings</th><th>lint warnings</th><th>timing</th>
     </tr>
   </thead>
   <tbody>{chunk_rows}

@@ -96,7 +96,7 @@ import time
 import uuid
 from collections.abc import Callable, Collection, Mapping, Sequence
 from collections.abc import Set as AbstractSet
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -108,6 +108,7 @@ from music_video_maker.contracts import (
     ChunkStatus,
     ExecutionClient,
     RunState,
+    TimingUnverified,
     VramStopEvent,
     Workflow,
 )
@@ -571,6 +572,12 @@ def _serialize_run_state(run_state: RunState) -> dict[str, Any]:
         # runs after it -- so an old reader that has never heard of this key
         # simply never sees it change shape.
         "vram_stop": _serialize_vram_stop(run_state.vram_stop),
+        # Issue #104 (a). Informational and additive: absent in an older file
+        # (read as empty), never part of the --resume match, so no schema bump.
+        "timing_unverified": {
+            str(chunk_id): asdict(entry)
+            for chunk_id, entry in sorted(run_state.timing_unverified.items())
+        },
     }
 
 
@@ -604,6 +611,10 @@ def _deserialize_run_state(payload: dict[str, Any]) -> RunState:
         # the correct reading for "this run never hit the floor" and for
         # "this build predates the field" alike -- see `_deserialize_result`.
         vram_stop=_deserialize_vram_stop(payload.get("vram_stop")),
+        timing_unverified={
+            int(key): TimingUnverified(**raw)
+            for key, raw in (payload.get("timing_unverified") or {}).items()
+        },
     )
 
 
@@ -861,8 +872,15 @@ class ResilientRunner:
         fingerprints: Mapping[int, ChunkFingerprint] | None = None,
         fingerprint_amender: Callable[[int, ChunkFingerprint], ChunkFingerprint] | None = None,
         force_chunk_ids: Collection[int] | None = None,
+        timing_unverified: Mapping[int, TimingUnverified] | None = None,
     ) -> RunState:
         """Render every chunk in ``chunk_ids``, reusing prior work on ``resume``.
+
+        ``timing_unverified`` (issue #104 (a)) is the chunks this invocation's
+        alignment could not verify. It is recorded in the run state and changes
+        nothing else: no chunk is skipped, reordered or re-rendered because of
+        it. ``None`` (the caller computed nothing) leaves an empty record;
+        ``{}`` says "checked, none".
 
         ``fingerprints`` (issue #34) maps chunk id -> what that chunk is being
         rendered *for* this run: its span, frame count, resolution and prompt.
@@ -884,6 +902,11 @@ class ResilientRunner:
         self._preflight_disk_check(output_dir)
 
         run_state = self._load_or_init_run_state(resume=resume)
+        # Describes THIS invocation's alignment, so it replaces whatever a resumed
+        # file carried (a re-alignment may clear a chunk, or flag a new one).
+        run_state.timing_unverified = dict(timing_unverified or {})
+        if run_state.timing_unverified:
+            self._persist(run_state)
         wholesale_change = (
             self._report_timeline_change(run_state, chunk_ids, fingerprints) if resume else False
         )
