@@ -103,9 +103,18 @@ refused wherever it appears, in the cast and in every shot's prose (`wardrobe-te
 zipper...); add your own with `banned_terms`. An unknown `era` warns (`era-unknown`)
 rather than silently checking nothing.
 
-The check is on text. It cannot see a rendered portrait: **look at every generated cast
-image for period correctness before spending video time on it**, and put the garment, in
-words, in the portrait prompt too.
+State the garment's **opening**, not only its name (`garment-opening-unstated` warns when a
+garment never says "round neck", "wrapped" and so on). A second render's portraits said
+"tunic" and still came out with real buttons on a placket, because an image model fills an
+unstated opening with the commonest one. `compose_portrait_prompt` is the one way to build a
+cast image's prompt: it states the garment, the script's style and the era's lock (for
+`pre-industrial`: a pullover tunic with a plain round neckline and no front opening, naming
+slit, placket, buttons, toggles and collar as absent), and a cast member can replace the lock
+with their own `wardrobe_lock`. Use it, so a portrait cannot omit what the linter checks.
+
+The check is on text. It cannot see a rendered portrait: **zoom into the neckline of every
+generated cast image at full size before spending video time on it**. At contact-sheet size a
+buttoned placket and a plain slit look identical; at full size, two buttons were plain.
 
 ## State every posture, and mark every change
 
@@ -118,6 +127,15 @@ shot's `transition` (`posture-change-unmarked`):
 ```toml
 transition = "Mara sits down on a stool"
 ```
+
+## Give every speaker a voice of their own
+
+A voice taken from the video model's own audio gave every character the same voice. Put each
+speaking character's synthesis voice id in `tts_voice`: two characters sharing one is an error
+(`voice-shared`), and a speaker with none while others have one warns (`voice-missing`).
+`voice` stays the prose description of what you are aiming for. Audition the voices on the
+script's own hardest lines before authoring against them: a voice that cannot do a given
+character is found in a minute with a synthesis engine and a day later in a render.
 
 ## Cast who is in frame, and no one else
 
@@ -136,6 +154,29 @@ then the shot's `text`) and never includes the `line`; `lint_generation_prompt` 
 the two measured patterns. Also refused: quoted speech inside `text`
 (`dialogue-in-prose`), which invites the model to say it. Put no label, duration or
 instruction ahead of the description, and no dialogue in it.
+
+## Rendering a single-speaker shot (lessons, not yet code in this repo)
+
+These are what the second render of the same piece settled; the driver that did them is not
+in the repo yet (see the open issue), so they are written down here.
+
+- **Drive the mouth with the finished line.** Reference image of the speaker plus the
+  synthesized line as the reference audio, one face and one voice per generated shot. The
+  hosted and local reference-to-video paths both return the reference audio unchanged, so the
+  voice track you assembled is the voice track you ship; discard everything else the model
+  generated.
+- **A short line still renders at the model's frame floor.** Quantize the work, not the cut
+  (`boundary_overrun`'s principle): render the grid-valid length, then trim the shot at the edit
+  to the last word plus a short tail. Padding the audio with silence to reach the floor leaves
+  the mouth moving over nothing (#103, #107).
+- **A pause is the edit's, not the audio's.** The model starts the mouth at frame 0, so leading
+  silence in the audio is a mouth moving before the voice. Hold the shot's first frame for the
+  pause instead.
+- **Score a speaking take by whether the speaker's face is there** (a plain face detector over
+  twelve frames) and retake the worst until the deadline; a speaker turned away or missing is
+  the common failure, and it needs no model to find. Sync scoring is the next instrument.
+- **Anything a person is "supposed to look at" needs a first look at the first shot.** Check
+  one rendered speaking shot (identity, clothing, mouth) before releasing 80.
 
 ## What is not checked (open)
 

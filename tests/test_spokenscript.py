@@ -36,13 +36,13 @@ GOOD = textwrap.dedent(
 
     [cast.mara]
     name = "Mara"
-    garment = "undyed linen tunic with a rope belt"
+    garment = "undyed linen tunic, round neck, rope belt"
     appearance = "weathered woman in her forties, grey-streaked braid"
     voice = "low, dry, unhurried"
 
     [cast.teo]
     name = "Teo"
-    garment = "wool vest over a patched linen tunic"
+    garment = "wool vest over a patched linen tunic, round neck"
     appearance = "thin young man, nervous eyes"
     voice = "high, quick, eager"
 
@@ -189,12 +189,14 @@ def test_a_line_too_long_for_its_shot_is_an_error():
 
 
 def test_every_cast_member_must_state_a_garment_when_an_era_is_set():
-    bad = GOOD.replace('garment = "undyed linen tunic with a rope belt"\n', "")
+    bad = GOOD.replace('garment = "undyed linen tunic, round neck, rope belt"\n', "")
     assert "garment-missing" in errors(ss.lint_script(load(bad)))
 
 
 def test_modern_garment_terms_are_refused_for_a_pre_industrial_era():
-    bad = GOOD.replace("wool vest over a patched linen tunic", "button-down shirt")
+    bad = GOOD.replace(
+        "wool vest over a patched linen tunic, round neck", "button-down shirt, round neck"
+    )
     findings = ss.lint_script(load(bad))
     assert "wardrobe-term" in errors(findings)
     assert any("button-down" in f.message for f in findings)
@@ -382,3 +384,65 @@ def test_cli_prints_warnings_but_still_exits_zero(tmp_path, capsys):
     )
     assert ss.main([str(p)]) == 0
     assert "delivery-flat" in capsys.readouterr().out
+
+
+# --- the second render's lessons: openings, portraits, voices -----------------------
+
+
+def test_a_placket_or_toggle_is_refused_for_a_pre_industrial_era():
+    for term in ("placket", "toggles"):
+        bad = GOOD.replace("linen tunic, round neck, rope belt", f"linen tunic with a {term}")
+        assert "wardrobe-term" in errors(ss.lint_script(load(bad))), term
+
+
+def test_a_garment_that_never_states_its_opening_is_a_warning():
+    vague = GOOD.replace(
+        "undyed linen tunic, round neck, rope belt", "undyed linen tunic, rope belt"
+    )
+    findings = ss.lint_script(load(vague))
+    assert "garment-opening-unstated" in rules(findings)
+    assert "garment-opening-unstated" not in errors(findings)
+
+
+def test_the_portrait_prompt_carries_the_era_lock_garment_and_style():
+    script = load()
+    prompt = ss.compose_portrait_prompt(script, script.cast["mara"], "Head-and-shoulders portrait.")
+    assert "undyed linen tunic" in prompt and "market square" in prompt
+    assert "no placket" in prompt and "no buttons" in prompt
+    assert "no front opening" in prompt.lower()
+    assert "Head-and-shoulders portrait." in prompt
+
+
+def test_a_cast_member_can_override_the_era_lock():
+    custom = GOOD.replace(
+        'voice = "low, dry, unhurried"',
+        'voice = "low, dry, unhurried"\nwardrobe_lock = "Leather jerkin, laced."'
+    )
+    script = load(custom)
+    prompt = ss.compose_portrait_prompt(script, script.cast["mara"], "")
+    assert "Leather jerkin, laced." in prompt and "no placket" not in prompt
+
+
+def test_no_era_means_no_lock_in_the_portrait_prompt():
+    script = load(GOOD.replace('era = "pre-industrial"\n', ""))
+    assert "no placket" not in ss.compose_portrait_prompt(script, script.cast["mara"], "")
+
+
+def _with_voices(text, **voices):
+    descriptions = {"mara": "low, dry, unhurried", "teo": "high, quick, eager"}
+    for who, tts in voices.items():
+        d = descriptions[who]
+        text = text.replace(f'voice = "{d}"', f'voice = "{d}"\ntts_voice = "{tts}"')
+    return text
+
+
+def test_two_characters_sharing_a_synthesis_voice_is_an_error():
+    same = _with_voices(GOOD, teo="Aaa", mara="aaa")
+    assert "voice-shared" in errors(ss.lint_script(load(same)))
+
+
+def test_distinct_synthesis_voices_pass_and_a_missing_one_warns():
+    ok = _with_voices(GOOD, teo="Bbb", mara="Aaa")
+    assert "voice-shared" not in rules(ss.lint_script(load(ok)))
+    one = _with_voices(GOOD, mara="Aaa")
+    assert "voice-missing" in rules(ss.lint_script(load(one)))

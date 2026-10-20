@@ -89,8 +89,22 @@ ERA_BANNED: dict[str, tuple[str, ...]] = {
         "button", "buttons", "buttoned", "button-down", "button-up", "collar", "collared",
         "shirt", "t-shirt", "polo", "henley", "jeans", "denim", "zipper", "velcro",
         "sneakers", "sunglasses", "wristwatch", "hoodie", "blazer", "necktie", "lapel",
+        "placket", "toggle", "toggles", "snaps",
     ),
 }
+
+# What a portrait prompt must say, per era, beyond naming the garment. A second render's
+# portraits came out with real buttons on a placket although the prompt said "tunic": an
+# image model fills an unstated opening with the commonest one, so the opening is stated
+# and the alternatives are named.
+ERA_PORTRAIT_LOCK: dict[str, str] = {
+    "pre-industrial": (
+        "Simple hand-woven period clothing, a pullover tunic with a plain round neckline and NO "
+        "front opening: no slit, no placket, no buttons, no toggles, no collar, no modern clothing."
+    ),
+}
+
+_OPENING_WORDS = re.compile(r"\b(?:neck|neckline|hood|wrap|wrapped|robe|cloak)\b", re.I)
 
 _QUOTED = re.compile(r"[\"“][^\"”]{3,}[\"”]")
 
@@ -145,6 +159,8 @@ class CastMember:
     appearance: str
     voice: str
     garment: str = ""
+    tts_voice: str = ""      # synthesis voice id; must differ between speaking characters
+    wardrobe_lock: str = ""  # overrides the era's portrait lock for this one character
 
 
 @dataclass(frozen=True)
@@ -171,7 +187,7 @@ class Script:
 
 # --------------------------------------------------------------------- loading
 _SCRIPT_KEYS = {"era", "style", "banned_terms"}
-_CAST_KEYS = {"name", "garment", "appearance", "voice"}
+_CAST_KEYS = {"name", "garment", "appearance", "voice", "tts_voice", "wardrobe_lock"}
 _SHOT_KEYS = {
     "id", "seconds", "characters", "speaker", "line", "text", "posture", "transition", "delivery",
 }
@@ -236,6 +252,8 @@ def _build(raw: dict[str, Any]) -> Script:
             appearance=c.get("appearance", ""),
             voice=c.get("voice", ""),
             garment=c.get("garment", ""),
+            tts_voice=c.get("tts_voice", ""),
+            wardrobe_lock=c.get("wardrobe_lock", ""),
         )
     shots: list[Shot] = []
     seen: set[str] = set()
@@ -301,6 +319,28 @@ def lint_script(script: Script) -> list[Finding]:
                 add("garment-missing", None, "error",
                     f"cast {member.key!r} states no garment; with era {script.era!r} every "
                     "character's clothing must be written down, or the model picks it")
+    if script.era:
+        for member in script.cast.values():
+            if member.garment and not _OPENING_WORDS.search(member.garment):
+                add("garment-opening-unstated", None, "warning",
+                    f"cast {member.key!r}: the garment never states its neckline or opening; "
+                    "an image model fills an unstated opening with the commonest one "
+                    "(a buttoned placket)")
+    voiced = {k: m.tts_voice.strip().lower() for k, m in script.cast.items() if m.tts_voice.strip()}
+    if voiced:
+        owners: dict[str, str] = {}
+        for key, voice in voiced.items():
+            if voice in owners:
+                add("voice-shared", None, "error",
+                    f"cast {owners[voice]!r} and {key!r} share synthesis voice {voice!r}; "
+                    "every speaking character needs a voice of their own or the cast "
+                    "sounds like one person")
+            owners.setdefault(voice, key)
+        for shot in script.shots:
+            if shot.speaker and shot.speaker in script.cast and shot.speaker not in voiced:
+                add("voice-missing", shot, "warning",
+                    f"{shot.speaker!r} speaks but has no tts_voice while other characters do")
+                break
     for member in script.cast.values():
         for term in banned:
             if _word_re(term).search(f"{member.garment} {member.appearance}"):
@@ -416,6 +456,26 @@ def compose_generation_prompt(script: Script, shot: Shot) -> str:
         parts.append(sentence + ".")
     if shot.text.strip():
         parts.append(shot.text.strip())
+    return " ".join(parts)
+
+
+def compose_portrait_prompt(script: Script, member: CastMember, view: str = "") -> str:
+    """The still that a cast member's reference image is generated from.
+
+    States the garment, the era's lock (or the character's own ``wardrobe_lock``) and the script's
+    style, so a portrait cannot omit the wardrobe the script's linter checks the prose for.
+    """
+    lock = member.wardrobe_lock or ERA_PORTRAIT_LOCK.get(script.era or "", "")
+    parts = [f"Portrait of {member.name}: {member.appearance}."]
+    if member.garment:
+        parts.append(f"Wearing {member.garment}.")
+    if view.strip():
+        parts.append(view.strip())
+    if script.style.strip():
+        parts.append(script.style.strip())
+    if lock:
+        parts.append(lock)
+    parts.append("Photoreal, dignified, live-action film still.")
     return " ".join(parts)
 
 
