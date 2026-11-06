@@ -46,6 +46,16 @@ GOOD = textwrap.dedent(
     appearance = "thin young man, nervous eyes"
     voice = "high, quick, eager"
 
+    [setup.stall]
+    characters = ["mara"]
+    posture = { mara = "standing" }
+    still = "stills/stall.png"
+
+    [setup.crate]
+    characters = ["teo"]
+    posture = { teo = "standing" }
+    still = "stills/crate.png"
+
     [[shot]]
     id = "s1"
     seconds = 6
@@ -54,6 +64,7 @@ GOOD = textwrap.dedent(
     line = "We open at dawn."
     text = "Close on Mara at her stall, hands on the counter."
     posture = { mara = "standing" }
+    setup = "stall"
     [shot.delivery]
     pace = "measured"
     pitch = "low"
@@ -68,6 +79,7 @@ GOOD = textwrap.dedent(
     line = "Dawn? Which dawn?"
     text = "Close on Teo, leaning in over a crate."
     posture = { teo = "standing" }
+    setup = "crate"
     [shot.delivery]
     pace = "fast"
     pitch = "high"
@@ -446,3 +458,96 @@ def test_distinct_synthesis_voices_pass_and_a_missing_one_warns():
     assert "voice-shared" not in rules(ss.lint_script(load(ok)))
     one = _with_voices(GOOD, mara="Aaa")
     assert "voice-missing" in rules(ss.lint_script(load(one)))
+
+
+# --- one still per camera setup ------------------------------------------------------
+# A dialogue piece cuts back to the same few angles. Rendered one shot at a time, every return
+# to an angle invented its own background, neighbours and posture; started from one still per
+# setup, every return opened on that still (music_video_maker.setupmatch measures it). So every
+# shot names its setup, and the setup -- not the prose -- decides who is in frame and how.
+
+
+def test_every_shot_must_name_a_setup():
+    bad = GOOD.replace('setup = "crate"\n', "")
+    found = ss.lint_script(load(bad))
+    assert "setup-missing" in errors(found)
+    assert [f.shot_id for f in found if f.rule == "setup-missing"] == ["s2"]
+
+
+def test_a_setup_must_be_declared():
+    bad = GOOD.replace('setup = "crate"', 'setup = "dock"')
+    assert "unknown-setup" in errors(ss.lint_script(load(bad)))
+
+
+def test_the_speaker_must_be_on_the_setups_still():
+    # the still is the shot's first frame, so the speaker's face has to be in it (#47's lesson)
+    bad = GOOD.replace('characters = ["teo"]\nposture = { teo = "standing" }\nstill',
+                       'characters = ["mara"]\nposture = { mara = "standing" }\nstill')
+    assert "setup-speaker-unframed" in errors(ss.lint_script(load(bad)))
+
+
+def test_nobody_may_be_in_a_shot_who_is_not_on_its_still():
+    bad = GOOD.replace('characters = ["teo"]\nspeaker', 'characters = ["mara", "teo"]\nspeaker')
+    bad = bad.replace('posture = { teo = "standing" }\nsetup',
+                      'posture = { teo = "standing", mara = "standing" }\nsetup')
+    assert "setup-character-not-on-still" in errors(ss.lint_script(load(bad)))
+
+
+def test_a_shot_posture_must_match_its_setups_still():
+    bad = GOOD.replace('posture = { teo = "standing" }\nsetup',
+                       'posture = { teo = "seated" }\nsetup')
+    assert "setup-posture-mismatch" in errors(ss.lint_script(load(bad)))
+
+
+def test_setup_posture_must_come_from_the_vocabulary():
+    with pytest.raises(ss.SpokenScriptError, match="setup"):
+        load(GOOD.replace('posture = { teo = "standing" }\nstill',
+                          'posture = { teo = "floating" }\nstill'))
+
+
+def test_an_unknown_setup_key_is_refused():
+    with pytest.raises(ss.SpokenScriptError, match="setup.crate"):
+        load(GOOD.replace('still = "stills/crate.png"', 'stil = "stills/crate.png"'))
+
+
+def test_an_unused_setup_is_a_warning():
+    extra = GOOD.replace('[[shot]]\nid = "s1"',
+                         '[setup.dock]\ncharacters = ["teo"]\nstill = "d.png"\n\n'
+                         '[[shot]]\nid = "s1"')
+    found = ss.lint_script(load(extra))
+    assert "setup-unused" in rules(found) and "setup-unused" not in errors(found)
+
+
+def test_a_setup_without_a_still_warns_while_authoring_and_refuses_for_render():
+    bad = GOOD.replace('still = "stills/crate.png"\n', "")
+    assert "setup-still-missing" in rules(ss.lint_script(load(bad)))
+    assert "setup-still-missing" not in errors(ss.lint_script(load(bad)))
+    assert "setup-still-missing" in errors(ss.lint_script(load(bad), for_render=True))
+
+
+def test_for_render_the_still_file_must_exist_beside_the_script(tmp_path):
+    p = tmp_path / "s.toml"
+    p.write_text(GOOD)
+    (tmp_path / "stills").mkdir()
+    (tmp_path / "stills" / "stall.png").write_bytes(b"png")
+    found = ss.lint_script(ss.load_script(p), for_render=True)
+    assert [f.message for f in found if f.rule == "setup-still-missing"] == [
+        f"setup 'crate': still {tmp_path / 'stills' / 'crate.png'} does not exist"
+    ]
+    (tmp_path / "stills" / "crate.png").write_bytes(b"png")
+    assert ss.lint_script(ss.load_script(p), for_render=True) == []
+
+
+def test_still_path_resolves_against_the_script_file(tmp_path):
+    p = tmp_path / "s.toml"
+    p.write_text(GOOD)
+    script = ss.load_script(p)
+    assert ss.setup_still_path(script, script.setups["crate"]) == tmp_path / "stills" / "crate.png"
+
+
+def test_cli_for_render_flag(tmp_path, capsys):
+    p = tmp_path / "s.toml"
+    p.write_text(GOOD)
+    assert ss.main([str(p)]) == 0
+    assert ss.main(["--for-render", str(p)]) == 1
+    assert "setup-still-missing" in capsys.readouterr().out

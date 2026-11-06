@@ -12,6 +12,7 @@ refuses a script that breaks a rule, before any GPU time is spent.
 
 ```bash
 python -m music_video_maker.spokenscript my_script.toml   # 0 clean, 1 errors, 2 unreadable
+python -m music_video_maker.spokenscript --for-render my_script.toml   # also: every still exists
 ```
 
 **General form: a render takes hours and reports nothing about what it got wrong.**
@@ -37,6 +38,11 @@ garment = "undyed linen tunic with a rope belt"
 appearance = "weathered woman in her forties, grey-streaked braid"
 voice = "low, dry, unhurried"
 
+[setup.stall]                    # one camera angle: every shot on it starts from its still
+characters = ["mara"]            # who the still shows
+posture = { mara = "standing" }  # how the still shows them
+still = "stills/stall.png"       # relative to this file; may be absent while authoring
+
 [[shot]]
 id = "s1"
 seconds = 6
@@ -45,6 +51,7 @@ speaker = "mara"                 # at most one, and must be in `characters`
 line = "We open at dawn."        # the voice track's words, not the video prompt's
 text = "Close on Mara at her stall, hands on the counter."
 posture = { mara = "standing" }
+setup = "stall"
 [shot.delivery]
 pace = "measured"
 pitch = "low"
@@ -128,6 +135,44 @@ shot's `transition` (`posture-change-unmarked`):
 transition = "Mara sits down on a stool"
 ```
 
+## Cut between setups, not places
+
+**General form: a cut back to an angle the audience has seen must open on what they saw,
+and a prompt cannot make that true.** The second render cut back and forth between a few
+angles (one speaker, the other, the first again), and every shot, rendered alone from a
+portrait and a prompt, invented its own hillside, its own neighbours and its own posture. A
+viewer read every cut as the camera jumping somewhere new. The script asked for nothing
+else: it had one location for the whole piece, so no check on locations would have fired.
+
+So the unit of continuity is the **setup**, one camera angle, and each setup has one
+**still**, the frame every shot on it starts from:
+
+* every shot names its `setup` (`setup-missing`, `unknown-setup`);
+* the setup lists who is on its still, and the shot's speaker must be one of them
+  (`setup-speaker-unframed`): the still is the shot's first frame, so it must carry the
+  speaker's face, the same lesson as the chained path's seed frame;
+* nobody may be in a shot who is not on its still (`setup-character-not-on-still`), and
+  nobody may be in a posture the still contradicts (`setup-posture-mismatch`). The still
+  decides, so a shot that needs someone seated who stands on the still needs another setup;
+* a setup with no still warns while authoring and is an error with `--for-render`, which
+  also requires the file to exist (`setup-still-missing`). A declared setup no shot uses
+  warns (`setup-unused`).
+
+Measured on three cut-backs to two setups, 30 renders, everything else identical: started
+from the still, a shot's first frame scored 3.7-5.0 from it (ffmpeg thumbnail, mean absolute
+difference, 0-255); rendered without it, 27.6-44.3, the closest being the still's own source
+shot at another seed (14.7). The two setups' stills are 33.0 apart, so an unanchored cut-back
+looked as unlike its own setup as a different setup does. Without the still the cut-backs
+also dropped the people the script put beside the speaker. Check a render the same way:
+
+```bash
+python -m music_video_maker.setupmatch stills/stall.png takes/s1.mp4 takes/s7.mp4   # 1 on a mismatch
+```
+
+Cutting a lot is not the defect, and there is no limit on it: a quick back-and-forth can be
+the joke. Name a few setups per scene, keep each person's eyeline the same way on every
+return, and hold a speaker longer where the timing allows.
+
 ## Give every speaker a voice of their own
 
 A voice taken from the video model's own audio gave every character the same voice. Put each
@@ -160,6 +205,23 @@ instruction ahead of the description, and no dialogue in it.
 These are what the second render of the same piece settled; the driver that did them is not
 in the repo yet (see the open issue), so they are written down here.
 
+- **Start from the setup's still and pin the finished line to it.** On the local graph
+  (`MiniMaxH3ReferenceToVideo` as before, then `MiniMaxH3AddGuide` with the still as `image`
+  and the padded line as `audio`, both at `frame_idx = 0`, feeding the guider), measured over
+  three shots and two seeds: the line given only as a *reference* audio passed SyncNet 0 of
+  15 times (offsets up to 15 frames), the still alone 0 of 6, the still with the line pinned
+  3 of 6 plus one at offset 0 and confidence 2.7. A viewer agreed with the meter on which
+  speaker was in sync. The hosted path has not been tried this way.
+- **Set the speaker's face size on the still, by cropping it.** One speaker stayed out of sync
+  in every arm: his still was a wide frame with others in it (face 89 px of 480 tall). A
+  re-generated still with the repo's `close` framing sentence came back waist-up (115 px) and
+  did not fix it; the same still *cropped and enlarged* to head-and-shoulders (210 px) brought
+  the timing to offset 0 or -1 on three of four takes, and a viewer called one of them
+  perfect. The prompt did not set the size; the pixels did, as #97 found for sung chunks. The
+  speaker who synced from the start had a 150 px face.
+- **SyncNet's confidence floor fails takes a person passes.** Both shots the viewer called
+  perfect scored offset 0 and -1 but confidence 2.35 and 1.59, under `syncscore`'s 3.0. On
+  short single-speaker lines read the offset, and look before trusting the verdict.
 - **Drive the mouth with the finished line.** Reference image of the speaker plus the
   synthesized line as the reference audio, one face and one voice per generated shot. The
   hosted and local reference-to-video paths both return the reference audio unchanged, so the
@@ -189,3 +251,15 @@ in the repo yet (see the open issue), so they are written down here.
 - **Whether the delivery is funny.** Only a listener can say.
 - **Lip-sync of the finished video.** Check by eye and ear; the repo's lip-sync lessons
   (join placement, leading offset) apply unchanged to a spoken master.
+- **The camera drifts inside a shot.** Started from the still, about two thirds of the
+  shots pushed in, panned or tracked during the shot: same place, new framing by the time
+  the edit cuts away. `setupmatch` checks the first frame only, because at the cut-away
+  frame no threshold separates reframed from relocated. A style line that says "handheld"
+  invites it; a locked-off wording is untried.
+- **The still's face size and wardrobe.** Nothing measures the speaker's face on a still yet
+  (crop to roughly 200 px of 480 tall, as above), and a still copies whatever it shows into
+  every shot on its setup, a wrong garment included. Fix the still once, and every shot on
+  it is fixed.
+- **Consecutive shots on one setup.** Restarting both from the same still repeats the pose
+  across the cut, which #118 found reads as a jump; chaining the second from the first's
+  last frame is the obvious alternative and is untried for speech.
