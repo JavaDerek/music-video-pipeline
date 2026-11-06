@@ -688,6 +688,11 @@ def _find_video_output(outputs: dict[str, Any]) -> dict[str, Any] | None:
     Deliberately does **not** key on a fixed collection name (e.g.
     ``"videos"``) -- real ComfyUI SaveVideo-style nodes have been inconsistent
     about it, and the harness's default is just a convention, not a contract.
+
+    An item typed anything but ``"output"`` is skipped (#119): a ``LoadVideo``
+    node lists the file it *loaded* in ``/history`` with ``type = "input"``, so
+    a graph with a reference video otherwise hands back its own input clip as
+    the render. An untyped item still counts, as it always has.
     """
     for node_outputs in outputs.values():
         if not isinstance(node_outputs, dict):
@@ -697,6 +702,8 @@ def _find_video_output(outputs: dict[str, Any]) -> dict[str, Any] | None:
                 continue
             for item in items:
                 if not isinstance(item, dict):
+                    continue
+                if item.get("type", "output") != "output":
                     continue
                 filename = str(item.get("filename", ""))
                 fmt = str(item.get("format", ""))

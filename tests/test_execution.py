@@ -812,3 +812,34 @@ def test_the_timeout_is_configurable_per_client():
     )
     client.interrupt()
     assert session.requests[-1].kwargs["timeout"] == 5.0
+
+
+# --------------------------------------------------------------------------- #
+# A graph's *input* video is listed among its outputs (#119)
+# --------------------------------------------------------------------------- #
+
+
+def test_an_input_video_listed_in_history_is_not_taken_for_the_render():
+    # A LoadVideo node (a reference video fed to the model) reports the file it
+    # LOADED in /history, typed "input". Taking the first .mp4 copied the
+    # reference clip back as the render.
+    from music_video_maker.execution import _find_video_output
+
+    outputs = {
+        "40": {"images": [{"filename": "eyebrow_ref.mp4", "subfolder": "", "type": "input"}]},
+        "16": {"images": [{"filename": "shot_00001_.mp4", "subfolder": "", "type": "output"}]},
+    }
+    assert _find_video_output(outputs)["filename"] == "shot_00001_.mp4"
+
+
+def test_an_input_video_alone_is_no_output_at_all():
+    from music_video_maker.execution import _find_video_output
+
+    outputs = {"40": {"images": [{"filename": "ref.mp4", "type": "input"}]}}
+    assert _find_video_output(outputs) is None
+
+
+def test_an_untyped_video_item_still_counts_as_output():
+    from music_video_maker.execution import _find_video_output
+
+    assert _find_video_output({"16": {"videos": [{"filename": "a.mp4"}]}})["filename"] == "a.mp4"
