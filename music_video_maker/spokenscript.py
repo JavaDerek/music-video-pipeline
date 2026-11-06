@@ -173,6 +173,7 @@ class CastMember:
     garment: str = ""
     tts_voice: str = ""      # synthesis voice id; must differ between speaking characters
     wardrobe_lock: str = ""  # overrides the era's portrait lock for this one character
+    portrait: str = ""       # reference image path, relative to the script file
 
 
 @dataclass(frozen=True)
@@ -212,7 +213,7 @@ class Script:
 
 # --------------------------------------------------------------------- loading
 _SCRIPT_KEYS = {"era", "style", "banned_terms"}
-_CAST_KEYS = {"name", "garment", "appearance", "voice", "tts_voice", "wardrobe_lock"}
+_CAST_KEYS = {"name", "garment", "appearance", "voice", "tts_voice", "wardrobe_lock", "portrait"}
 _SHOT_KEYS = {
     "id", "seconds", "characters", "speaker", "line", "text", "posture", "transition", "delivery",
     "setup",
@@ -281,6 +282,7 @@ def _build(raw: dict[str, Any], source_dir: Path | None = None) -> Script:
             garment=c.get("garment", ""),
             tts_voice=c.get("tts_voice", ""),
             wardrobe_lock=c.get("wardrobe_lock", ""),
+            portrait=c.get("portrait", ""),
         )
     setups: dict[str, Setup] = {}
     for key, s in raw.get("setup", {}).items():
@@ -343,10 +345,19 @@ def _banned_for(script: Script) -> tuple[str, ...]:
     return tuple(ERA_BANNED.get(script.era or "", ())) + script.banned_terms
 
 
+def _beside_script(script: Script, path: str) -> Path:
+    p = Path(path)
+    return p if p.is_absolute() or script.source_dir is None else script.source_dir / p
+
+
 def setup_still_path(script: Script, setup: Setup) -> Path:
     """Where ``setup``'s still lives: relative to the script file (or as written, from text)."""
-    still = Path(setup.still)
-    return still if still.is_absolute() or script.source_dir is None else script.source_dir / still
+    return _beside_script(script, setup.still)
+
+
+def cast_portrait_path(script: Script, member: CastMember) -> Path:
+    """Where ``member``'s reference image lives, resolved the same way as a still."""
+    return _beside_script(script, member.portrait)
 
 
 def lint_script(script: Script, *, for_render: bool = False) -> list[Finding]:
@@ -503,6 +514,16 @@ def _lint_setups(script: Script, for_render: bool) -> list[Finding]:
                     f"{setup.key!r}'s still; the still decides, so this needs another setup")
     for key in sorted(set(script.setups) - used):
         add("setup-unused", None, "warning", f"setup {key!r} is declared but no shot uses it")
+    in_frame = {who for shot in script.shots for who in shot.characters}
+    for key, member in script.cast.items():
+        if key not in in_frame:
+            continue
+        if not member.portrait:
+            add("portrait-missing", None, "error" if for_render else "warning",
+                f"cast {key!r} is in frame but has no portrait to render from")
+        elif for_render and not cast_portrait_path(script, member).is_file():
+            add("portrait-missing", None, "error",
+                f"cast {key!r}: portrait {cast_portrait_path(script, member)} does not exist")
     return found
 
 

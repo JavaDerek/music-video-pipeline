@@ -39,12 +39,14 @@ GOOD = textwrap.dedent(
     garment = "undyed linen tunic, round neck, rope belt"
     appearance = "weathered woman in her forties, grey-streaked braid"
     voice = "low, dry, unhurried"
+    portrait = "cast/mara.png"
 
     [cast.teo]
     name = "Teo"
     garment = "wool vest over a patched linen tunic, round neck"
     appearance = "thin young man, nervous eyes"
     voice = "high, quick, eager"
+    portrait = "cast/teo.png"
 
     [setup.stall]
     characters = ["mara"]
@@ -530,6 +532,9 @@ def test_for_render_the_still_file_must_exist_beside_the_script(tmp_path):
     p.write_text(GOOD)
     (tmp_path / "stills").mkdir()
     (tmp_path / "stills" / "stall.png").write_bytes(b"png")
+    (tmp_path / "cast").mkdir()
+    for who in ("mara", "teo"):
+        (tmp_path / "cast" / f"{who}.png").write_bytes(b"png")
     found = ss.lint_script(ss.load_script(p), for_render=True)
     assert [f.message for f in found if f.rule == "setup-still-missing"] == [
         f"setup 'crate': still {tmp_path / 'stills' / 'crate.png'} does not exist"
@@ -551,3 +556,35 @@ def test_cli_for_render_flag(tmp_path, capsys):
     assert ss.main([str(p)]) == 0
     assert ss.main(["--for-render", str(p)]) == 1
     assert "setup-still-missing" in capsys.readouterr().out
+
+
+# --- a render needs each character's reference image ------------------------------------
+
+
+def test_a_character_in_frame_without_a_portrait_warns_and_refuses_for_render():
+    bad = GOOD.replace('portrait = "cast/teo.png"\n', "")
+    assert "portrait-missing" in rules(ss.lint_script(load(bad)))
+    assert "portrait-missing" not in errors(ss.lint_script(load(bad)))
+    assert "portrait-missing" in errors(ss.lint_script(load(bad), for_render=True))
+
+
+def test_a_cast_member_never_in_frame_needs_no_portrait():
+    extra = GOOD.replace("[setup.stall]", '[cast.zed]\nname = "Zed"\ngarment = "a cloak with '
+                         'a hood"\nappearance = "old"\nvoice = "dry"\n\n[setup.stall]')
+    assert "portrait-missing" not in rules(ss.lint_script(load(extra)))
+
+
+def test_for_render_the_portrait_file_must_exist(tmp_path):
+    p = tmp_path / "s.toml"
+    p.write_text(GOOD)
+    (tmp_path / "stills").mkdir()
+    for s in ("stall", "crate"):
+        (tmp_path / "stills" / f"{s}.png").write_bytes(b"png")
+    (tmp_path / "cast").mkdir()
+    (tmp_path / "cast" / "mara.png").write_bytes(b"png")
+    found = ss.lint_script(ss.load_script(p), for_render=True)
+    assert [f.message for f in found if f.rule == "portrait-missing"] == [
+        f"cast 'teo': portrait {tmp_path / 'cast' / 'teo.png'} does not exist"
+    ]
+    script = ss.load_script(p)
+    assert ss.cast_portrait_path(script, script.cast["teo"]) == tmp_path / "cast" / "teo.png"
