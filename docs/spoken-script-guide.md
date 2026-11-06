@@ -200,10 +200,27 @@ the two measured patterns. Also refused: quoted speech inside `text`
 (`dialogue-in-prose`), which invites the model to say it. Put no label, duration or
 instruction ahead of the description, and no dialogue in it.
 
-## Rendering a single-speaker shot (lessons, not yet code in this repo)
+## Rendering a single-speaker shot
 
-These are what the second render of the same piece settled; the driver that did them is not
-in the repo yet (see the open issue), so they are written down here.
+`music_video_maker/spokenrender.py` renders a script that passes `--for-render`, one shot at a
+time on the local graph, and cuts it together:
+
+```bash
+python -m music_video_maker.spokenrender my_script.toml --lines lines/ --out out/ \
+    --h3-authorization license/minimax_h3_authorization.pdf [--only s7,s8] [--seed N]
+```
+
+`lines/` holds one finished WAV per spoken shot, named `<shot id>.wav`, made by whatever
+synthesis engine you chose (not this module's job yet). Each shot gets the speaker's
+`portrait` first among its reference images, the line as reference audio, and its setup's
+still and the same line pinned at frame 0. Every take is checked with `setupmatch` and recorded
+in `out/provenance.json` as it lands; `out/spoken_cut.mp4` is the cut, with the finished lines
+as its only audio. It exits 1 if any shot failed to open on its still. It is `local_h3` only,
+so the authorization lock applies, and it takes custody the way a render does: a free-VRAM
+pre-flight first, `POST /free` however it ends. Not built yet: line synthesis, take scoring
+and retakes, an ambience bed and loudness.
+
+These are the lessons it encodes:
 
 - **Start from the setup's still and pin the finished line to it.** On the local graph
   (`MiniMaxH3ReferenceToVideo` as before, then `MiniMaxH3AddGuide` with the still as `image`

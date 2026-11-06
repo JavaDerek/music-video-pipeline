@@ -68,6 +68,7 @@ SUBPROCESS_ALLOWLIST = frozenset(
         "luminance.py",  # ffmpeg frame sampling for the darkness floor (issue #77) -- no model
         "scenecuts.py",  # ffmpeg scene-detection probe (issue #81) -- no model
         "setupmatch.py",  # ffmpeg frame thumbnails vs a setup's still (#121) -- no model
+        "spokenrender.py",  # ffmpeg pad/trim/concat of spoken shots (#119) -- no model
         "webui.py",  # `tailscale ip -4` bind discovery + ffmpeg thumbnails (issue #36) -- no model
         # control.py (issue #36, 2026-10-04): spawns THIS project's own CLI
         # (`python -m music_video_maker.cli`) so a browser can start and stop
