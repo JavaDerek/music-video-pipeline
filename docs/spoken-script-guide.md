@@ -42,6 +42,7 @@ voice = "low, dry, unhurried"
 characters = ["mara"]            # who the still shows
 posture = { mara = "standing" }  # how the still shows them
 still = "stills/stall.png"       # relative to this file; may be absent while authoring
+framing = "close"                # face | close | medium | wide; required if anyone speaks here
 
 [[shot]]
 id = "s1"
@@ -156,7 +157,27 @@ So the unit of continuity is the **setup**, one camera angle, and each setup has
   decides, so a shot that needs someone seated who stands on the still needs another setup;
 * a setup with no still warns while authoring and is an error with `--for-render`, which
   also requires the file to exist (`setup-still-missing`). A declared setup no shot uses
-  warns (`setup-unused`).
+  warns (`setup-unused`);
+* a setup anyone speaks on states its `framing` (`setup-framing-missing`; `wide` warns,
+  `setup-framing-wide`), and the render composes the repo's framing sentence for it into
+  every shot on the setup.
+
+**The still fixes the first frame; the framing sentence keeps the camera there.** Started
+from a head-and-shoulders still, one speaker's camera pulled back through every shot, his face
+going from 200 px of 480 to 61-102 px by the end, until a viewer saw "him not talking at all".
+Measured on his two shots at two seeds each, everything else identical:
+
+| | camera | longer line (2.6 s) | short line (1.4 s), SyncNet offset |
+|---|---|---|---|
+| still only | pulled back, 4 of 4 | 0 of 2 in sync | -15, -14 |
+| + the still also pinned at the last frame | held | 2 of 2 | -15, -15 |
+| **+ the `close` framing sentence** | **held or pushed in, 4 of 4** | **2 of 2** | **0, -1** |
+| + both | held | 2 of 2 | -1, -15 |
+
+A viewer watched the cuts and called both framing versions great and both still-only versions
+broken. Pinning the last frame held the camera too, but lost the short line both times, so it
+is not done. The other speaker never needed it: his shot text said "medium close-up ...
+seated", and his camera pushed in.
 
 Measured on three cut-backs to two setups, 30 renders, everything else identical: started
 from the still, a shot's first frame scored 3.7-5.0 from it (ffmpeg thumbnail, mean absolute
@@ -268,11 +289,10 @@ These are the lessons it encodes:
 - **Whether the delivery is funny.** Only a listener can say.
 - **Lip-sync of the finished video.** Check by eye and ear; the repo's lip-sync lessons
   (join placement, leading offset) apply unchanged to a spoken master.
-- **The camera drifts inside a shot.** Started from the still, about two thirds of the
-  shots pushed in, panned or tracked during the shot: same place, new framing by the time
-  the edit cuts away. `setupmatch` checks the first frame only, because at the cut-away
-  frame no threshold separates reframed from relocated. A style line that says "handheld"
-  invites it; a locked-off wording is untried.
+- **The camera still moves inside a shot.** The setup's framing sentence stopped it pulling
+  back from a speaker; pans and push-ins remain (same place, new framing by the cut-away).
+  `setupmatch` checks the first frame only, because at the cut-away frame no threshold
+  separates reframed from relocated. A style line that says "handheld" invites it.
 - **The still's face size and wardrobe.** Nothing measures the speaker's face on a still yet
   (crop to roughly 200 px of 480 tall, as above), and a still copies whatever it shows into
   every shot on its setup, a wrong garment included. Fix the still once, and every shot on

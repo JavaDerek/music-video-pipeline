@@ -46,11 +46,13 @@ portrait = "cast/teo.png"
 characters = ["mara"]
 posture = { mara = "seated" }
 still = "stills/mara_single.png"
+framing = "close"
 
 [setup.teo_single]
 characters = ["teo"]
 posture = { teo = "standing" }
 still = "stills/teo_single.png"
+framing = "close"
 
 [[shot]]
 id = "s1"
@@ -435,3 +437,41 @@ def test_cli_refuses_a_script_that_is_not_render_ready(project, capsys):
                     "--out", str(project / "out"), "--h3-authorization", str(auth)])
     assert code == 2
     assert "setup-still-missing" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- framing
+
+
+def test_the_script_framing_vocabulary_is_the_render_path_one():
+    from music_video_maker import prompting
+    assert ss.FRAMINGS == prompting.FRAMING_LEVELS
+
+
+def test_the_setups_framing_sentence_follows_the_description_and_precedes_the_tag(project):
+    script = ss.load_script(project / "script.toml")
+    prompt = sr.shot_prompt(script, script.shots[0])
+    assert prompt.endswith("Medium close-up of Mara seated, raising a hand. Mara is framed head "
+                           "and shoulders, the face taking up most of the frame." + sr.SPEAKER_TAG)
+
+
+def test_a_description_without_a_full_stop_gets_one_before_the_framing(project):
+    script_file = project / "script.toml"
+    text = script_file.read_text().replace("Teo, patient.", "Teo, patient")
+    script_file.write_text(text)
+    script = ss.load_script(script_file)
+    prompt = sr.shot_prompt(script, script.shots[2])
+    assert "Teo, patient. Teo is framed head and shoulders" in prompt
+
+
+def test_a_silent_shot_frames_whoever_its_setup_shows(project):
+    script = ss.load_script(project / "script.toml")
+    prompt = sr.shot_prompt(script, script.shots[1])
+    assert prompt.endswith("Teo is framed head and shoulders, the face taking up most of "
+                           "the frame.")
+
+
+def test_a_setup_without_framing_composes_none(project):
+    text = (project / "script.toml").read_text().replace('framing = "close"\n', "")
+    (project / "script.toml").write_text(text)
+    script = ss.load_script(project / "script.toml")
+    assert "framed" not in sr.shot_prompt(script, script.shots[1])

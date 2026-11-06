@@ -50,7 +50,10 @@ A second render fixed those and failed in a seventh way, which is the reason for
   angles, and each shot, rendered alone from a portrait and a prompt, invented its own
   hillside, its own neighbours and its own posture -- a viewer read every cut as the camera
   jumping somewhere new. One still per camera ``[setup.<key>]``, anchored at each shot's
-  first frame, fixed it at a measured margin (``setupmatch``). So every shot names its
+  first frame, fixed it at a measured margin (``setupmatch``). Started from its still, a
+  speaker's camera then pulled back through the shot until the mouth was too small to read;
+  a setup a speaker uses therefore states its ``framing``, which the render composes into every
+  shot on it, and with it no shot pulled back. So every shot names its
   ``setup``; the setup lists who is on its still and in what posture, and a shot may not put
   anyone in frame, or in a posture, that its still contradicts. A setup with no ``still``
   is a warning while authoring and an error with ``for_render=True``.
@@ -85,6 +88,10 @@ PACES = ("slow", "measured", "normal", "brisk", "fast")
 PITCHES = ("low", "mid", "high")
 VOLUMES = ("whisper", "soft", "normal", "loud")
 POSTURES = ("standing", "seated", "kneeling", "walking", "lying", "crouching")
+# How close a setup's camera is: the render path's own ordinal (``prompting.FRAMING_LEVELS``, #97),
+# restated rather than imported because this module imports nothing that renders; a test pins
+# the two equal.
+FRAMINGS = ("face", "close", "medium", "wide")
 
 # Spoken words per second at each pace. Starting values (ordinary conversation is
 # ~2.5 wps); a synthesis engine's real rate replaces these once one is chosen.
@@ -184,6 +191,7 @@ class Setup:
     characters: tuple[str, ...]
     posture: dict[str, str] = field(default_factory=dict)
     still: str = ""  # path, relative to the script file; absent while authoring
+    framing: str = ""  # one of FRAMINGS; required when a speaker uses the setup
 
 
 @dataclass(frozen=True)
@@ -218,7 +226,7 @@ _SHOT_KEYS = {
     "id", "seconds", "characters", "speaker", "line", "text", "posture", "transition", "delivery",
     "setup",
 }
-_SETUP_KEYS = {"characters", "posture", "still"}
+_SETUP_KEYS = {"characters", "posture", "still", "framing"}
 _DELIVERY_KEYS = {"pace", "pitch", "volume", "pause_before"}
 
 
@@ -295,6 +303,8 @@ def _build(raw: dict[str, Any], source_dir: Path | None = None) -> Script:
                 for who, p in s.get("posture", {}).items()
             },
             still=s.get("still", ""),
+            framing=_choice(f"[setup.{key}]", "framing", s["framing"], FRAMINGS)
+            if "framing" in s else "",
         )
     shots: list[Shot] = []
     seen: set[str] = set()
@@ -514,6 +524,18 @@ def _lint_setups(script: Script, for_render: bool) -> list[Finding]:
                     f"{setup.key!r}'s still; the still decides, so this needs another setup")
     for key in sorted(set(script.setups) - used):
         add("setup-unused", None, "warning", f"setup {key!r} is declared but no shot uses it")
+    spoken_on = {s.setup for s in script.shots if s.speaker and s.setup in script.setups}
+    for key in sorted(spoken_on):
+        setup = script.setups[key]
+        if not setup.framing:
+            add("setup-framing-missing", None, "error",
+                f"setup {key!r} carries a speaker but states no framing; started from its still, "
+                "a speaker's camera pulled back until the mouth was too small to read "
+                f"(one of {list(FRAMINGS)})")
+        elif setup.framing == "wide":
+            add("setup-framing-wide", None, "warning",
+                f"setup {key!r} carries a speaker at framing 'wide'; a mouth that small does "
+                "not read, whatever it does")
     in_frame = {who for shot in script.shots for who in shot.characters}
     for key, member in script.cast.items():
         if key not in in_frame:

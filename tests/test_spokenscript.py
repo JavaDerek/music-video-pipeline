@@ -52,11 +52,13 @@ GOOD = textwrap.dedent(
     characters = ["mara"]
     posture = { mara = "standing" }
     still = "stills/stall.png"
+    framing = "close"
 
     [setup.crate]
     characters = ["teo"]
     posture = { teo = "standing" }
     still = "stills/crate.png"
+    framing = "close"
 
     [[shot]]
     id = "s1"
@@ -588,3 +590,41 @@ def test_for_render_the_portrait_file_must_exist(tmp_path):
     ]
     script = ss.load_script(p)
     assert ss.cast_portrait_path(script, script.cast["teo"]) == tmp_path / "cast" / "teo.png"
+
+
+# --- a setup says how close the camera is ---------------------------------------------
+# Without it, a speaker's camera pulled back through every shot (face 200 -> 61-102 px of 480 in
+# 4 of 4 takes) until the mouth was too small to read; with the setup's framing sentence composed
+# into the prompt, 0 of 4 pulled back and the lines synced (spokenrender, #120/#121).
+
+
+def no_crate_framing() -> str:
+    return GOOD.replace('still = "stills/crate.png"\nframing = "close"\n',
+                        'still = "stills/crate.png"\n')
+
+
+def test_a_setup_a_speaker_uses_must_state_its_framing():
+    bad = no_crate_framing()
+    found = ss.lint_script(load(bad))
+    assert "setup-framing-missing" in errors(found)
+    message = [f.message for f in found if f.rule == "setup-framing-missing"][0]
+    assert message.startswith("setup 'crate'")
+
+
+def test_a_silent_setup_needs_no_framing():
+    silent = no_crate_framing()
+    silent = silent.replace('speaker = "teo"\nline = "Dawn? Which dawn?"\n',
+                            "")
+    silent = silent.split("[shot.delivery]\npace = \"fast\"")[0]
+    assert "setup-framing-missing" not in rules(ss.lint_script(load(silent)))
+
+
+def test_framing_comes_from_the_ordinal_vocabulary():
+    with pytest.raises(ss.SpokenScriptError, match="framing"):
+        load(GOOD.replace('framing = "close"', 'framing = "tight-ish"', 1))
+
+
+def test_a_wide_setup_for_a_speaker_warns():
+    wide = GOOD.replace('framing = "close"', 'framing = "wide"', 1)
+    found = ss.lint_script(load(wide))
+    assert "setup-framing-wide" in rules(found) and "setup-framing-wide" not in errors(found)

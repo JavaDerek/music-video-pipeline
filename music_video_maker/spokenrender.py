@@ -30,7 +30,8 @@ Local graph only, so ``local_h3`` and its authorization lock apply (:mod:`lipsyn
 is ``MiniMaxH3AddGuide``, and the hosted API has not been tried this way. Not here yet (#119):
 line synthesis, take scoring and retakes, an ambience bed and loudness, and a check of the
 speaker's face size on the still (crop it to roughly 200 px of 480 tall; the prompt does not set
-size). The camera may still drift inside a shot; ``setupmatch`` checks the first frame only.
+size). The setup's ``framing`` sentence holds the camera near the still; ``setupmatch`` still
+checks the first frame only.
 """
 
 from __future__ import annotations
@@ -51,6 +52,7 @@ from typing import Any
 from music_video_maker import lipsync, setupmatch
 from music_video_maker import spokenscript as ss
 from music_video_maker.contracts import H3_FRAME_GRID
+from music_video_maker.prompting import _framing_clause  # the #97 clause, never a second copy
 from music_video_maker.provenance import ShotProvenance, record_shot, sha256_file, utc_now_iso
 from music_video_maker.workflow_graph import (
     _free_node_id,  # one allocator for new node ids, shared with insert_lora
@@ -187,8 +189,24 @@ def reference_cast(shot: ss.Shot) -> tuple[str, ...]:
 
 
 def shot_prompt(script: ss.Script, shot: ss.Shot) -> str:
-    """Description only (``compose_generation_prompt``), plus which picture and audio speak."""
+    """Description only (``compose_generation_prompt``), then the setup's framing sentence, then
+    which picture and audio speak.
+
+    The framing sentence is what keeps the camera where the still put it. Measured on two
+    speakers' shots at two seeds each, everything else identical: without it the camera pulled
+    back in 4 of 4 (face 200 -> 61-102 px of 480) and SyncNet passed 0; with it 0 of 4 pulled
+    back, and both lines read in sync. Pinning the still at the last frame as well also held the
+    framing but cost the short line its sync (offset -15 at both seeds), so it is not done.
+    """
     prompt = ss.compose_generation_prompt(script, shot)
+    setup = script.setups.get(shot.setup) if shot.setup else None
+    if setup is not None and setup.framing:
+        who = (shot.speaker,) if shot.speaker else setup.characters
+        clause = _framing_clause(tuple(script.cast[k] for k in who if k in script.cast),
+                                 setup.framing)
+        if clause:
+            prompt = prompt.rstrip()
+            prompt += ("" if prompt.endswith(".") else ".") + f" {clause}."
     return prompt + SPEAKER_TAG if shot.line else prompt
 
 
