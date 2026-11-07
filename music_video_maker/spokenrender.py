@@ -296,8 +296,9 @@ def render_shots(script: ss.Script, plans: Sequence[PlannedShot], *, template: W
             shot = plan.shot
             setup = script.setups[shot.setup]  # type: ignore[index]
             still = ss.setup_still_path(script, setup)
+            # A shot with nobody in it (a landscape) is referenced by its own still.
             portraits = [ss.cast_portrait_path(script, script.cast[k])
-                         for k in reference_cast(shot)]
+                         for k in reference_cast(shot)] or [still]
             images = [stager.upload_image(p) for p in portraits]
             still_name = stager.upload_image(still)
             line_name, line_pad = None, None

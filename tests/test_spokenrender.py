@@ -475,3 +475,35 @@ def test_a_setup_without_framing_composes_none(project):
     (project / "script.toml").write_text(text)
     script = ss.load_script(project / "script.toml")
     assert "framed" not in sr.shot_prompt(script, script.shots[1])
+
+
+EMPTY_SHOT = """
+[setup.empty_hill]
+characters = []
+posture = {}
+still = "stills/empty_hill.png"
+framing = "wide"
+
+[[shot]]
+id = "s4"
+seconds = 3
+characters = []
+text = "The empty hillside at dusk, grass moving."
+posture = {}
+setup = "empty_hill"
+"""
+
+
+def test_a_shot_with_nobody_in_it_references_its_own_still(project):
+    with (project / "script.toml").open("a") as f:
+        f.write(EMPTY_SHOT)
+    (project / "stills" / "empty_hill.png").write_bytes(b"png:empty")
+    client = FakeClient()
+    run(project, client, only={"s4"})
+    wf = client.workflows[0]
+    ref = _inputs_of(wf, "MiniMaxH3ReferenceToVideo")
+    assert wf[ref["ref_images.ref_image_0"][0]]["inputs"]["image"] == "up_empty_hill.png"
+    _check_anchor(wf, "up_empty_hill.png", None)
+    prov = json.loads((project / "out" / "provenance.json").read_text())
+    s4 = prov["shots"][0]["inputs"]
+    assert s4["reference_image"] == s4["setup_still"]
